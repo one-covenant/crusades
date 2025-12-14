@@ -66,7 +66,9 @@ class SandboxVerifier:
 
         Args:
             code_path: Path to the miner's train.py file.
-            seed: Random seed for reproducibility (generated randomly if None).
+            seed: Random seed for this evaluation (generated randomly if None).
+                  Same seed is used for both reference and miner execution to ensure
+                  outputs match. Different seed per evaluation prevents pre-computation.
             timeout_seconds: Sandbox timeout (defaults to sandbox config).
             num_steps: Number of training steps (defaults to benchmark config).
 
@@ -74,8 +76,11 @@ class SandboxVerifier:
             VerificationResult with success status and TPS if valid.
         """
         # Generate random seed if not provided (security: prevents pre-computation)
+        # The SAME seed is used for both reference and miner in this evaluation
         import random
         seed = seed if seed is not None else random.randint(1, 2**31 - 1)
+        
+        logger.info(f"Using random seed: {seed} for this evaluation")
 
         try:
             # Step 1: Run reference execution
