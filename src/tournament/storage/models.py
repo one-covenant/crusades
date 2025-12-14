@@ -49,6 +49,12 @@ class SubmissionModel(Base):
     final_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Payment fields (anti-spam mechanism)
+    payment_block_hash: Mapped[str | None] = mapped_column(String(66), nullable=True)
+    payment_extrinsic_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    payment_amount_rao: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    payment_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     # Relationships
     evaluations: Mapped[list["EvaluationModel"]] = relationship(
         "EvaluationModel", back_populates="submission", cascade="all, delete-orphan"

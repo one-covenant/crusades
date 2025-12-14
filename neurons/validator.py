@@ -10,6 +10,7 @@ import bittensor as bt
 from tournament.chain.weights import WeightSetter
 from tournament.config import get_config, get_hparams
 from tournament.core.protocols import SubmissionStatus
+from tournament.payment.verifier import PaymentVerifier
 from tournament.pipeline.validator import CodeValidator
 from tournament.sandbox.manager import SandboxManager
 from tournament.schemas import BenchmarkConfig
@@ -56,6 +57,7 @@ class Validator(BaseNode):
         self.verifier: SandboxVerifier | None = None
         self.code_validator: CodeValidator | None = None
         self.weight_setter: WeightSetter | None = None
+        self.payment_verifier: PaymentVerifier | None = None
 
         # Timing
         self.last_weight_set_time: float = 0
@@ -113,6 +115,12 @@ class Validator(BaseNode):
             burn_enabled=self.burn_enabled,
         )
 
+        # Payment verifier (anti-spam)
+        self.payment_verifier = PaymentVerifier(
+            recipient_address=self.wallet.hotkey.ss58_address,
+            subtensor=chain.subtensor,
+        )
+
     async def start(self) -> None:
         """Start the validator."""
         await self.initialize()
@@ -143,7 +151,7 @@ class Validator(BaseNode):
             self.last_sync_time = now
 
     async def process_pending_submissions(self) -> None:
-        """Validate pending submissions."""
+        """Validate pending submissions (including payment verification)."""
         pending = await self.db.get_pending_submissions()
 
         for submission in pending:
@@ -155,11 +163,38 @@ class Validator(BaseNode):
                 SubmissionStatus.VALIDATING,
             )
 
-            # TODO: Download code from R2
+            # Step 1: Verify payment (if payment info provided)
+            if submission.payment_block_hash and not submission.payment_verified:
+                logger.info(f"Verifying payment for submission {submission.submission_id}")
+                
+                payment_valid, payment_error = await self.payment_verifier.verify_payment(
+                    block_hash=submission.payment_block_hash,
+                    extrinsic_index=submission.payment_extrinsic_index,
+                    miner_coldkey=submission.miner_hotkey,  # Assuming hotkey used for payment
+                    expected_amount_rao=submission.payment_amount_rao,
+                )
+
+                if not payment_valid:
+                    await self.db.update_submission_status(
+                        submission.submission_id,
+                        SubmissionStatus.FAILED_VALIDATION,
+                        error_message=f"Payment verification failed: {payment_error}",
+                    )
+                    logger.warning(
+                        f"Submission {submission.submission_id} failed payment verification: {payment_error}"
+                    )
+                    continue
+
+                # Mark payment as verified
+                submission.payment_verified = True
+                logger.info(f"Payment verified for submission {submission.submission_id}")
+
+            # Step 2: Download code from R2
+            # TODO: Implement R2 download
             # For now, assume code is available locally
             # code = await download_from_r2(submission.bucket_path)
 
-            # Validate code
+            # Step 3: Validate code
             # result = self.code_validator.validate(code)
             # For now, just mark as evaluating
             result_valid = True

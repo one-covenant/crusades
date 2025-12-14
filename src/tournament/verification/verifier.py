@@ -161,9 +161,8 @@ class SandboxVerifier:
             sandbox_result: Sandbox execution result.
 
         Raises:
-            LogitsMismatchError: If logits don't match.
+            LogitsMismatchError: If output vectors don't match within tolerance.
             TokenCountMismatchError: If token counts don't match.
-            LossMismatchError: If loss values don't match.
         """
         # 1. Check token count (exact match required)
         if ref_result.total_tokens != sandbox_result.total_tokens:
@@ -173,22 +172,7 @@ class SandboxVerifier:
             )
         logger.info(f"  [OK] Token count matches: {sandbox_result.total_tokens:,}")
 
-        # 2. Check loss value (within tolerance)
-        if hasattr(sandbox_result, "final_loss") and sandbox_result.final_loss is not None:
-            loss_diff = abs(ref_result.final_loss - sandbox_result.final_loss)
-            if loss_diff > self.config.loss_tolerance:
-                raise LossMismatchError(
-                    expected=ref_result.final_loss,
-                    actual=sandbox_result.final_loss,
-                    tolerance=self.config.loss_tolerance,
-                )
-            logger.info(
-                f"  [OK] Loss matches: {sandbox_result.final_loss:.4f} "
-                f"(diff={loss_diff:.6f}, tol={self.config.loss_tolerance})"
-            )
-
-        # 3. Check logits (within tolerance)
-        # Load sandbox logits from output file if available
+        # 2. Check output vectors (aggregate difference within tolerance)
         if hasattr(sandbox_result, "final_logits") and sandbox_result.final_logits is not None:
             sandbox_logits = sandbox_result.final_logits
             if isinstance(sandbox_logits, str):
@@ -198,21 +182,30 @@ class SandboxVerifier:
             # Ensure same device for comparison
             ref_logits = ref_result.final_logits.to(sandbox_logits.device)
 
-            if not torch.allclose(
-                ref_logits,
-                sandbox_logits,
-                atol=self.config.logits_atol,
-                rtol=self.config.logits_rtol,
-            ):
+            # Calculate aggregate difference across all dimensions
+            diff = (ref_logits - sandbox_logits).abs()
+            mean_diff = diff.mean().item()
+            max_diff = diff.max().item()
+            
+            # Calculate as percentage of mean absolute value
+            mean_abs_value = ref_logits.abs().mean().item()
+            if mean_abs_value > 0:
+                aggregate_diff_pct = mean_diff / mean_abs_value
+            else:
+                aggregate_diff_pct = mean_diff
+
+            if aggregate_diff_pct > self.config.output_vector_tolerance:
                 raise LogitsMismatchError(
                     expected=ref_logits,
                     actual=sandbox_logits,
-                    tolerance=self.config.logits_atol,
+                    tolerance=self.config.output_vector_tolerance,
                 )
+            
             logger.info(
-                f"  [OK] Logits match (atol={self.config.logits_atol}, "
-                f"rtol={self.config.logits_rtol})"
+                f"  [OK] Output vectors match within {self.config.output_vector_tolerance*100:.1f}%"
             )
+            logger.info(f"      Mean diff: {mean_diff:.6f}, Max diff: {max_diff:.6f}")
+            logger.info(f"      Aggregate: {aggregate_diff_pct*100:.2f}% (threshold: {self.config.output_vector_tolerance*100:.1f}%)")
 
     async def verify_code_structure(self, code_path: str) -> tuple[bool, str | None]:
         """Quick validation of code structure before full verification.

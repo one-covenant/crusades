@@ -40,6 +40,9 @@ class HParams(BaseModel):
 
     # Timing settings
     set_weights_interval_seconds: int = 600
+    
+    # Payment settings (anti-spam)
+    submission_cost_rao: int = 100_000_000  # 0.1 TAO default
 
     # Nested configs
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)

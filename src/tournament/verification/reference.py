@@ -210,9 +210,10 @@ class ReferenceExecutor:
                 logits = model(input_ids)
 
                 # Cross entropy loss
+                # Use reshape instead of view to handle non-contiguous tensors
                 loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    labels.view(-1),
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1),
                     ignore_index=-100,
                 )
 
