@@ -31,7 +31,6 @@ def verification_config():
     """Standard verification config with production tolerances."""
     return VerificationConfig(
         output_vector_tolerance=0.01,  # 1% aggregate tolerance
-        random_seed=42,
     )
 
 
@@ -439,7 +438,6 @@ class TestToleranceConfiguration:
         """Stricter tolerance (0.1%) rejects small differences."""
         strict_config = VerificationConfig(
             output_vector_tolerance=0.001,  # 0.1% - very strict
-            random_seed=42,
         )
         
         mock_sandbox = AsyncMock()
@@ -455,7 +453,6 @@ class TestToleranceConfiguration:
         """Looser tolerance (10%) accepts larger differences."""
         loose_config = VerificationConfig(
             output_vector_tolerance=0.1,  # 10% - very loose
-            random_seed=42,
         )
         
         mock_sandbox = AsyncMock()

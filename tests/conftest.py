@@ -10,7 +10,6 @@ import torch
 def mock_config():
     return VerificationConfig(
         output_vector_tolerance=0.01,  # 1% tolerance
-        random_seed=42
     )
 
 @pytest.fixture

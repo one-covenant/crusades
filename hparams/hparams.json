@@ -23,8 +23,7 @@
     "verification": {
         "output_vector_tolerance": 0.01,
         "verify_model_state": false,
-        "deterministic_mode": true,
-        "random_seed": 42
+        "deterministic_mode": true
     },
 
     "storage": {

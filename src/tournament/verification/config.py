@@ -17,9 +17,6 @@ class VerificationConfig:
     # Deterministic mode settings
     deterministic_mode: bool = True
 
-    # Random seed for reproducibility
-    random_seed: int = 42
-
     @classmethod
     def from_dict(cls, data: dict) -> "VerificationConfig":
         """Create config from dictionary."""
@@ -27,7 +24,6 @@ class VerificationConfig:
             output_vector_tolerance=data.get("output_vector_tolerance", 0.01),
             verify_model_state=data.get("verify_model_state", False),
             deterministic_mode=data.get("deterministic_mode", True),
-            random_seed=data.get("random_seed", 42),
         )
 
     def to_dict(self) -> dict:
@@ -36,5 +32,4 @@ class VerificationConfig:
             "output_vector_tolerance": self.output_vector_tolerance,
             "verify_model_state": self.verify_model_state,
             "deterministic_mode": self.deterministic_mode,
-            "random_seed": self.random_seed,
         }
