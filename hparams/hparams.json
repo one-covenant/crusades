@@ -2,7 +2,7 @@
     "netuid": 3,
 
     "num_evals_per_submission": 3,
-    "eval_steps": 100,
+    "eval_steps": 5,
     "eval_timeout": 600,
 
     "benchmark_model_size": "150M",
