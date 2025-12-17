@@ -60,30 +60,40 @@ class ReferenceExecutor:
         torch.backends.cudnn.benchmark = False
 
     def _load_model(self) -> nn.Module:
-        """Load the benchmark model.
+        """Load the official 8B benchmark model.
+        
+        Loads from HuggingFace transformers format (saved by setup_benchmark.py).
+        All miners and validators use this exact model for fairness.
 
         Returns:
-            Loaded model on the target device.
+            Loaded model on the target device in train mode.
         """
-        # For now, we'll assume model is saved as a state dict
-        # In practice, this would load from the actual model checkpoint
         if not self.model_path.exists():
-            raise FileNotFoundError(f"Model not found at {self.model_path}")
+            raise FileNotFoundError(
+                f"Model not found at {self.model_path}\n"
+                f"Run: uv run python scripts/setup_benchmark.py"
+            )
 
-        # Load model architecture and weights
-        # This is a placeholder - actual implementation depends on model format
-        checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
-
-        if isinstance(checkpoint, nn.Module):
-            model = checkpoint
-        elif isinstance(checkpoint, dict) and "model" in checkpoint:
-            model = checkpoint["model"]
-        else:
-            raise ValueError(f"Unknown checkpoint format at {self.model_path}")
-
-        model = model.to(self.device)
-        model.train()
-        return model
+        try:
+            from transformers import AutoModelForCausalLM
+            
+            # Load model from HuggingFace format
+            logger.info(f"Loading model from {self.model_path}")
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            
+            model.train()
+            logger.info(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+            return model
+            
+        except ImportError:
+            raise ImportError("transformers library required. Run: uv sync")
+        except Exception as e:
+            raise ValueError(f"Failed to load model from {self.model_path}: {e}")
 
     def _create_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
         """Create optimizer for reference execution.

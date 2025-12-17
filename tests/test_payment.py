@@ -4,11 +4,12 @@ Unit tests for Payment System
 Tests the anti-spam payment mechanism adapted from Ridges.
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
 from tournament.payment.manager import PaymentManager, PaymentReceipt
 from tournament.payment.verifier import PaymentVerifier
-
 
 # ============================================================================
 # FIXTURES
@@ -27,18 +28,18 @@ def mock_wallet():
 def mock_subtensor():
     """Mock Subtensor for blockchain interactions."""
     subtensor = MagicMock()
-    
+
     # Mock substrate
     subtensor.substrate = MagicMock()
     subtensor.substrate.compose_call = MagicMock(return_value="mock_call")
     subtensor.substrate.create_signed_extrinsic = MagicMock(return_value="mock_extrinsic")
-    
+
     # Mock receipt
     mock_receipt = MagicMock()
     mock_receipt.block_hash = "0xabcd1234"
     mock_receipt.extrinsic_idx = 5
     subtensor.substrate.submit_extrinsic = MagicMock(return_value=mock_receipt)
-    
+
     return subtensor
 
 
@@ -72,7 +73,7 @@ class TestPaymentManager:
     def test_get_submission_cost(self, payment_manager):
         """Can retrieve submission cost in RAO and TAO."""
         cost_rao, cost_tao = payment_manager.get_submission_cost()
-        
+
         assert cost_rao == 100_000_000
         assert cost_tao == 0.1
 
@@ -80,7 +81,7 @@ class TestPaymentManager:
         """Default submission cost is 0.1 TAO."""
         manager = PaymentManager(wallet=mock_wallet, subtensor=mock_subtensor)
         cost_rao, cost_tao = manager.get_submission_cost()
-        
+
         assert cost_rao == 100_000_000
         assert cost_tao == 0.1
 
@@ -92,7 +93,7 @@ class TestPaymentManager:
             submission_cost_rao=50_000_000,  # 0.05 TAO
         )
         cost_rao, cost_tao = manager.get_submission_cost()
-        
+
         assert cost_rao == 50_000_000
         assert cost_tao == 0.05
 
@@ -103,7 +104,7 @@ class TestPaymentManager:
             recipient_address="5RecipientAddress456",
             amount_rao=100_000_000,
         )
-        
+
         assert isinstance(receipt, PaymentReceipt)
         assert receipt.block_hash == "0xabcd1234"
         assert receipt.extrinsic_index == 5
@@ -116,7 +117,7 @@ class TestPaymentManager:
         receipt = await payment_manager.make_payment(
             recipient_address="5RecipientAddress456",
         )
-        
+
         assert receipt.amount_rao == 100_000_000  # Default
 
     @pytest.mark.asyncio
@@ -126,7 +127,7 @@ class TestPaymentManager:
             recipient_address="5RecipientAddress456",
             amount_rao=100_000_000,
         )
-        
+
         # Verify compose_call was called
         mock_subtensor.substrate.compose_call.assert_called_once_with(
             call_module="Balances",
@@ -136,7 +137,7 @@ class TestPaymentManager:
                 "value": 100_000_000,
             },
         )
-        
+
         # Verify extrinsic was submitted
         mock_subtensor.substrate.submit_extrinsic.assert_called_once()
 
@@ -170,14 +171,14 @@ class TestPaymentVerifier:
             ]
         }
         mock_subtensor.substrate.get_block = MagicMock(return_value=mock_block)
-        
+
         is_valid, message = await payment_verifier.verify_payment(
             block_hash="0xabcd1234",
             extrinsic_index=0,
             miner_coldkey="5MinerColdkey123",
             expected_amount_rao=100_000_000,
         )
-        
+
         assert is_valid is True
         assert "verified" in message.lower()
 
@@ -185,13 +186,13 @@ class TestPaymentVerifier:
     async def test_verify_payment_block_not_found(self, payment_verifier, mock_subtensor):
         """Payment verification fails if block not found."""
         mock_subtensor.substrate.get_block = MagicMock(return_value=None)
-        
+
         is_valid, message = await payment_verifier.verify_payment(
             block_hash="0xinvalid",
             extrinsic_index=0,
             miner_coldkey="5MinerColdkey123",
         )
-        
+
         assert is_valid is False
         assert "Block not found" in message
 
@@ -216,13 +217,13 @@ class TestPaymentVerifier:
             ]
         }
         mock_subtensor.substrate.get_block = MagicMock(return_value=mock_block)
-        
+
         is_valid, message = await payment_verifier.verify_payment(
             block_hash="0xabcd1234",
             extrinsic_index=0,
             miner_coldkey="5MinerColdkey123",
         )
-        
+
         assert is_valid is False
         assert "Sender mismatch" in message
 
@@ -247,13 +248,13 @@ class TestPaymentVerifier:
             ]
         }
         mock_subtensor.substrate.get_block = MagicMock(return_value=mock_block)
-        
+
         is_valid, message = await payment_verifier.verify_payment(
             block_hash="0xabcd1234",
             extrinsic_index=0,
             miner_coldkey="5MinerColdkey123",
         )
-        
+
         assert is_valid is False
         assert "Recipient mismatch" in message
 
@@ -278,14 +279,14 @@ class TestPaymentVerifier:
             ]
         }
         mock_subtensor.substrate.get_block = MagicMock(return_value=mock_block)
-        
+
         is_valid, message = await payment_verifier.verify_payment(
             block_hash="0xabcd1234",
             extrinsic_index=0,
             miner_coldkey="5MinerColdkey123",
             expected_amount_rao=100_000_000,
         )
-        
+
         assert is_valid is False
         assert "Insufficient payment" in message
 
@@ -307,13 +308,13 @@ class TestPaymentVerifier:
             ]
         }
         mock_subtensor.substrate.get_block = MagicMock(return_value=mock_block)
-        
+
         is_valid, message = await payment_verifier.verify_payment(
             block_hash="0xabcd1234",
             extrinsic_index=0,
             miner_coldkey="5MinerColdkey123",
         )
-        
+
         assert is_valid is False
         assert "Not a Balances call" in message
 
@@ -322,13 +323,13 @@ class TestPaymentVerifier:
         """Payment verification fails if extrinsic index is invalid."""
         mock_block = {"extrinsics": []}  # Empty
         mock_subtensor.substrate.get_block = MagicMock(return_value=mock_block)
-        
+
         is_valid, message = await payment_verifier.verify_payment(
             block_hash="0xabcd1234",
             extrinsic_index=5,  # Out of range
             miner_coldkey="5MinerColdkey123",
         )
-        
+
         assert is_valid is False
         assert "out of range" in message
 
@@ -349,21 +350,21 @@ class TestPaymentIntegration:
             subtensor=mock_subtensor,
             submission_cost_rao=100_000_000,
         )
-        
+
         receipt = await manager.make_payment(
             recipient_address="5RecipientAddress456",
         )
-        
+
         assert receipt.block_hash == "0xabcd1234"
         assert receipt.amount_rao == 100_000_000
-        
+
         # Step 2: Validator verifies payment
         verifier = PaymentVerifier(
             recipient_address="5RecipientAddress456",
             subtensor=mock_subtensor,
             required_amount_rao=100_000_000,
         )
-        
+
         # Mock the block data to match the payment
         mock_block = {
             "extrinsics": [
@@ -383,14 +384,14 @@ class TestPaymentIntegration:
             ] * 6  # Need at least 6 extrinsics for index 5
         }
         mock_subtensor.substrate.get_block = MagicMock(return_value=mock_block)
-        
+
         is_valid, message = await verifier.verify_payment(
             block_hash=receipt.block_hash,
             extrinsic_index=receipt.extrinsic_index,
             miner_coldkey=mock_wallet.hotkey.ss58_address,
             expected_amount_rao=receipt.amount_rao,
         )
-        
+
         assert is_valid is True
 
     @pytest.mark.asyncio
@@ -398,16 +399,16 @@ class TestPaymentIntegration:
         """Payment mechanism prevents spam submissions."""
         # Without payment: unlimited submissions
         # With payment: each submission costs 0.1 TAO
-        
+
         # Scenario: Miner wants to spam 100 submissions
         num_spam_attempts = 100
         cost_per_submission_tao = 0.1
-        
+
         total_cost_tao = num_spam_attempts * cost_per_submission_tao
-        
+
         # Cost becomes prohibitive
         assert total_cost_tao == 10.0  # 10 TAO to spam 100 times
-        
+
         # This economic barrier prevents spam
         assert total_cost_tao > 1.0  # More than 1 TAO makes spam expensive
 
@@ -428,7 +429,7 @@ class TestPaymentEdgeCases:
             recipient_address="5RecipientAddress456",
             amount_rao=0,
         )
-        
+
         assert receipt.amount_rao == 0
 
     @pytest.mark.asyncio
@@ -452,27 +453,27 @@ class TestPaymentEdgeCases:
             ]
         }
         mock_subtensor.substrate.get_block = MagicMock(return_value=mock_block)
-        
+
         is_valid, message = await payment_verifier.verify_payment(
             block_hash="0xabcd1234",
             extrinsic_index=0,
             miner_coldkey="5MinerColdkey123",
             expected_amount_rao=100_000_000,
         )
-        
+
         assert is_valid is True
 
     @pytest.mark.asyncio
     async def test_verify_payment_handles_exceptions(self, payment_verifier, mock_subtensor):
         """Payment verification handles exceptions gracefully."""
         mock_subtensor.substrate.get_block = MagicMock(side_effect=Exception("Network error"))
-        
+
         is_valid, message = await payment_verifier.verify_payment(
             block_hash="0xabcd1234",
             extrinsic_index=0,
             miner_coldkey="5MinerColdkey123",
         )
-        
+
         assert is_valid is False
         assert "Verification error" in message
 

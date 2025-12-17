@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """
-Sandbox runner script - executes inside Docker container.
+Sandbox runner - executes miner code inside isolated Docker container.
+
+SECURITY:
+- Runs untrusted miner code in isolated environment
+- No network access
+- Read-only filesystem
+- External time measurement (prevents timing manipulation)
+- Random seed per evaluation (prevents pre-computation)
 
 This script:
-1. Loads the benchmark config
-2. Imports and validates the miner's train.py
-3. Runs the miner's inner_steps function
-4. Captures output logits and loss for verification
+1. Loads official 8B model and dataset (same for all miners)
+2. Imports miner's train.py
+3. Runs miner's inner_steps function
+4. Captures outputs for verification
 5. Writes results to /output/result.json
+
+Model/Data: Specified in hparams.json (same for all participants)
 """
 
 import importlib.util
@@ -150,20 +159,22 @@ def main():
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Load model
+        # Load official 7B model (HuggingFace format from setup_benchmark.py)
         print(f"Loading model from {model_path}...")
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        if isinstance(checkpoint, torch.nn.Module):
-            model = checkpoint
-        elif isinstance(checkpoint, dict) and "model" in checkpoint:
-            model = checkpoint["model"]
-        else:
-            write_result(output_dir, 0, 0, False, f"Unknown model format at {model_path}")
+        try:
+            from transformers import AutoModelForCausalLM
+            
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            model.train()
+            print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+        except Exception as e:
+            write_result(output_dir, 0, 0, False, f"Failed to load model: {e}")
             return 1
-
-        model = model.to(device)
-        model.train()
-        print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
 
         # Load initial model state if provided (for verification)
         initial_state_path = sandbox_dir / "initial_state.pt"

@@ -1,14 +1,14 @@
 """
 Reference inner_steps implementation for templar-tournament.
 
-This is the canonical implementation that miners must match in terms of
-output logits, token counts, and loss values. Miners can optimize this
-implementation but must produce the same outputs.
+VALIDATOR USE ONLY:
+This is the canonical implementation used by validators to generate
+reference outputs that miners' code must match.
 
-Usage:
-    from benchmark.reference_inner_steps import inner_steps, InnerStepsResult
+SECURITY: This file is public for transparency, but validators run it
+with random seeds per evaluation to prevent miners from pre-computing outputs.
 
-    result = inner_steps(model, data_iterator, optimizer, num_steps, device)
+Miners should use example_train.py as their starting point, NOT this file.
 """
 
 from collections.abc import Iterator
@@ -89,12 +89,14 @@ def inner_steps(
 
         # Forward pass with bf16 autocast
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            logits = model(input_ids)
+            outputs = model(input_ids)
+            # Handle both HuggingFace models (return object) and simple models (return tensor)
+            logits = outputs.logits if hasattr(outputs, 'logits') else outputs
 
             # Cross-entropy loss for next-token prediction
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
                 ignore_index=-100,
             )
 

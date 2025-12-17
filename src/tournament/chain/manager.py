@@ -1,4 +1,14 @@
-"""Bittensor chain manager for subnet interactions."""
+"""Bittensor chain manager for subnet interactions.
+
+BLOCKCHAIN INTEGRATION:
+- Connects to Bittensor network (mainnet or testnet)
+- Syncs metagraph (gets all registered miners)
+- Verifies miner registration
+- Sets weights (distributes incentives)
+- Reads current block
+
+All on-chain operations happen through this manager.
+"""
 
 import asyncio
 
@@ -9,7 +19,14 @@ from ..core.exceptions import ChainError
 
 
 class ChainManager:
-    """Manages interactions with the Bittensor network."""
+    """Manages interactions with the Bittensor blockchain.
+    
+    Handles:
+    - Metagraph syncing (who is registered)
+    - Weight setting (incentive distribution)
+    - Miner verification (is hotkey registered?)
+    - Block queries
+    """
 
     def __init__(
         self,
@@ -101,7 +118,7 @@ class ChainManager:
         loop = asyncio.get_event_loop()
 
         try:
-            result = await loop.run_in_executor(
+            await loop.run_in_executor(
                 None,
                 lambda: self.subtensor.set_weights(
                     wallet=self.wallet,

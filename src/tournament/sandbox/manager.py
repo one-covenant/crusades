@@ -1,4 +1,18 @@
-"""Docker sandbox manager for executing miner training code."""
+"""Docker sandbox manager for executing miner training code.
+
+SECURITY: Runs untrusted code in isolated containers with:
+- No network access
+- Read-only filesystem
+- Resource limits (16GB RAM, 4 CPUs, 1 GPU)
+- External time measurement (host-side timing)
+- Random seed per evaluation (prevents pre-computation)
+
+FAIRNESS: All miners evaluated with:
+- Same 8B model (from hparams.json)
+- Same dataset (from hparams.json)
+- Same hardware limits
+- External timing (can't be manipulated)
+"""
 
 import asyncio
 import shutil
@@ -16,7 +30,11 @@ from ..schemas import BenchmarkConfig, SandboxOutput
 
 
 class SandboxManager:
-    """Manages Docker containers for running untrusted training code."""
+    """Manages Docker containers for running untrusted miner code.
+    
+    Mounts official 8B model and dataset (read-only) into sandbox.
+    Model/data paths come from config (benchmark_model_path, benchmark_data_path).
+    """
 
     IMAGE_NAME = "tournament-sandbox:latest"
 
@@ -25,6 +43,12 @@ class SandboxManager:
         benchmark_model_path: str,
         benchmark_data_path: str,
     ):
+        """Initialize sandbox manager.
+        
+        Args:
+            benchmark_model_path: Path to official 8B model directory
+            benchmark_data_path: Path to official dataset file
+        """
         self.benchmark_model_path = Path(benchmark_model_path).resolve()
         self.benchmark_data_path = Path(benchmark_data_path).resolve()
         self.hparams = get_hparams()

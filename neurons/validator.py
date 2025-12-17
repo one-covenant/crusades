@@ -16,6 +16,7 @@ from tournament.sandbox.manager import SandboxManager
 from tournament.schemas import BenchmarkConfig
 from tournament.storage.database import Database, get_database
 from tournament.storage.models import EvaluationModel
+from tournament.storage.r2 import get_r2_storage
 from tournament.verification import (
     ReferenceExecutor,
     SandboxVerifier,
@@ -118,7 +119,7 @@ class Validator(BaseNode):
         # Payment verifier (anti-spam)
         self.payment_verifier = PaymentVerifier(
             recipient_address=self.wallet.hotkey.ss58_address,
-            subtensor=chain.subtensor,
+            subtensor=self.chain.subtensor,
         )
 
     async def start(self) -> None:
@@ -166,7 +167,7 @@ class Validator(BaseNode):
             # Step 1: Verify payment (if payment info provided)
             if submission.payment_block_hash and not submission.payment_verified:
                 logger.info(f"Verifying payment for submission {submission.submission_id}")
-                
+
                 payment_valid, payment_error = await self.payment_verifier.verify_payment(
                     block_hash=submission.payment_block_hash,
                     extrinsic_index=submission.payment_extrinsic_index,
@@ -229,10 +230,31 @@ class Validator(BaseNode):
 
             logger.info(f"Evaluating submission {submission.submission_id}")
 
-            # TODO: Download code from R2
-            # code_path = await download_from_r2(submission.bucket_path)
-            # For now, use a placeholder path
+            # Download code from R2
+            r2_storage = get_r2_storage()
             code_path = f"/tmp/submissions/{submission.submission_id}/train.py"
+
+            logger.info(f"Downloading code from storage: {submission.bucket_path}")
+            download_success = await r2_storage.download_code(
+                submission.bucket_path, code_path
+            )
+
+            if not download_success:
+                logger.error(f"Failed to download code for submission {submission.submission_id}")
+                # Save failed evaluation
+                evaluation = EvaluationModel(
+                    submission_id=submission.submission_id,
+                    evaluator_hotkey=self.hotkey,
+                    tokens_per_second=0.0,
+                    total_tokens=0,
+                    wall_time_seconds=0.0,
+                    success=False,
+                    error="Failed to download code from storage",
+                )
+                await self.db.save_evaluation(evaluation)
+                continue
+
+            logger.info(f"Code downloaded successfully: {code_path}")
 
             # Run verification and benchmarking
             result = await self.verifier.verify_and_benchmark(code_path)

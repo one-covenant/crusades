@@ -5,6 +5,7 @@ Tests the validation logic that checks miner code before sandbox execution.
 """
 
 import pytest
+
 from tournament.pipeline.validator import CodeValidator, ValidationResult
 
 
@@ -19,7 +20,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 """
         validator = CodeValidator(check_imports=False)
         result = validator.validate(code)
-        
+
         assert result.valid is True
         assert len(result.errors) == 0
 
@@ -32,7 +33,7 @@ def some_other_function():
 """
         validator = CodeValidator(check_imports=False)
         result = validator.validate(code)
-        
+
         assert result.valid is False
         assert any("inner_steps" in error for error in result.errors)
 
@@ -44,7 +45,7 @@ def some_other_function():
 """
         validator = CodeValidator(check_imports=False)
         result = validator.validate(code)
-        
+
         assert result.valid is False
         assert len(result.errors) > 0
         assert "inner_steps" in result.errors[0]
@@ -61,7 +62,7 @@ def setup_data(data_path, batch_size, seq_len
 """
         validator = CodeValidator(check_imports=False)
         result = validator.validate(code)
-        
+
         assert result.valid is False
         assert len(result.errors) > 0
         assert "Syntax error" in result.errors[0]
@@ -76,7 +77,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 """
         validator = CodeValidator(check_imports=True)
         result = validator.validate(code)
-        
+
         assert result.valid is False
         assert any("os" in error for error in result.errors)
 
@@ -90,7 +91,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 """
         validator = CodeValidator(check_imports=True)
         result = validator.validate(code)
-        
+
         assert result.valid is False
         assert any("subprocess" in error for error in result.errors)
 
@@ -104,7 +105,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 """
         validator = CodeValidator(check_imports=True)
         result = validator.validate(code)
-        
+
         assert result.valid is False
         assert any("socket" in error for error in result.errors)
 
@@ -118,7 +119,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 """
         validator = CodeValidator(check_imports=True)
         result = validator.validate(code)
-        
+
         assert result.valid is True
 
     def test_allowed_import_numpy_passes(self):
@@ -131,7 +132,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 """
         validator = CodeValidator(check_imports=True)
         result = validator.validate(code)
-        
+
         assert result.valid is True
 
     def test_multiple_errors_reported(self):
@@ -146,7 +147,7 @@ def some_other_function():
 """
         validator = CodeValidator(check_imports=True)
         result = validator.validate(code)
-        
+
         assert result.valid is False
         assert len(result.errors) >= 2  # Missing functions + forbidden imports
 
@@ -160,7 +161,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 """
         validator = CodeValidator(check_imports=False)
         result = validator.validate(code)
-        
+
         assert result.valid is True
 
     def test_async_functions_detected(self):
@@ -171,7 +172,7 @@ async def inner_steps(model, data_iterator, optimizer, num_steps, device):
 """
         validator = CodeValidator(check_imports=False)
         result = validator.validate(code)
-        
+
         assert result.valid is True
 
     def test_nested_functions_counted(self):
@@ -183,7 +184,7 @@ def outer():
 """
         validator = CodeValidator(check_imports=False)
         result = validator.validate(code)
-        
+
         # ast.walk() traverses the entire tree, so nested functions are found
         # This is acceptable - miners shouldn't nest functions anyway
         assert result.valid is True

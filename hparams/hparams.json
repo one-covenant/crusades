@@ -5,7 +5,13 @@
     "eval_steps": 5,
     "eval_timeout": 600,
 
-    "benchmark_model_size": "150M",
+    "_comment_benchmark": "CRITICAL: All miners and validators must use these EXACT resources",
+    "benchmark_model_name": "Qwen/Qwen2.5-7B",
+    "benchmark_model_revision": "main",
+    "benchmark_dataset_name": "HuggingFaceFW/fineweb",
+    "benchmark_dataset_split": "train",
+    "benchmark_dataset_subset": null,
+    "benchmark_dataset_size": 100000,
     "benchmark_sequence_length": 1024,
     "benchmark_batch_size": 8,
 

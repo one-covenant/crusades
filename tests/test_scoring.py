@@ -8,19 +8,19 @@ These tests verify the core verification logic:
 4. TPS calculation
 """
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 import torch
-from unittest.mock import MagicMock, AsyncMock
 
-from tournament.verification.verifier import SandboxVerifier
+from tournament.core.protocols import SandboxResult
 from tournament.verification.config import VerificationConfig
 from tournament.verification.errors import (
-    TokenCountMismatchError,
-    LossMismatchError, 
     LogitsMismatchError,
+    LossMismatchError,
+    TokenCountMismatchError,
 )
-from tournament.core.protocols import SandboxResult
-
+from tournament.verification.verifier import SandboxVerifier
 
 # ============================================================================
 # FIXTURES
@@ -94,10 +94,10 @@ class TestTokenCountMatching:
         """Token count must match exactly - same count passes."""
         mock_sandbox = AsyncMock()
         mock_sandbox.run.return_value = create_sandbox_result(token_diff=0)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is True
         assert result.total_tokens == 1280
 
@@ -108,10 +108,10 @@ class TestTokenCountMatching:
         """Even 1 token difference should fail."""
         mock_sandbox = AsyncMock()
         mock_sandbox.run.return_value = create_sandbox_result(token_diff=1)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is False
         assert result.error_type == "TokenCountMismatchError"
 
@@ -123,10 +123,10 @@ class TestTokenCountMatching:
         mock_sandbox = AsyncMock()
         # Missing one batch worth (batch_size=2, seq_len=128 = 256 tokens)
         mock_sandbox.run.return_value = create_sandbox_result(token_diff=-256)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is False
         assert result.error_type == "TokenCountMismatchError"
 
@@ -137,10 +137,10 @@ class TestTokenCountMatching:
         """Extra tokens (cheating attempt) should fail."""
         mock_sandbox = AsyncMock()
         mock_sandbox.run.return_value = create_sandbox_result(token_diff=1000)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is False
         assert result.error_type == "TokenCountMismatchError"
 
@@ -159,10 +159,10 @@ class TestOutputVectorMatching:
         """Exact output vector match passes."""
         mock_sandbox = AsyncMock()
         mock_sandbox.run.return_value = create_sandbox_result(logits_diff=0.0)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is True
 
     @pytest.mark.asyncio
@@ -173,10 +173,10 @@ class TestOutputVectorMatching:
         mock_sandbox = AsyncMock()
         # Small difference that's under 1% aggregate
         mock_sandbox.run.return_value = create_sandbox_result(logits_diff=0.001)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is True
 
     @pytest.mark.asyncio
@@ -185,14 +185,14 @@ class TestOutputVectorMatching:
     ):
         """Output difference at 1% boundary passes."""
         mock_sandbox = AsyncMock()
-        
+
         # Create result with small difference (under 1%)
         result = create_sandbox_result(logits_diff=0.005)
         mock_sandbox.run.return_value = result
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         verify_result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         # Should pass (0.005 is much less than 1% aggregate)
         assert verify_result.success is True
 
@@ -204,10 +204,10 @@ class TestOutputVectorMatching:
         mock_sandbox = AsyncMock()
         # Large difference exceeding 1%
         mock_sandbox.run.return_value = create_sandbox_result(logits_diff=0.1)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is False
         assert result.error_type == "LogitsMismatchError"
 
@@ -218,10 +218,10 @@ class TestOutputVectorMatching:
         """Large output difference (cheating attempt) fails."""
         mock_sandbox = AsyncMock()
         mock_sandbox.run.return_value = create_sandbox_result(logits_diff=1.0)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is False
         assert result.error_type == "LogitsMismatchError"
 
@@ -240,10 +240,10 @@ class TestLogitsMatching:
         """Exact logits match passes."""
         mock_sandbox = AsyncMock()
         mock_sandbox.run.return_value = create_sandbox_result(logits_diff=0.0)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is True
 
     @pytest.mark.asyncio
@@ -253,10 +253,10 @@ class TestLogitsMatching:
         """Small logits difference within tolerance passes."""
         mock_sandbox = AsyncMock()
         mock_sandbox.run.return_value = create_sandbox_result(logits_diff=0.0005)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is True
 
     @pytest.mark.asyncio
@@ -267,10 +267,10 @@ class TestLogitsMatching:
         mock_sandbox = AsyncMock()
         # Large difference that exceeds tolerance
         mock_sandbox.run.return_value = create_sandbox_result(logits_diff=0.1)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is False
         assert result.error_type == "LogitsMismatchError"
 
@@ -280,7 +280,7 @@ class TestLogitsMatching:
     ):
         """Completely random logits (cheating) fails."""
         mock_sandbox = AsyncMock()
-        
+
         result = SandboxResult(
             success=True,
             tokens_per_second=1280.0,
@@ -294,10 +294,10 @@ class TestLogitsMatching:
         # Completely different random logits
         result.final_logits = torch.randn_like(reference_result.final_logits) * 100
         mock_sandbox.run.return_value = result
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         verify_result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert verify_result.success is False
         assert verify_result.error_type == "LogitsMismatchError"
 
@@ -319,13 +319,13 @@ class TestTPSCalculation:
         result.total_tokens = 10000
         result.wall_time_seconds = 2.0  # TPS should be 5000
         mock_sandbox.run.return_value = result
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         # Override reference to match tokens
         mock_reference_executor.execute.return_value.total_tokens = 10000
-        
+
         verify_result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert verify_result.success is True
         assert verify_result.tokens_per_second == 5000.0
 
@@ -339,12 +339,12 @@ class TestTPSCalculation:
         result.total_tokens = 100000
         result.wall_time_seconds = 0.5  # TPS should be 200000
         mock_sandbox.run.return_value = result
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         mock_reference_executor.execute.return_value.total_tokens = 100000
-        
+
         verify_result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert verify_result.success is True
         assert verify_result.tokens_per_second == 200000.0
 
@@ -358,12 +358,12 @@ class TestTPSCalculation:
         result.total_tokens = 1000
         result.wall_time_seconds = 10.0  # TPS should be 100
         mock_sandbox.run.return_value = result
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         mock_reference_executor.execute.return_value.total_tokens = 1000
-        
+
         verify_result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert verify_result.success is True
         assert verify_result.tokens_per_second == 100.0
 
@@ -386,10 +386,10 @@ class TestCombinedVerification:
             loss_diff=0.0,
             logits_diff=0.0,
         )
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is True
         assert result.error_message is None
 
@@ -404,10 +404,10 @@ class TestCombinedVerification:
             loss_diff=0.0,   # Would pass
             logits_diff=0.0, # Would pass
         )
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is False
         assert result.error_type == "TokenCountMismatchError"
 
@@ -418,10 +418,10 @@ class TestCombinedVerification:
         """Sandbox execution failure is handled gracefully."""
         mock_sandbox = AsyncMock()
         mock_sandbox.run.return_value = create_sandbox_result(success=False)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, verification_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is False
         assert result.error_type == "SandboxExecutionError"
 
@@ -439,13 +439,13 @@ class TestToleranceConfiguration:
         strict_config = VerificationConfig(
             output_vector_tolerance=0.001,  # 0.1% - very strict
         )
-        
+
         mock_sandbox = AsyncMock()
         mock_sandbox.run.return_value = create_sandbox_result(logits_diff=0.005)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, strict_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is False
 
     @pytest.mark.asyncio
@@ -454,12 +454,12 @@ class TestToleranceConfiguration:
         loose_config = VerificationConfig(
             output_vector_tolerance=0.1,  # 10% - very loose
         )
-        
+
         mock_sandbox = AsyncMock()
         mock_sandbox.run.return_value = create_sandbox_result(logits_diff=0.05)
-        
+
         verifier = SandboxVerifier(mock_sandbox, mock_reference_executor, loose_config)
         result = await verifier.verify_and_benchmark("dummy.py")
-        
+
         assert result.success is True
 

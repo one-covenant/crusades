@@ -120,7 +120,7 @@ class Database:
                 .select_from(EvaluationModel)
                 .where(
                     EvaluationModel.submission_id == submission_id,
-                    EvaluationModel.success == True,
+                    EvaluationModel.success,
                 )
             )
             return result.scalar() or 0

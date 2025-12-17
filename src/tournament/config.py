@@ -33,14 +33,18 @@ class HParams(BaseModel):
     eval_steps: int = 100
     eval_timeout: int = 600
 
-    # Benchmark settings
-    benchmark_model_size: str = "150M"
+    # Benchmark settings - EXACT model and data everyone uses
+    benchmark_model_name: str = "meta-llama/Llama-3.2-8B"
+    benchmark_model_revision: str = "main"
+    benchmark_dataset_name: str = "HuggingFaceFW/fineweb"
+    benchmark_dataset_split: str = "train"
+    benchmark_dataset_subset: str | None = None
     benchmark_sequence_length: int = 1024
     benchmark_batch_size: int = 8
 
     # Timing settings
     set_weights_interval_seconds: int = 600
-    
+
     # Payment settings (anti-spam)
     submission_cost_rao: int = 100_000_000  # 0.1 TAO default
 
@@ -91,10 +95,10 @@ class Config(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
 
-    # Paths
+    # Paths (where official 8B model and data are stored after setup)
     hparams_path: str = "hparams/hparams.json"
-    benchmark_model_path: str = "benchmark/model"
-    benchmark_data_path: str = "benchmark/data"
+    benchmark_model_path: str = "benchmark/model"  # HuggingFace model directory
+    benchmark_data_path: str = "benchmark/data/train.pt"  # Tokenized dataset
 
     # Debug
     debug: bool = False

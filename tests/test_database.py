@@ -4,13 +4,14 @@ Unit tests for Database Operations
 Tests CRUD operations for submissions and evaluations.
 """
 
-import pytest
 from datetime import datetime
 from uuid import uuid4
 
-from tournament.storage.database import Database
-from tournament.storage.models import SubmissionModel, EvaluationModel
+import pytest
+
 from tournament.core.protocols import SubmissionStatus
+from tournament.storage.database import Database
+from tournament.storage.models import EvaluationModel, SubmissionModel
 
 
 @pytest.fixture
@@ -53,10 +54,10 @@ class TestSubmissionOperations:
     async def test_save_submission(self, test_db, sample_submission):
         """Can save a new submission to database."""
         await test_db.save_submission(sample_submission)
-        
+
         # Retrieve it
         retrieved = await test_db.get_submission(sample_submission.submission_id)
-        
+
         assert retrieved is not None
         assert retrieved.miner_hotkey == sample_submission.miner_hotkey
         assert retrieved.miner_uid == sample_submission.miner_uid
@@ -71,13 +72,13 @@ class TestSubmissionOperations:
     async def test_update_submission_status(self, test_db, sample_submission):
         """Can update submission status."""
         await test_db.save_submission(sample_submission)
-        
+
         # Update status
         await test_db.update_submission_status(
             sample_submission.submission_id,
             SubmissionStatus.EVALUATING,
         )
-        
+
         # Verify update
         updated = await test_db.get_submission(sample_submission.submission_id)
         assert updated.status == SubmissionStatus.EVALUATING
@@ -86,7 +87,7 @@ class TestSubmissionOperations:
     async def test_update_submission_status_with_error(self, test_db, sample_submission):
         """Can update submission status with error message."""
         await test_db.save_submission(sample_submission)
-        
+
         # Update with error
         error_msg = "Validation failed: missing function"
         await test_db.update_submission_status(
@@ -94,7 +95,7 @@ class TestSubmissionOperations:
             SubmissionStatus.FAILED_VALIDATION,
             error_message=error_msg,
         )
-        
+
         # Verify update
         updated = await test_db.get_submission(sample_submission.submission_id)
         assert updated.status == SubmissionStatus.FAILED_VALIDATION
@@ -104,14 +105,14 @@ class TestSubmissionOperations:
     async def test_update_submission_score(self, test_db, sample_submission):
         """Can update submission final score."""
         await test_db.save_submission(sample_submission)
-        
+
         # Update score
         final_score = 12345.67
         await test_db.update_submission_score(
             sample_submission.submission_id,
             final_score,
         )
-        
+
         # Verify update
         updated = await test_db.get_submission(sample_submission.submission_id)
         assert updated.final_score == final_score
@@ -139,17 +140,17 @@ class TestSubmissionOperations:
             code_hash="hash3",
             bucket_path="path3",
         )
-        
+
         await test_db.save_submission(sub1)
         await test_db.save_submission(sub2)
         await test_db.save_submission(sub3)
-        
+
         # Update one to evaluating
         await test_db.update_submission_status(sub2.submission_id, SubmissionStatus.EVALUATING)
-        
+
         # Get pending
         pending = await test_db.get_pending_submissions()
-        
+
         assert len(pending) == 2
         pending_ids = {s.submission_id for s in pending}
         assert sub1.submission_id in pending_ids
@@ -171,16 +172,16 @@ class TestSubmissionOperations:
             code_hash="hash2",
             bucket_path="path2",
         )
-        
+
         await test_db.save_submission(sub1)
         await test_db.save_submission(sub2)
-        
+
         # Update one to evaluating
         await test_db.update_submission_status(sub1.submission_id, SubmissionStatus.EVALUATING)
-        
+
         # Get evaluating
         evaluating = await test_db.get_evaluating_submissions()
-        
+
         assert len(evaluating) == 1
         assert evaluating[0].submission_id == sub1.submission_id
 
@@ -193,7 +194,7 @@ class TestEvaluationOperations:
         """Can save evaluation result."""
         # Save submission first
         await test_db.save_submission(sample_submission)
-        
+
         # Create evaluation for the saved submission
         evaluation = EvaluationModel(
             submission_id=sample_submission.submission_id,
@@ -204,10 +205,10 @@ class TestEvaluationOperations:
             success=True,
         )
         await test_db.save_evaluation(evaluation)
-        
+
         # Retrieve evaluations
         evals = await test_db.get_evaluations(sample_submission.submission_id)
-        
+
         assert len(evals) == 1
         assert evals[0].evaluator_hotkey == evaluation.evaluator_hotkey
 
@@ -215,7 +216,7 @@ class TestEvaluationOperations:
     async def test_get_evaluations_for_submission(self, test_db, sample_submission):
         """Can retrieve all evaluations for a submission."""
         await test_db.save_submission(sample_submission)
-        
+
         # Add multiple evaluations
         eval1 = EvaluationModel(
             submission_id=sample_submission.submission_id,
@@ -233,20 +234,20 @@ class TestEvaluationOperations:
             wall_time_seconds=8.33,
             success=True,
         )
-        
+
         await test_db.save_evaluation(eval1)
         await test_db.save_evaluation(eval2)
-        
+
         # Get evaluations
         evals = await test_db.get_evaluations(sample_submission.submission_id)
-        
+
         assert len(evals) == 2
 
     @pytest.mark.asyncio
     async def test_count_evaluations(self, test_db, sample_submission):
         """Can count successful evaluations."""
         await test_db.save_submission(sample_submission)
-        
+
         # Add evaluations (mix of success/failure)
         eval1 = EvaluationModel(
             submission_id=sample_submission.submission_id,
@@ -273,11 +274,11 @@ class TestEvaluationOperations:
             wall_time_seconds=9.09,
             success=True,
         )
-        
+
         await test_db.save_evaluation(eval1)
         await test_db.save_evaluation(eval2)
         await test_db.save_evaluation(eval3)
-        
+
         # Count should only include successful
         count = await test_db.count_evaluations(sample_submission.submission_id)
         assert count == 2
@@ -308,19 +309,19 @@ class TestLeaderboardOperations:
             code_hash="hash3",
             bucket_path="path3",
         )
-        
+
         await test_db.save_submission(sub1)
         await test_db.save_submission(sub2)
         await test_db.save_submission(sub3)
-        
+
         # Set scores
         await test_db.update_submission_score(sub1.submission_id, 1000.0)
         await test_db.update_submission_score(sub2.submission_id, 2000.0)  # Highest
         await test_db.update_submission_score(sub3.submission_id, 1500.0)
-        
+
         # Get top
         top = await test_db.get_top_submission()
-        
+
         assert top is not None
         assert top.submission_id == sub2.submission_id
         assert top.final_score == 2000.0
@@ -329,7 +330,7 @@ class TestLeaderboardOperations:
     async def test_get_top_submission_no_finished(self, test_db, sample_submission):
         """Returns None when no finished submissions."""
         await test_db.save_submission(sample_submission)
-        
+
         top = await test_db.get_top_submission()
         assert top is None
 
@@ -339,7 +340,7 @@ class TestLeaderboardOperations:
         # Create multiple finished submissions
         submissions = []
         scores = [1000.0, 3000.0, 2000.0, 500.0]
-        
+
         for i, score in enumerate(scores):
             sub = SubmissionModel(
                 miner_hotkey=f"hotkey{i}",
@@ -350,10 +351,10 @@ class TestLeaderboardOperations:
             await test_db.save_submission(sub)
             await test_db.update_submission_score(sub.submission_id, score)
             submissions.append(sub)
-        
+
         # Get leaderboard
         leaderboard = await test_db.get_leaderboard(limit=10)
-        
+
         assert len(leaderboard) == 4
         # Should be sorted by score descending
         assert leaderboard[0].final_score == 3000.0
@@ -374,9 +375,9 @@ class TestLeaderboardOperations:
             )
             await test_db.save_submission(sub)
             await test_db.update_submission_score(sub.submission_id, float(i * 1000))
-        
+
         # Get top 3
         leaderboard = await test_db.get_leaderboard(limit=3)
-        
+
         assert len(leaderboard) == 3
 

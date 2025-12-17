@@ -1,4 +1,8 @@
-"""Miner CLI for submitting training code to the tournament."""
+"""Miner CLI for submitting training code to the tournament.
+
+SECURITY NOTE: Miners submit code to validator API, NOT directly to storage.
+Validators handle storage privately to prevent cheating.
+"""
 
 import argparse
 import asyncio
@@ -7,12 +11,11 @@ import sys
 from pathlib import Path
 
 import bittensor as bt
+import httpx
 
 from tournament.chain.manager import ChainManager
 from tournament.payment.manager import PaymentManager
 from tournament.pipeline.validator import CodeValidator
-from tournament.storage.database import get_database
-from tournament.storage.models import SubmissionModel
 
 
 async def submit_code(
@@ -21,13 +24,20 @@ async def submit_code(
     skip_validation: bool = False,
     skip_payment: bool = False,
     payment_recipient: str | None = None,
+    validator_api_url: str = "http://localhost:8000",
 ) -> str | None:
-    """Submit training code to the tournament.
+    """Submit training code to validator via API.
+    
+    SECURITY: Code is sent to validator's API endpoint, not directly to storage.
+    This prevents miners from accessing or manipulating the storage layer.
 
     Args:
         code_path: Path to train.py file
         wallet: Bittensor wallet for signing
         skip_validation: Skip local code validation
+        skip_payment: Skip payment (for testing only)
+        payment_recipient: Validator's payment address
+        validator_api_url: Validator API endpoint
 
     Returns:
         Submission ID if successful, None otherwise
@@ -81,7 +91,7 @@ async def submit_code(
         # Confirm payment
         print(f"\n💰 Submission Cost: {cost_rao:,} RAO ({cost_tao:.4f} TAO)")
         print(f"📍 Payment Recipient: {payment_recipient}")
-        
+
         confirm = input("\nProceed with payment? (y/n): ").strip().lower()
         if confirm != "y":
             print("Payment cancelled. Submission aborted.")
@@ -92,7 +102,7 @@ async def submit_code(
             payment_receipt = await payment_manager.make_payment(
                 recipient_address=payment_recipient,
             )
-            print(f"✅ Payment confirmed!")
+            print("✅ Payment confirmed!")
             print(f"   Block: {payment_receipt.block_hash}")
             print(f"   Extrinsic: {payment_receipt.extrinsic_index}")
         except Exception as e:
@@ -101,28 +111,54 @@ async def submit_code(
     else:
         print("⚠️  Skipping payment (testing mode)")
 
-    # For now, store code locally (in production, upload to R2)
-    # TODO: Implement R2 upload
-    bucket_path = f"submissions/{uid}/{code_hash}/train.py"
-
-    # Create submission in database
-    db = await get_database()
-    submission = SubmissionModel(
-        miner_hotkey=hotkey,
-        miner_uid=uid,
-        code_hash=code_hash,
-        bucket_path=bucket_path,
-        payment_block_hash=payment_receipt.block_hash if payment_receipt else None,
-        payment_extrinsic_index=payment_receipt.extrinsic_index if payment_receipt else None,
-        payment_amount_rao=payment_receipt.amount_rao if payment_receipt else None,
-        payment_verified=False,  # Validator will verify
-    )
-    await db.save_submission(submission)
-
-    print(f"\n✅ Submission created: {submission.submission_id}")
-    print(f"   Status: {submission.status.value}")
-
-    return submission.submission_id
+    # Submit code to validator API
+    print(f"\nSubmitting code to validator API: {validator_api_url}")
+    
+    # Prepare submission data
+    submission_data = {
+        "code": code,
+        "code_hash": code_hash,
+        "miner_hotkey": hotkey,
+        "miner_uid": uid,
+        "payment_block_hash": payment_receipt.block_hash if payment_receipt else None,
+        "payment_extrinsic_index": payment_receipt.extrinsic_index if payment_receipt else None,
+        "payment_amount_rao": payment_receipt.amount_rao if payment_receipt else None,
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{validator_api_url}/api/submissions",
+                json=submission_data,
+            )
+            
+            if response.status_code != 200:
+                print(f"Error: Validator API returned {response.status_code}")
+                print(f"       {response.text}")
+                return None
+            
+            result = response.json()
+            submission_id = result.get("submission_id")
+            
+            print("✅ Submission accepted by validator")
+            print(f"\n📋 Submission Details:")
+            print(f"   ID: {submission_id}")
+            print(f"   Code Hash: {code_hash[:16]}...")
+            print(f"   Status: pending")
+            
+            print(f"\n📊 Track your submission:")
+            print(f"   curl {validator_api_url}/api/submissions/{submission_id}")
+            
+            return submission_id
+            
+    except httpx.RequestError as e:
+        print(f"Error: Failed to connect to validator API")
+        print(f"       {e}")
+        print(f"\n💡 Make sure validator is running at: {validator_api_url}")
+        return None
+    except Exception as e:
+        print(f"Error: Submission failed: {e}")
+        return None
 
 
 def main():
@@ -162,6 +198,12 @@ def main():
         default=None,
         help="SS58 address to send payment to (validator address)",
     )
+    parser.add_argument(
+        "--validator-api",
+        type=str,
+        default="http://localhost:8000",
+        help="Validator API endpoint (default: http://localhost:8000)",
+    )
 
     args = parser.parse_args()
 
@@ -176,6 +218,7 @@ def main():
             skip_validation=args.skip_validation,
             skip_payment=args.skip_payment,
             payment_recipient=args.payment_recipient,
+            validator_api_url=args.validator_api,
         )
     )
 

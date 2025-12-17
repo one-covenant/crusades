@@ -1,10 +1,13 @@
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+import torch
+
+from tournament.sandbox.manager import SandboxManager, SandboxResult
 from tournament.schemas import BenchmarkConfig
 from tournament.verification.config import VerificationConfig
 from tournament.verification.reference import ReferenceExecutor, ReferenceResult
-from tournament.sandbox.manager import SandboxManager, SandboxResult
-import torch
+
 
 @pytest.fixture
 def mock_config():
@@ -50,7 +53,7 @@ def mock_sandbox_manager():
     # Add attributes that might be dynamically added in real execution
     result.final_logits = torch.randn(1, 10) # Different from reference initially
     result.final_loss = 0.5
-    
+
     manager.run.return_value = result
     return manager
 

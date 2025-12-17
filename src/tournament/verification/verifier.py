@@ -79,7 +79,7 @@ class SandboxVerifier:
         # The SAME seed is used for both reference and miner in this evaluation
         import random
         seed = seed if seed is not None else random.randint(1, 2**31 - 1)
-        
+
         logger.info(f"Using random seed: {seed} for this evaluation")
 
         try:
@@ -97,7 +97,7 @@ class SandboxVerifier:
                 temp_path = Path(temp_dir)
 
                 # Save reference data for sandbox
-                reference_paths = self.reference.save_reference_outputs(ref_result, temp_path)
+                self.reference.save_reference_outputs(ref_result, temp_path)
 
                 # Step 3: Run miner code in sandbox
                 logger.info("Step 3/4: Running miner code in sandbox...")
@@ -193,7 +193,7 @@ class SandboxVerifier:
             diff = (ref_logits - sandbox_logits).abs()
             mean_diff = diff.mean().item()
             max_diff = diff.max().item()
-            
+
             # Calculate as percentage of mean absolute value
             mean_abs_value = ref_logits.abs().mean().item()
             if mean_abs_value > 0:
@@ -207,7 +207,7 @@ class SandboxVerifier:
                     actual=sandbox_logits,
                     tolerance=self.config.output_vector_tolerance,
                 )
-            
+
             logger.info(
                 f"  [OK] Output vectors match within {self.config.output_vector_tolerance*100:.1f}%"
             )
