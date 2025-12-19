@@ -44,12 +44,18 @@ class ReferenceExecutor:
             model_path: Path to the benchmark model checkpoint.
             data_path: Path to the benchmark dataset.
             config: Benchmark configuration (batch size, seq len, num steps).
-            device: Device to run on (defaults to cuda if available).
+            device: Device to run on (defaults to CPU to save GPU memory).
         """
         self.model_path = Path(model_path)
         self.data_path = Path(data_path)
         self.config = config
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Run reference on CPU to save GPU memory for sandbox evaluation
+        self.device = device or torch.device("cpu")
+        
+        # Cache for loaded model (load once, reuse for all evaluations)
+        self._model_cache: nn.Module | None = None
+        
+        logger.info(f"Reference executor will use device: {self.device}")
 
     def _set_deterministic_mode(self, seed: int) -> None:
         """Set deterministic mode for reproducibility."""
@@ -60,34 +66,45 @@ class ReferenceExecutor:
         torch.backends.cudnn.benchmark = False
 
     def _load_model(self) -> nn.Module:
-        """Load the official 8B benchmark model.
+        """Load the official 7B benchmark model.
         
-        Loads from HuggingFace transformers format (saved by setup_benchmark.py).
-        All miners and validators use this exact model for fairness.
+        Uses caching: loads once, then reuses for all evaluations.
+        This saves time and memory while maintaining fairness.
 
         Returns:
             Loaded model on the target device in train mode.
         """
+        # Return cached model if available
+        if self._model_cache is not None:
+            logger.info(f"Using cached reference model ({sum(p.numel() for p in self._model_cache.parameters()):,} parameters)")
+            return self._model_cache
+        
         if not self.model_path.exists():
             raise FileNotFoundError(
                 f"Model not found at {self.model_path}\n"
-                f"Run: uv run python scripts/setup_benchmark.py"
+                f"Run: uv run python scripts/setup_validator.py"
             )
 
         try:
             from transformers import AutoModelForCausalLM
             
-            # Load model from HuggingFace format
-            logger.info(f"Loading model from {self.model_path}")
+            # Load model from HuggingFace format on CPU (saves GPU for sandbox)
+            logger.info(f"Loading model from {self.model_path} on {self.device} (first time)")
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
-                dtype=torch.bfloat16,
-                device_map="auto",
+                dtype=torch.float32 if self.device.type == "cpu" else torch.bfloat16,
+                device_map="cpu" if self.device.type == "cpu" else "auto",
                 trust_remote_code=True,
+                low_cpu_mem_usage=True,
             )
             
             model.train()
-            logger.info(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+            num_params = sum(p.numel() for p in model.parameters())
+            logger.info(f"Model loaded and cached: {num_params:,} parameters")
+            
+            # Cache for future evaluations
+            self._model_cache = model
+            
             return model
             
         except ImportError:

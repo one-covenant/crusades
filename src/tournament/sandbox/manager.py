@@ -139,7 +139,7 @@ class SandboxManager:
             # Write benchmark config
             config = BenchmarkConfig(
                 model_path="/benchmark/model",
-                data_path="/benchmark/data",
+                data_path="/benchmark/data/test.pt",  # Full path to data file
                 sequence_length=self.hparams.benchmark_sequence_length,
                 batch_size=self.hparams.benchmark_batch_size,
                 num_steps=num_steps,

@@ -58,3 +58,8 @@ Thumbs.db
 
 # Private test data (validators only)
 benchmark/data/test.pt
+
+# Local development files
+local_storage/
+tournament.db
+tournament_local.db
