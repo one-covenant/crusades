@@ -54,10 +54,11 @@ tournament-screener = "neurons.screener:main"
 tournament-miner = "neurons.miner:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["tournament*", "neurons*"]
 
 [tool.setuptools.package-dir]
-"" = "src"
+tournament = "src/tournament"
 
 [tool.ruff]
 line-length = 100

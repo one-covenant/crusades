@@ -65,17 +65,24 @@ async def submit_code(
     print(f"Code hash: {code_hash}")
 
     # Initialize chain manager
-    chain = ChainManager(wallet=wallet)
-    await chain.sync_metagraph()
-
-    # Check if miner is registered
     hotkey = wallet.hotkey.ss58_address
-    if not chain.is_registered(hotkey):
-        print(f"Error: Hotkey {hotkey} is not registered on subnet {chain.netuid}")
-        return None
+    
+    if not skip_payment:
+        # Production: Verify registration on-chain
+        chain = ChainManager(wallet=wallet)
+        await chain.sync_metagraph()
 
-    uid = chain.get_uid_for_hotkey(hotkey)
-    print(f"Miner UID: {uid}")
+        if not chain.is_registered(hotkey):
+            print(f"Error: Hotkey {hotkey} is not registered on subnet {chain.netuid}")
+            return None
+
+        uid = chain.get_uid_for_hotkey(hotkey)
+        print(f"Miner UID: {uid}")
+    else:
+        # Testing mode: Use mock values
+        print("⚠️  Skipping blockchain verification (testing mode)")
+        uid = 1  # Mock UID for testing
+        print(f"Mock Miner UID: {uid}")
 
     # Payment for submission (anti-spam)
     payment_receipt = None

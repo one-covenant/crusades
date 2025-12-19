@@ -81,7 +81,7 @@ class ReferenceExecutor:
             logger.info(f"Loading model from {self.model_path}")
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 device_map="auto",
                 trust_remote_code=True,
             )
@@ -217,7 +217,9 @@ class ReferenceExecutor:
                 input_ids = batch[:, :-1]
                 labels = batch[:, 1:]
 
-                logits = model(input_ids)
+                outputs = model(input_ids)
+                # Handle HuggingFace models that return objects
+                logits = outputs.logits if hasattr(outputs, 'logits') else outputs
 
                 # Cross entropy loss
                 # Use reshape instead of view to handle non-contiguous tensors

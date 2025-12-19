@@ -46,11 +46,13 @@ class Validator(BaseNode):
         wallet: bt.wallet | None = None,
         burn_hotkey: str | None = None,
         burn_enabled: bool = False,
+        skip_blockchain_check: bool = False,
     ):
         super().__init__(wallet=wallet)
 
         self.burn_hotkey = burn_hotkey
         self.burn_enabled = burn_enabled
+        self.skip_blockchain_check = skip_blockchain_check
 
         # Components (initialized in start)
         self.db: Database | None = None
@@ -72,10 +74,10 @@ class Validator(BaseNode):
         # Database
         self.db = await get_database()
 
-        # Sandbox
+        # Sandbox (uses test.pt for evaluation - hidden from miners)
         self.sandbox = SandboxManager(
             benchmark_model_path=config.benchmark_model_path,
-            benchmark_data_path=config.benchmark_data_path,
+            benchmark_data_path=config.benchmark_data_path,  # Points to test.pt for validators
         )
         await self.sandbox.initialize()
 
@@ -84,17 +86,17 @@ class Validator(BaseNode):
             hparams.verification if hasattr(hparams, "verification") else {}
         )
 
-        # Reference executor for verification
+        # Reference executor (uses test.pt for evaluation)
         benchmark_config = BenchmarkConfig(
             model_path=config.benchmark_model_path,
-            data_path=config.benchmark_data_path,
+            data_path=config.benchmark_data_path,  # Points to test.pt for validators
             sequence_length=hparams.benchmark_sequence_length,
             batch_size=hparams.benchmark_batch_size,
             num_steps=hparams.eval_steps,
         )
         reference_executor = ReferenceExecutor(
             model_path=config.benchmark_model_path,
-            data_path=config.benchmark_data_path,
+            data_path=config.benchmark_data_path,  # Points to test.pt for validators
             config=benchmark_config,
         )
 
@@ -364,6 +366,11 @@ def main():
         action="store_true",
         help="Enable burn mode (all emissions to burn hotkey)",
     )
+    parser.add_argument(
+        "--skip-blockchain-check",
+        action="store_true",
+        help="Skip blockchain registration check (for local testing)",
+    )
 
     args = parser.parse_args()
 
@@ -375,6 +382,7 @@ def main():
         wallet=wallet,
         burn_hotkey=args.burn_hotkey,
         burn_enabled=args.burn_enabled,
+        skip_blockchain_check=args.skip_blockchain_check,
     )
 
     asyncio.run(validator.start())

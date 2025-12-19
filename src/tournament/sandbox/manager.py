@@ -15,6 +15,7 @@ FAIRNESS: All miners evaluated with:
 """
 
 import asyncio
+import logging
 import shutil
 import tempfile
 import time
@@ -27,6 +28,8 @@ from ..config import get_hparams
 from ..core.exceptions import SandboxError, SandboxTimeoutError
 from ..core.protocols import SandboxResult
 from ..schemas import BenchmarkConfig, SandboxOutput
+
+logger = logging.getLogger(__name__)
 
 
 class SandboxManager:
@@ -71,11 +74,21 @@ class SandboxManager:
         if self._image_built:
             return
 
+        # Check if image already exists
+        try:
+            self.client.images.get(self.IMAGE_NAME)
+            logger.info(f"Docker image {self.IMAGE_NAME} already exists")
+            self._image_built = True
+            return
+        except docker.errors.ImageNotFound:
+            pass  # Image doesn't exist, need to build
+
         dockerfile_path = Path(__file__).parent / "Dockerfile"
         if not dockerfile_path.exists():
             raise SandboxError(f"Dockerfile not found at {dockerfile_path}")
 
         # Run in thread pool to avoid blocking
+        logger.info(f"Building Docker image: {self.IMAGE_NAME}")
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None,
@@ -86,6 +99,7 @@ class SandboxManager:
             ),
         )
         self._image_built = True
+        logger.info(f"Docker image built: {self.IMAGE_NAME}")
 
     async def run(
         self,

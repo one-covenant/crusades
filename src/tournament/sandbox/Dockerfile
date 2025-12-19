@@ -14,12 +14,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /uvx /bin/
 
 # Configure uv for production
-ENV UV_COMPILE_BYTECODE=1
+ENV UV_COMPILE_BYTECODE=0
 ENV UV_LINK_MODE=copy
 ENV UV_PYTHON=python3.12
 
 # Create non-root user for security
-RUN useradd -m -s /bin/bash -u 1000 runner
+RUN useradd -m -s /bin/bash -u 2000 runner
 
 # Set up working directory
 WORKDIR /home/runner

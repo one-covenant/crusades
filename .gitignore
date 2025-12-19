@@ -55,3 +55,6 @@ Thumbs.db
 /benchmark/model/
 /benchmark/data/
 /submissions/
+
+# Private test data (validators only)
+benchmark/data/test.pt

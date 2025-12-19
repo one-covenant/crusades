@@ -11,7 +11,9 @@
     "benchmark_dataset_name": "HuggingFaceFW/fineweb",
     "benchmark_dataset_split": "train",
     "benchmark_dataset_subset": null,
-    "benchmark_dataset_size": 100000,
+    "benchmark_train_size": 100000,
+    "benchmark_test_size": 100000,
+    "benchmark_master_seed": 42,
     "benchmark_sequence_length": 1024,
     "benchmark_batch_size": 8,
 

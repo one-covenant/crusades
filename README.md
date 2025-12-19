@@ -1,8 +1,10 @@
 # Templar Tournament
+
 Compete to write the fastest PyTorch training code. Winner-takes-all: Highest TPS → 100% of subnet emissions.
 
-## For Miners
+---
 
+## For Miners - Quick Start
 
 ### Step 1: Setup
 ```bash
@@ -11,268 +13,224 @@ git clone https://github.com/one-covenant/templar-tournament.git
 cd templar-tournament
 uv sync
 
-# Download official 7B model and dataset (~20GB, 30-60 mins)
-uv run python scripts/setup_benchmark.py
+# Download official 7B model and training data (~20GB, 30-60 mins)
+uv run python scripts/setup_miner.py
 ```
 
-This downloads:
-- **Model**: Qwen2.5-7B (~15GB, 7B parameters, publicly accessible)
-- **Data**: FineWeb dataset (100k samples, ~80MB tokenized)
+**Downloads:**
+- Model: Qwen2.5-7B (~15GB, 7.6B parameters)
+- Training data: 100k samples (seed=42, deterministic)
 
+---
 
-### Step 2: Optimize the Code
-Edit `train.py` (included in the repo) and optimize it. The file includes a basic implementation you can improve.
-
-
-### Step 3: Test Your Code
-**Quick baseline test** (see current performance):
+### Step 2: Test Baseline
 ```bash
-PYTORCH_ALLOC_CONF=expandable_segments:True uv run python train.py 2>&1
+uv run python train.py
 ```
 
-**Validate before submitting** (check structure):
+**Output:**
+```
+📊 Results (Averaged over 3 evaluations):
+   Average TPS: 4,302
+```
+
+This is your unoptimized baseline (~4,300 TPS).
+
+---
+
+### Step 3: Optimize Your Code
+
+Edit `train.py` to improve TPS:
+
+```python
+# Easy win: Add torch.compile() at start of inner_steps
+compiled_model = torch.compile(model, mode="reduce-overhead")
+
+# Use compiled_model instead of model
+outputs = compiled_model(input_ids)
+```
+
+Test after each change:
+```bash
+uv run python train.py  # See new TPS
+```
+
+---
+
+### Step 4: Validate Before Submitting
 ```bash
 uv run python -m tournament.test_local train.py
 ```
-    ✅ Checks code syntax (no errors)
-    ✅ Verifies inner_steps function exists
-    ✅ Verifies InnerStepsResult class exists
-    ✅ Checks for forbidden imports (os, socket, etc.)
-    ❌ Does NOT run the code
-    ❌ Does NOT measure TPS
-**Iterate and optimize until you're happy!**
 
+Checks:
+- ✅ Code syntax valid
+- ✅ inner_steps function exists  
+- ✅ No forbidden imports
 
-### Step 4: Register on Subnet
+---
+
+### Step 5: Register on Subnet
+
 ```bash
-btcli subnet register --netuid 3 --wallet.name mywallet --wallet.hotkey myhotkey
+# Register on Templar subnet (netuid 3)
+btcli subnet register \
+    --netuid 3 \
+    --wallet.name mywallet \
+    --wallet.hotkey myhotkey
 ```
 
-### Step 5: Submit (Costs 0.1 TAO)
+**Cost:** ~0.01 TAO (one-time)
+
+---
+
+### Step 6: Submit Your Code (Costs 0.1 TAO)
+
 ```bash
+# Submit to validator
 uv run python -m neurons.miner train.py \
     --wallet.name mywallet \
     --wallet.hotkey myhotkey \
-    --payment-recipient <validator_address> \
-    --validator-api http://validator-url:8000
+    --payment-recipient <validator_hotkey_address> \
+    --validator-api <validator_api_url>
 ```
 
-### Step 6: Check Results
+**What happens:**
+1. ✅ Pays 0.1 TAO on-chain to validator
+2. ✅ Sends code content to validator API  
+3. ✅ Validator stores in private R2 bucket
+4. ✅ Validator evaluates in Docker sandbox
+5. ✅ Your TPS score published to leaderboard
+
+---
+
+### Step 7: Check Results
+
 ```bash
-curl http://validator-url:8000/api/submissions/<submission_id>
+# Check your submission
+curl <validator_url>/api/submissions/<submission_id>
+
+# Check leaderboard
+curl <validator_url>/leaderboard
 ```
 
-Response:
+**Response:**
 ```json
 {
     "submission_id": "abc-123",
-    "status": "finished",
+    "status": "finished", 
     "final_score": 18543.2,
     "miner_uid": 42
 }
 ```
 
-### Step 7: Win Emissions
-If your TPS is highest → You get 100% of subnet emissions!
+---
 
-Check earnings:
+### Step 8: Win Emissions!
+
+If you're #1 → You get 100% of subnet emissions!
+
 ```bash
+# Check your emissions
 btcli wallet overview --netuid 3 --wallet.name mywallet
 ```
+
+**Winner updates every 10 minutes.**
 
 ---
 
 ## The Competition
 
-### What You're Optimizing
-- **Task**: Run 5 training steps on 7B model
-- **Goal**: Maximum tokens per second (TPS)
-- **Model**: Qwen2.5-7B (7 billion parameters)
-- **Data**: FineWeb dataset (100,000 samples × 1024 tokens)
-- **Format**: Batch size 8, sequence length 1024
-- **Per Eval**: 5 steps × 8 batch × 1024 seq = 40,960 tokens
-
-### How You Win
-- **Metric**: TPS = total_tokens / wall_time
+- **Task**: Run 5 training steps as fast as possible
+- **Model**: Qwen2.5-7B (everyone uses same)
+- **Data**: Miners test on train.pt, Validators evaluate on test.pt (hidden)
+- **Metric**: TPS = 40,960 tokens / wall_time
 - **Winner**: Highest average TPS across 3 evaluations
-- **Reward**: 100% of subnet emissions
-- **Updates**: Every 10 minutes
-
-
-## Verification (How We Check Correctness)
-
-Your code runs in a Docker sandbox with a **random seed**. Validator compares your outputs against a hidden reference:
-
-### **3 Verification Checks:**
-
-**1. Token Count (EXACT match)**
-```
-Expected: 819,200 tokens
-Your output: must be exactly 819,200
-Fail if: different by even 1 token
-```
-This ensures you processed all batches correctly.
-
-**2. Output Vectors (1% tolerance)**
-```
-Expected: reference_logits from last forward pass  
-Your output: final_logits from your last forward pass
-Tolerance: 1% aggregate difference
-Fail if: aggregate_diff > 1%
-```
-This ensures your training actually matches the reference.
-
-**3. Timeout (10 minutes max)**
-```
-Fail if: execution takes > 600 seconds
-```
-
-### **Pass All 3 → Get Your TPS Score**
-
-If verification passes:
-- Your TPS = total_tokens / wall_time
-- TPS saved to leaderboard
-- Highest TPS wins 100% emissions
-
-If verification fails:
-- No TPS score
-- You see error message
-- No refund (test locally first!)
 
 ---
 
-## Rules
+## Verification
 
-### ✅ You Can Change
-- How you run the training loop
-- Any PyTorch optimizations
-- Custom CUDA kernels
-- Memory management
-- Data loading strategy
+Validator runs your code with **random seed** and checks:
 
-### ❌ You Cannot Change
-- Model (must use official 7B model)
-- Dataset (must use official FineWeb data)
-- Loss function (must be cross_entropy)
-- Number of steps (must complete all 100)
-- Input/output format
-- Label preparation (next-token prediction)
+1. **Token count**: Exactly 40,960 tokens
+2. **Output vectors**: Within 1% of reference
+3. **Timeout**: Under 10 minutes
 
----
-
-## Security
-
-### What You Can Access
-- ✅ Official 7B model (from HuggingFace)
-- ✅ Official dataset (from HuggingFace)
-- ✅ Reference implementation (for matching outputs)
-- ✅ Local testing (unlimited, free)
-
-### What You Cannot Access
-- ❌ Validator's storage credentials
-- ❌ Other miners' code
-- ❌ Internal evaluation details
-- ❌ Exact validation seeds
-
-### How Evaluation Works
-1. You submit code to validator API (not direct storage)
-2. Validator stores your code privately
-3. Validator runs your code in isolated Docker sandbox
-4. Validator compares outputs vs reference (with random seed)
-5. Validator measures TPS externally
-6. You see final TPS score only
-
----
-
-## Costs
-
-- **Registration**: ~0.01-0.1 TAO (one-time)
-- **Per Submission**: 0.1 TAO
-- **Local Testing**: FREE (unlimited)
-
-**Tip**: Test thoroughly locally before submitting to save TAO!
+**Pass all 3 → Get TPS score**
 
 ---
 
 ## For Validators
 
 ### Requirements
-- Registered on subnet NetUID 3
-- Docker with GPU support  
-- NVIDIA A100 GPU (or equivalent)
-- Private R2/S3 bucket
-- Sufficient stake for weight setting
+- Registered on subnet (netuid 3) with stake
+- Docker with GPU support
+- Private R2 bucket
+- Public API endpoint
 
 ### Setup
+
+**Step 1: Download Model + Test Data**
 ```bash
-# Configure private credentials
+# Downloads model + test.pt (private evaluation data)
+uv run python scripts/setup_validator.py
+```
+
+**Step 2: Configure R2 Credentials**
+```bash
 cat > .env << 'EOF'
 TOURNAMENT_SUBTENSOR_NETWORK=finney
-TOURNAMENT_R2_ACCOUNT_ID=your_account
-TOURNAMENT_R2_ACCESS_KEY_ID=your_key
-TOURNAMENT_R2_SECRET_ACCESS_KEY=your_secret
-TOURNAMENT_R2_BUCKET_NAME=private-submissions
+TOURNAMENT_R2_ACCOUNT_ID=your_r2_account_id
+TOURNAMENT_R2_ACCESS_KEY_ID=your_access_key  
+TOURNAMENT_R2_SECRET_ACCESS_KEY=your_secret_key
+TOURNAMENT_R2_BUCKET_NAME=validator-submissions
 EOF
+```
 
-# Download same model/data as miners
-uv run python scripts/setup_benchmark.py
+**Step 3: Register & Stake**
+```bash
+# Register
+btcli subnet register --netuid 3 --wallet.name validator --wallet.hotkey validator_hotkey
 
-# Start API
-uv run python -m api.app &
+# Stake (required to set weights)
+btcli stake add --netuid 3 --wallet.name validator --wallet.hotkey validator_hotkey --amount 100
+```
 
-# Run validator
+**Step 4: Build Docker Sandbox**
+```bash
+cd src/tournament/sandbox
+docker build -t tournament-sandbox:latest .
+```
+
+**Step 5: Start Services**
+
+Terminal 1 - API:
+```bash
+uv run python -m api.app
+# Miners submit to: http://your-server-ip:8000
+```
+
+Terminal 2 - Validator:
+```bash
 uv run python -m neurons.validator \
     --wallet.name validator \
-    --wallet.hotkey validator_hotkey \
-    --burn-hotkey <fallback_address>
+    --wallet.hotkey validator_hotkey
 ```
 
----
+**Step 6: Announce API**
 
-## API Endpoints
-
-```bash
-# Submit code (via miner CLI)
-POST /api/submissions
-
-# Check status
-GET /api/submissions/{id}
-
-# View leaderboard
-GET /leaderboard
-
-# Health check
-GET /health
-```
+Share with miners:
+- API URL: `http://your-server.com:8000`
+- Payment address: `<your_validator_hotkey_address>`
 
 ---
 
-## FAQ
+## Data Separation
 
-**Q: Can I test before paying?**  
-A: Yes! Local testing is free and unlimited.
-
-**Q: How many times should I submit?**  
-A: Test locally first. Most miners submit 3-5 times.
-
-**Q: Can I see other miners' code?**  
-A: No. All submissions are private.
-
-**Q: What if my submission fails?**  
-A: No refund. Always test locally first.
-
-**Q: How do I know what TPS to beat?**  
-A: Check leaderboard: `curl http://validator:8000/leaderboard`
-
-**Q: Can I use a different model?**  
-A: No. Everyone must use the official 7B model for fairness.
-
----
-
-## Support
-
-- **GitHub**: https://github.com/one-covenant/templar-tournament
-- **Issues**: https://github.com/one-covenant/templar-tournament/issues
+- **Miners**: train.pt (samples 0-99,999, seed=42)
+- **Validators**: test.pt (samples 100,000-199,999, seed=42)
+- **Zero overlap** - Prevents overfitting
+- **Deterministic** - Everyone gets same samples
 
 ---
 

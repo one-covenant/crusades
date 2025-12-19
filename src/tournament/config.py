@@ -95,10 +95,11 @@ class Config(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
 
-    # Paths (where official 8B model and data are stored after setup)
+    # Paths (where official 7B model and data are stored after setup)
     hparams_path: str = "hparams/hparams.json"
     benchmark_model_path: str = "benchmark/model"  # HuggingFace model directory
-    benchmark_data_path: str = "benchmark/data/train.pt"  # Tokenized dataset
+    benchmark_data_path: str = "benchmark/data/test.pt"  # Test data (validators use for evaluation)
+    # Note: Miners have train.pt, validators have test.pt (different seeds)
 
     # Debug
     debug: bool = False
