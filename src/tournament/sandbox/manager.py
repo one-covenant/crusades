@@ -40,6 +40,10 @@ class SandboxManager:
     """
 
     IMAGE_NAME = "tournament-sandbox:latest"
+    
+    # GPU assignment: GPU 0 reserved for reference, GPU 1-7 for sandbox evaluations
+    SANDBOX_GPUS = list(range(1, 8))  # GPUs 1, 2, 3, 4, 5, 6, 7
+    _gpu_counter = 0  # Round-robin counter
 
     def __init__(
         self,
@@ -49,8 +53,12 @@ class SandboxManager:
         """Initialize sandbox manager.
         
         Args:
-            benchmark_model_path: Path to official 8B model directory
+            benchmark_model_path: Path to official 7B model directory
             benchmark_data_path: Path to official dataset file
+            
+        GPU Assignment:
+            - GPU 0: Reserved for reference execution (always)
+            - GPU 1-7: Round-robin for miner evaluations (parallel)
         """
         self.benchmark_model_path = Path(benchmark_model_path).resolve()
         self.benchmark_data_path = Path(benchmark_data_path).resolve()
@@ -101,6 +109,16 @@ class SandboxManager:
         self._image_built = True
         logger.info(f"Docker image built: {self.IMAGE_NAME}")
 
+    def _get_next_gpu(self) -> int:
+        """Get next available GPU in round-robin fashion.
+        
+        Returns:
+            GPU ID (1-7)
+        """
+        gpu_id = self.SANDBOX_GPUS[self._gpu_counter % len(self.SANDBOX_GPUS)]
+        self._gpu_counter += 1
+        return gpu_id
+
     async def run(
         self,
         code_path: str,
@@ -110,6 +128,9 @@ class SandboxManager:
     ) -> SandboxResult:
         """
         Run training code in sandbox and measure TPS.
+        
+        Assigns each evaluation to a different GPU (1-7) in round-robin.
+        GPU 0 is reserved for reference execution.
 
         Args:
             code_path: Path to the miner's train.py file
@@ -128,6 +149,10 @@ class SandboxManager:
         code_path = Path(code_path).resolve()
         if not code_path.exists():
             raise SandboxError(f"Code file not found: {code_path}")
+
+        # Assign GPU for this evaluation (round-robin across GPUs 1-7)
+        assigned_gpu = self._get_next_gpu()
+        logger.info(f"Assigning evaluation to GPU {assigned_gpu}")
 
         # Create temporary directory for sandbox I/O
         temp_dir = Path(tempfile.mkdtemp(prefix="sandbox_"))
@@ -151,11 +176,12 @@ class SandboxManager:
             output_dir = temp_dir / "output"
             output_dir.mkdir()
 
-            # Run container with external timing
+            # Run container with external timing on assigned GPU
             result = await self._run_container(
                 temp_dir=temp_dir,
                 output_dir=output_dir,
                 timeout_seconds=timeout_seconds,
+                assigned_gpu=assigned_gpu,
             )
 
             return result
@@ -169,15 +195,23 @@ class SandboxManager:
         temp_dir: Path,
         output_dir: Path,
         timeout_seconds: int,
+        assigned_gpu: int,
     ) -> SandboxResult:
-        """Run the Docker container and collect results."""
+        """Run the Docker container on assigned GPU and collect results.
+        
+        Args:
+            temp_dir: Temporary directory with code and config
+            output_dir: Directory for results
+            timeout_seconds: Maximum execution time
+            assigned_gpu: GPU ID to use for this evaluation (1-7)
+        """
         sandbox_config = self.hparams.sandbox
 
         container: Container | None = None
         start_time = time.perf_counter()
 
         try:
-            # Create container
+            # Create container with specific GPU assignment
             loop = asyncio.get_event_loop()
             container = await loop.run_in_executor(
                 None,
@@ -199,14 +233,17 @@ class SandboxManager:
                             "bind": "/benchmark/data",
                             "mode": "ro",
                         },
-                        str(temp_dir): {"bind": "/sandbox", "mode": "rw"},  # Changed to rw
+                        str(temp_dir): {"bind": "/sandbox", "mode": "rw"},
                         str(output_dir): {"bind": "/output", "mode": "rw"},
                     },
                     user="0:0",  # Run as root to avoid permission issues
+                    environment={
+                        "CUDA_VISIBLE_DEVICES": str(assigned_gpu),  # Assign specific GPU
+                    },
                     device_requests=(
                         [
                             docker.types.DeviceRequest(
-                                count=sandbox_config.gpu_count,
+                                device_ids=[str(assigned_gpu)],  # Specific GPU
                                 capabilities=[["gpu"]],
                             )
                         ]

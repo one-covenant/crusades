@@ -49,8 +49,13 @@ class ReferenceExecutor:
         self.model_path = Path(model_path)
         self.data_path = Path(data_path)
         self.config = config
-        # Run reference on CPU to save GPU memory for sandbox evaluation
-        self.device = device or torch.device("cpu")
+        
+        # Use GPU 0 for reference execution (dedicated)
+        # Sandbox uses GPU 1-7 (round-robin) - no conflicts!
+        if device is None:
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
         
         # Cache for loaded model (load once, reuse for all evaluations)
         self._model_cache: nn.Module | None = None
@@ -88,17 +93,23 @@ class ReferenceExecutor:
         try:
             from transformers import AutoModelForCausalLM
             
-            # Load model from HuggingFace format on CPU (saves GPU for sandbox)
+            # Load model on GPU 0 (dedicated for reference)
             logger.info(f"Loading model from {self.model_path} on {self.device} (first time)")
+            device_map = {"": 0} if self.device.type == "cuda" else "cpu"
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
-                dtype=torch.float32 if self.device.type == "cpu" else torch.bfloat16,
-                device_map="cpu" if self.device.type == "cpu" else "auto",
+                dtype=torch.bfloat16,
+                device_map=device_map,  # Pin to GPU 0
                 trust_remote_code=True,
-                low_cpu_mem_usage=True,
             )
             
             model.train()
+            
+            # Enable gradient checkpointing to reduce memory
+            if hasattr(model, 'gradient_checkpointing_enable'):
+                model.gradient_checkpointing_enable()
+                logger.info("Gradient checkpointing enabled")
+            
             num_params = sum(p.numel() for p in model.parameters())
             logger.info(f"Model loaded and cached: {num_params:,} parameters")
             
