@@ -195,13 +195,14 @@ class SandboxManager:
                             "bind": "/benchmark/model",
                             "mode": "ro",
                         },
-                        str(self.benchmark_data_path): {
+                        str(self.benchmark_data_path.parent): {
                             "bind": "/benchmark/data",
                             "mode": "ro",
                         },
-                        str(temp_dir): {"bind": "/sandbox", "mode": "ro"},
+                        str(temp_dir): {"bind": "/sandbox", "mode": "rw"},  # Changed to rw
                         str(output_dir): {"bind": "/output", "mode": "rw"},
                     },
+                    user="0:0",  # Run as root to avoid permission issues
                     device_requests=(
                         [
                             docker.types.DeviceRequest(
