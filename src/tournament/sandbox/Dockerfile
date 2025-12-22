@@ -31,18 +31,25 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     torch \
     transformers \
     datasets \
-    accelerate
+    accelerate \
+    fastapi \
+    uvicorn \
+    pydantic
 
 # Set PATH to use venv
 ENV PATH="/home/runner/.venv/bin:$PATH"
 ENV VIRTUAL_ENV="/home/runner/.venv"
 
-# Copy runner script
+# Copy scripts
 COPY runner.py /home/runner/runner.py
+COPY server.py /home/runner/server.py
 RUN chown -R runner:runner /home/runner
 
 # Switch to non-root user
 USER runner
 
-# Entry point
-ENTRYPOINT ["python", "/home/runner/runner.py"]
+# Expose HTTP port
+EXPOSE 8000
+
+# Entry point - HTTP server mode
+ENTRYPOINT ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
