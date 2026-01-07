@@ -77,13 +77,6 @@ curl <validator_url>/api/submissions/<your_id>
 
 ## 🛠️ For Validators
 
-### System Requirements
-- Ubuntu 22.04+
-- NVIDIA GPU (80GB+ VRAM)
-- Docker with NVIDIA runtime
-- 100GB disk space
-- Public IP, port 8000 open
-
 ### Setup
 
 ```bash

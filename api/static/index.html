@@ -136,16 +136,89 @@
         }
         
         .status-badge {
-            padding: 4px 12px;
-            border-radius: 12px;
+            padding: 6px 14px;
+            border-radius: 20px;
             font-size: 0.85em;
             font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
         }
         
-        .status-pending { background: #fef3c7; color: #92400e; }
-        .status-running { background: #dbeafe; color: #1e40af; }
-        .status-finished { background: #d1fae5; color: #065f46; }
-        .status-failed { background: #fee2e2; color: #991b1b; }
+        .status-badge::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        
+        /* Pending - Yellow/Orange */
+        .status-pending { 
+            background: #fef3c7; 
+            color: #92400e; 
+        }
+        .status-pending::before { 
+            background: #f59e0b;
+            animation: pulse 2s infinite;
+        }
+        
+        /* Validating - Light Blue */
+        .status-validating { 
+            background: #dbeafe; 
+            color: #1e40af; 
+        }
+        .status-validating::before { 
+            background: #3b82f6;
+            animation: pulse 1.5s infinite;
+        }
+        
+        /* Evaluating - Purple/Indigo */
+        .status-evaluating { 
+            background: #e0e7ff; 
+            color: #4338ca; 
+        }
+        .status-evaluating::before { 
+            background: #6366f1;
+            animation: pulse 1s infinite;
+        }
+        
+        /* Finished - Green */
+        .status-finished { 
+            background: #d1fae5; 
+            color: #065f46; 
+        }
+        .status-finished::before { 
+            background: #10b981;
+        }
+        
+        /* Failed Validation - Red */
+        .status-failed_validation { 
+            background: #fee2e2; 
+            color: #991b1b; 
+        }
+        .status-failed_validation::before { 
+            background: #ef4444;
+        }
+        
+        /* Error - Dark Red */
+        .status-error { 
+            background: #fecaca; 
+            color: #7f1d1d; 
+        }
+        .status-error::before { 
+            background: #dc2626;
+        }
+        
+        /* Running (for validator) */
+        .status-running { 
+            background: #dbeafe; 
+            color: #1e40af; 
+        }
+        .status-running::before { 
+            background: #3b82f6;
+            animation: pulse 1s infinite;
+        }
         
         .loading {
             text-align: center;
@@ -371,10 +444,23 @@
                 if (recent.length === 0) {
                     recentBody.innerHTML = '<tr><td colspan="4" class="loading">No recent submissions</td></tr>';
                 } else {
+                    // Format status text properly
+                    const formatStatus = (status) => {
+                        const statusMap = {
+                            'pending': 'Pending',
+                            'validating': 'Validating',
+                            'evaluating': 'Evaluating',
+                            'finished': 'Finished',
+                            'failed_validation': 'Failed',
+                            'error': 'Error'
+                        };
+                        return statusMap[status] || status;
+                    };
+                    
                     recentBody.innerHTML = recent.map(sub => `
                         <tr style="cursor: pointer;" onclick="window.location.href='/submission.html?id=${sub.submission_id}'">
                             <td>${sub.miner_uid}</td>
-                            <td><span class="status-badge status-${sub.status}">${sub.status}</span></td>
+                            <td><span class="status-badge status-${sub.status}">${formatStatus(sub.status)}</span></td>
                             <td class="score">${sub.final_score ? sub.final_score.toLocaleString() : '-'}</td>
                             <td>${new Date(sub.created_at).toLocaleString()}</td>
                         </tr>
