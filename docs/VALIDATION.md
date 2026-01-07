@@ -78,7 +78,7 @@ This is the core validation process orchestrated by `SandboxVerifier.verify_and_
 | Check | Requirement | Purpose |
 |-------|-------------|---------|
 | Token count | **Exact match** | Prevents batch skipping or early termination |
-| Logits | Aggregate difference < 1% | Allows bf16 precision variance while detecting wrong outputs |
+| Logits | Aggregate difference < 10% | Allows bf16 precision and GPU variance while detecting wrong outputs |
 | Loss | Informational only | Reference loss used for comparison |
 
 #### Step 4: Calculate Performance
@@ -177,11 +177,11 @@ Logits compared using aggregate difference:
 
 ```python
 aggregate_diff = mean_diff / mean_abs_value
-if aggregate_diff > output_vector_tolerance:  # 0.01 = 1%
+if aggregate_diff > output_vector_tolerance:  # 0.10 = 10%
     raise LogitsMismatchError(...)
 ```
 
-The 1% tolerance accounts for bf16 floating-point precision differences while still detecting:
+The 10% tolerance accounts for bf16 floating-point precision and GPU variance while still detecting:
 - Modified architectures
 - Wrong precision settings
 - Incorrect forward pass implementations
@@ -212,6 +212,83 @@ AST-based analysis prevents:
 - Prevents submission flooding/spam
 - Amount configurable via `submission_cost_rao`
 
+### 10. PKE Authentication
+
+- Miners sign timestamp with their wallet's private key
+- API verifies signature with public key (hotkey)
+- Prevents impersonation attacks
+- 5-minute timestamp window prevents replay attacks
+
+```python
+# Miner signs
+timestamp = int(time.time())
+signature = wallet.hotkey.sign(str(timestamp)).hex()
+
+# API verifies
+keypair = Keypair(ss58_address=miner_hotkey)
+is_valid = keypair.verify(timestamp, signature)
+```
+
+### 11. Blockchain Timestamp (Anti-Copying)
+
+**Critical for multi-validator protection:**
+
+Miners post code_hash to blockchain BEFORE submitting code:
+
+```python
+# Step 1: Post hash to chain
+success = subtensor.commit(wallet, netuid=2, data=code_hash)
+# Creates record: "Miner X posted hash Y at block Z"
+
+# Step 2: Submit code to validator with block number
+submission_data = {
+    "code": code,
+    "code_timestamp_block_hash": str(block_number),
+    ...
+}
+```
+
+**Prevents malicious validators from stealing code:**
+- Malicious validator sees code during evaluation
+- Tries to submit as their own
+- Their blockchain timestamp is LATER
+- System rejects (original miner was first)
+
+**Database fields:**
+- `code_timestamp_block_hash` - Block number where hash was posted
+- `code_timestamp_extrinsic_index` - Extrinsic index in block
+
+### 12. Submission Cooldown
+
+- Minimum time between submissions per miner
+- Configurable: `anti_copying.submission_cooldown_minutes` (default: 60)
+- Prevents rapid copying after seeing others' submissions
+- Returns HTTP 429 if violated
+
+### 13. Code Visibility Control
+
+**Code only visible after evaluation completes:**
+
+```python
+# During evaluation (pending/evaluating status):
+GET /api/submissions/{id}/code
+→ 403 Forbidden ("Code not available yet")
+
+# After evaluation (finished/failed/error status):
+GET /api/submissions/{id}/code
+→ 200 OK (returns full code with syntax highlighting)
+```
+
+**Reduces attack window for code theft.**
+
+### 14. Hide Pending Submissions
+
+**Recent submissions endpoint filters:**
+- Only shows: `finished`, `failed_validation`, `error`
+- Hides: `pending`, `evaluating`
+- Prevents queue snooping
+- Reduces information leakage
+
 ## Key Files Reference
 
 | File | Purpose |
@@ -228,6 +305,9 @@ AST-based analysis prevents:
 | `src/tournament/storage/database.py` | Submission & evaluation storage |
 | `src/tournament/storage/models.py` | Database models |
 | `src/tournament/config.py` | Tournament configuration |
+| `api/endpoints/submissions.py` | Submission API with PKE & timestamp verification |
+| `api/endpoints/stats.py` | Statistics API with visibility controls |
+| `api/app.py` | FastAPI application with CORS |
 
 ## Configuration
 
@@ -235,8 +315,8 @@ AST-based analysis prevents:
 
 ```python
 class HParams:
-    num_evals_per_submission: int = 3      # Evaluations required
-    eval_steps: int = 100                   # Training steps per eval
+    num_evals_per_submission: int = 1      # Evaluations required (1 for single validator)
+    eval_steps: int = 5                     # Training steps per eval
     eval_timeout: int = 600                 # Max execution time (seconds)
     benchmark_sequence_length: int = 1024   # Sequence length
     benchmark_batch_size: int = 8           # Batch size
@@ -248,8 +328,7 @@ class HParams:
 
 ```python
 class VerificationConfig:
-    output_vector_tolerance: float = 0.01   # 1% aggregate difference allowed
-    verify_model_state: bool = False        # State verification (disabled)
+    output_vector_tolerance: float = 0.10   # 10% aggregate difference allowed
     deterministic_mode: bool = True         # Reproducibility enforcement
 ```
 
@@ -262,11 +341,26 @@ class VerificationConfig:
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
+                 ┌───────────────────────────┐
+                 │ BLOCKCHAIN TIMESTAMP      │
+                 │ - Post code_hash to chain │
+                 │ - Proves ownership        │
+                 └──────────┬────────────────┘
+                            │
+                            ▼
+                  ┌──────────────────────┐
+                  │   PKE AUTHENTICATION │
+                  │   - Sign timestamp   │
+                  │   - Verify signature │
+                  └──────────┬───────────┘
+                             │
+                             ▼
                   ┌──────────────────────┐
                   │   CODE VALIDATION    │
                   │   - Syntax check     │
                   │   - Function check   │
                   │   - Import check     │
+                  │   - Anti-spam        │
                   └──────────┬───────────┘
                              │ PASS
                              ▼
@@ -278,7 +372,7 @@ class VerificationConfig:
                              │ PASS
                              ▼
     ┌────────────────────────────────────────────────────────────┐
-    │       VERIFICATION (3x Independent Validators)             │
+    │                    VERIFICATION                            │
     │                                                            │
     │  ┌──────────────────────────────────────────────────────┐  │
     │  │ 1. RUN REFERENCE                                     │  │
@@ -299,7 +393,7 @@ class VerificationConfig:
     │  ┌──────────────────────────────────────────────────────┐  │
     │  │ 3. VERIFY OUTPUTS                                    │  │
     │  │    - Token count: EXACT match required               │  │
-    │  │    - Logits: <1% aggregate difference                │  │
+    │  │    - Logits: <10% aggregate difference               │  │
     │  │    - Calculate TPS = tokens / wall_time              │  │
     │  └──────────────────────────────────────────────────────┘  │
     └────────────────────────────┬───────────────────────────────┘
@@ -307,8 +401,8 @@ class VerificationConfig:
                                  ▼
                  ┌───────────────────────────────┐
                  │           SCORING             │
-                 │   final_score = avg TPS       │
-                 │   (min 3 successful evals)    │
+                 │   final_score = TPS           │
+                 │   (1 evaluation per validator)│
                  └───────────────┬───────────────┘
                                  │
                                  ▼
