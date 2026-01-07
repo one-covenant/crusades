@@ -112,16 +112,50 @@ async def verify_code_timestamp(
         all_submissions = await db.get_all_submissions()
         for sub in all_submissions:
             if sub.code_hash == code_hash and sub.miner_hotkey != miner_hotkey:
-                # Duplicate code! Compare timestamps
-                if sub.code_timestamp_block_hash:
-                    original_block = int(sub.code_timestamp_block_hash)
-                    if original_block < block_number:
-                        # Original was first
-                        logger.warning(f"🚫 Code already submitted at earlier block {original_block}")
-                        return False, f"This code was already submitted at block {original_block} (you submitted at {block_number})"
-                else:
-                    # Original has no timestamp, but we do - we win!
+                # Duplicate code! Need to determine who was first
+                
+                if not sub.code_timestamp_block_hash:
+                    # Original has no blockchain proof, but we do - we win!
                     logger.info(f"✅ Our timestamp proves we're first (original had no proof)")
+                    continue
+                
+                original_block = int(sub.code_timestamp_block_hash)
+                original_extrinsic = sub.code_timestamp_extrinsic_index or 999999
+                
+                # Compare block numbers first
+                if original_block < block_number:
+                    # Original posted to blockchain earlier (different block)
+                    logger.warning(f"🚫 Code already posted at block {original_block} (yours: {block_number})")
+                    return False, (
+                        f"This code was already submitted at block {original_block}. "
+                        f"You submitted at block {block_number}. Original wins."
+                    )
+                
+                elif original_block > block_number:
+                    # We posted earlier! Original submission was LATER
+                    logger.info(f"✅ You posted first! Block {block_number} < {original_block}")
+                    logger.info(f"   Marking original submission {sub.submission_id[:8]}... as duplicate")
+                    # TODO: Mark original as duplicate/copied
+                    continue
+                
+                else:
+                    # SAME BLOCK! Use extrinsic index as tiebreaker
+                    if original_extrinsic < extrinsic_index:
+                        # Original was earlier in the same block
+                        logger.warning(f"🚫 Same block {block_number}, but earlier extrinsic")
+                        logger.warning(f"   Original: extrinsic {original_extrinsic}")
+                        logger.warning(f"   Yours: extrinsic {extrinsic_index}")
+                        return False, (
+                            f"This code was posted in the same block ({block_number}) "
+                            f"but at earlier extrinsic index ({original_extrinsic} < {extrinsic_index}). "
+                            f"Original wins."
+                        )
+                    else:
+                        # We were earlier in the same block!
+                        logger.info(f"✅ Same block, but you were earlier! Extrinsic {extrinsic_index} < {original_extrinsic}")
+                        logger.info(f"   Marking original as duplicate")
+                        # TODO: Mark original as duplicate
+                        continue
         
         return True, ""
         
