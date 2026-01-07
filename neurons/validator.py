@@ -131,19 +131,29 @@ class Validator(BaseNode):
 
     async def run_step(self) -> None:
         """Run one iteration of the validator loop."""
+        logger.info("🔄 Starting validation loop iteration...")
+        
         # 1. Process pending submissions (validation)
+        logger.info("Step 1: Processing pending submissions...")
         await self.process_pending_submissions()
 
         # 2. Evaluate submissions ready for evaluation
+        logger.info("Step 2: Evaluating submissions...")
         await self.evaluate_submissions()
 
-        # 3. Set weights periodically
-        await self.maybe_set_weights()
+        # 3. Set weights periodically (skip on localnet - not supported)
+        logger.info("Step 3: Checking weight setting...")
+        if self.config.subtensor_network != "local":
+            await self.maybe_set_weights()
+        else:
+            logger.info("Skipping weight setting (localnet mode)")
 
         # 4. Sync metagraph periodically (every 5 minutes)
+        logger.info("Step 4: Checking metagraph sync...")
         await self.maybe_sync()
 
         # Sleep before next iteration
+        logger.info("✅ Loop iteration complete. Sleeping 10s...")
         await asyncio.sleep(10)
 
     async def maybe_sync(self) -> None:

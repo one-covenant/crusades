@@ -13,12 +13,12 @@ git clone https://github.com/one-covenant/templar-tournament.git
 cd templar-tournament
 uv sync
 
-# Download official 7B model and training data (~20GB, 30-60 mins)
+# Download official 3B model and training data (~10GB, 15-30 mins)
 uv run python scripts/setup_miner.py
 ```
 
 **Downloads:**
-- Model: Qwen2.5-7B (~15GB, 7.6B parameters)
+- Model: Qwen2.5-3B (~6GB, 3.1B parameters)
 - Training data: 100k samples (seed=42, deterministic)
 
 ---
@@ -141,7 +141,7 @@ btcli wallet overview --netuid 3 --wallet.name mywallet
 ## The Competition
 
 - **Task**: Run 5 training steps as fast as possible
-- **Model**: Qwen2.5-7B (everyone uses same)
+- **Model**: Qwen2.5-3B (everyone uses same)
 - **Data**: Miners test on train.pt, Validators evaluate on test.pt (hidden)
 - **Metric**: TPS = 40,960 tokens / wall_time
 - **Winner**: Highest average TPS across 3 evaluations

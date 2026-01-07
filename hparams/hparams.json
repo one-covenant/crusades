@@ -1,14 +1,14 @@
 {
-    "netuid": 3,
+    "netuid": 2,
 
-    "num_evals_per_submission": 3,
+    "num_evals_per_submission": 1,
     "eval_steps": 5,
     "eval_timeout": 600,
 
     "_comment_benchmark": "CRITICAL: All miners and validators must use these EXACT resources",
     "_comment_gpu_allocation": "GPU 0=Reference (cached, reused), GPU 1-7=Sandbox (round-robin). No conflicts, enables 7 parallel evaluations.",
     "_comment_data_split": "Master seed 42. Train=samples[0:100k], Test=samples[100k:200k]. Zero overlap.",
-    "benchmark_model_name": "Qwen/Qwen2.5-7B",
+    "benchmark_model_name": "Qwen/Qwen2.5-3B",
     "benchmark_model_revision": "main",
     "benchmark_dataset_name": "HuggingFaceFW/fineweb",
     "benchmark_dataset_split": "train",

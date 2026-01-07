@@ -152,7 +152,9 @@ class SandboxManager:
 
         # Assign GPU for this evaluation (round-robin across GPUs 1-7)
         assigned_gpu = self._get_next_gpu()
-        logger.info(f"Assigning evaluation to GPU {assigned_gpu}")
+        logger.info(f"🎯 Assigning evaluation to GPU {assigned_gpu}")
+        logger.info(f"📁 Code path: {code_path}")
+        logger.info(f"⚙️  Config: {num_steps} steps, seed={random_seed}, timeout={timeout_seconds}s")
 
         # Create temporary directory for sandbox I/O
         temp_dir = Path(tempfile.mkdtemp(prefix="sandbox_"))
@@ -212,7 +214,11 @@ class SandboxManager:
 
         try:
             # Create container with specific GPU assignment
+            logger.info(f"🐳 Creating Docker container on GPU {assigned_gpu}...")
+            logger.info(f"   Memory limit: {sandbox_config.memory_limit}, CPUs: {sandbox_config.cpu_count}")
+            
             loop = asyncio.get_event_loop()
+            # Use gpus parameter - simpler and more reliable
             container = await loop.run_in_executor(
                 None,
                 lambda: self.client.containers.run(
@@ -238,20 +244,19 @@ class SandboxManager:
                     },
                     user="0:0",  # Run as root to avoid permission issues
                     environment={
-                        "CUDA_VISIBLE_DEVICES": str(assigned_gpu),  # Assign specific GPU
+                        "CUDA_VISIBLE_DEVICES": "0",  # Inside container, mapped GPU appears as device 0
                     },
-                    device_requests=(
-                        [
-                            docker.types.DeviceRequest(
-                                device_ids=[str(assigned_gpu)],  # Specific GPU
-                                capabilities=[["gpu"]],
-                            )
-                        ]
-                        if sandbox_config.gpu_count > 0
-                        else None
-                    ),
+                    device_requests=[
+                        docker.types.DeviceRequest(
+                            device_ids=[str(assigned_gpu)],
+                            capabilities=[["gpu"]],
+                        )
+                    ] if sandbox_config.gpu_count > 0 else [],
                 ),
             )
+            
+            logger.info(f"✅ Container created: {container.id[:12]}")
+            logger.info(f"⏳ Waiting for execution (timeout: {timeout_seconds}s)...")
 
             # Wait for container with timeout
             try:
@@ -260,13 +265,16 @@ class SandboxManager:
                     timeout=timeout_seconds,
                 )
                 exit_code = exit_result["StatusCode"]
+                logger.info(f"🏁 Container finished with exit code: {exit_code}")
             except TimeoutError:
                 # Kill container on timeout
+                logger.error(f"⏰ Container timed out after {timeout_seconds}s - killing...")
                 await loop.run_in_executor(None, lambda: container.stop(timeout=5))
                 wall_time = time.perf_counter() - start_time
                 raise SandboxTimeoutError(f"Execution timed out after {wall_time:.1f}s")
 
             wall_time = time.perf_counter() - start_time
+            logger.info(f"⏱️  Walltime: {wall_time:.2f}s")
 
             # Get container logs
             stdout = await loop.run_in_executor(
@@ -277,11 +285,17 @@ class SandboxManager:
             )
 
             # Parse output
+            logger.info(f"📊 Parsing results from {output_dir}/result.json...")
             output_file = output_dir / "result.json"
             if output_file.exists():
                 output = SandboxOutput.model_validate_json(output_file.read_text())
+                logger.info(f"✅ Results parsed: {output.total_tokens} tokens in {wall_time:.2f}s")
             else:
                 # No output file - execution failed
+                logger.error(f"❌ No result.json found - execution failed")
+                logger.error(f"Exit code: {exit_code}")
+                logger.error(f"Stdout: {stdout[:500] if stdout else 'None'}")
+                logger.error(f"Stderr: {stderr[:500] if stderr else 'None'}")
                 return SandboxResult(
                     success=False,
                     tokens_per_second=0.0,

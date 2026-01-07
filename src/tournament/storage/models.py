@@ -39,7 +39,9 @@ class SubmissionModel(Base):
     bucket_path: Mapped[str] = mapped_column(String(256), nullable=False)
 
     status: Mapped[SubmissionStatus] = mapped_column(
-        Enum(SubmissionStatus), nullable=False, default=SubmissionStatus.PENDING
+        Enum(SubmissionStatus, values_callable=lambda obj: [e.value for e in obj]),
+        nullable=False,
+        default=SubmissionStatus.PENDING
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(

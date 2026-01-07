@@ -74,6 +74,14 @@ class Database:
                 submission.status = SubmissionStatus.FINISHED
                 await session.commit()
 
+    async def get_all_submissions(self) -> list[SubmissionModel]:
+        """Get all submissions."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SubmissionModel).order_by(desc(SubmissionModel.created_at))
+            )
+            return list(result.scalars().all())
+
     async def get_pending_submissions(self) -> list[SubmissionModel]:
         """Get submissions pending validation."""
         async with self.session_factory() as session:

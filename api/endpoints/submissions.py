@@ -135,3 +135,33 @@ async def get_submission_evaluations(
     evaluations = await db.get_evaluations(submission_id)
 
     return [EvaluationResponse.model_validate(e) for e in evaluations]
+
+
+@router.get("/{submission_id}/code")
+async def get_submission_code(
+    submission_id: str,
+    db: Database = Depends(get_database),
+) -> dict:
+    """Get the code for a submission (for demo/debugging purposes)."""
+    submission = await db.get_submission(submission_id)
+
+    if submission is None:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    # Download code from R2
+    r2_storage = get_r2_storage()
+    import tempfile
+    from pathlib import Path
+    
+    temp_file = Path(tempfile.mktemp(suffix=".py"))
+    try:
+        success = await r2_storage.download_code(submission.bucket_path, str(temp_file))
+        
+        if not success or not temp_file.exists():
+            raise HTTPException(status_code=404, detail="Code not found in storage")
+        
+        code = temp_file.read_text()
+        return {"code": code, "code_hash": submission.code_hash}
+    finally:
+        if temp_file.exists():
+            temp_file.unlink()

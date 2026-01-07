@@ -2,13 +2,15 @@
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from tournament.config import get_config
 from tournament.storage.database import get_database
 
-from .endpoints import leaderboard, submissions
+from .endpoints import leaderboard, submissions, stats
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +38,17 @@ def create_app() -> FastAPI:
     # Include routers
     app.include_router(leaderboard.router)
     app.include_router(submissions.router)
+    app.include_router(stats.router)
 
     @app.get("/health")
     async def health():
         """Health check endpoint."""
         return {"status": "ok"}
+
+    # Mount static files for dashboard
+    static_dir = Path(__file__).parent / "static"
+    if static_dir.exists():
+        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 
     return app
 

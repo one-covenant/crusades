@@ -158,20 +158,25 @@ def main():
             torch.backends.cudnn.benchmark = False
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Device: {device}")
+        sys.stdout.flush()
 
-        # Load official 7B model (HuggingFace format from setup_benchmark.py)
+        # Load official model (HuggingFace format)
         print(f"Loading model from {model_path}...")
+        sys.stdout.flush()
         try:
             from transformers import AutoModelForCausalLM
             
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
-                dtype=torch.bfloat16,
-                device_map="auto",
+                torch_dtype=torch.bfloat16,
+                device_map={"": device},  # Force to specific device
                 trust_remote_code=True,
             )
             model.train()
-            print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+            model_device = next(model.parameters()).device
+            print(f"✅ Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters on {model_device}")
+            sys.stdout.flush()
         except Exception as e:
             write_result(output_dir, 0, 0, False, f"Failed to load model: {e}")
             return 1
@@ -180,23 +185,37 @@ def main():
         initial_state_path = sandbox_dir / "initial_state.pt"
         if initial_state_path.exists():
             print("Loading initial model state for verification...")
+            sys.stdout.flush()
             initial_state = torch.load(initial_state_path, map_location=device, weights_only=True)
             model.load_state_dict(initial_state)
+            print(f"✅ Initial state loaded ({len(initial_state)} parameters)")
+            sys.stdout.flush()
 
         # Create optimizer
+        print("Creating optimizer...")
+        sys.stdout.flush()
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=1e-4,
             weight_decay=0.1,
             betas=(0.9, 0.95),
         )
+        print("✅ Optimizer created")
+        sys.stdout.flush()
 
         # Create data iterator
         print(f"Loading data from {data_path}...")
+        sys.stdout.flush()
         data_iterator = create_data_iterator(data_path, batch_size, sequence_length)
+        print("✅ Data iterator created")
+        sys.stdout.flush()
 
         # Run miner's inner_steps
-        print(f"Running inner_steps for {num_steps} steps...")
+        print(f"🏃 Running inner_steps for {num_steps} steps...")
+        print(f"   Model device: {next(model.parameters()).device}")
+        print(f"   Batch size: {batch_size}, Sequence length: {sequence_length}")
+        sys.stdout.flush()
+        
         result = train_module.inner_steps(
             model=model,
             data_iterator=data_iterator,
@@ -204,6 +223,9 @@ def main():
             num_steps=num_steps,
             device=device,
         )
+        
+        print("✅ inner_steps completed")
+        sys.stdout.flush()
 
         # Validate result
         if not isinstance(result, InnerStepsResult):

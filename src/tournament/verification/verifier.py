@@ -90,12 +90,6 @@ class SandboxVerifier:
                 f"  Reference complete: {ref_result.total_tokens:,} tokens, "
                 f"loss={ref_result.final_loss:.4f}"
             )
-            
-            # Clear GPU memory before sandbox (saves ~50GB for sandbox on different GPU)
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                logger.info("  GPU cache cleared (ready for sandbox)")
 
             # Step 2: Save reference outputs for sandbox comparison
             logger.info("Step 2/4: Preparing sandbox inputs...")

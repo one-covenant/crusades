@@ -47,6 +47,11 @@ class WeightSetter:
         """
         # Sync metagraph to get latest state
         await self.chain.sync_metagraph()
+        
+        # Skip weight setting if metagraph isn't available (e.g., localnet)
+        if self.chain.metagraph is None:
+            logger.info("Metagraph not available (localnet mode) - skipping weight setting")
+            return True, "Weight setting skipped (localnet)"
 
         # Check if burn mode is enabled
         if self.burn_enabled:

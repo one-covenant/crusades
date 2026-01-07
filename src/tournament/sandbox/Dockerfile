@@ -25,10 +25,13 @@ RUN useradd -m -s /bin/bash -u 2000 runner
 WORKDIR /home/runner
 
 # Create virtual environment and install dependencies
+# Install PyTorch with CUDA 12.8 support (matching base image)
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv /home/runner/.venv && \
     uv pip install --python=/home/runner/.venv/bin/python \
-    torch \
+    --index-url https://download.pytorch.org/whl/cu128 \
+    torch torchvision && \
+    uv pip install --python=/home/runner/.venv/bin/python \
     transformers \
     datasets \
     accelerate

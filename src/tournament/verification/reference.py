@@ -1,6 +1,7 @@
 """Reference executor for running canonical inner_steps implementation."""
 
 import logging
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -233,9 +234,10 @@ class ReferenceExecutor:
         final_logits = None
         final_loss = None
 
-        logger.info(f"Running {self.config.num_steps} training steps...")
+        logger.info(f"🏃 Running {self.config.num_steps} training steps...")
 
         for step in range(self.config.num_steps):
+            step_start = time.time()
             batch = next(data_iter)
             batch = batch.to(self.device, dtype=torch.long)
 
@@ -264,6 +266,8 @@ class ReferenceExecutor:
 
             # Track metrics
             total_tokens += batch.numel()
+            step_time = time.time() - step_start
+            logger.info(f"  Step {step+1}/{self.config.num_steps}: loss={loss.item():.4f}, tokens={batch.numel():,}, time={step_time:.2f}s")
             final_logits = logits.detach().float()  # Convert back to fp32 for comparison
             final_loss = loss.item()
 
