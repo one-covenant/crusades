@@ -28,7 +28,7 @@ def load_config():
 
 
 def download_model(model_dir: Path, config: dict) -> None:
-    """Download the official 7B model."""
+    """Download the benchmark model (from hparams.json)."""
     model_name = config["benchmark_model_name"]
     model_revision = config.get("benchmark_model_revision", "main")
     

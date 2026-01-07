@@ -35,7 +35,7 @@ def inner_steps(
     OPTIMIZE THIS FUNCTION to maximize your TPS (tokens per second)!
     
     Args:
-        model: Pre-loaded 7B model (already on device, in train mode)
+        model: Pre-loaded 3B model (already on device, in train mode)
         data_iterator: Iterator yielding batches of shape (batch_size, seq_len)
         optimizer: Pre-configured AdamW optimizer
         num_steps: Number of training steps to run (typically 5)
@@ -114,7 +114,7 @@ if __name__ == "__main__":
     from pathlib import Path
     
     print("="*70)
-    print("TESTING train.py - Baseline Performance")
+    print("TESTING train.py Performance with Gradient Checkpointing")
     print("="*70)
     print()
     
@@ -136,7 +136,6 @@ if __name__ == "__main__":
     from transformers import AutoModelForCausalLM
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"   Device: {device}")
     
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
@@ -144,8 +143,13 @@ if __name__ == "__main__":
         device_map="auto",  # Let accelerate handle device placement
         trust_remote_code=True,
     )
+    
+    # Enable gradient checkpointing to reduce memory usage
+    model.gradient_checkpointing_enable()
     model.train()
+    
     print(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"   Gradient checkpointing: enabled")
     print()
     
     print("✅ Loading data from benchmark/data/train.pt")
@@ -218,7 +222,3 @@ if __name__ == "__main__":
     print(f"   Min TPS: {min(tps_scores):,.1f}")
     print(f"   Max TPS: {max(tps_scores):,.1f}")
     print(f"   Final loss: {result.final_loss:.4f}")
-    print()
-    print("💡 This is your BASELINE. Now optimize to increase TPS!")
-    print("   Test: uv run python -m tournament.test_local train.py")
-    print("   Submit: uv run python -m neurons.miner train.py ...")

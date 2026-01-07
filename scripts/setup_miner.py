@@ -2,10 +2,6 @@
 """
 Download model and data for MINERS.
 
-This downloads:
-- Official 7B model (everyone uses same)
-- Data (public, for local testing)
-
 Usage:
     uv run python scripts/setup_miner.py
 """
@@ -28,7 +24,7 @@ def load_config():
 
 
 def download_model(model_dir: Path, config: dict) -> None:
-    """Download the official 7B model."""
+    """Download the benchmark model (from hparams.json)."""
     model_name = config["benchmark_model_name"]
     model_revision = config.get("benchmark_model_revision", "main")
     
@@ -149,7 +145,7 @@ def main():
     logger.info("TEMPLAR TOURNAMENT - BENCHMARK SETUP")
     logger.info("="*70)
     logger.info("")
-    logger.info("This downloads the OFFICIAL 7B model and TRAINING data:")
+    logger.info("This downloads the OFFICIAL 3B model and TRAINING data:")
     logger.info("  ✓ Miners use this for local testing")
     logger.info("")
     
@@ -188,7 +184,7 @@ def main():
     logger.info("")
     logger.info("📝 Next steps:")
     logger.info("   1. Edit train.py and optimize the inner_steps function")
-    logger.info("   2. Test: python train.py  (see your TPS)")
+    logger.info("   2. Test: uv run python train.py  (see your TPS)")
     logger.info("   3. Validate: uv run python -m tournament.test_local train.py")
     logger.info("   4. Submit when ready and compete!")
 

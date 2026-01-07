@@ -1,4 +1,4 @@
-# ⚡ Templar Tournament
+# ⚡ Templar Competition
 
 Compete to write the fastest PyTorch training code. Winner-takes-all: Highest TPS → 100% of subnet emissions.
 
@@ -26,14 +26,13 @@ git clone https://github.com/one-covenant/templar-tournament.git
 cd templar-tournament
 uv sync
 
-# 2. Download model and data (~10GB, 15-30 mins)
+# 2. Download model and data
 uv run python scripts/setup_miner.py
 ```
 
 ### Test Locally
 ```bash
-# Test baseline (~4,300 TPS)
-uv run python train.py
+PYTORCH_ALLOC_CONF=expandable_segments:True uv run python train.py
 
 # Validate before submitting
 uv run python -m tournament.test_local train.py
