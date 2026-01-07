@@ -151,10 +151,56 @@ class Validator(BaseNode):
         # 4. Sync metagraph periodically (every 5 minutes)
         logger.info("Step 4: Checking metagraph sync...")
         await self.maybe_sync()
+        
+        # 5. Memory cleanup to prevent OOM
+        self._cleanup_memory()
 
         # Sleep before next iteration
         logger.info("✅ Loop iteration complete. Sleeping 10s...")
         await asyncio.sleep(10)
+    
+    def _cleanup_memory(self):
+        """Clean up GPU memory after each loop iteration.
+        
+        Prevents OOM errors in long-running validators by:
+        1. Clearing PyTorch's memory cache
+        2. Running garbage collection
+        3. Periodic aggressive cleanup every 10 iterations
+        """
+        import gc
+        import torch
+        
+        if not hasattr(self, '_loop_count'):
+            self._loop_count = 0
+        
+        self._loop_count += 1
+        
+        # Light cleanup every iteration
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        # Aggressive cleanup every 10 iterations
+        if self._loop_count % 10 == 0:
+            logger.info(f"🧹 Aggressive memory cleanup (iteration {self._loop_count})...")
+            
+            if torch.cuda.is_available():
+                # Clear all caches
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                
+                # Force garbage collection
+                gc.collect()
+                
+                # Log memory status
+                for i in range(torch.cuda.device_count()):
+                    allocated = torch.cuda.memory_allocated(i) / 1e9
+                    reserved = torch.cuda.memory_reserved(i) / 1e9
+                    logger.info(f"   GPU {i}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                    
+                    if reserved > allocated * 2:
+                        logger.warning(f"   GPU {i}: High fragmentation ({reserved - allocated:.2f}GB wasted)")
+            
+            gc.collect()
 
     async def maybe_sync(self) -> None:
         """Sync metagraph periodically."""
@@ -350,6 +396,11 @@ class Validator(BaseNode):
 
 
 def main():
+    # Configure PyTorch memory management to prevent OOM
+    import os
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    logger.info("🧠 Memory management configured: expandable_segments=True")
+    
     parser = argparse.ArgumentParser(description="Tournament Validator")
     parser.add_argument(
         "--wallet.name",

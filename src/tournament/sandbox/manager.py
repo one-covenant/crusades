@@ -229,7 +229,11 @@ class SandboxManager:
                     nano_cpus=int(sandbox_config.cpu_count * 1e9),
                     pids_limit=sandbox_config.pids_limit,
                     read_only=True,
-                    tmpfs={"/tmp": "size=1G,mode=1777"},
+                    tmpfs={
+                        "/tmp": "size=1G,mode=1777",
+                        "/root/.triton": "size=512M,mode=1777",  # For torch.compile cache
+                        "/root/.cache": "size=512M,mode=1777",   # For other caches
+                    },
                     volumes={
                         str(self.benchmark_model_path): {
                             "bind": "/benchmark/model",
@@ -333,7 +337,7 @@ class SandboxManager:
                     final_logits = torch.load(logits_file, weights_only=True)
                     final_logits_path = str(logits_file)
 
-            return SandboxResult(
+            result = SandboxResult(
                 success=True,
                 tokens_per_second=tps,
                 total_tokens=output.total_tokens,
@@ -345,6 +349,15 @@ class SandboxManager:
                 final_logits=final_logits,
                 final_logits_path=final_logits_path,
             )
+            
+            # Cleanup memory after sandbox
+            import gc
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            
+            return result
 
         except SandboxTimeoutError:
             raise

@@ -279,6 +279,9 @@ class ReferenceExecutor:
             torch.cuda.synchronize()
 
         logger.info(f"Reference execution complete: {total_tokens} tokens, loss={final_loss:.4f}")
+        
+        # Memory cleanup to prevent OOM in long-running validators
+        self._cleanup_memory()
 
         return ReferenceResult(
             final_logits=final_logits,
@@ -286,6 +289,26 @@ class ReferenceExecutor:
             final_loss=final_loss,
             initial_state=initial_state,
         )
+    
+    def _cleanup_memory(self):
+        """Clean up GPU memory after evaluation to prevent OOM.
+        
+        This is critical for long-running validators that evaluate many submissions.
+        Without this, memory fragments accumulate and eventually cause OOM errors.
+        """
+        import gc
+        
+        if torch.cuda.is_available():
+            # Clear PyTorch's memory cache
+            torch.cuda.empty_cache()
+            
+            # Run Python garbage collection
+            gc.collect()
+            
+            # Log memory status
+            allocated = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            logger.debug(f"GPU memory after cleanup: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
     def save_reference_outputs(
         self,

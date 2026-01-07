@@ -20,7 +20,7 @@
     "submission_cost_rao": 100000000,
 
     "anti_copying": {
-        "submission_cooldown_minutes": 3,
+        "submission_cooldown_minutes": 5,
         "hide_pending_submissions": true
     },
 
