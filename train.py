@@ -23,13 +23,7 @@ class InnerStepsResult:
     final_loss: float           # Loss value from last training step
 
 
-def inner_steps(
-    model: torch.nn.Module,
-    data_iterator: Iterator[torch.Tensor],
-    optimizer: torch.optim.Optimizer,
-    num_steps: int,
-    device: torch.device,
-) -> InnerStepsResult:
+def inner_steps(model, data_iterator, optimizer, num_steps, device):
     """Run training for num_steps and return results.
     
     OPTIMIZE THIS FUNCTION to maximize your TPS (tokens per second)!

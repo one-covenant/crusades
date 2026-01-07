@@ -56,6 +56,12 @@ class SubmissionModel(Base):
     payment_extrinsic_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     payment_amount_rao: Mapped[int | None] = mapped_column(Integer, nullable=True)
     payment_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    
+    # Anti-copying: Blockchain timestamp (proves code ownership)
+    # Miner posts code_hash to chain BEFORE submitting to validator
+    # Prevents malicious validators from stealing and resubmitting code
+    code_timestamp_block_hash: Mapped[str | None] = mapped_column(String(66), nullable=True)
+    code_timestamp_extrinsic_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Relationships
     evaluations: Mapped[list["EvaluationModel"]] = relationship(

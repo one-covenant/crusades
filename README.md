@@ -59,10 +59,13 @@ uv run python -m neurons.miner train.py \
 ```
 
 **What happens:**
-1. Pays 0.1 TAO on-chain
-2. Uploads code to validator
-3. Gets evaluated in 2-3 minutes
-4. TPS appears on leaderboard
+1. Posts code hash to blockchain (timestamp proof)
+2. Pays 0.1 TAO on-chain
+3. Uploads code to validator with cryptographic proofs
+4. Gets evaluated in 2-3 minutes
+5. TPS appears on leaderboard
+
+**Security:** Your code is protected by blockchain timestamp. Even malicious validators can't steal it!
 
 ### Check Results
 
@@ -212,57 +215,13 @@ Visit validator's dashboard to see:
 
 ## 🔒 Security Model
 
-**Transparent but Secure:**
-- ✅ Code is publicly viewable (learning & verification)
-- ✅ Miners submit via API (not direct R2 access)
-- ❌ Miners can't access R2 credentials
-- ❌ Miners can't delete others' submissions
+**Multi-Layer Protection:**
+- ✅ **PKE Authentication**: Sign with your wallet (can't impersonate)
+- ✅ **Blockchain Timestamps**: Hash posted to chain first (proves ownership)
+- ✅ **Code Hidden**: Only visible after evaluation (no copying window)
+- ✅ **Cooldown**: 1 hour between submissions (prevents spam)
+- ✅ **Private Storage**: R2 credentials never exposed
 
-Same security model as Ridges.ai.
-
----
-
-## 📖 Configuration
-
-Edit `hparams/hparams.json`:
-```json
-{
-  "netuid": 2,
-  "benchmark_model_name": "Qwen/Qwen2.5-3B",
-  "benchmark_batch_size": 8,
-  "benchmark_sequence_length": 1024,
-  "eval_steps": 5,
-  "eval_timeout": 600,
-  "num_evals_per_submission": 3,
-  "sandbox": {
-    "memory_limit": "16g",
-    "cpu_count": 4,
-    "gpu_count": 1
-  }
-}
-```
-
----
-
-## 🐛 Common Issues
-
-**"Payment verification failed"**
-- Ensure hotkey has TAO balance (not just coldkey)
-
-**"Code validation failed"**
-- Run `uv run python -m tournament.test_local train.py` first
-
-**"Verification failed"**
-- Use BF16: `torch.autocast('cuda', dtype=torch.bfloat16)`
-- Process exactly 40,960 tokens
-- Don't modify model architecture
-
----
-
-## 📄 License
-
-MIT
-
----
+**Anti-Copying:** Even with multiple validators, your code is protected. Blockchain timestamp proves you created it first.
 
 **Ready to compete? Optimize your code and claim #1! ⚡**

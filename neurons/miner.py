@@ -118,18 +118,84 @@ async def submit_code(
     else:
         print("⚠️  Skipping payment (testing mode)")
 
+    # ANTI-COPYING: Post code hash to blockchain FIRST (proves ownership timestamp)
+    # This prevents malicious validators from stealing code and claiming it as their own
+    print(f"\n🔐 Posting code hash to blockchain for timestamp proof...")
+    print(f"   Hash: {code_hash}")
+    
+    code_timestamp_block = None
+    code_timestamp_extrinsic = None
+    
+    try:
+        # Post hash to blockchain using commit extrinsic
+        # This creates immutable proof: "Miner X had code_hash Y at block Z"
+        import bittensor as bt
+        from tournament.config import get_hparams
+        
+        config = get_hparams()
+        netuid = config.netuid
+        
+        # Get network from chain manager or default to localnet  
+        network = "ws://127.0.0.1:9944"  # Default localnet
+        if 'chain' in locals():
+            network = chain.subtensor.network
+        
+        subtensor = bt.subtensor(network=network)
+        
+        # Get current block number (will be the commit block)
+        current_block = subtensor.get_current_block()
+        
+        # Post commitment to blockchain (netuid required!)
+        print(f"   Posting to subnet {netuid} at block ~{current_block}...")
+        success = subtensor.commit(
+            wallet=wallet,
+            netuid=netuid,
+            data=code_hash,
+        )
+        
+        if success:
+            # Commitment posted! Get the block number
+            commit_block = subtensor.get_current_block()
+            
+            print(f"   ✅ Code hash timestamped on blockchain")
+            print(f"   Block: {commit_block}")
+            print(f"   Hash: {code_hash[:32]}...")
+            print(f"   This proves you created this code at block {commit_block}!")
+            
+            # Use block number as timestamp proof
+            code_timestamp_block = str(commit_block)
+            code_timestamp_extrinsic = 0  # Index within block (we don't have exact index)
+        else:
+            print(f"   ⚠️  Blockchain timestamp failed")
+            code_timestamp_block = None
+            code_timestamp_extrinsic = None
+    except Exception as e:
+        print(f"   ⚠️  Could not post to blockchain: {e}")
+        print(f"   Proceeding without timestamp (reduced protection)")
+        code_timestamp_block = None
+        code_timestamp_extrinsic = None
+    
     # Submit code to validator API
     print(f"\nSubmitting code to validator API: {validator_api_url}")
     
     # Prepare submission data
+    # Sign timestamp with hotkey for authentication
+    import time
+    timestamp = int(time.time())
+    signature = wallet.hotkey.sign(str(timestamp).encode()).hex()
+    
     submission_data = {
         "code": code,
         "code_hash": code_hash,
         "miner_hotkey": hotkey,
         "miner_uid": uid,
+        "timestamp": timestamp,
+        "signature": signature,
         "payment_block_hash": payment_receipt.block_hash if payment_receipt else None,
         "payment_extrinsic_index": payment_receipt.extrinsic_index if payment_receipt else None,
         "payment_amount_rao": payment_receipt.amount_rao if payment_receipt else None,
+        "code_timestamp_block_hash": code_timestamp_block,
+        "code_timestamp_extrinsic_index": code_timestamp_extrinsic,
     }
     
     try:

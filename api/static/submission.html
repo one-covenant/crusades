@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Submission Details - Templar Competition</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -103,20 +106,21 @@
         .status-failed { background: #fee2e2; color: #991b1b; }
         
         .code-viewer {
-            background: #1e1e1e;
-            color: #d4d4d4;
-            padding: 20px;
             border-radius: 8px;
-            overflow-x: auto;
-            font-family: 'Courier New', monospace;
-            font-size: 14px;
-            line-height: 1.6;
-            max-height: 600px;
-            overflow-y: auto;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
         }
         
         .code-viewer pre {
-            margin: 0;
+            margin: 0 !important;
+            max-height: 600px;
+            overflow-y: auto;
+            font-size: 14px !important;
+            line-height: 1.6 !important;
+        }
+        
+        .code-viewer pre code {
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace !important;
         }
         
         .eval-table {
@@ -340,9 +344,11 @@
                     if (data && data.code) {
                         document.getElementById('code-container').innerHTML = `
                             <div class="code-viewer">
-                                <pre>${escapeHtml(data.code)}</pre>
+                                <pre><code class="language-python">${escapeHtml(data.code)}</code></pre>
                             </div>
                         `;
+                        // Apply syntax highlighting
+                        Prism.highlightAll();
                     } else {
                         document.getElementById('code-container').innerHTML = `
                             <p style="color: #999; font-style: italic;">

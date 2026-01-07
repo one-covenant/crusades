@@ -199,24 +199,35 @@ async def get_recent_submissions(
     limit: int = 50,
     db: Database = Depends(get_database),
 ) -> list[dict]:
-    """Get recent submissions with details for activity feed."""
+    """Get recent submissions with details for activity feed.
+    
+    SECURITY: Only show finished/failed submissions to prevent code theft.
+    Pending/evaluating submissions are hidden until complete.
+    """
     try:
         submissions = await db.get_all_submissions()
         
-        # Sort by created_at descending
-        submissions.sort(key=lambda s: s.created_at, reverse=True)
+        # SECURITY: Filter out pending/evaluating submissions
+        # This prevents attackers from seeing submissions before they're safe
+        visible_statuses = ['finished', 'failed_validation', 'error']
+        visible_submissions = [
+            s for s in submissions 
+            if s.status.value in visible_statuses
+        ]
         
-        # Calculate TPS for finished or show status for others
+        # Sort by created_at descending
+        visible_submissions.sort(key=lambda s: s.created_at, reverse=True)
+        
         return [
             {
                 "submission_id": s.submission_id,
                 "miner_uid": s.miner_uid,
                 "miner_hotkey": s.miner_hotkey[:8] + "...",  # Truncate for privacy
                 "status": s.status.value,
-                "final_score": s.final_score if s.final_score else 0,  # Show 0 for pending
+                "final_score": s.final_score if s.final_score else 0,
                 "created_at": s.created_at.isoformat(),
             }
-            for s in submissions[:limit]
+            for s in visible_submissions[:limit]
         ]
     except Exception as e:
         return []

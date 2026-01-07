@@ -23,6 +23,13 @@ class StorageConfig(BaseModel):
     database_url: str = "sqlite+aiosqlite:///tournament.db"
 
 
+class AntiCopyingConfig(BaseModel):
+    """Anti-copying protection settings."""
+
+    submission_cooldown_minutes: int = 60
+    hide_pending_submissions: bool = True
+
+
 class HParams(BaseModel):
     """Hyperparameters loaded from hparams.json."""
 
@@ -51,6 +58,7 @@ class HParams(BaseModel):
     # Nested configs
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    anti_copying: AntiCopyingConfig = Field(default_factory=AntiCopyingConfig)
 
     @classmethod
     def load(cls, path: Path | str | None = None) -> Self:
