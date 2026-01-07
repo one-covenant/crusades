@@ -12,6 +12,68 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/stats", tags=["stats"])
 
 
+@router.get("/validator")
+async def get_validator_status(db: Database = Depends(get_database)) -> dict:
+    """Get current validator status."""
+    try:
+        # Get recent evaluations to show validator activity
+        all_submissions = await db.get_all_submissions()
+        
+        # Count evaluations in last hour
+        now = datetime.utcnow()
+        last_hour = now - timedelta(hours=1)
+        
+        recent_evals = []
+        for s in all_submissions:
+            if s.created_at > last_hour:
+                evals = await db.get_evaluations(s.submission_id)
+                recent_evals.extend(evals)
+        
+        # Find currently evaluating submission
+        evaluating = await db.get_evaluating_submissions()
+        current_eval = evaluating[0] if evaluating else None
+        
+        return {
+            "status": "running",
+            "evaluations_completed_1h": len(recent_evals),
+            "current_evaluation": {
+                "submission_id": current_eval.submission_id if current_eval else None,
+                "miner_uid": current_eval.miner_uid if current_eval else None,
+            } if current_eval else None,
+            "uptime": "Running",
+        }
+    except Exception as e:
+        return {
+            "status": "unknown",
+            "evaluations_completed_1h": 0,
+            "current_evaluation": None,
+            "uptime": "Unknown",
+        }
+
+
+@router.get("/history")
+async def get_tps_history(
+    limit: int = 50,
+    db: Database = Depends(get_database),
+) -> list[dict]:
+    """Get historical TPS data for charting."""
+    try:
+        submissions = await db.get_leaderboard(limit=limit)
+        
+        # Return time series data
+        return [
+            {
+                "timestamp": s.created_at.isoformat(),
+                "tps": s.final_score,
+                "miner_uid": s.miner_uid,
+                "submission_id": s.submission_id,
+            }
+            for s in reversed(submissions)  # Oldest first for chart
+        ]
+    except Exception as e:
+        return []
+
+
 @router.get("/overview")
 async def get_overview_stats(
     db: Database = Depends(get_database),

@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Templar Competition - Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -159,6 +160,71 @@
             border-radius: 8px;
             margin: 20px 0;
         }
+        
+        .validator-card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        .validator-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 20px;
+            padding-bottom: 16px;
+            border-bottom: 2px solid #f0f0f0;
+        }
+        
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        
+        .status-dot.running {
+            background: #10b981;
+            box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        
+        .validator-name {
+            font-size: 1.2em;
+            font-weight: 600;
+            color: #333;
+        }
+        
+        .validator-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+        
+        .validator-stat {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px;
+            background: #f9fafb;
+            border-radius: 8px;
+        }
+        
+        .vstat-label {
+            color: #666;
+            font-size: 0.9em;
+        }
+        
+        .vstat-value {
+            color: #333;
+            font-weight: 600;
+            font-size: 1.1em;
+        }
     </style>
 </head>
 <body>
@@ -188,6 +254,35 @@
             </div>
         </div>
         
+        <!-- Validator Status -->
+        <div class="section">
+            <h2 class="section-title">⚡ Validator Status</h2>
+            <div class="validator-card">
+                <div class="validator-header">
+                    <span class="status-dot running" id="validator-dot"></span>
+                    <span class="validator-name">Primary Validator</span>
+                    <span class="status-badge status-running" id="validator-status">Running</span>
+                </div>
+                <div class="validator-stats">
+                    <div class="validator-stat">
+                        <span class="vstat-label">Evaluations (1h):</span>
+                        <span class="vstat-value" id="validator-evals">-</span>
+                    </div>
+                    <div class="validator-stat">
+                        <span class="vstat-label">Current Task:</span>
+                        <span class="vstat-value" id="validator-current">Checking for submissions...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- TPS History Chart -->
+        <div class="section">
+            <h2 class="section-title">📊 TPS Performance History</h2>
+            <div style="background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); height: 400px;">
+                <canvas id="tps-chart"></canvas>
+            </div>
+        </div>
         
         <!-- Top Submissions Leaderboard -->
         <div class="section">
@@ -245,6 +340,12 @@
                 changeEl.textContent = improvement >= 0 ? '↑ Improved' : '↓ Decreased';
                 changeEl.className = 'stat-change ' + (improvement >= 0 ? 'positive' : 'negative');
                 
+                // Load validator status
+                loadValidatorStatus();
+                
+                // Load TPS history chart
+                loadTPSChart();
+                
                 // Load leaderboard
                 const leaderboard = await fetch(`${API_BASE}/leaderboard?limit=50`).then(r => r.json());
                 const leaderboardBody = document.getElementById('leaderboard-body');
@@ -293,6 +394,151 @@
         
         // Load data on page load
         loadData();
+        
+        // Load validator status
+        async function loadValidatorStatus() {
+            try {
+                const status = await fetch(`${API_BASE}/api/stats/validator`).then(r => r.json());
+                document.getElementById('validator-evals').textContent = status.evaluations_completed_1h;
+                
+                if (status.current_evaluation && status.current_evaluation.submission_id) {
+                    document.getElementById('validator-current').textContent = 
+                        `Evaluating Miner ${status.current_evaluation.miner_uid}`;
+                } else {
+                    document.getElementById('validator-current').textContent = 'Idle - Checking for submissions';
+                }
+            } catch (error) {
+                console.error('Failed to load validator status:', error);
+            }
+        }
+        
+        // Load and draw TPS history chart with Chart.js
+        let tpsChart = null;
+        
+        async function loadTPSChart() {
+            try {
+                const history = await fetch(`${API_BASE}/api/stats/history?limit=20`).then(r => r.json());
+                
+                if (!history || history.length === 0) {
+                    document.getElementById('tps-chart').parentElement.innerHTML = 
+                        '<p style="text-align: center; color: #999; padding: 40px;">No data yet. Submit your first code to see TPS history!</p>';
+                    return;
+                }
+                
+                const canvas = document.getElementById('tps-chart');
+                const ctx = canvas.getContext('2d');
+                
+                // Destroy existing chart if any
+                if (tpsChart) {
+                    tpsChart.destroy();
+                }
+                
+                // Prepare data
+                const labels = history.map((h, i) => `#${i + 1}`);
+                const tpsData = history.map(h => h.tps);
+                const minerData = history.map(h => `Miner ${h.miner_uid}`);
+                const timestamps = history.map(h => new Date(h.timestamp).toLocaleString());
+                
+                // Create chart
+                tpsChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: 'TPS (Tokens Per Second)',
+                            data: tpsData,
+                            borderColor: '#667eea',
+                            backgroundColor: 'rgba(102, 126, 234, 0.1)',
+                            borderWidth: 3,
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 6,
+                            pointHoverRadius: 8,
+                            pointBackgroundColor: '#667eea',
+                            pointBorderColor: '#fff',
+                            pointBorderWidth: 2,
+                            pointHoverBackgroundColor: '#fff',
+                            pointHoverBorderColor: '#667eea',
+                            pointHoverBorderWidth: 3,
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        interaction: {
+                            intersect: false,
+                            mode: 'index',
+                        },
+                        plugins: {
+                            legend: {
+                                display: true,
+                                position: 'top',
+                                labels: {
+                                    font: { size: 14, weight: 'bold' },
+                                    color: '#333'
+                                }
+                            },
+                            tooltip: {
+                                backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                                padding: 12,
+                                titleFont: { size: 14, weight: 'bold' },
+                                bodyFont: { size: 13 },
+                                callbacks: {
+                                    title: function(context) {
+                                        return minerData[context[0].dataIndex];
+                                    },
+                                    label: function(context) {
+                                        return `TPS: ${context.parsed.y.toFixed(2)}`;
+                                    },
+                                    afterLabel: function(context) {
+                                        return `Submitted: ${timestamps[context.dataIndex]}`;
+                                    }
+                                }
+                            }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: false,
+                                title: {
+                                    display: true,
+                                    text: 'TPS (Tokens Per Second)',
+                                    font: { size: 14, weight: 'bold' },
+                                    color: '#666'
+                                },
+                                ticks: {
+                                    callback: function(value) {
+                                        return value.toFixed(0);
+                                    },
+                                    font: { size: 12 },
+                                    color: '#666'
+                                },
+                                grid: {
+                                    color: 'rgba(0, 0, 0, 0.05)'
+                                }
+                            },
+                            x: {
+                                title: {
+                                    display: true,
+                                    text: 'Submission Rank (Chronological)',
+                                    font: { size: 14, weight: 'bold' },
+                                    color: '#666'
+                                },
+                                ticks: {
+                                    font: { size: 12 },
+                                    color: '#666'
+                                },
+                                grid: {
+                                    display: false
+                                }
+                            }
+                        }
+                    }
+                });
+                
+            } catch (error) {
+                console.error('Failed to load TPS chart:', error);
+            }
+        }
         
         // Auto-refresh every 30 seconds
         setInterval(loadData, 30000);

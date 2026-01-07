@@ -99,9 +99,10 @@ def inner_steps(
 # =============================================================================
 # REMEMBER:
 # - Test locally first (FREE): uv run python -m tournament.test_local train.py
-# - Your outputs must match reference within 1% tolerance
+# - Your outputs must match reference within 10% tolerance
 # - Token count must be exact
 # - Submission costs 0.1 TAO
+# - Version 2: Testing updated submission flow
 # =============================================================================
 
 

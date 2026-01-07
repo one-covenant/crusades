@@ -1,239 +1,276 @@
-# Templar Tournament
+# ⚡ Templar Tournament
 
 Compete to write the fastest PyTorch training code. Winner-takes-all: Highest TPS → 100% of subnet emissions.
 
+**Live Dashboard:** Check with your validator for their dashboard URL
+
 ---
 
-## For Miners - Quick Start
+## 🎯 Overview
 
-### Step 1: Setup
+**The Challenge:** Optimize training to achieve maximum tokens-per-second (TPS)
+
+- **Task**: Run 5 training steps on Qwen2.5-3B
+- **Metric**: TPS = 40,960 tokens / wall time
+- **Reward**: #1 on leaderboard gets 100% emissions
+- **Cost**: 0.1 TAO per submission
+
+---
+
+## 🚀 For Miners
+
+### Setup
 ```bash
-# Clone and install
+# 1. Clone and install
 git clone https://github.com/one-covenant/templar-tournament.git
 cd templar-tournament
 uv sync
 
-# Download official 3B model and training data (~10GB, 15-30 mins)
+# 2. Download model and data (~10GB, 15-30 mins)
 uv run python scripts/setup_miner.py
 ```
 
-**Downloads:**
-- Model: Qwen2.5-3B (~6GB, 3.1B parameters)
-- Training data: 100k samples (seed=42, deterministic)
-
----
-
-### Step 2: Test Baseline
+### Test Locally
 ```bash
+# Test baseline (~4,300 TPS)
 uv run python train.py
-```
 
-**Output:**
-```
-📊 Results (Averaged over 3 evaluations):
-   Average TPS: 4,302
-```
-
-This is your unoptimized baseline (~4,300 TPS).
-
----
-
-### Step 3: Optimize Your Code
-
-Edit `train.py` to improve TPS:
-
-```python
-# Easy win: Add torch.compile() at start of inner_steps
-compiled_model = torch.compile(model, mode="reduce-overhead")
-
-# Use compiled_model instead of model
-outputs = compiled_model(input_ids)
-```
-
-Test after each change:
-```bash
-uv run python train.py  # See new TPS
-```
-
----
-
-### Step 4: Validate Before Submitting
-```bash
+# Validate before submitting
 uv run python -m tournament.test_local train.py
 ```
 
-Checks:
-- ✅ Code syntax valid
-- ✅ inner_steps function exists  
-- ✅ No forbidden imports
-
----
-
-### Step 5: Register on Subnet
-
+### Submit to Validator
 ```bash
-# Register on Templar subnet (netuid 3)
-btcli subnet register \
-    --netuid 3 \
-    --wallet.name mywallet \
-    --wallet.hotkey myhotkey
-```
+# One-time: Register on subnet 2
+btcli subnet register --netuid 2 --wallet.name mywallet --wallet.hotkey myhotkey
 
-**Cost:** ~0.01 TAO (one-time)
-
----
-
-### Step 6: Submit Your Code (Costs 0.1 TAO)
-
-```bash
-# Submit to validator
+# Submit code (costs 0.1 TAO)
 uv run python -m neurons.miner train.py \
     --wallet.name mywallet \
     --wallet.hotkey myhotkey \
-    --payment-recipient <validator_hotkey_address> \
-    --validator-api <validator_api_url>
+    --payment-recipient <validator_hotkey> \
+    --validator-api <validator_url>
+
+# Example:
+uv run python -m neurons.miner train.py \
+    --wallet.name miner \
+    --wallet.hotkey default \
+    --payment-recipient 5GEKtrNMzRE3Xh7x7csKS1eGrZ7oSAzYYSQgxhZv3QUdVr9a \
+    --validator-api http://154.54.100.65:8000
 ```
 
 **What happens:**
-1. ✅ Pays 0.1 TAO on-chain to validator
-2. ✅ Sends code content to validator API  
-3. ✅ Validator stores in private R2 bucket
-4. ✅ Validator evaluates in Docker sandbox
-5. ✅ Your TPS score published to leaderboard
+1. Pays 0.1 TAO on-chain
+2. Uploads code to validator
+3. Gets evaluated in 2-3 minutes
+4. TPS appears on leaderboard
 
----
+### Check Results
 
-### Step 7: Check Results
-
+Visit the validator's dashboard or use API:
 ```bash
-# Check your submission
-curl <validator_url>/api/submissions/<submission_id>
-
-# Check leaderboard
 curl <validator_url>/leaderboard
-```
-
-**Response:**
-```json
-{
-    "submission_id": "abc-123",
-    "status": "finished", 
-    "final_score": 18543.2,
-    "miner_uid": 42
-}
+curl <validator_url>/api/submissions/<your_id>
 ```
 
 ---
 
-### Step 8: Win Emissions!
+## 🛠️ For Validators
 
-If you're #1 → You get 100% of subnet emissions!
-
-```bash
-# Check your emissions
-btcli wallet overview --netuid 3 --wallet.name mywallet
-```
-
-**Winner updates every 10 minutes.**
-
----
-
-## The Competition
-
-- **Task**: Run 5 training steps as fast as possible
-- **Model**: Qwen2.5-3B (everyone uses same)
-- **Data**: Miners test on train.pt, Validators evaluate on test.pt (hidden)
-- **Metric**: TPS = 40,960 tokens / wall_time
-- **Winner**: Highest average TPS across 3 evaluations
-
----
-
-## Verification
-
-Validator runs your code with **random seed** and checks:
-
-1. **Token count**: Exactly 40,960 tokens
-2. **Output vectors**: Within 1% of reference
-3. **Timeout**: Under 10 minutes
-
-**Pass all 3 → Get TPS score**
-
----
-
-## For Validators
-
-### Requirements
-- Registered on subnet (netuid 3) with stake
-- Docker with GPU support
-- Private R2 bucket
-- Public API endpoint
+### System Requirements
+- Ubuntu 22.04+
+- NVIDIA GPU (80GB+ VRAM)
+- Docker with NVIDIA runtime
+- 100GB disk space
+- Public IP, port 8000 open
 
 ### Setup
 
-**Step 1: Download Model + Test Data**
 ```bash
-# Downloads model + test.pt (private evaluation data)
+# 1. Install
+git clone https://github.com/one-covenant/templar-tournament.git
+cd templar-tournament
+uv sync
+
+# 2. Download model and test data
 uv run python scripts/setup_validator.py
-```
 
-**Step 2: Configure R2 Credentials**
-```bash
+# 3. Configure environment
 cat > .env << 'EOF'
+# Wallet
+TOURNAMENT_WALLET_NAME=validator
+TOURNAMENT_WALLET_HOTKEY=validator_hotkey
 TOURNAMENT_SUBTENSOR_NETWORK=finney
-TOURNAMENT_R2_ACCOUNT_ID=your_r2_account_id
-TOURNAMENT_R2_ACCESS_KEY_ID=your_access_key  
+
+# R2 Storage
+TOURNAMENT_R2_ACCOUNT_ID=your_account_id
+TOURNAMENT_R2_BUCKET_NAME=tournament-submissions
+TOURNAMENT_R2_ACCESS_KEY_ID=your_access_key
 TOURNAMENT_R2_SECRET_ACCESS_KEY=your_secret_key
-TOURNAMENT_R2_BUCKET_NAME=validator-submissions
 EOF
-```
 
-**Step 3: Register & Stake**
-```bash
-# Register
-btcli subnet register --netuid 3 --wallet.name validator --wallet.hotkey validator_hotkey
-
-# Stake (required to set weights)
-btcli stake add --netuid 3 --wallet.name validator --wallet.hotkey validator_hotkey --amount 100
-```
-
-**Step 4: Build Docker Sandbox**
-```bash
+# 4. Build Docker sandbox
 cd src/tournament/sandbox
 docker build -t tournament-sandbox:latest .
+cd ../../..
+
+# 5. Register on blockchain
+btcli subnet register --netuid 2 --wallet.name validator --wallet.hotkey validator_hotkey
+btcli stake add --amount 1000 --wallet.name validator --wallet.hotkey validator_hotkey
 ```
 
-**Step 5: Start Services**
+### Run Validator
 
-Terminal 1 - API:
+**Terminal 1 - API Server:**
 ```bash
 uv run python -m api.app
-# Miners submit to: http://your-server-ip:8000
+# Dashboard: http://your-ip:8000/
 ```
 
-Terminal 2 - Validator:
+**Terminal 2 - Validator:**
 ```bash
 uv run python -m neurons.validator \
     --wallet.name validator \
     --wallet.hotkey validator_hotkey
 ```
 
-**Step 6: Announce API**
-
-Share with miners:
-- API URL: `http://your-server.com:8000`
+**Announce to miners:**
+- API URL: `http://your-ip:8000`
 - Payment address: `<your_validator_hotkey_address>`
 
 ---
 
-## Data Separation
+## 📋 Required Code Format
 
-- **Miners**: train.pt (samples 0-99,999, seed=42)
-- **Validators**: test.pt (samples 100,000-199,999, seed=42)
-- **Zero overlap** - Prevents overfitting
-- **Deterministic** - Everyone gets same samples
+Your `train.py` must have an `inner_steps` function:
+
+```python
+from dataclasses import dataclass
+import torch
+
+@dataclass
+class InnerStepsResult:
+    final_logits: torch.Tensor  # (batch, seq_len-1, vocab_size)
+    total_tokens: int           # Must be 40,960
+    final_loss: float
+
+def inner_steps(model, data_iterator, optimizer, num_steps, device):
+    """Your optimized training loop."""
+    
+    for step in range(num_steps):
+        batch = next(data_iterator)  # Shape: (8, 1024)
+        
+        # Your optimization code here
+        # ...
+        
+        total_tokens += batch.numel()
+    
+    return InnerStepsResult(
+        final_logits=logits,
+        total_tokens=total_tokens,
+        final_loss=loss
+    )
+```
+
+**Must:**
+- ✅ Process exactly 40,960 tokens
+- ✅ Output logits within 10% of reference
+- ✅ Complete under 10 minutes
+- ✅ Use only allowed imports
+
+**Forbidden:**
+- ❌ Network access
+- ❌ Filesystem access
+- ❌ Subprocess calls
+- ❌ Model architecture changes
 
 ---
 
-## License
+## 🏆 How Scoring Works
+
+```python
+# Evaluated 3 times with different seeds
+Run 1: seed=12345 → 4,302 TPS
+Run 2: seed=67890 → 4,289 TPS
+Run 3: seed=54321 → 4,315 TPS
+
+Final Score: 4,302 TPS (average)
+
+# TPS calculation
+TPS = 40,960 tokens / wall_time_seconds
+```
+
+**Winner gets 100% of emissions!**
+
+Weights update every 10 minutes. Hold #1 → Earn TAO continuously.
+
+---
+
+## 📊 Dashboard Features
+
+Visit validator's dashboard to see:
+- 📈 Network stats (submissions, top TPS, active miners)
+- ⚡ Validator status (live evaluations)
+- 📊 TPS history chart
+- 🏆 Leaderboard with rankings
+- 💻 Code viewer (all submissions public)
+- 🔍 Detailed evaluation results
+
+---
+
+## 🔒 Security Model
+
+**Transparent but Secure:**
+- ✅ Code is publicly viewable (learning & verification)
+- ✅ Miners submit via API (not direct R2 access)
+- ❌ Miners can't access R2 credentials
+- ❌ Miners can't delete others' submissions
+
+Same security model as Ridges.ai.
+
+---
+
+## 📖 Configuration
+
+Edit `hparams/hparams.json`:
+```json
+{
+  "netuid": 2,
+  "benchmark_model_name": "Qwen/Qwen2.5-3B",
+  "benchmark_batch_size": 8,
+  "benchmark_sequence_length": 1024,
+  "eval_steps": 5,
+  "eval_timeout": 600,
+  "num_evals_per_submission": 3,
+  "sandbox": {
+    "memory_limit": "16g",
+    "cpu_count": 4,
+    "gpu_count": 1
+  }
+}
+```
+
+---
+
+## 🐛 Common Issues
+
+**"Payment verification failed"**
+- Ensure hotkey has TAO balance (not just coldkey)
+
+**"Code validation failed"**
+- Run `uv run python -m tournament.test_local train.py` first
+
+**"Verification failed"**
+- Use BF16: `torch.autocast('cuda', dtype=torch.bfloat16)`
+- Process exactly 40,960 tokens
+- Don't modify model architecture
+
+---
+
+## 📄 License
 
 MIT
+
+---
+
+**Ready to compete? Optimize your code and claim #1! ⚡**
