@@ -118,17 +118,27 @@ async def submit_code(
     else:
         print("⚠️  Skipping payment (testing mode)")
 
-    # ANTI-COPYING: Post code hash to blockchain FIRST (proves ownership timestamp)
+    # ANTI-COPYING: Post code hash AND fingerprint to blockchain FIRST
     # This prevents malicious validators from stealing code and claiming it as their own
-    print(f"\n🔐 Posting code hash to blockchain for timestamp proof...")
+    # The fingerprint allows cross-validator copy detection even for modified code
+    
+    from tournament.anti_copying import compute_fingerprint
+    
+    fingerprint = compute_fingerprint(code)
+    fingerprint_chain = fingerprint.to_chain_format()
+    
+    print(f"\n🔐 Posting code hash + fingerprint to blockchain for timestamp proof...")
     print(f"   Hash: {code_hash}")
+    print(f"   Fingerprint: {fingerprint_chain}")
     
     code_timestamp_block = None
     code_timestamp_extrinsic = None
+    code_fingerprint = None
     
     try:
-        # Post hash to blockchain using commit extrinsic
+        # Post hash AND fingerprint to blockchain using commit extrinsic
         # This creates immutable proof: "Miner X had code_hash Y at block Z"
+        # Fingerprint enables detection even if code is slightly modified
         import bittensor as bt
         from tournament.config import get_hparams
         
@@ -145,35 +155,43 @@ async def submit_code(
         # Get current block number (will be the commit block)
         current_block = subtensor.get_current_block()
         
+        # Combine hash and fingerprint for commitment
+        # Format: "hash|fingerprint" so validators can parse both
+        commitment_data = f"{code_hash}|{fingerprint_chain}"
+        
         # Post commitment to blockchain (netuid required!)
         print(f"   Posting to subnet {netuid} at block ~{current_block}...")
         success = subtensor.commit(
             wallet=wallet,
             netuid=netuid,
-            data=code_hash,
+            data=commitment_data,
         )
         
         if success:
             # Commitment posted! Get the block number
             commit_block = subtensor.get_current_block()
             
-            print(f"   ✅ Code hash timestamped on blockchain")
+            print(f"   ✅ Code hash + fingerprint timestamped on blockchain")
             print(f"   Block: {commit_block}")
             print(f"   Hash: {code_hash[:32]}...")
+            print(f"   Fingerprint: {fingerprint_chain}")
             print(f"   This proves you created this code at block {commit_block}!")
             
             # Use block number as timestamp proof
             code_timestamp_block = str(commit_block)
             code_timestamp_extrinsic = 0  # Index within block (we don't have exact index)
+            code_fingerprint = fingerprint_chain
         else:
             print(f"   ⚠️  Blockchain timestamp failed")
             code_timestamp_block = None
             code_timestamp_extrinsic = None
+            code_fingerprint = None
     except Exception as e:
         print(f"   ⚠️  Could not post to blockchain: {e}")
         print(f"   Proceeding without timestamp (reduced protection)")
         code_timestamp_block = None
         code_timestamp_extrinsic = None
+        code_fingerprint = fingerprint_chain  # Still include fingerprint in submission
     
     # Submit code to validator API
     print(f"\nSubmitting code to validator API: {validator_api_url}")
@@ -196,6 +214,7 @@ async def submit_code(
         "payment_amount_rao": payment_receipt.amount_rao if payment_receipt else None,
         "code_timestamp_block_hash": code_timestamp_block,
         "code_timestamp_extrinsic_index": code_timestamp_extrinsic,
+        "code_fingerprint": code_fingerprint,  # Structural fingerprint for cross-validator copy detection
     }
     
     try:

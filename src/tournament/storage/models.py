@@ -62,6 +62,12 @@ class SubmissionModel(Base):
     # Prevents malicious validators from stealing and resubmitting code
     code_timestamp_block_hash: Mapped[str | None] = mapped_column(String(66), nullable=True)
     code_timestamp_extrinsic_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    
+    # Anti-copying: Structural fingerprint (for cross-validator copy detection)
+    # Unlike code_hash which is completely different for any change,
+    # fingerprint is similar for similar code structures
+    # This allows validators to detect modified copies even if they never saw the original
+    code_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
 
     # Relationships
     evaluations: Mapped[list["EvaluationModel"]] = relationship(

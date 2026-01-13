@@ -187,6 +187,11 @@ class SubmissionRequest(BaseModel):
     # This proves they had the code at that block height
     code_timestamp_block_hash: str | None = None
     code_timestamp_extrinsic_index: int | None = None
+    
+    # Anti-copying: Structural fingerprint (cross-validator detection)
+    # Similar code → similar fingerprint, unlike hash which changes completely
+    # Allows detection of modified copies even across different validators
+    code_fingerprint: str | None = None
 
 
 @router.post("", status_code=200)
@@ -231,6 +236,83 @@ async def create_submission(
     else:
         # Warning: Proceeding without blockchain timestamp
         logger.warning(f"⚠️  No blockchain timestamp - vulnerable to code theft by malicious validators")
+    
+    # ANTI-COPYING: Check for similar code (using actual code comparison)
+    # Since we have the actual code at submission time, we can do detailed comparison
+    from tournament.anti_copying import compute_fingerprint, calculate_similarity
+    
+    # Compute and store fingerprint for cross-validator detection
+    computed_fp = compute_fingerprint(request.code)
+    computed_chain_fp = computed_fp.to_chain_format()
+    
+    # If miner provided fingerprint, verify it matches
+    if request.code_fingerprint:
+        if not request.code_fingerprint.startswith(computed_chain_fp[:16]):
+            logger.warning(f"⚠️  Fingerprint mismatch: claimed {request.code_fingerprint[:32]}, computed {computed_chain_fp[:32]}")
+    
+    # Use computed fingerprint for storage
+    request.code_fingerprint = computed_chain_fp
+    
+    # Check for similar code in existing submissions
+    # We can do actual code comparison here since we have the code
+    all_submissions = await db.get_all_submissions()
+    
+    for sub in all_submissions:
+        if sub.miner_hotkey == request.miner_hotkey:
+            continue  # Skip own submissions
+        
+        # Download existing code for comparison
+        r2 = get_r2_storage()
+        import tempfile
+        temp_file = Path(tempfile.mktemp(suffix=".py"))
+        
+        try:
+            success = await r2.download_code(sub.bucket_path, str(temp_file))
+            if success and temp_file.exists():
+                existing_code = temp_file.read_text()
+                
+                # Calculate actual similarity
+                similarity = calculate_similarity(request.code, existing_code)
+                
+                if similarity.is_copy and similarity.confidence in ["high", "medium"]:
+                    # Similar code found! Check blockchain timestamps
+                    my_block = int(request.code_timestamp_block_hash or 999999999)
+                    their_block = int(sub.code_timestamp_block_hash or 999999999)
+                    
+                    logger.warning(
+                        f"🔍 Similar code detected! "
+                        f"Similarity: {similarity.overall_score:.0%} ({similarity.confidence}) "
+                        f"Reason: {similarity.reason}"
+                    )
+                    
+                    if their_block < my_block:
+                        # They were first - this is likely a copy!
+                        logger.warning(
+                            f"🚫 Rejecting submission - similar to {sub.submission_id[:8]}... "
+                            f"(block {their_block} < {my_block})"
+                        )
+                        raise HTTPException(
+                            status_code=403,
+                            detail=(
+                                f"Code is {similarity.overall_score:.0%} similar to existing submission "
+                                f"(block {their_block}). Your block: {my_block}. "
+                                f"Earlier timestamp wins. Reason: {similarity.reason}"
+                            )
+                        )
+                    else:
+                        # We were first - log but allow (they might be the copy)
+                        logger.info(
+                            f"📍 Our submission (block {my_block}) is earlier than "
+                            f"similar submission {sub.submission_id[:8]}... (block {their_block})"
+                        )
+        except HTTPException:
+            # Re-raise HTTP exceptions (like copy detection rejection)
+            raise
+        except Exception as e:
+            logger.debug(f"Could not compare with submission {sub.submission_id[:8]}...: {e}")
+        finally:
+            if temp_file.exists():
+                temp_file.unlink()
     
     # ANTI-COPYING: Check submission cooldown (prevent rapid copying)
     recent_submissions = await db.get_all_submissions()
@@ -301,6 +383,7 @@ async def create_submission(
             payment_verified=False,  # Validator will verify
             code_timestamp_block_hash=request.code_timestamp_block_hash,
             code_timestamp_extrinsic_index=request.code_timestamp_extrinsic_index,
+            code_fingerprint=request.code_fingerprint,  # For cross-validator copy detection
         )
         await db.save_submission(submission)
         
