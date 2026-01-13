@@ -41,13 +41,14 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=[
             "https://bittensor-templar-git-feat-competitions-tplr.vercel.app",
-            "https://*.vercel.app",  # All Vercel preview URLs
+            "https://templar.tplr.ai",  # Production domain
             "http://localhost:3000",  # Local development
             "http://localhost:8000",  # Our dashboard
         ],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        allow_origin_regex=r"https://.*\.vercel\.app",  # All Vercel preview URLs
     )
 
     # Include routers

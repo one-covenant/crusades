@@ -89,7 +89,9 @@ async def verify_code_timestamp(
         
         # Query blockchain to verify commitment exists
         import bittensor as bt
-        subtensor = bt.subtensor(network="ws://127.0.0.1:9944")  # TODO: Get from config
+        from tournament.config import get_config
+        config = get_config()
+        subtensor = bt.subtensor(network=config.subtensor_network)
         
         try:
             # Get commitment from blockchain
