@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends
 
+from tournament.core.protocols import SubmissionStatus
 from tournament.storage.database import Database, get_database
 
 logger = logging.getLogger(__name__)
@@ -155,8 +156,6 @@ async def get_queue_stats(
     - Average score
     """
     try:
-        from tournament.core.protocols import SubmissionStatus
-        
         all_submissions = await db.get_all_submissions()
         
         # Count by status

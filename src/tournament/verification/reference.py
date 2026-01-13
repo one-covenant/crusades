@@ -1,5 +1,6 @@
 """Reference executor for running canonical inner_steps implementation."""
 
+import gc
 import logging
 import time
 from collections.abc import Iterator
@@ -9,6 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import AutoModelForCausalLM
 
 from ..schemas import BenchmarkConfig
 
@@ -60,6 +62,9 @@ class ReferenceExecutor:
         
         # Cache for loaded model (load once, reuse for all evaluations)
         self._model_cache: nn.Module | None = None
+        # CRITICAL: Store original weights to reset before each evaluation
+        # Without this, subsequent evaluations start from modified weights!
+        self._original_state: dict[str, torch.Tensor] | None = None
         
         logger.info(f"Reference executor will use device: {self.device}")
 
@@ -75,7 +80,8 @@ class ReferenceExecutor:
         """Load the official 7B benchmark model.
         
         Uses caching: loads once, then reuses for all evaluations.
-        This saves time and memory while maintaining fairness.
+        CRITICAL: Also saves original weights to reset before each evaluation.
+        This ensures each evaluation starts from the same initial state.
 
         Returns:
             Loaded model on the target device in train mode.
@@ -83,6 +89,11 @@ class ReferenceExecutor:
         # Return cached model if available
         if self._model_cache is not None:
             logger.info(f"Using cached reference model ({sum(p.numel() for p in self._model_cache.parameters()):,} parameters)")
+            # CRITICAL: Reset model to original state before each evaluation!
+            # Without this, evaluations would start from modified weights.
+            if self._original_state is not None:
+                logger.info("Resetting model to original weights...")
+                self._model_cache.load_state_dict(self._original_state)
             return self._model_cache
         
         if not self.model_path.exists():
@@ -92,8 +103,6 @@ class ReferenceExecutor:
             )
 
         try:
-            from transformers import AutoModelForCausalLM
-            
             # Load model on GPU 0 (dedicated for reference)
             logger.info(f"Loading model from {self.model_path} on {self.device} (first time)")
             device_map = {"": 0} if self.device.type == "cuda" else "cpu"
@@ -113,6 +122,12 @@ class ReferenceExecutor:
             
             num_params = sum(p.numel() for p in model.parameters())
             logger.info(f"Model loaded and cached: {num_params:,} parameters")
+            
+            # CRITICAL: Save original state for resetting between evaluations
+            # This ensures each evaluation starts from the exact same weights
+            logger.info("Saving original model state for reset between evaluations...")
+            self._original_state = {k: v.clone() for k, v in model.state_dict().items()}
+            logger.info(f"Original state saved ({len(self._original_state)} parameters)")
             
             # Cache for future evaluations
             self._model_cache = model
@@ -296,8 +311,6 @@ class ReferenceExecutor:
         This is critical for long-running validators that evaluate many submissions.
         Without this, memory fragments accumulate and eventually cause OOM errors.
         """
-        import gc
-        
         if torch.cuda.is_available():
             # Clear PyTorch's memory cache
             torch.cuda.empty_cache()

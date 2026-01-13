@@ -1,6 +1,8 @@
 """Main verification orchestrator for comparing miner submissions against reference."""
 
+import ast
 import logging
+import random
 import tempfile
 from pathlib import Path
 
@@ -77,7 +79,6 @@ class SandboxVerifier:
         """
         # Generate random seed if not provided (security: prevents pre-computation)
         # The SAME seed is used for both reference and miner in this evaluation
-        import random
         seed = seed if seed is not None else random.randint(1, 2**31 - 1)
 
         logger.info(f"Using random seed: {seed} for this evaluation")
@@ -228,8 +229,6 @@ class SandboxVerifier:
         Returns:
             Tuple of (is_valid, error_message).
         """
-        import ast
-
         code_path = Path(code_path)
         if not code_path.exists():
             return False, f"Code file not found: {code_path}"

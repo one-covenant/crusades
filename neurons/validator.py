@@ -2,10 +2,14 @@
 
 import argparse
 import asyncio
+import gc
 import logging
+import os
+import statistics
 import time
 
 import bittensor as bt
+import torch
 
 from tournament.chain.weights import WeightSetter
 from tournament.config import get_config, get_hparams
@@ -81,10 +85,13 @@ class Validator(BaseNode):
         )
         await self.sandbox.initialize()
 
-        # Verification configuration
-        verification_config = VerificationConfig.from_dict(
-            hparams.verification if hasattr(hparams, "verification") else {}
+        # Verification configuration (read from hparams.json)
+        verification_dict = (
+            hparams.verification.model_dump() 
+            if hasattr(hparams, "verification") and hparams.verification 
+            else {}
         )
+        verification_config = VerificationConfig.from_dict(verification_dict)
 
         # Reference executor (uses test.pt for evaluation)
         benchmark_config = BenchmarkConfig(
@@ -167,9 +174,6 @@ class Validator(BaseNode):
         2. Running garbage collection
         3. Periodic aggressive cleanup every 10 iterations
         """
-        import gc
-        import torch
-        
         if not hasattr(self, '_loop_count'):
             self._loop_count = 0
         
@@ -273,20 +277,33 @@ class Validator(BaseNode):
                 logger.warning(f"Submission {submission.submission_id} failed validation")
 
     async def evaluate_submissions(self) -> None:
-        """Evaluate submissions that are ready with verification."""
+        """Evaluate submissions that are ready with verification.
+        
+        FAIRNESS: Each submission is evaluated 3 times (configurable).
+        The final score is the MEDIAN of successful evaluations.
+        
+        Why median?
+        - Protects against random GPU hiccups (one bad run doesn't tank your score)
+        - More fair than average (outliers are ignored)
+        - Example: [1200, 1250, 50] → median=1200 (fair), average=833 (unfair)
+        """
         hparams = get_hparams()
         evaluating = await self.db.get_evaluating_submissions()
+        
+        # Number of evaluation runs per submission (from hparams.json)
+        num_runs = hparams.evaluation_runs
 
         for submission in evaluating:
-            # Check if we've already evaluated this submission
+            # Check if we've already evaluated this submission enough times
             existing_evals = await self.db.get_evaluations(submission.submission_id)
             my_evals = [e for e in existing_evals if e.evaluator_hotkey == self.hotkey]
 
-            if len(my_evals) > 0:
-                # Already evaluated by this validator
+            if len(my_evals) >= num_runs:
+                # Already did all evaluation runs for this validator
                 continue
 
-            logger.info(f"Evaluating submission {submission.submission_id}")
+            runs_remaining = num_runs - len(my_evals)
+            logger.info(f"Evaluating submission {submission.submission_id} (run {len(my_evals)+1}/{num_runs})")
 
             # Download code from R2
             r2_storage = get_r2_storage()
@@ -314,49 +331,71 @@ class Validator(BaseNode):
 
             logger.info(f"Code downloaded successfully: {code_path}")
 
-            # Run verification and benchmarking
-            result = await self.verifier.verify_and_benchmark(code_path)
+            # Run multiple evaluations for fairness
+            for run_idx in range(runs_remaining):
+                current_run = len(my_evals) + run_idx + 1
+                logger.info(f"🔄 Evaluation run {current_run}/{num_runs}")
+                
+                # Run verification and benchmarking
+                result = await self.verifier.verify_and_benchmark(code_path)
 
-            if result.success:
-                logger.info(
-                    f"Verification PASSED for {submission.submission_id}\n"
-                    f"  TPS: {result.tokens_per_second:,.2f}\n"
-                    f"  Tokens: {result.total_tokens:,}\n"
-                    f"  Time: {result.wall_time_seconds:.2f}s"
+                if result.success:
+                    logger.info(
+                        f"✅ Run {current_run} PASSED for {submission.submission_id}\n"
+                        f"  TPS: {result.tokens_per_second:,.2f}\n"
+                        f"  Tokens: {result.total_tokens:,}\n"
+                        f"  Time: {result.wall_time_seconds:.2f}s"
+                    )
+                else:
+                    logger.warning(
+                        f"❌ Run {current_run} FAILED for {submission.submission_id}\n"
+                        f"  Error type: {result.error_type}\n"
+                        f"  Message: {result.error_message}"
+                    )
+
+                # Save evaluation result
+                evaluation = EvaluationModel(
+                    submission_id=submission.submission_id,
+                    evaluator_hotkey=self.hotkey,
+                    tokens_per_second=result.tokens_per_second,
+                    total_tokens=result.total_tokens,
+                    wall_time_seconds=result.wall_time_seconds,
+                    success=result.success,
+                    error=result.error_message,
                 )
-            else:
-                logger.warning(
-                    f"Verification FAILED for {submission.submission_id}\n"
-                    f"  Error type: {result.error_type}\n"
-                    f"  Message: {result.error_message}"
-                )
+                await self.db.save_evaluation(evaluation)
+                
+                # Clean up memory between runs
+                self._cleanup_memory()
 
-            # Save evaluation result
-            evaluation = EvaluationModel(
-                submission_id=submission.submission_id,
-                evaluator_hotkey=self.hotkey,
-                tokens_per_second=result.tokens_per_second,
-                total_tokens=result.total_tokens,
-                wall_time_seconds=result.wall_time_seconds,
-                success=result.success,
-                error=result.error_message,
-            )
-            await self.db.save_evaluation(evaluation)
-
-            # Check if submission has enough evaluations
+            # Check if submission has enough evaluations from all validators
             num_evals = await self.db.count_evaluations(submission.submission_id)
-            if num_evals >= hparams.num_evals_per_submission:
-                # Calculate final score (average TPS of successful evaluations)
+            required_evals = hparams.num_evals_per_submission * num_runs
+            
+            if num_evals >= required_evals:
+                # Calculate final score using MEDIAN (fair - ignores outliers)
                 all_evals = await self.db.get_evaluations(submission.submission_id)
                 successful_evals = [e for e in all_evals if e.success]
 
                 if successful_evals:
-                    avg_tps = sum(e.tokens_per_second for e in successful_evals) / len(
-                        successful_evals
-                    )
-                    await self.db.update_submission_score(submission.submission_id, avg_tps)
+                    tps_scores = [e.tokens_per_second for e in successful_evals]
+                    
+                    # Use median for fairness (protects against random bad runs)
+                    median_tps = statistics.median(tps_scores)
+                    avg_tps = statistics.mean(tps_scores)
+                    
                     logger.info(
-                        f"Submission {submission.submission_id} finished with score {avg_tps:,.2f} TPS"
+                        f"📊 Final scoring for {submission.submission_id}:\n"
+                        f"   Runs: {len(tps_scores)} successful\n"
+                        f"   Scores: {[f'{s:.1f}' for s in sorted(tps_scores)]}\n"
+                        f"   Median: {median_tps:,.2f} TPS (FINAL)\n"
+                        f"   Average: {avg_tps:,.2f} TPS (for reference)"
+                    )
+                    
+                    # Use median as final score
+                    await self.db.update_submission_score(submission.submission_id, median_tps)
+                    logger.info(
+                        f"✅ Submission {submission.submission_id} finished with score {median_tps:,.2f} TPS (median)"
                     )
                 else:
                     # All evaluations failed verification
@@ -397,7 +436,6 @@ class Validator(BaseNode):
 
 def main():
     # Configure PyTorch memory management to prevent OOM
-    import os
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     logger.info("🧠 Memory management configured: expandable_segments=True")
     

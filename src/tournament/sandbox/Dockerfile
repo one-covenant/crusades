@@ -1,13 +1,16 @@
-FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
 
 # Avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install Python 3.12
+# Install Python 3.12 and build dependencies for flash-attn
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
     python3.12-venv \
+    python3.12-dev \
     ca-certificates \
+    git \
+    ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -34,7 +37,22 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python=/home/runner/.venv/bin/python \
     transformers \
     datasets \
-    accelerate
+    accelerate \
+    "torchtitan @ git+https://github.com/pytorch/torchtitan.git"
+
+# Install flash-attn dependencies first (required for compilation)
+# See: https://github.com/Dao-AILab/flash-attention
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python=/home/runner/.venv/bin/python \
+    packaging ninja wheel setuptools
+
+# Install flash-attn (requires compilation)
+# MAX_JOBS=4 prevents OOM during compilation on machines with many cores
+# --no-build-isolation is required per flash-attn docs
+ENV MAX_JOBS=4
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python=/home/runner/.venv/bin/python \
+    flash-attn --no-build-isolation
 
 # Set PATH to use venv
 ENV PATH="/home/runner/.venv/bin:$PATH"

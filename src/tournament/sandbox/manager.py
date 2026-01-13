@@ -15,6 +15,7 @@ FAIRNESS: All miners evaluated with:
 """
 
 import asyncio
+import gc
 import logging
 import shutil
 import tempfile
@@ -22,6 +23,7 @@ import time
 from pathlib import Path
 
 import docker
+import torch
 from docker.models.containers import Container
 
 from ..config import get_hparams
@@ -332,8 +334,6 @@ class SandboxManager:
             if output.final_logits_path:
                 logits_file = output_dir / "final_logits.pt"
                 if logits_file.exists():
-                    import torch
-
                     final_logits = torch.load(logits_file, weights_only=True)
                     final_logits_path = str(logits_file)
 
@@ -351,8 +351,6 @@ class SandboxManager:
             )
             
             # Cleanup memory after sandbox
-            import gc
-            import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()

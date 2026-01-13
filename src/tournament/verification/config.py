@@ -7,10 +7,10 @@ from dataclasses import dataclass
 class VerificationConfig:
     """Configuration for verification tolerances and settings."""
 
-    # Output vector comparison tolerance (10% = 0.10)
+    # Output vector comparison tolerance (2% = 0.02)
     # Aggregate difference across all dimensions must be under this threshold
-    # Note: GPU variance and BF16 precision can cause ~5-10% differences
-    output_vector_tolerance: float = 0.10  # 10% aggregate difference allowed
+    # Note: With proper model state reset, variance is <1% between GPUs
+    output_vector_tolerance: float = 0.02  # 2% aggregate difference allowed
 
     # Whether to verify model state after training
     verify_model_state: bool = False
@@ -22,7 +22,7 @@ class VerificationConfig:
     def from_dict(cls, data: dict) -> "VerificationConfig":
         """Create config from dictionary."""
         return cls(
-            output_vector_tolerance=data.get("output_vector_tolerance", 0.10),
+            output_vector_tolerance=data.get("output_vector_tolerance", 0.02),
             verify_model_state=data.get("verify_model_state", False),
             deterministic_mode=data.get("deterministic_mode", True),
         )

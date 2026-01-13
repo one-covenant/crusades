@@ -48,10 +48,12 @@ class WeightSetter:
         # Sync metagraph to get latest state
         await self.chain.sync_metagraph()
         
-        # Skip weight setting if metagraph isn't available (e.g., localnet)
+        # Skip weight setting if metagraph sync failed
+        # This can happen if: subtensor not running, network issues, or netuid doesn't exist
         if self.chain.metagraph is None:
-            logger.info("Metagraph not available (localnet mode) - skipping weight setting")
-            return True, "Weight setting skipped (localnet)"
+            logger.warning("Metagraph not available - cannot set weights")
+            logger.warning("Possible causes: subtensor not running, network issues, or netuid doesn't exist")
+            return False, "Metagraph sync failed - cannot set weights"
 
         # Check if burn mode is enabled
         if self.burn_enabled:

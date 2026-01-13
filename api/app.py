@@ -4,6 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -74,8 +75,6 @@ app = create_app()
 
 def main():
     """Run the API server."""
-    import uvicorn
-
     config = get_config()
     uvicorn.run(
         "api.app:app",

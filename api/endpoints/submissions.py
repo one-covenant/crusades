@@ -15,14 +15,19 @@ This prevents miners from:
 
 import hashlib
 import logging
+import tempfile
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import bittensor as bt
 from bittensor_wallet.keypair import Keypair
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from tournament.config import get_hparams
+from tournament.anti_copying import calculate_similarity, compute_fingerprint
+from tournament.config import get_config, get_hparams
+from tournament.core.protocols import SubmissionStatus
 from tournament.schemas import EvaluationResponse, SubmissionResponse
 from tournament.storage.database import Database, get_database
 from tournament.storage.models import SubmissionModel
@@ -88,8 +93,6 @@ async def verify_code_timestamp(
         logger.info(f"📍 Verifying blockchain timestamp: block {block_number}")
         
         # Query blockchain to verify commitment exists
-        import bittensor as bt
-        from tournament.config import get_config
         config = get_config()
         subtensor = bt.subtensor(network=config.subtensor_network)
         
@@ -239,8 +242,6 @@ async def create_submission(
     
     # ANTI-COPYING: Check for similar code (using actual code comparison)
     # Since we have the actual code at submission time, we can do detailed comparison
-    from tournament.anti_copying import compute_fingerprint, calculate_similarity
-    
     # Compute and store fingerprint for cross-validator detection
     computed_fp = compute_fingerprint(request.code)
     computed_chain_fp = computed_fp.to_chain_format()
@@ -253,17 +254,22 @@ async def create_submission(
     # Use computed fingerprint for storage
     request.code_fingerprint = computed_chain_fp
     
-    # Check for similar code in existing submissions
-    # We can do actual code comparison here since we have the code
-    all_submissions = await db.get_all_submissions()
+    # Check for similar code in TOP submissions only (optimization)
+    # Rationale: Copiers target top-performing code, so checking top 5 catches most cases
+    # This is O(5) instead of O(n), making it fast even with many submissions
+    top_submissions = await db.get_top_submissions(limit=5)
     
-    for sub in all_submissions:
+    if len(top_submissions) == 0:
+        logger.info("📝 First submission or no evaluated submissions yet - no similarity check needed")
+    else:
+        logger.info(f"🔍 Checking similarity against top {len(top_submissions)} submissions")
+    
+    for sub in top_submissions:
         if sub.miner_hotkey == request.miner_hotkey:
             continue  # Skip own submissions
         
         # Download existing code for comparison
         r2 = get_r2_storage()
-        import tempfile
         temp_file = Path(tempfile.mktemp(suffix=".py"))
         
         try:
@@ -319,7 +325,6 @@ async def create_submission(
     miner_submissions = [s for s in recent_submissions if s.miner_uid == request.miner_uid]
     
     if miner_submissions:
-        from datetime import datetime, timedelta
         latest = max(miner_submissions, key=lambda s: s.created_at)
         time_since_last = datetime.utcnow() - latest.created_at
         
@@ -356,7 +361,6 @@ async def create_submission(
     r2_storage = get_r2_storage()
     
     # Save code to temporary file first
-    import tempfile
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(request.code)
         temp_path = Path(f.name)
@@ -447,7 +451,6 @@ async def get_submission_code(
         raise HTTPException(status_code=404, detail="Submission not found")
     
     # SECURITY: Only show code for finished submissions
-    from tournament.core.protocols import SubmissionStatus
     if submission.status not in [SubmissionStatus.FINISHED, SubmissionStatus.FAILED_VALIDATION, SubmissionStatus.ERROR]:
         raise HTTPException(
             status_code=403,
@@ -456,9 +459,6 @@ async def get_submission_code(
 
     # Download code from R2
     r2_storage = get_r2_storage()
-    import tempfile
-    from pathlib import Path
-    
     temp_file = Path(tempfile.mktemp(suffix=".py"))
     try:
         success = await r2_storage.download_code(submission.bucket_path, str(temp_file))

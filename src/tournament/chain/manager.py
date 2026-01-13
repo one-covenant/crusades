@@ -14,6 +14,7 @@ import asyncio
 import logging
 
 import bittensor as bt
+import torch
 
 from ..config import get_config, get_hparams
 from ..core.exceptions import ChainError
@@ -66,34 +67,35 @@ class ChainManager:
         """Get the wallet's hotkey address."""
         return self.wallet.hotkey.ss58_address
 
-    async def sync_metagraph(self) -> bt.metagraph:
-        """Sync and return the metagraph."""
+    async def sync_metagraph(self) -> bt.metagraph | None:
+        """Sync and return the metagraph.
+        
+        Returns:
+            The synced metagraph, or None if sync fails.
+        """
         loop = asyncio.get_event_loop()
         try:
             self._metagraph = await loop.run_in_executor(
                 None,
                 lambda: bt.metagraph(netuid=self.netuid, network=self.config.subtensor_network),
             )
+            logger.info(f"Metagraph synced: {len(self._metagraph.hotkeys)} neurons")
         except Exception as e:
-            # Fallback for localnet compatibility issues
-            logger.warning(f"Metagraph sync failed (likely localnet compatibility): {e}")
-            logger.warning("Using None for metagraph (localnet mode)")
-            # On localnet, metagraph sync isn't supported - return None
-            # Weight setting will be skipped anyway for localnet
+            logger.error(f"Metagraph sync failed: {e}")
+            logger.error("Weight setting will be unavailable until metagraph syncs")
             self._metagraph = None
         return self._metagraph
 
     @property
     def metagraph(self) -> bt.metagraph | None:
-        """Get the cached metagraph (may be None on localnet)."""
+        """Get the cached metagraph (None if sync failed)."""
         return self._metagraph
 
     def get_uid_for_hotkey(self, hotkey: str) -> int | None:
         """Get the UID for a hotkey, or None if not registered."""
-        # On localnet, return mock UID based on hotkey hash
         if self.metagraph is None:
-            # Simple mapping for testing: hash hotkey to get consistent UID
-            return abs(hash(hotkey)) % 256
+            logger.warning("Metagraph not synced - cannot get UID")
+            return None
         try:
             idx = self.metagraph.hotkeys.index(hotkey)
             return int(self.metagraph.uids[idx])
@@ -102,10 +104,9 @@ class ChainManager:
 
     def is_registered(self, hotkey: str) -> bool:
         """Check if a hotkey is registered on the subnet."""
-        # On localnet, skip registration check (metagraph not available)
         if self.metagraph is None:
-            logger.info(f"Skipping registration check (localnet mode)")
-            return True
+            logger.warning("Metagraph not synced - cannot check registration")
+            return False
         return hotkey in self.metagraph.hotkeys
 
     async def get_current_block(self) -> int:
@@ -130,22 +131,34 @@ class ChainManager:
         Returns:
             Tuple of (success, message)
         """
-        import torch
-
         loop = asyncio.get_event_loop()
 
         try:
-            await loop.run_in_executor(
+            # Convert to tensors
+            uids_tensor = torch.tensor(uids, dtype=torch.int64)
+            weights_tensor = torch.tensor(weights, dtype=torch.float32)
+            
+            logger.info(f"Setting weights: UIDs={uids}, weights={weights}")
+            
+            # Call set_weights and capture result
+            success, message = await loop.run_in_executor(
                 None,
                 lambda: self.subtensor.set_weights(
                     wallet=self.wallet,
                     netuid=self.netuid,
-                    uids=torch.tensor(uids, dtype=torch.int64),
-                    weights=torch.tensor(weights, dtype=torch.float32),
-                    wait_for_inclusion=False,
+                    uids=uids_tensor,
+                    weights=weights_tensor,
+                    wait_for_inclusion=True,  # Wait for inclusion
                     wait_for_finalization=False,
                 ),
             )
-            return (True, "Weights set successfully")
+            
+            if success:
+                logger.info(f"Weights set successfully: {message}")
+            else:
+                logger.error(f"Weight setting failed: {message}")
+            
+            return (success, message)
         except Exception as e:
+            logger.error(f"Exception during weight setting: {e}")
             return (False, str(e))

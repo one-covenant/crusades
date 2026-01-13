@@ -8,12 +8,15 @@ import argparse
 import asyncio
 import hashlib
 import sys
+import time
 from pathlib import Path
 
 import bittensor as bt
 import httpx
 
+from tournament.anti_copying import compute_fingerprint
 from tournament.chain.manager import ChainManager
+from tournament.config import get_config, get_hparams
 from tournament.payment.manager import PaymentManager
 from tournament.pipeline.validator import CodeValidator
 
@@ -121,9 +124,6 @@ async def submit_code(
     # ANTI-COPYING: Post code hash AND fingerprint to blockchain FIRST
     # This prevents malicious validators from stealing code and claiming it as their own
     # The fingerprint allows cross-validator copy detection even for modified code
-    
-    from tournament.anti_copying import compute_fingerprint
-    
     fingerprint = compute_fingerprint(code)
     fingerprint_chain = fingerprint.to_chain_format()
     
@@ -139,15 +139,13 @@ async def submit_code(
         # Post hash AND fingerprint to blockchain using commit extrinsic
         # This creates immutable proof: "Miner X had code_hash Y at block Z"
         # Fingerprint enables detection even if code is slightly modified
-        import bittensor as bt
-        from tournament.config import get_hparams
+        hparams = get_hparams()
+        netuid = hparams.netuid
         
-        config = get_hparams()
-        netuid = config.netuid
-        
-        # Get network from chain manager or default to localnet  
-        network = "ws://127.0.0.1:9944"  # Default localnet
-        if 'chain' in locals():
+        # Get network from chain manager if available, otherwise from config
+        app_config = get_config()
+        network = app_config.subtensor_network
+        if 'chain' in locals() and chain.subtensor:
             network = chain.subtensor.network
         
         subtensor = bt.subtensor(network=network)
@@ -198,7 +196,6 @@ async def submit_code(
     
     # Prepare submission data
     # Sign timestamp with hotkey for authentication
-    import time
     timestamp = int(time.time())
     signature = wallet.hotkey.sign(str(timestamp).encode()).hex()
     
@@ -293,8 +290,8 @@ def main():
     parser.add_argument(
         "--validator-api",
         type=str,
-        default="http://localhost:8000",
-        help="Validator API endpoint (default: http://localhost:8000)",
+        required=True,
+        help="Validator API endpoint (e.g., http://validator.example.com:8000)",
     )
 
     args = parser.parse_args()

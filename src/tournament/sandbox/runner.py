@@ -174,6 +174,13 @@ def main():
                 trust_remote_code=True,
             )
             model.train()
+            
+            # Enable gradient checkpointing (MUST match reference executor)
+            # This ensures identical computation between reference and sandbox
+            if hasattr(model, 'gradient_checkpointing_enable'):
+                model.gradient_checkpointing_enable()
+                print("✅ Gradient checkpointing enabled (matches reference)")
+            
             model_device = next(model.parameters()).device
             print(f"✅ Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters on {model_device}")
             sys.stdout.flush()

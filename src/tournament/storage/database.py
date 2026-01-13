@@ -163,6 +163,30 @@ class Database:
             )
             return list(result.scalars().all())
 
+    async def get_top_submissions(self, limit: int = 5) -> list[SubmissionModel]:
+        """Get top N submissions by score for similarity checking.
+        
+        This is used during submission to check if new code is similar
+        to existing top-performing code (anti-copying).
+        
+        Args:
+            limit: Number of top submissions to return (default 5)
+            
+        Returns:
+            List of top submissions sorted by score (highest first)
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SubmissionModel)
+                .where(
+                    SubmissionModel.status == SubmissionStatus.FINISHED,
+                    SubmissionModel.final_score.isnot(None),
+                )
+                .order_by(desc(SubmissionModel.final_score))
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
 
 # Global instance
 _database: Database | None = None

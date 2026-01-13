@@ -185,7 +185,7 @@ def main():
     logger.info("📝 Next steps:")
     logger.info("   1. Edit train.py and optimize the inner_steps function")
     logger.info("   2. Test: uv run python train.py  (see your TPS)")
-    logger.info("   3. Validate: uv run python -m tournament.test_local train.py")
+    logger.info("   3. Validate: uv run python -m local_test train.py")
     logger.info("   4. Submit when ready and compete!")
 
 

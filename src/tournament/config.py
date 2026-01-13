@@ -30,13 +30,21 @@ class AntiCopyingConfig(BaseModel):
     hide_pending_submissions: bool = True
 
 
+class VerificationConfig(BaseModel):
+    """Verification tolerance settings."""
+
+    output_vector_tolerance: float = 0.02  # 2% aggregate difference allowed
+    deterministic_mode: bool = True
+
+
 class HParams(BaseModel):
     """Hyperparameters loaded from hparams.json."""
 
     netuid: int = 3
 
     # Evaluation settings
-    num_evals_per_submission: int = 3
+    num_evals_per_submission: int = 1  # Number of validators that must evaluate
+    evaluation_runs: int = 5  # Number of runs per submission (median taken for fairness)
     eval_steps: int = 100
     eval_timeout: int = 600
 
@@ -59,6 +67,7 @@ class HParams(BaseModel):
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     anti_copying: AntiCopyingConfig = Field(default_factory=AntiCopyingConfig)
+    verification: VerificationConfig = Field(default_factory=VerificationConfig)
 
     @classmethod
     def load(cls, path: Path | str | None = None) -> Self:

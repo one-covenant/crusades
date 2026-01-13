@@ -1,7 +1,8 @@
 {
-    "netuid": 2,
+    "netuid": 3,
 
     "num_evals_per_submission": 1,
+    "evaluation_runs": 5,
     "eval_steps": 5,
     "eval_timeout": 600,
 
@@ -25,14 +26,14 @@
     },
 
     "sandbox": {
-        "memory_limit": "16g",
+        "memory_limit": "32g",
         "cpu_count": 4,
         "gpu_count": 1,
         "pids_limit": 256
     },
 
     "verification": {
-        "output_vector_tolerance": 0.10,
+        "output_vector_tolerance": 0.02,
         "deterministic_mode": true
     },
 

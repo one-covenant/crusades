@@ -9,7 +9,9 @@ even if they never see the original code.
 
 import ast
 import hashlib
+import io
 import logging
+import tokenize
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -156,8 +158,6 @@ def compute_fingerprint(code: str) -> CodeFingerprint:
                 function_hashes[node.name] = func_hash
         
         # Count tokens (rough size indicator)
-        import tokenize
-        import io
         try:
             tokens = list(tokenize.generate_tokens(io.StringIO(code).readline))
             token_count = len(tokens)

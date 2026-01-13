@@ -5,6 +5,7 @@ Cloudflare R2 (S3-compatible storage).
 """
 
 import logging
+import shutil
 from pathlib import Path
 
 import boto3
@@ -177,9 +178,6 @@ class R2Storage:
             local_path = Path(local_path)
             storage_path = self._get_local_storage_path(remote_key)
             storage_path.parent.mkdir(parents=True, exist_ok=True)
-
-            import shutil
-
             shutil.copy2(local_path, storage_path)
             logger.info(f"Stored locally: {storage_path}")
             return True
@@ -197,9 +195,6 @@ class R2Storage:
 
             local_path = Path(local_path)
             local_path.parent.mkdir(parents=True, exist_ok=True)
-
-            import shutil
-
             shutil.copy2(storage_path, local_path)
             logger.info(f"Loaded from local storage: {local_path}")
             return True
