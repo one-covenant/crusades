@@ -399,7 +399,7 @@ class Validator(BaseNode):
                     # All evaluations failed verification
                     await self.db.update_submission_status(
                         submission.submission_id,
-                        SubmissionStatus.FAILED_VALIDATION,
+                        SubmissionStatus.FAILED_EVALUATION,
                         error_message="All evaluations failed verification",
                     )
                     logger.warning(

@@ -16,7 +16,7 @@
     "benchmark_test_size": 100000,
     "benchmark_master_seed": 42,
     "benchmark_sequence_length": 1024,
-    "benchmark_batch_size": 8,
+    "benchmark_batch_size": 12,
 
     "set_weights_interval_seconds": 600,
     

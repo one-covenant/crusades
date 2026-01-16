@@ -208,10 +208,11 @@ async def get_recent_submissions(
         
         # SECURITY: Filter out pending/evaluating submissions
         # This prevents attackers from seeing submissions before they're safe
-        visible_statuses = ['finished', 'failed_validation', 'error']
+        # Show ALL final statuses (finished, failed, error)
+        final_statuses = ['finished', 'failed_validation', 'failed_evaluation', 'failed_copy', 'error']
         visible_submissions = [
             s for s in submissions 
-            if s.status.value in visible_statuses
+            if s.status.value in final_statuses
         ]
         
         # Sort by created_at descending

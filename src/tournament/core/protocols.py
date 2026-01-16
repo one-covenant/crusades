@@ -12,12 +12,17 @@ from typing import Any, Protocol, runtime_checkable
 class SubmissionStatus(str, Enum):
     """Status of a code submission."""
 
+    # In-progress statuses (hidden from dashboard for security)
     PENDING = "pending"  # Just submitted, awaiting validation
     VALIDATING = "validating"  # Being validated (syntax, imports, functions)
-    EVALUATING = "evaluating"  # Passed validation, being evaluated by validators
-    FINISHED = "finished"  # Evaluation complete, has final score
-    FAILED_VALIDATION = "failed_validation"  # Code validation failed
-    ERROR = "error"  # Unexpected error during processing
+    EVALUATING = "evaluating"  # Passed validation, being evaluated in sandbox
+    
+    # Final statuses (shown in recent submissions)
+    FINISHED = "finished"  # ✅ Evaluation complete, has final TPS score
+    FAILED_VALIDATION = "failed_validation"  # ❌ Code validation failed (syntax, imports, missing function)
+    FAILED_EVALUATION = "failed_evaluation"  # ❌ Sandbox ran but verification failed (logits mismatch, timeout)
+    FAILED_COPY = "failed_copy"  # ❌ Rejected as duplicate or too similar to existing code
+    ERROR = "error"  # ❌ Unexpected system error
 
 
 @runtime_checkable

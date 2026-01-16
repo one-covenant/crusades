@@ -17,6 +17,7 @@ import hashlib
 import logging
 import tempfile
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -463,6 +464,17 @@ async def create_submission(
     for existing in all_submissions:
         if existing.code_hash == request.code_hash:
             logger.warning(f"🚫 Duplicate code detected: hash {request.code_hash[:16]}... already exists")
+            # Store the failed submission so it appears in recent submissions
+            failed_submission = SubmissionModel(
+                submission_id=str(uuid.uuid4()),
+                miner_hotkey=request.miner_hotkey,
+                miner_uid=request.miner_uid,
+                code_hash=request.code_hash,
+                bucket_path="",  # No code stored for duplicates
+                status=SubmissionStatus.FAILED_COPY,
+                error_message=f"Duplicate: same code as {existing.submission_id[:8]}...",
+            )
+            await db.save_submission(failed_submission)
             raise HTTPException(
                 status_code=409,
                 detail=f"This exact code has already been submitted (submission {existing.submission_id[:8]}...)"
@@ -500,6 +512,17 @@ async def create_submission(
                         f"🚫 Code too similar to own previous submission: "
                         f"{similarity.overall_score:.0%} similar to {sub.submission_id[:8]}..."
                     )
+                    # Store the failed submission so it appears in recent submissions
+                    failed_submission = SubmissionModel(
+                        submission_id=str(uuid.uuid4()),
+                        miner_hotkey=request.miner_hotkey,
+                        miner_uid=request.miner_uid,
+                        code_hash=request.code_hash,
+                        bucket_path="",
+                        status=SubmissionStatus.FAILED_COPY,
+                        error_message=f"Too similar ({similarity.overall_score:.0%}) to {sub.submission_id[:8]}...",
+                    )
+                    await db.save_submission(failed_submission)
                     raise HTTPException(
                         status_code=409,
                         detail=(
