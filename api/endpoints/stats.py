@@ -23,6 +23,7 @@ async def get_validator_status(db: Database = Depends(get_database)) -> dict:
         # Count evaluations in last hour
         now = datetime.utcnow()
         last_hour = now - timedelta(hours=1)
+        last_24h = now - timedelta(hours=24)
         
         recent_evals = []
         for s in all_submissions:
@@ -34,16 +35,33 @@ async def get_validator_status(db: Database = Depends(get_database)) -> dict:
         evaluating = await db.get_evaluating_submissions()
         current_eval = evaluating[0] if evaluating else None
         
+        # Calculate success rate (uptime proxy) from last 24h
+        recent_submissions = [s for s in all_submissions if s.created_at > last_24h]
+        if recent_submissions:
+            finished = [s for s in recent_submissions if s.status == SubmissionStatus.FINISHED]
+            failed = [s for s in recent_submissions if s.status in (
+                SubmissionStatus.FAILED_VALIDATION,
+                SubmissionStatus.FAILED_EVALUATION,
+                SubmissionStatus.ERROR,
+            )]
+            # Only count processing failures, not copy rejections (those are working as intended)
+            total_processed = len(finished) + len(failed)
+            success_rate = (len(finished) / total_processed * 100) if total_processed > 0 else 100.0
+            uptime_str = f"{success_rate:.1f}%"
+        else:
+            uptime_str = "N/A"
+        
         return {
-            "status": "running",
+            "status": "running" if current_eval or recent_evals else "idle",
             "evaluations_completed_1h": len(recent_evals),
             "current_evaluation": {
                 "submission_id": current_eval.submission_id if current_eval else None,
                 "miner_uid": current_eval.miner_uid if current_eval else None,
             } if current_eval else None,
-            "uptime": "Running",
+            "uptime": uptime_str,
         }
     except Exception as e:
+        logger.error(f"Error getting validator status: {e}")
         return {
             "status": "unknown",
             "evaluations_completed_1h": 0,
@@ -150,8 +168,10 @@ async def get_queue_stats(
     """Get queue statistics.
     
     Returns:
-    - Pending submissions count
-    - Running submissions count
+    - Queued submissions count (pending + validating)
+    - Running submissions count (evaluating)
+    - Finished submissions count (successful)
+    - Failed submissions count (all failure types)
     - Average wait time
     - Average score
     """
@@ -159,9 +179,18 @@ async def get_queue_stats(
         all_submissions = await db.get_all_submissions()
         
         # Count by status
-        pending = [s for s in all_submissions if s.status in (SubmissionStatus.PENDING, SubmissionStatus.VALIDATING)]
+        queued = [s for s in all_submissions if s.status in (SubmissionStatus.PENDING, SubmissionStatus.VALIDATING)]
         running = [s for s in all_submissions if s.status == SubmissionStatus.EVALUATING]
         finished = [s for s in all_submissions if s.status == SubmissionStatus.FINISHED]
+        
+        # Count all failed submissions
+        failed_statuses = [
+            SubmissionStatus.FAILED_VALIDATION,
+            SubmissionStatus.FAILED_EVALUATION,
+            SubmissionStatus.FAILED_COPY,
+            SubmissionStatus.ERROR,
+        ]
+        failed = [s for s in all_submissions if s.status in failed_statuses]
         
         # Calculate average wait time for finished submissions
         wait_times = []
@@ -177,19 +206,24 @@ async def get_queue_stats(
         avg_score = sum(scores) / len(scores) if scores else 0
         
         return {
-            "pending_count": len(pending),
+            "queued_count": len(queued),
             "running_count": len(running),
             "finished_count": len(finished),
+            "failed_count": len(failed),
             "avg_wait_time_seconds": avg_wait_time,
             "avg_score": avg_score,
+            # Keep old names for backwards compatibility
+            "pending_count": len(queued),
         }
     except Exception as e:
         return {
-            "pending_count": 0,
+            "queued_count": 0,
             "running_count": 0,
             "finished_count": 0,
+            "failed_count": 0,
             "avg_wait_time_seconds": 0,
             "avg_score": 0,
+            "pending_count": 0,
         }
 
 

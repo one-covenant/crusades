@@ -30,15 +30,18 @@ MOCK_VALIDATOR = {
         "submission_id": "sub_abc123",
         "miner_uid": 42,
     },
-    "uptime": "99.8%",
+    "uptime": "96.2%",
 }
 
 MOCK_QUEUE = {
-    "pending_count": 3,
+    "queued_count": 3,
     "running_count": 1,
     "finished_count": 1279,
+    "failed_count": 47,
     "avg_wait_time_seconds": 45.2,
     "avg_score": 3842.5,
+    # Backwards compatibility
+    "pending_count": 3,
 }
 
 MOCK_LEADERBOARD = [

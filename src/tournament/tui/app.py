@@ -154,7 +154,12 @@ def create_validator_panel(data: TournamentData) -> Panel:
     queue = data.queue
 
     status = validator.get("status", "unknown")
-    status_color = "green" if status == "running" else "red"
+    if status == "running":
+        status_color = "green"
+    elif status == "idle":
+        status_color = "yellow"
+    else:
+        status_color = "red"
     status_dot = f"[{status_color}]●[/{status_color}]"
 
     current_eval = validator.get("current_evaluation")
@@ -165,15 +170,21 @@ def create_validator_panel(data: TournamentData) -> Panel:
     uptime = validator.get("uptime", "N/A")
     evals_1h = validator.get("evaluations_completed_1h", 0)
 
-    pending = queue.get("pending_count", 0)
+    # Use queued_count if available, fallback to pending_count for backwards compat
+    queued = queue.get("queued_count", queue.get("pending_count", 0))
     running = queue.get("running_count", 0)
+    finished = queue.get("finished_count", 0)
+    failed = queue.get("failed_count", 0)
 
     info = (
         f"{status_dot} {status.upper()}  |  "
         f"Evaluating: {eval_text}  |  "
         f"Evals/hr: {evals_1h}  |  "
-        f"Queue: {pending} pending, {running} running  |  "
-        f"Uptime: {uptime}"
+        f"[yellow]Queued: {queued}[/]  |  "
+        f"[cyan]Running: {running}[/]  |  "
+        f"[green]Done: {finished}[/]  |  "
+        f"[red]Failed: {failed}[/]  |  "
+        f"Success: {uptime}"
     )
 
     return Panel(

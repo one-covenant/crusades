@@ -181,11 +181,13 @@ class TournamentClient:
         data = self._get("/api/stats/queue")
         if not data:
             return {
-                "pending_count": 0,
+                "queued_count": 0,
                 "running_count": 0,
                 "finished_count": 0,
+                "failed_count": 0,
                 "avg_wait_time_seconds": 0.0,
                 "avg_score": 0.0,
+                "pending_count": 0,
             }
         return data
 
