@@ -122,16 +122,19 @@ def _load_hf_dataset(
         tokenizer.pad_token = tokenizer.eos_token
     
     # Load dataset with streaming for efficiency
+    print(f"Loading dataset: {dataset_name} (streaming)...")
     dataset = load_dataset(
         dataset_name,
         split=split,
         streaming=True,
-        trust_remote_code=True,
     )
     
-    # Sample and tokenize with the determined seed
+    # Shuffle with buffer for efficiency (key: buffer_size parameter!)
+    dataset = dataset.shuffle(seed=actual_seed, buffer_size=10000)
+    
+    # Sample and tokenize
     tokens_list = []
-    dataset_iter = iter(dataset.shuffle(seed=actual_seed))
+    dataset_iter = iter(dataset)
     
     for _ in range(num_samples):
         try:
