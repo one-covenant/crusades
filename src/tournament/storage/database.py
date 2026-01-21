@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from ..config import get_hparams
 from ..core.protocols import SubmissionStatus
-from .models import Base, EvaluationModel, PaymentModel, SubmissionModel
+from .models import Base, EvaluationModel, SubmissionModel
 
 
 class Database:
@@ -102,6 +102,26 @@ class Database:
             )
             return list(result.scalars().all())
 
+    async def get_latest_submission_by_hotkey(self, hotkey: str) -> SubmissionModel | None:
+        """Get the most recent submission from a miner.
+        
+        Used for rate limiting - checking when miner last submitted.
+        
+        Args:
+            hotkey: Miner's hotkey
+            
+        Returns:
+            Most recent submission or None
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SubmissionModel)
+                .where(SubmissionModel.miner_hotkey == hotkey)
+                .order_by(desc(SubmissionModel.created_at))
+                .limit(1)
+            )
+            return result.scalar_one_or_none()
+
     # Evaluation operations
 
     async def save_evaluation(self, evaluation: EvaluationModel) -> None:
@@ -186,67 +206,6 @@ class Database:
                 .limit(limit)
             )
             return list(result.scalars().all())
-
-    # Payment operations (anti-spam / prevent double-spending)
-
-    async def get_payment_by_hash(
-        self, 
-        block_hash: str, 
-        extrinsic_index: int
-    ) -> PaymentModel | None:
-        """Check if a payment has already been used.
-        
-        Args:
-            block_hash: Block hash of the payment transaction
-            extrinsic_index: Extrinsic index within the block
-            
-        Returns:
-            PaymentModel if found (payment already used), None otherwise
-        """
-        async with self.session_factory() as session:
-            result = await session.execute(
-                select(PaymentModel).where(
-                    PaymentModel.payment_block_hash == block_hash,
-                    PaymentModel.payment_extrinsic_index == extrinsic_index,
-                )
-            )
-            return result.scalar_one_or_none()
-
-    async def record_payment(
-        self,
-        block_hash: str,
-        extrinsic_index: int,
-        submission_id: str,
-        miner_hotkey: str,
-        miner_coldkey: str,
-        amount_rao: int,
-    ) -> PaymentModel:
-        """Record a verified payment to prevent reuse.
-        
-        Args:
-            block_hash: Block hash of the payment transaction
-            extrinsic_index: Extrinsic index within the block
-            submission_id: ID of the submission this payment is for
-            miner_hotkey: Miner's hotkey
-            miner_coldkey: Miner's coldkey (sender of payment)
-            amount_rao: Amount paid in RAO
-            
-        Returns:
-            The created PaymentModel
-        """
-        async with self.session_factory() as session:
-            payment = PaymentModel(
-                payment_block_hash=block_hash,
-                payment_extrinsic_index=extrinsic_index,
-                submission_id=submission_id,
-                miner_hotkey=miner_hotkey,
-                miner_coldkey=miner_coldkey,
-                amount_rao=amount_rao,
-            )
-            session.add(payment)
-            await session.commit()
-            return payment
-
 
 # Global instance
 _database: Database | None = None

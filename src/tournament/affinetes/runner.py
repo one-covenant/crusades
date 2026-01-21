@@ -108,6 +108,7 @@ class AffinetesRunner:
         steps: int = 5,
         batch_size: int = 8,
         sequence_length: int = 1024,
+        data_samples: int = 10000,
         task_id: int = 0,
     ) -> EvaluationResult:
         """Evaluate a miner's Docker image.
@@ -120,6 +121,7 @@ class AffinetesRunner:
             steps: Number of training steps
             batch_size: Batch size
             sequence_length: Sequence length for evaluation
+            data_samples: Number of data samples to load
             task_id: Evaluation task identifier
             
         Returns:
@@ -143,6 +145,7 @@ class AffinetesRunner:
                 steps=steps,
                 batch_size=batch_size,
                 sequence_length=sequence_length,
+                data_samples=data_samples,
                 task_id=task_id,
             )
         elif self.mode == "basilica":
@@ -154,6 +157,7 @@ class AffinetesRunner:
                 steps=steps,
                 batch_size=batch_size,
                 sequence_length=sequence_length,
+                data_samples=data_samples,
                 task_id=task_id,
             )
         else:
@@ -171,6 +175,7 @@ class AffinetesRunner:
         steps: int,
         batch_size: int,
         sequence_length: int,
+        data_samples: int,
         task_id: int,
     ) -> EvaluationResult:
         """Run evaluation locally using Docker.
@@ -209,6 +214,7 @@ async def main():
         steps={steps},
         batch_size={batch_size},
         sequence_length={sequence_length},
+        data_samples={data_samples},
         timeout={self.timeout},
     )
     print("EVAL_RESULT:" + json.dumps(result))
@@ -324,6 +330,7 @@ asyncio.run(main())
         steps: int,
         batch_size: int,
         sequence_length: int,
+        data_samples: int,
         task_id: int,
     ) -> EvaluationResult:
         """Run evaluation remotely via Basilica.
@@ -358,6 +365,7 @@ asyncio.run(main())
                 steps=steps,
                 batch_size=batch_size,
                 sequence_length=sequence_length,
+                data_samples=data_samples,
                 timeout=self.timeout,
             )
             
@@ -373,6 +381,7 @@ asyncio.run(main())
                 steps=steps,
                 batch_size=batch_size,
                 sequence_length=sequence_length,
+                data_samples=data_samples,
                 task_id=task_id,
             )
         except Exception as e:
@@ -390,6 +399,7 @@ asyncio.run(main())
         steps: int,
         batch_size: int,
         sequence_length: int,
+        data_samples: int,
         task_id: int,
     ) -> EvaluationResult:
         """Fallback: Call Basilica directly via HTTP."""
@@ -412,6 +422,7 @@ asyncio.run(main())
                 "steps": steps,
                 "batch_size": batch_size,
                 "sequence_length": sequence_length,
+                "data_samples": data_samples,
                 "timeout": self.timeout,
             },
         }

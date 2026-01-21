@@ -9,12 +9,14 @@
 
     "benchmark_model_name": "Qwen/Qwen2.5-7B",
     "benchmark_dataset_name": "HuggingFaceFW/fineweb",
+    "benchmark_data_samples": 100000,
     "benchmark_sequence_length": 1024,
-    "benchmark_batch_size": 8,
+    "benchmark_batch_size": 16,
 
     "set_weights_interval_seconds": 600,
 
     "reveal_blocks": 100,
+    "min_blocks_between_commits": 100,
 
     "verification": {
         "output_vector_tolerance": 0.02,

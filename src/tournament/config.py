@@ -44,6 +44,7 @@ class HParams(BaseModel):
     # Benchmark settings - model and data for evaluation
     benchmark_model_name: str = "Qwen/Qwen2.5-7B"
     benchmark_dataset_name: str = "HuggingFaceFW/fineweb"
+    benchmark_data_samples: int = 10000  # Number of samples to load
     benchmark_sequence_length: int = 1024
     benchmark_batch_size: int = 8
 
@@ -52,6 +53,7 @@ class HParams(BaseModel):
 
     # Commitment settings
     reveal_blocks: int = 100  # Blocks until commitment is revealed
+    min_blocks_between_commits: int = 100  # Rate limit: ~20 min between commits
 
     # Verification
     verification: VerificationConfig = Field(default_factory=VerificationConfig)

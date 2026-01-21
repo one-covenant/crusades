@@ -183,12 +183,36 @@ class Validator(BaseNode):
         self,
         commitment: MinerCommitment,
     ) -> None:
-        """Create a submission record from a blockchain commitment."""
+        """Create a submission record from a blockchain commitment.
+        
+        Includes rate limiting: miners must wait min_blocks_between_commits
+        between submissions to prevent spam.
+        """
+        hparams = get_hparams()
         submission_id = f"chi_{commitment.commit_block}_{commitment.uid}"
         
         existing = await self.db.get_submission(submission_id)
         if existing:
             return
+        
+        # Rate limiting: Check if miner submitted too recently
+        min_blocks = getattr(hparams, 'min_blocks_between_commits', 100)
+        last_submission = await self.db.get_latest_submission_by_hotkey(commitment.hotkey)
+        
+        if last_submission:
+            # Extract commit_block from submission_id (format: chi_<block>_<uid>)
+            try:
+                last_block = int(last_submission.submission_id.split('_')[1])
+                blocks_since = commitment.commit_block - last_block
+                
+                if blocks_since < min_blocks:
+                    logger.warning(
+                        f"Rate limit: {commitment.hotkey[:16]}... submitted too soon "
+                        f"({blocks_since} blocks, min={min_blocks}). Skipping."
+                    )
+                    return
+            except (IndexError, ValueError):
+                pass  # Can't parse, allow submission
         
         submission = SubmissionModel(
             submission_id=submission_id,
@@ -260,6 +284,7 @@ class Validator(BaseNode):
                     steps=getattr(hparams, 'eval_steps', 5),
                     batch_size=getattr(hparams, 'benchmark_batch_size', 8),
                     sequence_length=getattr(hparams, 'benchmark_sequence_length', 1024),
+                    data_samples=getattr(hparams, 'benchmark_data_samples', 10000),
                     task_id=current_run,
                 )
 

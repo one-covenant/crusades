@@ -491,6 +491,7 @@ class Actor:
         batch_size: int = 8,
         timeout: int = 600,
         sequence_length: int | None = None,
+        data_samples: int = 10000,
     ) -> dict:
         """
         Run TPS evaluation on the miner's train.py.
@@ -504,6 +505,7 @@ class Actor:
             batch_size: Batch size for evaluation
             timeout: Maximum seconds for evaluation
             sequence_length: Sequence length (defaults to EVAL_SEQUENCE_LENGTH)
+            data_samples: Number of data samples to load (from hparams)
             
         Returns:
             Dict with: tps, total_tokens, wall_time_seconds, success, error, diagnostics
@@ -640,7 +642,7 @@ class Actor:
             data = _get_cached_data(
                 data_path,
                 model_name=model_url if is_hf_model else "Qwen/Qwen2.5-7B",
-                num_samples=10000,
+                num_samples=data_samples,
                 sequence_length=sequence_length or EVAL_SEQUENCE_LENGTH,
                 validator_seed=seed,  # Validators pass unpredictable seed
             )

@@ -26,7 +26,13 @@ class Base(DeclarativeBase):
 
 
 class SubmissionModel(Base):
-    """Database model for code submissions."""
+    """Database model for code submissions.
+    
+    Chi/Affinetes Architecture:
+    - submission_id: Format "chi_{block}_{uid}" for blockchain submissions
+    - code_hash: Hash of Docker image (from commitment)
+    - bucket_path: Docker image name (from commitment)
+    """
 
     __tablename__ = "submissions"
 
@@ -51,23 +57,9 @@ class SubmissionModel(Base):
     final_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # Payment fields (anti-spam mechanism)
-    payment_block_hash: Mapped[str | None] = mapped_column(String(66), nullable=True)
-    payment_extrinsic_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    payment_amount_rao: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    payment_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    
-    # Anti-copying: Blockchain timestamp (proves code ownership)
-    # Miner posts code_hash to chain BEFORE submitting to validator
-    # Prevents malicious validators from stealing and resubmitting code
-    code_timestamp_block_hash: Mapped[str | None] = mapped_column(String(66), nullable=True)
-    code_timestamp_extrinsic_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    
-    # Anti-copying: Structural fingerprint (for cross-validator copy detection)
-    # Unlike code_hash which is completely different for any change,
-    # fingerprint is similar for similar code structures
-    # This allows validators to detect modified copies even if they never saw the original
-    code_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # Rate limiting handled by checking commit_block in submission_id
+    # No payment required - we use min_blocks_between_commits instead
+    payment_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     # Relationships
     evaluations: Mapped[list["EvaluationModel"]] = relationship(
@@ -78,32 +70,6 @@ class SubmissionModel(Base):
         Index("idx_submissions_status", "status"),
         Index("idx_submissions_final_score", "final_score"),
         Index("idx_submissions_created_at", "created_at"),
-    )
-
-
-class PaymentModel(Base):
-    """Database model for tracking used payments (prevents double-spending)."""
-
-    __tablename__ = "payments"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    payment_block_hash: Mapped[str] = mapped_column(String(66), nullable=False)
-    payment_extrinsic_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    
-    # Link to submission that used this payment
-    submission_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    
-    # Payment details
-    miner_hotkey: Mapped[str] = mapped_column(String(48), nullable=False)
-    miner_coldkey: Mapped[str] = mapped_column(String(48), nullable=False)
-    amount_rao: Mapped[int] = mapped_column(Integer, nullable=False)
-    
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
-
-    __table_args__ = (
-        # Unique constraint on block_hash + extrinsic_index (prevents reuse)
-        Index("idx_payments_unique", "payment_block_hash", "payment_extrinsic_index", unique=True),
-        Index("idx_payments_miner", "miner_hotkey"),
     )
 
 

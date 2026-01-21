@@ -4,8 +4,6 @@ import argparse
 import sys
 import time
 
-import sys
-
 from rich.align import Align
 from rich.console import Console
 from rich.layout import Layout
@@ -15,6 +13,7 @@ from rich.table import Table
 from rich.text import Text
 
 from tournament.tui.client import (
+    DatabaseClient,
     MockClient,
     SubmissionDetail,
     TournamentClient,
@@ -554,7 +553,7 @@ def get_key_nonblocking(timeout: float = 0.1) -> str | None:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def run_tui(base_url: str, refresh_interval: int, demo: bool = False):
+def run_tui(base_url: str, refresh_interval: int, demo: bool = False, db_path: str | None = None):
     """Run the interactive TUI."""
     import termios
 
@@ -562,9 +561,16 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False):
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
 
-    # Select client based on demo mode
-    client_class = MockClient if demo else TournamentClient
-    client_args = () if demo else (base_url,)
+    # Select client based on mode
+    if demo:
+        client_class = MockClient
+        client_args = ()
+    elif db_path:
+        client_class = DatabaseClient
+        client_args = (db_path,)
+    else:
+        client_class = TournamentClient
+        client_args = (base_url,)
 
     # Hide cursor and set up alternate screen buffer
     print("\033[?25l", end="", flush=True)  # Hide cursor
@@ -758,15 +764,21 @@ Controls:
     q              Quit
 
 Examples:
-  tplr --demo           # Run with mock data for demo
-  tplr --url http://..  # Connect to custom API
+  tplr --demo              # Run with mock data for demo
+  tplr --db tournament.db  # Read from validator's database (recommended)
+  tplr --url http://...    # Connect to API (legacy)
         """,
     )
 
     parser.add_argument(
+        "--db",
+        default=None,
+        help="Path to validator's SQLite database (recommended mode)",
+    )
+    parser.add_argument(
         "--url",
         default="http://localhost:8000",
-        help="Tournament API base URL (default: http://localhost:8000)",
+        help="Tournament API base URL (legacy mode)",
     )
     parser.add_argument(
         "--refresh",
@@ -781,7 +793,7 @@ Examples:
     )
 
     args = parser.parse_args()
-    run_tui(args.url, args.refresh, demo=args.demo)
+    run_tui(args.url, args.refresh, demo=args.demo, db_path=args.db)
 
 
 if __name__ == "__main__":

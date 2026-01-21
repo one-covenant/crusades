@@ -1,7 +1,9 @@
 """API client for tournament endpoints."""
 
+import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -105,6 +107,262 @@ class MockClient:
         return self._code
 
     def fetch_submission_detail(self, submission_id: str) -> SubmissionDetail:
+        return SubmissionDetail(
+            submission=self.get_submission(submission_id),
+            evaluations=self.get_submission_evaluations(submission_id),
+            code=self.get_submission_code(submission_id),
+        )
+
+
+class DatabaseClient:
+    """Client that reads directly from validator's SQLite database."""
+
+    def __init__(self, db_path: str = "tournament.db"):
+        self.db_path = Path(db_path)
+        if not self.db_path.exists():
+            raise FileNotFoundError(f"Database not found: {db_path}")
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def _query(self, sql: str, params: tuple = ()) -> list[dict]:
+        """Execute query and return list of dicts."""
+        cursor = self._conn.execute(sql, params)
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _query_one(self, sql: str, params: tuple = ()) -> dict | None:
+        """Execute query and return single dict or None."""
+        cursor = self._conn.execute(sql, params)
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_overview(self) -> dict[str, Any]:
+        """Get dashboard overview stats."""
+        now = datetime.now()
+        day_ago = (now - timedelta(days=1)).isoformat()
+
+        # Total submissions
+        total = self._query_one("SELECT COUNT(*) as count FROM submissions")
+        total_count = total["count"] if total else 0
+
+        # Submissions in last 24h
+        recent = self._query_one(
+            "SELECT COUNT(*) as count FROM submissions WHERE created_at > ?",
+            (day_ago,)
+        )
+        recent_count = recent["count"] if recent else 0
+
+        # Top score
+        top = self._query_one(
+            "SELECT final_score FROM submissions WHERE status = 'finished' "
+            "ORDER BY final_score DESC LIMIT 1"
+        )
+        top_score = top["final_score"] if top and top["final_score"] else 0.0
+
+        # Active miners (unique hotkeys in last 24h)
+        miners = self._query_one(
+            "SELECT COUNT(DISTINCT miner_hotkey) as count FROM submissions "
+            "WHERE created_at > ?",
+            (day_ago,)
+        )
+        active_miners = miners["count"] if miners else 0
+
+        return {
+            "submissions_24h": recent_count,
+            "current_top_score": top_score,
+            "score_improvement_24h": 0.0,  # Would need historical data
+            "total_submissions": total_count,
+            "active_miners": active_miners,
+        }
+
+    def get_validator_status(self) -> dict[str, Any]:
+        """Get validator status."""
+        now = datetime.now()
+        hour_ago = (now - timedelta(hours=1)).isoformat()
+
+        # Evaluations in last hour
+        evals = self._query_one(
+            "SELECT COUNT(*) as count FROM evaluations WHERE created_at > ?",
+            (hour_ago,)
+        )
+        eval_count = evals["count"] if evals else 0
+
+        # Current evaluation (most recent evaluating submission)
+        current = self._query_one(
+            "SELECT submission_id FROM submissions WHERE status = 'evaluating' "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+
+        # Queue stats
+        queue = self.get_queue_stats()
+        
+        # Success rate
+        finished = self._query_one(
+            "SELECT COUNT(*) as count FROM submissions WHERE status = 'finished'"
+        )
+        failed = self._query_one(
+            "SELECT COUNT(*) as count FROM submissions WHERE status LIKE 'failed%'"
+        )
+        finished_count = finished["count"] if finished else 0
+        failed_count = failed["count"] if failed else 0
+        total = finished_count + failed_count
+        success_rate = (finished_count / total * 100) if total > 0 else 0
+
+        return {
+            "status": "running" if current else "idle",
+            "evaluations_completed_1h": eval_count,
+            "current_evaluation": current["submission_id"] if current else None,
+            "uptime": "N/A",
+            "queued_count": queue["queued_count"],
+            "running_count": queue["running_count"],
+            "finished_count": queue["finished_count"],
+            "failed_count": queue["failed_count"],
+            "success_rate": f"{success_rate:.1f}%",
+        }
+
+    def get_leaderboard(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Get leaderboard entries."""
+        rows = self._query(
+            "SELECT submission_id, miner_hotkey, miner_uid, final_score, created_at "
+            "FROM submissions WHERE status = 'finished' AND final_score IS NOT NULL "
+            "ORDER BY final_score DESC LIMIT ?",
+            (limit,)
+        )
+        
+        leaderboard = []
+        for i, row in enumerate(rows, 1):
+            leaderboard.append({
+                "rank": i,
+                "submission_id": row["submission_id"],
+                "miner_hotkey": row["miner_hotkey"],
+                "miner_uid": row["miner_uid"],
+                "tps": row["final_score"],
+                "timestamp": row["created_at"],
+            })
+        return leaderboard
+
+    def get_recent_submissions(self) -> list[dict[str, Any]]:
+        """Get recent submissions (all final statuses)."""
+        rows = self._query(
+            "SELECT submission_id, miner_hotkey, miner_uid, status, final_score, "
+            "created_at, error_message FROM submissions "
+            "WHERE status IN ('finished', 'failed_validation', 'failed_evaluation', "
+            "'failed_copy', 'error') "
+            "ORDER BY created_at DESC LIMIT 20"
+        )
+        
+        recent = []
+        for row in rows:
+            recent.append({
+                "submission_id": row["submission_id"],
+                "miner_hotkey": row["miner_hotkey"],
+                "miner_uid": row["miner_uid"],
+                "status": row["status"],
+                "tps": row["final_score"] if row["final_score"] else 0,
+                "timestamp": row["created_at"],
+                "error": row["error_message"],
+            })
+        return recent
+
+    def get_queue_stats(self) -> dict[str, Any]:
+        """Get queue statistics."""
+        # Pending + validating = queued
+        queued = self._query_one(
+            "SELECT COUNT(*) as count FROM submissions "
+            "WHERE status IN ('pending', 'validating')"
+        )
+        
+        # Running = evaluating
+        running = self._query_one(
+            "SELECT COUNT(*) as count FROM submissions WHERE status = 'evaluating'"
+        )
+        
+        # Finished
+        finished = self._query_one(
+            "SELECT COUNT(*) as count FROM submissions WHERE status = 'finished'"
+        )
+        
+        # All failures
+        failed = self._query_one(
+            "SELECT COUNT(*) as count FROM submissions "
+            "WHERE status IN ('failed_validation', 'failed_evaluation', 'failed_copy', 'error')"
+        )
+        
+        # Average score
+        avg = self._query_one(
+            "SELECT AVG(final_score) as avg FROM submissions "
+            "WHERE status = 'finished' AND final_score IS NOT NULL"
+        )
+
+        return {
+            "queued_count": queued["count"] if queued else 0,
+            "running_count": running["count"] if running else 0,
+            "finished_count": finished["count"] if finished else 0,
+            "failed_count": failed["count"] if failed else 0,
+            "avg_wait_time_seconds": 0.0,
+            "avg_score": avg["avg"] if avg and avg["avg"] else 0.0,
+            "pending_count": queued["count"] if queued else 0,
+        }
+
+    def get_history(self) -> list[dict[str, Any]]:
+        """Get TPS history for chart."""
+        rows = self._query(
+            "SELECT submission_id, final_score, created_at FROM submissions "
+            "WHERE status = 'finished' AND final_score IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 50"
+        )
+        
+        history = []
+        for row in rows:
+            history.append({
+                "submission_id": row["submission_id"],
+                "tps": row["final_score"],
+                "timestamp": row["created_at"],
+            })
+        return list(reversed(history))  # Oldest first for chart
+
+    def fetch_all(self) -> TournamentData:
+        """Fetch all tournament data."""
+        return TournamentData(
+            overview=self.get_overview(),
+            validator=self.get_validator_status(),
+            leaderboard=self.get_leaderboard(),
+            recent=self.get_recent_submissions(),
+            queue=self.get_queue_stats(),
+            history=self.get_history(),
+        )
+
+    def get_submission(self, submission_id: str) -> dict[str, Any]:
+        """Get submission details."""
+        row = self._query_one(
+            "SELECT * FROM submissions WHERE submission_id = ?",
+            (submission_id,)
+        )
+        return row if row else {}
+
+    def get_submission_evaluations(self, submission_id: str) -> list[dict[str, Any]]:
+        """Get evaluations for a submission."""
+        return self._query(
+            "SELECT * FROM evaluations WHERE submission_id = ? ORDER BY created_at",
+            (submission_id,)
+        )
+
+    def get_submission_code(self, submission_id: str) -> str | None:
+        """Get code for a submission (not available in new architecture)."""
+        # In new architecture, code is in Docker image, not DB
+        return None
+
+    def fetch_submission_detail(self, submission_id: str) -> SubmissionDetail:
+        """Fetch all details for a submission."""
         return SubmissionDetail(
             submission=self.get_submission(submission_id),
             evaluations=self.get_submission_evaluations(submission_id),
