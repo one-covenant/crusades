@@ -776,8 +776,8 @@ Examples:
 
     parser.add_argument(
         "--db",
-        default=None,
-        help="Path to validator's SQLite database (recommended mode)",
+        default="tournament.db",
+        help="Path to validator's SQLite database (default: tournament.db)",
     )
     parser.add_argument(
         "--url",
