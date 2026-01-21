@@ -163,16 +163,16 @@ if __name__ == "__main__":
     data_path = Path("benchmark/data/train.pt")
     
     if not model_path.exists():
-        print("❌ Model not found at benchmark/model/")
+        print(" Model not found at benchmark/model/")
         print("   Run: uv run python scripts/setup_benchmark.py")
         exit(1)
     
     if not data_path.exists():
-        print("❌ Data not found at benchmark/data/train.pt")
+        print(" Data not found at benchmark/data/train.pt")
         print("   Run: uv run python scripts/setup_benchmark.py")
         exit(1)
     
-    print("✅ Loading model from benchmark/model/")
+    print(" Loading model from benchmark/model/")
     from transformers import AutoModelForCausalLM
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -203,7 +203,7 @@ if __name__ == "__main__":
     model.gradient_checkpointing_enable()
     model.train()
     
-    print(f"✅ Model loaded")
+    print(f" Model loaded")
     print(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"   Gradient checkpointing: enabled")
     print(f"   Attention: {attn_impl}")
@@ -211,12 +211,12 @@ if __name__ == "__main__":
     
     # Optional: Apply torch.compile for additional speedup
     # Uncomment to test (adds ~30s compilation time on first run)
-    # print("⚡ Compiling model with torch.compile...")
+    # print(" Compiling model with torch.compile...")
     # model = torch.compile(model, mode="reduce-overhead")
     # print("   Compilation will happen on first forward pass")
     # print()
     
-    print("✅ Loading data from benchmark/data/train.pt")
+    print(" Loading data from benchmark/data/train.pt")
     data = torch.load(data_path, weights_only=True)
     print(f"   Samples: {data.shape[0]:,}")
     print(f"   Sequence length: {data.shape[1]}")
@@ -241,11 +241,11 @@ if __name__ == "__main__":
         lr=1e-4,
         fused=use_fused,  # Fused optimizer for CUDA
     )
-    print(f"✅ Optimizer: AdamW (fused={use_fused})")
+    print(f" Optimizer: AdamW (fused={use_fused})")
     print()
     
     # Warmup run
-    print("🔥 Warmup run...")
+    print(" Warmup run...")
     torch.cuda.synchronize() if torch.cuda.is_available() else None
     _ = inner_steps(model, create_iterator(), optimizer, num_steps=2, device=device)
     torch.cuda.synchronize() if torch.cuda.is_available() else None
@@ -257,7 +257,7 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=use_fused)
     
     # Run 5 evaluations and take median (like validators do)
-    print("🔄 Running 5 evaluations (5 steps each)...")
+    print(" Running 5 evaluations (5 steps each)...")
     tps_scores = []
     
     for eval_num in range(5):
@@ -287,7 +287,7 @@ if __name__ == "__main__":
     
     print()
     print("="*70)
-    print("📊 RESULTS (Median of 5 evaluations)")
+    print(" RESULTS (Median of 5 evaluations)")
     print("="*70)
     print(f"   Tokens per eval: {result.total_tokens:,}")
     print(f"   Median TPS: {median_tps:,.0f}")
@@ -295,7 +295,7 @@ if __name__ == "__main__":
     print(f"   Max TPS: {max(tps_scores):,.0f}")
     print(f"   Final loss: {result.final_loss:.4f}")
     print()
-    print("💡 Tips to improve TPS:")
+    print(" Tips to improve TPS:")
     print("   - Try torch.compile (uncomment line ~170)")
     print("   - Experiment with different batch sizes")
     print("   - Try different activation checkpointing strategies")

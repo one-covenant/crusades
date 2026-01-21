@@ -76,6 +76,7 @@ class AffinetesRunner:
         timeout: int = 600,
         model_url: str | None = None,
         data_url: str | None = None,
+        output_tolerance: float = 0.02,
     ):
         """Initialize the runner.
         
@@ -87,6 +88,7 @@ class AffinetesRunner:
             timeout: Evaluation timeout in seconds
             model_url: Default model URL for evaluations
             data_url: Default data URL for evaluations
+            output_tolerance: Verification tolerance (0.02 = 2%)
         """
         self.mode = mode
         self.basilica_endpoint = basilica_endpoint or os.getenv("BASILICA_ENDPOINT")
@@ -95,6 +97,7 @@ class AffinetesRunner:
         self.timeout = timeout
         self.default_model_url = model_url
         self.default_data_url = data_url
+        self.output_tolerance = output_tolerance
         
         if mode == "basilica" and not self.basilica_endpoint:
             logger.warning("Basilica mode selected but no endpoint configured")
@@ -247,6 +250,11 @@ asyncio.run(main())
             docker_cmd.extend([
                 "--memory", "32g",
                 "--shm-size", "8g",
+            ])
+            
+            # Pass verification tolerance via env var
+            docker_cmd.extend([
+                "-e", f"OUTPUT_VECTOR_TOLERANCE={self.output_tolerance}",
             ])
             
             # Set timeout

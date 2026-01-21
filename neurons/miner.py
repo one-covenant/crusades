@@ -67,7 +67,7 @@ def build_docker_image(
         if not (env_path / f).exists():
             return False, f"Missing required file: {env_path / f}"
     
-    print(f"📦 Building Docker image: {image_name}:{image_tag}")
+    print(f" Building Docker image: {image_name}:{image_tag}")
     print(f"   Environment: {env_path}")
     print(f"   Train.py: {train_path}")
     
@@ -104,7 +104,7 @@ LABEL templar.build_time="{int(time.time())}"
         
         cmd.append(str(build_ctx))
         
-        print(f"\n🔨 Running: {' '.join(cmd)}")
+        print(f"\n Running: {' '.join(cmd)}")
         print("-" * 60)
         
         try:
@@ -114,7 +114,7 @@ LABEL templar.build_time="{int(time.time())}"
                 return False, f"Docker build failed with exit code {result.returncode}"
             
             print("-" * 60)
-            print(f"\n✅ Successfully built: {full_image_name}")
+            print(f"\n Successfully built: {full_image_name}")
             print(f"   Code hash: {code_hash[:16]}...")
             
             inspect_result = subprocess.run(
@@ -172,10 +172,10 @@ def push_to_registry(
         if push_result.returncode != 0:
             return False, f"Failed to push image"
         
-        print(f"\n✅ Pushed: {remote_name}")
+        print(f"\n Pushed: {remote_name}")
         return True, remote_name
     else:
-        print(f"\n📦 Local image (no registry push): {image_name}")
+        print(f"\n Local image (no registry push): {image_name}")
         print(f"   For local testing, validators will use this image directly")
         return True, image_name
 
@@ -205,7 +205,7 @@ def commit_to_chain(
     Returns:
         Tuple of (success, result_dict or error_message)
     """
-    print(f"\n🔗 Committing image...")
+    print(f"\n Committing image...")
     print(f"   Image: {image_name}")
     print(f"   Network: {network}")
     print(f"   Subnet: {netuid}")
@@ -223,7 +223,7 @@ def commit_to_chain(
     
     # For local testing, use file-based commitments
     if local_mode or network == "local":
-        print(f"\n📝 Using LOCAL FILE mode for testing...")
+        print(f"\n Using LOCAL FILE mode for testing...")
         
         commit_block = current_block
         reveal_block = commit_block + blocks_until_reveal
@@ -246,7 +246,7 @@ def commit_to_chain(
         commit_file = local_commits_dir / f"{commit_block}_{wallet.hotkey.ss58_address[:8]}.json"
         commit_file.write_text(json.dumps(result, indent=2))
         
-        print(f"\n✅ Local commitment saved!")
+        print(f"\n Local commitment saved!")
         print(f"   File: {commit_file}")
         print(f"   Commit block: {commit_block}")
         print(f"   Hotkey: {wallet.hotkey.ss58_address}")
@@ -254,7 +254,7 @@ def commit_to_chain(
         return True, result
     
     # Production: Use blockchain
-    print(f"\n📝 Commitment data: {commitment_data}")
+    print(f"\n Commitment data: {commitment_data}")
     
     try:
         success = False
@@ -268,7 +268,7 @@ def commit_to_chain(
                     blocks_until_reveal=blocks_until_reveal,
                 )
             except Exception as e:
-                print(f"   ⚠️  set_reveal_commitment failed: {e}")
+                print(f"     set_reveal_commitment failed: {e}")
                 success = False
         
         if not success and hasattr(subtensor, 'commit'):
@@ -295,7 +295,7 @@ def commit_to_chain(
                 "netuid": netuid,
             }
             
-            print(f"\n✅ Commitment successful!")
+            print(f"\n Commitment successful!")
             print(f"   Commit block: {commit_block}")
             print(f"   Reveal block: {reveal_block}")
             
@@ -321,7 +321,7 @@ def cmd_build(args):
     )
     
     if success:
-        print(f"\n🎉 Image ready: {result}")
+        print(f"\n Image ready: {result}")
         print(f"\nNext steps:")
         print(f"  1. (Optional) Push to registry:")
         print(f"     python -m neurons.miner push {result} --registry docker.io/yourname")
@@ -329,7 +329,7 @@ def cmd_build(args):
         print(f"     python -m neurons.miner commit --image {result} --wallet.name <name> --wallet.hotkey <hotkey>")
         return 0
     else:
-        print(f"\n❌ Build failed: {result}")
+        print(f"\n Build failed: {result}")
         return 1
 
 
@@ -341,12 +341,12 @@ def cmd_push(args):
     )
     
     if success:
-        print(f"\n🎉 Image pushed: {result}")
+        print(f"\n Image pushed: {result}")
         print(f"\nNext step:")
         print(f"  python -m neurons.miner commit --image {result} --wallet.name <name> --wallet.hotkey <hotkey>")
         return 0
     else:
-        print(f"\n❌ Push failed: {result}")
+        print(f"\n Push failed: {result}")
         return 1
 
 
@@ -363,7 +363,7 @@ def cmd_commit(args):
     )
     
     if success:
-        print(f"\n🎉 Commitment recorded on blockchain!")
+        print(f"\n Commitment recorded on blockchain!")
         print(f"\nValidators will evaluate your submission after block {result['reveal_block']}")
         
         # Save commitment info
@@ -374,7 +374,7 @@ def cmd_commit(args):
         
         return 0
     else:
-        print(f"\n❌ Commit failed: {result}")
+        print(f"\n Commit failed: {result}")
         return 1
 
 
@@ -384,7 +384,7 @@ def cmd_status(args):
         subtensor = bt.subtensor(network=args.network)
         current_block = subtensor.get_current_block()
         
-        print(f"\n📊 Blockchain Status")
+        print(f"\n Blockchain Status")
         print(f"   Network: {args.network}")
         print(f"   Current block: {current_block}")
         
@@ -393,7 +393,7 @@ def cmd_status(args):
             commits = sorted(commits_dir.glob("*.json"), reverse=True)[:5]
             
             if commits:
-                print(f"\n📝 Recent Commitments:")
+                print(f"\n Recent Commitments:")
                 for commit_file in commits:
                     data = json.loads(commit_file.read_text())
                     commit_block = data.get("commit_block", 0)
@@ -401,10 +401,10 @@ def cmd_status(args):
                     image = data.get("image", "unknown")
                     
                     if current_block >= reveal_block:
-                        status = "✅ REVEALED"
+                        status = " REVEALED"
                     else:
                         blocks_left = reveal_block - current_block
-                        status = f"⏳ Hidden ({blocks_left} blocks left)"
+                        status = f" Hidden ({blocks_left} blocks left)"
                     
                     print(f"   Block {commit_block}: {image[:40]}... - {status}")
         

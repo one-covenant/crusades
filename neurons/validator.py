@@ -74,7 +74,7 @@ class Validator(BaseNode):
         config = get_config()
         hparams = get_hparams()
 
-        logger.info("🔧 Initializing validator (Chi/Affinetes mode)")
+        logger.info("Initializing validator (Chi/Affinetes mode)")
         
         # Database
         self.db = await get_database()
@@ -98,14 +98,20 @@ class Validator(BaseNode):
         data_url = getattr(hparams, 'benchmark_dataset_name', None) or os.getenv('BENCHMARK_DATA_URL', '')
         
         if not model_url:
-            logger.warning("⚠️  benchmark_model_name not set in hparams.json")
+            logger.warning("benchmark_model_name not set in hparams.json")
         
         if not data_url:
-            logger.warning("⚠️  benchmark_dataset_name not set in hparams.json")
+            logger.warning("benchmark_dataset_name not set in hparams.json")
         
         # Affinetes runner
         basilica_endpoint = os.getenv('BASILICA_ENDPOINT')
         basilica_api_key = os.getenv('BASILICA_API_KEY')
+        
+        # Get verification tolerance from hparams
+        verification = getattr(hparams, 'verification', None)
+        output_tolerance = 0.02  # default 2%
+        if verification:
+            output_tolerance = getattr(verification, 'output_vector_tolerance', 0.02)
         
         self.affinetes_runner = AffinetesRunner(
             mode=self.affinetes_mode,
@@ -113,7 +119,8 @@ class Validator(BaseNode):
             basilica_api_key=basilica_api_key,
             model_url=model_url,
             data_url=data_url,
-            timeout=getattr(hparams, 'evaluation_timeout', 600),
+            timeout=getattr(hparams, 'eval_timeout', 600),
+            output_tolerance=output_tolerance,
         )
         
         self.last_processed_block = 0
@@ -131,7 +138,7 @@ class Validator(BaseNode):
 
     async def run_step(self) -> None:
         """Run one iteration of the validator loop."""
-        logger.info("🔄 Starting validation loop iteration...")
+        logger.info("Starting validation loop iteration...")
         
         # 1. Read blockchain commitments
         logger.info("Step 1: Reading blockchain commitments...")
@@ -152,7 +159,7 @@ class Validator(BaseNode):
         # Memory cleanup
         self._cleanup_memory()
 
-        logger.info("✅ Loop iteration complete. Sleeping 10s...")
+        logger.info("Loop iteration complete. Sleeping 10s...")
         await asyncio.sleep(10)
     
     async def process_blockchain_commitments(self) -> None:
@@ -276,7 +283,7 @@ class Validator(BaseNode):
                 current_run = len(my_evals) + run_idx + 1
                 seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}"
                 
-                logger.info(f"🔄 Evaluation run {current_run}/{num_runs} (seed: {seed})")
+                logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
                 
                 result = await self.affinetes_runner.evaluate(
                     image=image,
@@ -289,9 +296,9 @@ class Validator(BaseNode):
                 )
 
                 if result.success:
-                    logger.info(f"✅ Run {current_run} PASSED: {result.tps:,.2f} TPS")
+                    logger.info(f"Run {current_run} PASSED: {result.tps:,.2f} TPS")
                 else:
-                    logger.warning(f"❌ Run {current_run} FAILED: {result.error}")
+                    logger.warning(f"Run {current_run} FAILED: {result.error}")
 
                 evaluation = EvaluationModel(
                     submission_id=submission.submission_id,
@@ -326,7 +333,7 @@ class Validator(BaseNode):
                 median_tps = statistics.median(tps_scores)
                 
                 logger.info(
-                    f"📊 Final score for {submission_id}:\n"
+                    f"Final score for {submission_id}:\n"
                     f"   Successful runs: {len(tps_scores)}\n"
                     f"   Scores: {[f'{s:.1f}' for s in sorted(tps_scores)]}\n"
                     f"   Median TPS: {median_tps:,.2f}"
@@ -352,7 +359,7 @@ class Validator(BaseNode):
             torch.cuda.empty_cache()
             
         if self._loop_count % 10 == 0:
-            logger.info(f"🧹 Memory cleanup (iteration {self._loop_count})")
+            logger.info(f"Memory cleanup (iteration {self._loop_count})")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
@@ -432,7 +439,7 @@ def main():
         affinetes_mode=args.affinetes_mode,
     )
 
-    logger.info(f"🚀 Starting validator")
+    logger.info(f"Starting validator")
     logger.info(f"   Affinetes mode: {args.affinetes_mode}")
     
     asyncio.run(validator.start())
