@@ -73,6 +73,92 @@ def _download(url: str, dst: Path) -> None:
     urllib.request.urlretrieve(url, dst)
 
 
+def _load_hf_dataset(
+    dataset_name: str,
+    model_name: str,
+    num_samples: int = 10000,
+    sequence_length: int = 1024,
+    split: str = "train",
+    seed: int | None = None,
+    validator_seed: str | None = None,
+) -> torch.Tensor:
+    """Load and tokenize dataset from HuggingFace.
+    
+    SECURITY: Validators use unpredictable seeds so miners can't pre-compute
+    which samples will be used for evaluation.
+    
+    Args:
+        dataset_name: HuggingFace dataset (e.g., "HuggingFaceFW/fineweb")
+        model_name: Model name for tokenizer (e.g., "Qwen/Qwen2.5-7B")
+        num_samples: Number of samples to load
+        sequence_length: Sequence length for tokenization
+        split: Dataset split
+        seed: Fixed seed for miner local testing (use 42 for reproducibility)
+        validator_seed: Seed string from validator (format: "block:uid:run")
+                       If provided, overrides seed with unpredictable value
+        
+    Returns:
+        Tensor of shape [num_samples, sequence_length] with token IDs
+    """
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    import hashlib
+    
+    # Determine seed: validators use unpredictable seed, miners use fixed seed
+    if validator_seed:
+        # Hash the validator seed to get unpredictable but deterministic value
+        seed_hash = hashlib.sha256(validator_seed.encode()).hexdigest()
+        actual_seed = int(seed_hash[:8], 16)  # Use first 8 hex chars
+        print(f"Validator mode: seed={actual_seed} (from {validator_seed})")
+    else:
+        actual_seed = seed or 42  # Default fixed seed for miner testing
+        print(f"Miner mode: fixed seed={actual_seed}")
+    
+    print(f"Loading dataset: {dataset_name} (split={split}, samples={num_samples})")
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Load dataset with streaming for efficiency
+    dataset = load_dataset(
+        dataset_name,
+        split=split,
+        streaming=True,
+        trust_remote_code=True,
+    )
+    
+    # Sample and tokenize with the determined seed
+    tokens_list = []
+    dataset_iter = iter(dataset.shuffle(seed=actual_seed))
+    
+    for _ in range(num_samples):
+        try:
+            sample = next(dataset_iter)
+            text = sample.get("text", sample.get("content", ""))
+            
+            # Tokenize
+            encoded = tokenizer(
+                text,
+                max_length=sequence_length,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            tokens_list.append(encoded["input_ids"].squeeze(0))
+            
+        except StopIteration:
+            break
+    
+    if not tokens_list:
+        raise ValueError(f"No samples loaded from {dataset_name}")
+    
+    data = torch.stack(tokens_list)
+    print(f"Loaded data: shape={data.shape}, dtype={data.dtype}, seed={actual_seed}")
+    return data
+
+
 def _maybe_extract(archive_path: Path, extract_dir: Path) -> Path:
     """Extract archive if needed, return path to extracted content."""
     if archive_path.suffixes[-2:] == [".tar", ".gz"] or archive_path.suffix == ".tgz":
@@ -166,8 +252,37 @@ def _load_model(model_path: Path | str):
     return model
 
 
-def _load_data(data_path: Path) -> torch.Tensor:
-    """Load pre-tokenized data tensor."""
+def _load_data(
+    data_path: Path | str,
+    model_name: str = "Qwen/Qwen2.5-7B",
+    num_samples: int = 10000,
+    sequence_length: int = 1024,
+    validator_seed: str | None = None,
+) -> torch.Tensor:
+    """Load data from file or HuggingFace dataset.
+    
+    Supports:
+    - .pt files (pre-tokenized tensors)
+    - HuggingFace dataset names (e.g., "HuggingFaceFW/fineweb")
+    
+    For HuggingFace datasets:
+    - Miners (validator_seed=None): Use fixed seed for reproducible local testing
+    - Validators (validator_seed set): Use unpredictable seed based on block/task
+    """
+    data_str = str(data_path)
+    
+    # Check if it's a HuggingFace dataset
+    if "/" in data_str and not data_str.startswith("http") and not data_str.endswith(".pt"):
+        # Looks like a HuggingFace dataset name
+        return _load_hf_dataset(
+            dataset_name=data_str,
+            model_name=model_name,
+            num_samples=num_samples,
+            sequence_length=sequence_length,
+            validator_seed=validator_seed,  # Unpredictable if set by validator
+        )
+    
+    # Load pre-tokenized .pt file
     return torch.load(data_path, weights_only=True)
 
 
@@ -190,16 +305,48 @@ def _get_cached_model(model_path: Path | str):
     return model
 
 
-def _get_cached_data(data_path: Path) -> torch.Tensor:
-    """Get data from cache or load it."""
+def _get_cached_data(
+    data_path: Path | str,
+    model_name: str = "Qwen/Qwen2.5-7B",
+    num_samples: int = 10000,
+    sequence_length: int = 1024,
+    validator_seed: str | None = None,
+) -> torch.Tensor:
+    """Get data from cache or load it.
+    
+    NOTE: For validators, we DON'T cache HuggingFace data because each
+    evaluation should use different random samples (unpredictable).
+    """
+    data_path_str = str(data_path) if isinstance(data_path, Path) else data_path
+    is_hf_dataset = "/" in data_path_str and not data_path_str.startswith("http") and not data_path_str.endswith(".pt")
+    
+    # For validators with HuggingFace data, always reload (different samples each time)
+    if is_hf_dataset and validator_seed:
+        # Don't cache - validators get fresh random samples each evaluation
+        return _load_data(
+            data_path,
+            model_name=model_name,
+            num_samples=num_samples,
+            sequence_length=sequence_length,
+            validator_seed=validator_seed,
+        )
+    
+    # For miners or .pt files, use cache
     cached = _CACHE.get("data")
     cached_path = _CACHE.get("data_path")
-    if cached is not None and cached_path == str(data_path):
+    
+    if cached is not None and cached_path == data_path_str:
         return cached
     
-    data = _load_data(data_path)
+    data = _load_data(
+        data_path,
+        model_name=model_name,
+        num_samples=num_samples,
+        sequence_length=sequence_length,
+        validator_seed=validator_seed,
+    )
     _CACHE["data"] = data
-    _CACHE["data_path"] = str(data_path)
+    _CACHE["data_path"] = data_path_str
     return data
 
 
@@ -444,8 +591,13 @@ class Actor:
                     "seed": seed,
                 }
 
-        # Download data if needed
-        if not data_path.exists():
+        # Handle data loading - HuggingFace dataset or file download
+        is_hf_dataset = "/" in data_url and not data_url.startswith("http")
+        
+        if is_hf_dataset:
+            # Load from HuggingFace dataset (e.g., "HuggingFaceFW/fineweb")
+            data_path = data_url  # Will be handled by _get_cached_data
+        elif not data_path.exists():
             if time.monotonic() > deadline:
                 return {
                     "task_id": task_id,
@@ -483,8 +635,15 @@ class Actor:
 
         try:
             # Load model and data
+            # For HuggingFace datasets, pass the seed for unpredictable sampling
             model = _get_cached_model(model_dir)
-            data = _get_cached_data(data_path)
+            data = _get_cached_data(
+                data_path,
+                model_name=model_url if is_hf_model else "Qwen/Qwen2.5-7B",
+                num_samples=10000,
+                sequence_length=sequence_length or EVAL_SEQUENCE_LENGTH,
+                validator_seed=seed,  # Validators pass unpredictable seed
+            )
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
             seq_len = sequence_length or EVAL_SEQUENCE_LENGTH

@@ -93,17 +93,15 @@ class Validator(BaseNode):
         )
         self.commitment_reader.sync()
         
-        # Get model/data URLs - prefer hparams, fallback to env
+        # Get model/data from hparams - fallback to env variables
         model_url = getattr(hparams, 'benchmark_model_name', None) or os.getenv('BENCHMARK_MODEL_URL', '')
-        data_url = os.getenv('BENCHMARK_DATA_URL', '')
+        data_url = getattr(hparams, 'benchmark_dataset_name', None) or os.getenv('BENCHMARK_DATA_URL', '')
         
         if not model_url:
             logger.warning("⚠️  benchmark_model_name not set in hparams.json")
-            logger.warning("   Set it or use BENCHMARK_MODEL_URL env variable")
         
         if not data_url:
-            logger.warning("⚠️  BENCHMARK_DATA_URL not set")
-            logger.warning("   Evaluations will fail without data URL")
+            logger.warning("⚠️  benchmark_dataset_name not set in hparams.json")
         
         # Affinetes runner
         basilica_endpoint = os.getenv('BASILICA_ENDPOINT')
@@ -261,6 +259,7 @@ class Validator(BaseNode):
                     seed=seed,
                     steps=getattr(hparams, 'eval_steps', 5),
                     batch_size=getattr(hparams, 'benchmark_batch_size', 8),
+                    sequence_length=getattr(hparams, 'benchmark_sequence_length', 1024),
                     task_id=current_run,
                 )
 

@@ -1,4 +1,4 @@
-"""Configuration management for templar-tournament."""
+"""Configuration management for templar-tournament (Chi/Affinetes Architecture)."""
 
 import json
 from pathlib import Path
@@ -8,26 +8,10 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class SandboxConfig(BaseModel):
-    """Sandbox execution settings."""
-
-    memory_limit: str = "16g"
-    cpu_count: int = 4
-    gpu_count: int = 1
-    pids_limit: int = 256
-
-
 class StorageConfig(BaseModel):
     """Storage settings."""
 
     database_url: str = "sqlite+aiosqlite:///tournament.db"
-
-
-class AntiCopyingConfig(BaseModel):
-    """Anti-copying protection settings."""
-
-    submission_cooldown_minutes: int = 60
-    hide_pending_submissions: bool = True
 
 
 class VerificationConfig(BaseModel):
@@ -38,40 +22,42 @@ class VerificationConfig(BaseModel):
 
 
 class HParams(BaseModel):
-    """Hyperparameters loaded from hparams.json."""
-
-    netuid: int = 3
+    """Hyperparameters loaded from hparams.json.
     
-    # Emissions distribution
+    Chi/Affinetes Architecture:
+    - Miners build Docker images and commit to blockchain
+    - Validators read commitments and evaluate via Docker/Basilica
+    - All settings for evaluation are defined here
+    """
+
+    netuid: int = 2
+    
+    # Emissions distribution (winner-takes-some)
     burn_rate: float = 0.95  # 95% to validator, 5% to winner
     burn_uid: int = 1  # UID that receives burn portion (validator)
 
     # Evaluation settings
-    num_evals_per_submission: int = 1  # Number of validators that must evaluate
-    evaluation_runs: int = 5  # Number of runs per submission (median taken for fairness)
-    eval_steps: int = 100
-    eval_timeout: int = 600
+    evaluation_runs: int = 5  # Number of runs per submission (median taken)
+    eval_steps: int = 5  # Training steps per evaluation
+    eval_timeout: int = 600  # Max seconds per evaluation
 
-    # Benchmark settings - EXACT model and data everyone uses
-    benchmark_model_name: str = "meta-llama/Llama-3.2-8B"
-    benchmark_model_revision: str = "main"
+    # Benchmark settings - model and data for evaluation
+    benchmark_model_name: str = "Qwen/Qwen2.5-7B"
     benchmark_dataset_name: str = "HuggingFaceFW/fineweb"
-    benchmark_dataset_split: str = "train"
-    benchmark_dataset_subset: str | None = None
     benchmark_sequence_length: int = 1024
     benchmark_batch_size: int = 8
 
     # Timing settings
-    set_weights_interval_seconds: int = 600
+    set_weights_interval_seconds: int = 600  # 10 minutes
 
-    # Payment settings (anti-spam)
-    submission_cost_rao: int = 100_000_000  # 0.1 TAO default
+    # Commitment settings
+    reveal_blocks: int = 100  # Blocks until commitment is revealed
 
-    # Nested configs
-    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
-    storage: StorageConfig = Field(default_factory=StorageConfig)
-    anti_copying: AntiCopyingConfig = Field(default_factory=AntiCopyingConfig)
+    # Verification
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
+
+    # Storage (for evaluation records)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
 
     @classmethod
     def load(cls, path: Path | str | None = None) -> Self:
@@ -104,27 +90,10 @@ class Config(BaseSettings):
     # Bittensor settings
     wallet_name: str = "default"
     wallet_hotkey: str = "default"
-    subtensor_network: str = "finney"
-    
-    # Validator address that receives payments (set to validator's ss58 address)
-    # Miners pay this address to submit code (anti-spam)
-    validator_hotkey: str = ""  # MUST be set in .env for production
+    subtensor_network: str = "local"
 
-    # R2/S3 storage (for code submissions)
-    r2_account_id: str = ""
-    r2_bucket_name: str = "tournament-submissions"
-    r2_access_key_id: str = ""
-    r2_secret_access_key: str = ""
-
-    # API settings
-    api_host: str = "0.0.0.0"
-    api_port: int = 8000
-
-    # Paths (where official 7B model and data are stored after setup)
+    # Paths
     hparams_path: str = "hparams/hparams.json"
-    benchmark_model_path: str = "benchmark/model"  # HuggingFace model directory
-    benchmark_data_path: str = "benchmark/data/test.pt"  # Test data (validators use for evaluation)
-    # Note: Miners have train.pt, validators have test.pt (different seeds)
 
     # Debug
     debug: bool = False
