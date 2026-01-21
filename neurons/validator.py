@@ -1,4 +1,10 @@
-"""Tournament validator - evaluates miner submissions and sets weights."""
+"""Tournament validator - evaluates miner submissions and sets weights.
+
+Chi/Affinetes Architecture:
+1. Reads Docker image commitments from blockchain
+2. Evaluates via affinetes (Docker locally or Basilica remotely)
+3. Sets weights based on TPS scores
+"""
 
 import argparse
 import asyncio
@@ -7,25 +13,18 @@ import logging
 import os
 import statistics
 import time
+from typing import Literal
 
 import bittensor as bt
 import torch
 
+from tournament.chain.commitments import CommitmentReader, MinerCommitment
 from tournament.chain.weights import WeightSetter
 from tournament.config import get_config, get_hparams
 from tournament.core.protocols import SubmissionStatus
-from tournament.payment.verifier import PaymentVerifier
-from tournament.pipeline.validator import CodeValidator
-from tournament.sandbox.manager import SandboxManager
-from tournament.schemas import BenchmarkConfig
+from tournament.affinetes import AffinetesRunner, EvaluationResult
 from tournament.storage.database import Database, get_database
-from tournament.storage.models import EvaluationModel
-from tournament.storage.r2 import get_r2_storage
-from tournament.verification import (
-    ReferenceExecutor,
-    SandboxVerifier,
-    VerificationConfig,
-)
+from tournament.storage.models import EvaluationModel, SubmissionModel
 
 from .base_node import BaseNode
 
@@ -37,11 +36,11 @@ logger = logging.getLogger(__name__)
 
 
 class Validator(BaseNode):
-    """Tournament validator node.
+    """Tournament validator node (Chi/Affinetes Architecture).
 
     Responsibilities:
-    1. Validate pending submissions (syntax, required functions)
-    2. Evaluate validated submissions in sandbox
+    1. Read miner Docker image commitments from blockchain
+    2. Evaluate submissions via affinetes (Docker or Basilica)
     3. Calculate and set weights (winner-takes-all)
     """
 
@@ -49,81 +48,83 @@ class Validator(BaseNode):
         self,
         wallet: bt.wallet | None = None,
         skip_blockchain_check: bool = False,
+        affinetes_mode: Literal["docker", "basilica"] = "docker",
     ):
         super().__init__(wallet=wallet)
 
         self.skip_blockchain_check = skip_blockchain_check
+        self.affinetes_mode = affinetes_mode
 
         # Components (initialized in start)
         self.db: Database | None = None
-        self.sandbox: SandboxManager | None = None
-        self.verifier: SandboxVerifier | None = None
-        self.code_validator: CodeValidator | None = None
         self.weight_setter: WeightSetter | None = None
-        self.payment_verifier: PaymentVerifier | None = None
+        self.commitment_reader: CommitmentReader | None = None
+        self.affinetes_runner: AffinetesRunner | None = None
+        
+        # State
+        self.last_processed_block: int = 0
+        self.evaluated_images: set[str] = set()
 
         # Timing
         self.last_weight_set_time: float = 0
         self.last_sync_time: float = 0
 
     async def initialize(self) -> None:
-        """Initialize components."""
+        """Initialize validator components."""
         config = get_config()
         hparams = get_hparams()
 
+        logger.info("🔧 Initializing validator (Chi/Affinetes mode)")
+        
         # Database
         self.db = await get_database()
-
-        # Sandbox (uses test.pt for evaluation - hidden from miners)
-        self.sandbox = SandboxManager(
-            benchmark_model_path=config.benchmark_model_path,
-            benchmark_data_path=config.benchmark_data_path,  # Points to test.pt for validators
-        )
-        await self.sandbox.initialize()
-
-        # Verification configuration (read from hparams.json)
-        verification_dict = (
-            hparams.verification.model_dump() 
-            if hasattr(hparams, "verification") and hparams.verification 
-            else {}
-        )
-        verification_config = VerificationConfig.from_dict(verification_dict)
-
-        # Reference executor (uses test.pt for evaluation)
-        benchmark_config = BenchmarkConfig(
-            model_path=config.benchmark_model_path,
-            data_path=config.benchmark_data_path,  # Points to test.pt for validators
-            sequence_length=hparams.benchmark_sequence_length,
-            batch_size=hparams.benchmark_batch_size,
-            num_steps=hparams.eval_steps,
-        )
-        reference_executor = ReferenceExecutor(
-            model_path=config.benchmark_model_path,
-            data_path=config.benchmark_data_path,  # Points to test.pt for validators
-            config=benchmark_config,
-        )
-
-        # Verifier (combines sandbox + reference for verification)
-        self.verifier = SandboxVerifier(
-            sandbox_manager=self.sandbox,
-            reference_executor=reference_executor,
-            config=verification_config,
-        )
-
-        # Code validator
-        self.code_validator = CodeValidator()
-
-        # Weight setter (uses burn_rate from hparams)
+        
+        # Weight setter
         self.weight_setter = WeightSetter(
             chain=self.chain,
             database=self.db,
         )
-
-        # Payment verifier (anti-spam)
-        self.payment_verifier = PaymentVerifier(
-            recipient_address=self.wallet.hotkey.ss58_address,
+        
+        # Commitment reader for blockchain
+        self.commitment_reader = CommitmentReader(
             subtensor=self.chain.subtensor,
+            netuid=hparams.netuid,
+            network=config.subtensor_network,
         )
+        self.commitment_reader.sync()
+        
+        # Get model/data URLs - prefer hparams, fallback to env
+        model_url = getattr(hparams, 'benchmark_model_name', None) or os.getenv('BENCHMARK_MODEL_URL', '')
+        data_url = os.getenv('BENCHMARK_DATA_URL', '')
+        
+        if not model_url:
+            logger.warning("⚠️  benchmark_model_name not set in hparams.json")
+            logger.warning("   Set it or use BENCHMARK_MODEL_URL env variable")
+        
+        if not data_url:
+            logger.warning("⚠️  BENCHMARK_DATA_URL not set")
+            logger.warning("   Evaluations will fail without data URL")
+        
+        # Affinetes runner
+        basilica_endpoint = os.getenv('BASILICA_ENDPOINT')
+        basilica_api_key = os.getenv('BASILICA_API_KEY')
+        
+        self.affinetes_runner = AffinetesRunner(
+            mode=self.affinetes_mode,
+            basilica_endpoint=basilica_endpoint,
+            basilica_api_key=basilica_api_key,
+            model_url=model_url,
+            data_url=data_url,
+            timeout=getattr(hparams, 'evaluation_timeout', 600),
+        )
+        
+        self.last_processed_block = 0
+        
+        logger.info(f"   Affinetes mode: {self.affinetes_mode}")
+        logger.info(f"   Model URL: {model_url or 'NOT SET'}")
+        logger.info(f"   Data URL: {data_url or 'NOT SET'}")
+        if self.affinetes_mode == "basilica":
+            logger.info(f"   Basilica endpoint: {basilica_endpoint or 'NOT SET'}")
 
     async def start(self) -> None:
         """Start the validator."""
@@ -134,277 +135,213 @@ class Validator(BaseNode):
         """Run one iteration of the validator loop."""
         logger.info("🔄 Starting validation loop iteration...")
         
-        # 1. Process pending submissions (validation)
-        logger.info("Step 1: Processing pending submissions...")
-        await self.process_pending_submissions()
+        # 1. Read blockchain commitments
+        logger.info("Step 1: Reading blockchain commitments...")
+        await self.process_blockchain_commitments()
 
-        # 2. Evaluate submissions ready for evaluation
-        logger.info("Step 2: Evaluating submissions...")
+        # 2. Evaluate via affinetes
+        logger.info("Step 2: Evaluating via affinetes...")
         await self.evaluate_submissions()
-
-        # 3. Set weights periodically
+        
+        # 3. Set weights
         logger.info("Step 3: Checking weight setting...")
         await self.maybe_set_weights()
 
-        # 4. Sync metagraph periodically (every 5 minutes)
+        # 4. Sync metagraph
         logger.info("Step 4: Checking metagraph sync...")
         await self.maybe_sync()
         
-        # 5. Memory cleanup to prevent OOM
+        # Memory cleanup
         self._cleanup_memory()
 
-        # Sleep before next iteration
         logger.info("✅ Loop iteration complete. Sleeping 10s...")
         await asyncio.sleep(10)
     
-    def _cleanup_memory(self):
-        """Clean up GPU memory after each loop iteration.
+    async def process_blockchain_commitments(self) -> None:
+        """Read and process new commitments from blockchain."""
+        try:
+            new_commitments = self.commitment_reader.get_new_commitments_since(
+                self.last_processed_block
+            )
+            
+            current_block = self.commitment_reader.get_current_block()
+            
+            if new_commitments:
+                logger.info(f"Found {len(new_commitments)} new commitments")
+                
+                for commitment in new_commitments:
+                    if commitment.image_name in self.evaluated_images:
+                        logger.debug(f"Skipping already evaluated: {commitment.image_name}")
+                        continue
+                    
+                    await self._create_submission_from_commitment(commitment)
+            
+            self.last_processed_block = current_block
+            
+        except Exception as e:
+            logger.error(f"Error processing commitments: {e}")
+    
+    async def _create_submission_from_commitment(
+        self,
+        commitment: MinerCommitment,
+    ) -> None:
+        """Create a submission record from a blockchain commitment."""
+        submission_id = f"chi_{commitment.commit_block}_{commitment.uid}"
         
-        Prevents OOM errors in long-running validators by:
-        1. Clearing PyTorch's memory cache
-        2. Running garbage collection
-        3. Periodic aggressive cleanup every 10 iterations
-        """
+        existing = await self.db.get_submission(submission_id)
+        if existing:
+            return
+        
+        submission = SubmissionModel(
+            submission_id=submission_id,
+            miner_hotkey=commitment.hotkey,
+            miner_uid=commitment.uid,
+            code_hash=commitment.image_hash,
+            bucket_path=commitment.image_name,  # Docker image stored here
+            status=SubmissionStatus.EVALUATING,
+            payment_verified=True,
+        )
+        
+        await self.db.save_submission(submission)
+        logger.info(f"Created submission: {submission_id}")
+        logger.info(f"   Image: {commitment.image_name}")
+        logger.info(f"   UID: {commitment.uid}")
+    
+    async def evaluate_submissions(self) -> None:
+        """Evaluate submissions using affinetes."""
+        hparams = get_hparams()
+        evaluating = await self.db.get_evaluating_submissions()
+        num_runs = getattr(hparams, 'evaluation_runs', 5)
+
+        for submission in evaluating:
+            image = submission.bucket_path
+            
+            # Validate it's a Docker image
+            if not image:
+                continue
+            
+            existing_evals = await self.db.get_evaluations(submission.submission_id)
+            my_evals = [e for e in existing_evals if e.evaluator_hotkey == self.hotkey]
+
+            if len(my_evals) >= num_runs:
+                continue
+
+            runs_remaining = num_runs - len(my_evals)
+            logger.info(f"Evaluating {submission.submission_id}")
+            logger.info(f"   Image: {image}")
+            logger.info(f"   Runs: {len(my_evals)+1}/{num_runs}")
+
+            # Check if image exists
+            image_exists = await self.affinetes_runner.check_image_exists(image)
+            if not image_exists:
+                logger.warning(f"Image not found: {image}, attempting pull...")
+                pulled = await self.affinetes_runner.pull_image(image)
+                if not pulled:
+                    evaluation = EvaluationModel(
+                        submission_id=submission.submission_id,
+                        evaluator_hotkey=self.hotkey,
+                        tokens_per_second=0.0,
+                        total_tokens=0,
+                        wall_time_seconds=0.0,
+                        success=False,
+                        error=f"Docker image not found: {image}",
+                    )
+                    await self.db.save_evaluation(evaluation)
+                    continue
+
+            # Run evaluations
+            for run_idx in range(runs_remaining):
+                current_run = len(my_evals) + run_idx + 1
+                seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}"
+                
+                logger.info(f"🔄 Evaluation run {current_run}/{num_runs} (seed: {seed})")
+                
+                result = await self.affinetes_runner.evaluate(
+                    image=image,
+                    seed=seed,
+                    steps=getattr(hparams, 'eval_steps', 5),
+                    batch_size=getattr(hparams, 'benchmark_batch_size', 8),
+                    task_id=current_run,
+                )
+
+                if result.success:
+                    logger.info(f"✅ Run {current_run} PASSED: {result.tps:,.2f} TPS")
+                else:
+                    logger.warning(f"❌ Run {current_run} FAILED: {result.error}")
+
+                evaluation = EvaluationModel(
+                    submission_id=submission.submission_id,
+                    evaluator_hotkey=self.hotkey,
+                    tokens_per_second=result.tps,
+                    total_tokens=result.total_tokens,
+                    wall_time_seconds=result.wall_time_seconds,
+                    success=result.success,
+                    error=result.error,
+                )
+                await self.db.save_evaluation(evaluation)
+                self._cleanup_memory()
+
+            # Mark image as evaluated
+            self.evaluated_images.add(image)
+            
+            # Finalize submission
+            await self._finalize_submission(submission.submission_id, num_runs)
+    
+    async def _finalize_submission(self, submission_id: str, num_runs: int) -> None:
+        """Calculate final score and update submission status."""
+        hparams = get_hparams()
+        num_evals = await self.db.count_evaluations(submission_id)
+        required_evals = getattr(hparams, 'num_evals_per_submission', 1) * num_runs
+        
+        if num_evals >= required_evals:
+            all_evals = await self.db.get_evaluations(submission_id)
+            successful_evals = [e for e in all_evals if e.success]
+
+            if successful_evals:
+                tps_scores = [e.tokens_per_second for e in successful_evals]
+                median_tps = statistics.median(tps_scores)
+                
+                logger.info(
+                    f"📊 Final score for {submission_id}:\n"
+                    f"   Successful runs: {len(tps_scores)}\n"
+                    f"   Scores: {[f'{s:.1f}' for s in sorted(tps_scores)]}\n"
+                    f"   Median TPS: {median_tps:,.2f}"
+                )
+                
+                await self.db.update_submission_score(submission_id, median_tps)
+            else:
+                await self.db.update_submission_status(
+                    submission_id,
+                    SubmissionStatus.FAILED_EVALUATION,
+                    error_message="All evaluations failed",
+                )
+                logger.warning(f"Submission {submission_id} failed: no successful evaluations")
+    
+    def _cleanup_memory(self):
+        """Clean up GPU memory."""
         if not hasattr(self, '_loop_count'):
             self._loop_count = 0
         
         self._loop_count += 1
         
-        # Light cleanup every iteration
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
-        # Aggressive cleanup every 10 iterations
         if self._loop_count % 10 == 0:
-            logger.info(f"🧹 Aggressive memory cleanup (iteration {self._loop_count})...")
-            
+            logger.info(f"🧹 Memory cleanup (iteration {self._loop_count})")
             if torch.cuda.is_available():
-                # Clear all caches
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-                
-                # Force garbage collection
-                gc.collect()
-                
-                # Log memory status
-                for i in range(torch.cuda.device_count()):
-                    allocated = torch.cuda.memory_allocated(i) / 1e9
-                    reserved = torch.cuda.memory_reserved(i) / 1e9
-                    logger.info(f"   GPU {i}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
-                    
-                    if reserved > allocated * 2:
-                        logger.warning(f"   GPU {i}: High fragmentation ({reserved - allocated:.2f}GB wasted)")
-            
             gc.collect()
 
     async def maybe_sync(self) -> None:
         """Sync metagraph periodically."""
         now = time.time()
-        if now - self.last_sync_time >= 300:  # Every 5 minutes
+        if now - self.last_sync_time >= 300:
             await self.sync()
+            if self.commitment_reader:
+                self.commitment_reader.sync()
             self.last_sync_time = now
-
-    async def process_pending_submissions(self) -> None:
-        """Validate pending submissions.
-        
-        NOTE: Payment verification now happens at submission time (in API).
-        The payment_verified flag is set to True when submission is accepted.
-        This step only runs if payment wasn't verified at submission time
-        (legacy/fallback behavior).
-        """
-        pending = await self.db.get_pending_submissions()
-
-        for submission in pending:
-            logger.info(f"Validating submission {submission.submission_id}")
-
-            # Update status to validating
-            await self.db.update_submission_status(
-                submission.submission_id,
-                SubmissionStatus.VALIDATING,
-            )
-
-            # Step 1: Verify payment (FALLBACK - normally done at submission time)
-            # Payment is now verified upfront in API, so payment_verified should be True
-            if submission.payment_block_hash and not submission.payment_verified:
-                logger.warning(f"Payment not pre-verified for {submission.submission_id} - doing fallback verification")
-
-                payment_valid, payment_error = await self.payment_verifier.verify_payment(
-                    block_hash=submission.payment_block_hash,
-                    extrinsic_index=submission.payment_extrinsic_index,
-                    miner_coldkey=submission.miner_hotkey,  # Assuming hotkey used for payment
-                    expected_amount_rao=submission.payment_amount_rao,
-                )
-
-                if not payment_valid:
-                    await self.db.update_submission_status(
-                        submission.submission_id,
-                        SubmissionStatus.FAILED_VALIDATION,
-                        error_message=f"Payment verification failed: {payment_error}",
-                    )
-                    logger.warning(
-                        f"Submission {submission.submission_id} failed payment verification: {payment_error}"
-                    )
-                    continue
-
-                # Mark payment as verified
-                submission.payment_verified = True
-                logger.info(f"Payment verified for submission {submission.submission_id}")
-
-            # Step 2: Download code from R2
-            # TODO: Implement R2 download
-            # For now, assume code is available locally
-            # code = await download_from_r2(submission.bucket_path)
-
-            # Step 3: Validate code
-            # result = self.code_validator.validate(code)
-            # For now, just mark as evaluating
-            result_valid = True
-
-            if result_valid:
-                await self.db.update_submission_status(
-                    submission.submission_id,
-                    SubmissionStatus.EVALUATING,
-                )
-                logger.info(f"Submission {submission.submission_id} passed validation")
-            else:
-                await self.db.update_submission_status(
-                    submission.submission_id,
-                    SubmissionStatus.FAILED_VALIDATION,
-                    error_message="Validation failed",  # result.errors
-                )
-                logger.warning(f"Submission {submission.submission_id} failed validation")
-
-    async def evaluate_submissions(self) -> None:
-        """Evaluate submissions that are ready with verification.
-        
-        FAIRNESS: Each submission is evaluated 3 times (configurable).
-        The final score is the MEDIAN of successful evaluations.
-        
-        Why median?
-        - Protects against random GPU hiccups (one bad run doesn't tank your score)
-        - More fair than average (outliers are ignored)
-        - Example: [1200, 1250, 50] → median=1200 (fair), average=833 (unfair)
-        """
-        hparams = get_hparams()
-        evaluating = await self.db.get_evaluating_submissions()
-        
-        # Number of evaluation runs per submission (from hparams.json)
-        num_runs = hparams.evaluation_runs
-
-        for submission in evaluating:
-            # Check if we've already evaluated this submission enough times
-            existing_evals = await self.db.get_evaluations(submission.submission_id)
-            my_evals = [e for e in existing_evals if e.evaluator_hotkey == self.hotkey]
-
-            if len(my_evals) >= num_runs:
-                # Already did all evaluation runs for this validator
-                continue
-
-            runs_remaining = num_runs - len(my_evals)
-            logger.info(f"Evaluating submission {submission.submission_id} (run {len(my_evals)+1}/{num_runs})")
-
-            # Download code from R2
-            r2_storage = get_r2_storage()
-            code_path = f"/tmp/submissions/{submission.submission_id}/train.py"
-
-            logger.info(f"Downloading code from storage: {submission.bucket_path}")
-            download_success = await r2_storage.download_code(
-                submission.bucket_path, code_path
-            )
-
-            if not download_success:
-                logger.error(f"Failed to download code for submission {submission.submission_id}")
-                # Save failed evaluation
-                evaluation = EvaluationModel(
-                    submission_id=submission.submission_id,
-                    evaluator_hotkey=self.hotkey,
-                    tokens_per_second=0.0,
-                    total_tokens=0,
-                    wall_time_seconds=0.0,
-                    success=False,
-                    error="Failed to download code from storage",
-                )
-                await self.db.save_evaluation(evaluation)
-                continue
-
-            logger.info(f"Code downloaded successfully: {code_path}")
-
-            # Run multiple evaluations for fairness
-            for run_idx in range(runs_remaining):
-                current_run = len(my_evals) + run_idx + 1
-                logger.info(f"🔄 Evaluation run {current_run}/{num_runs}")
-                
-                # Run verification and benchmarking
-                result = await self.verifier.verify_and_benchmark(code_path)
-
-                if result.success:
-                    logger.info(
-                        f"✅ Run {current_run} PASSED for {submission.submission_id}\n"
-                        f"  TPS: {result.tokens_per_second:,.2f}\n"
-                        f"  Tokens: {result.total_tokens:,}\n"
-                        f"  Time: {result.wall_time_seconds:.2f}s"
-                    )
-                else:
-                    logger.warning(
-                        f"❌ Run {current_run} FAILED for {submission.submission_id}\n"
-                        f"  Error type: {result.error_type}\n"
-                        f"  Message: {result.error_message}"
-                    )
-
-                # Save evaluation result
-                evaluation = EvaluationModel(
-                    submission_id=submission.submission_id,
-                    evaluator_hotkey=self.hotkey,
-                    tokens_per_second=result.tokens_per_second,
-                    total_tokens=result.total_tokens,
-                    wall_time_seconds=result.wall_time_seconds,
-                    success=result.success,
-                    error=result.error_message,
-                )
-                await self.db.save_evaluation(evaluation)
-                
-                # Clean up memory between runs
-                self._cleanup_memory()
-
-            # Check if submission has enough evaluations from all validators
-            num_evals = await self.db.count_evaluations(submission.submission_id)
-            required_evals = hparams.num_evals_per_submission * num_runs
-            
-            if num_evals >= required_evals:
-                # Calculate final score using MEDIAN (fair - ignores outliers)
-                all_evals = await self.db.get_evaluations(submission.submission_id)
-                successful_evals = [e for e in all_evals if e.success]
-
-                if successful_evals:
-                    tps_scores = [e.tokens_per_second for e in successful_evals]
-                    
-                    # Use median for fairness (protects against random bad runs)
-                    median_tps = statistics.median(tps_scores)
-                    avg_tps = statistics.mean(tps_scores)
-                    
-                    logger.info(
-                        f"📊 Final scoring for {submission.submission_id}:\n"
-                        f"   Runs: {len(tps_scores)} successful\n"
-                        f"   Scores: {[f'{s:.1f}' for s in sorted(tps_scores)]}\n"
-                        f"   Median: {median_tps:,.2f} TPS (FINAL)\n"
-                        f"   Average: {avg_tps:,.2f} TPS (for reference)"
-                    )
-                    
-                    # Use median as final score
-                    await self.db.update_submission_score(submission.submission_id, median_tps)
-                    logger.info(
-                        f"✅ Submission {submission.submission_id} finished with score {median_tps:,.2f} TPS (median)"
-                    )
-                else:
-                    # All evaluations failed verification
-                    await self.db.update_submission_status(
-                        submission.submission_id,
-                        SubmissionStatus.FAILED_EVALUATION,
-                        error_message="All evaluations failed verification",
-                    )
-                    logger.warning(
-                        f"Submission {submission.submission_id} failed: no successful evaluations"
-                    )
 
     async def maybe_set_weights(self) -> None:
         """Set weights if enough time has passed."""
@@ -426,18 +363,14 @@ class Validator(BaseNode):
     async def cleanup(self) -> None:
         """Cleanup resources."""
         await super().cleanup()
-        if self.sandbox:
-            await self.sandbox.cleanup()
         if self.db:
             await self.db.close()
 
 
 def main():
-    # Configure PyTorch memory management to prevent OOM
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-    logger.info("🧠 Memory management configured: expandable_segments=True")
     
-    parser = argparse.ArgumentParser(description="Tournament Validator")
+    parser = argparse.ArgumentParser(description="Tournament Validator (Chi/Affinetes)")
     parser.add_argument(
         "--wallet.name",
         dest="wallet_name",
@@ -455,21 +388,29 @@ def main():
     parser.add_argument(
         "--skip-blockchain-check",
         action="store_true",
-        help="Skip blockchain registration check (for local testing)",
+        help="Skip blockchain registration check",
+    )
+    parser.add_argument(
+        "--affinetes-mode",
+        type=str,
+        choices=["docker", "basilica"],
+        default="docker",
+        help="Execution mode: docker (local) or basilica (remote GPU)",
     )
 
     args = parser.parse_args()
 
-    # Initialize wallet
     wallet = bt.wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
 
-    # Create and run validator
-    # Note: burn_rate and burn_uid are now configured in hparams.json
     validator = Validator(
         wallet=wallet,
         skip_blockchain_check=args.skip_blockchain_check,
+        affinetes_mode=args.affinetes_mode,
     )
 
+    logger.info(f"🚀 Starting validator")
+    logger.info(f"   Affinetes mode: {args.affinetes_mode}")
+    
     asyncio.run(validator.start())
 
 

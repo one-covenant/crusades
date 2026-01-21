@@ -1,0 +1,13 @@
+# Templar TPS Evaluation Environment Dependencies
+# These are installed in the Docker image for miner submissions
+
+# Core ML
+torch>=2.0.0
+transformers>=4.36.0
+accelerate>=0.24.0
+safetensors>=0.4.0
+
+# Utilities
+numpy>=1.24.0
+
+

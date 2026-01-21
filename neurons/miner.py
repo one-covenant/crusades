@@ -1,324 +1,479 @@
-"""Miner CLI for submitting training code to the tournament.
+"""Miner CLI for Templar Tournament (Chi/Affinetes Architecture).
 
-SECURITY NOTE: Miners submit code to validator API, NOT directly to storage.
-Validators handle storage privately to prevent cheating.
+Flow:
+1. miner build <train.py>  - Build Docker image with your optimized code
+2. miner push              - Push image to registry (optional for local testing)
+3. miner commit            - Commit image URL to blockchain
+4. Validator reads chain → runs via affinetes → scores your submission
 """
 
 import argparse
-import asyncio
 import hashlib
+import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import bittensor as bt
-import httpx
-
-from tournament.anti_copying import compute_fingerprint
-from tournament.chain.manager import ChainManager
-from tournament.config import get_config, get_hparams
-from tournament.payment.manager import PaymentManager
-from tournament.pipeline.validator import CodeValidator
 
 
-async def submit_code(
-    code_path: Path,
-    wallet: bt.wallet,
-    skip_validation: bool = False,
-    skip_payment: bool = False,
-    payment_recipient: str | None = None,
-    validator_api_url: str = "http://localhost:8000",
-) -> str | None:
-    """Submit training code to validator via API.
+# =============================================================================
+# DOCKER BUILD COMMAND
+# =============================================================================
+
+def build_docker_image(
+    train_path: Path,
+    image_name: str,
+    image_tag: str = "latest",
+    env_path: Path | None = None,
+    no_cache: bool = False,
+) -> tuple[bool, str]:
+    """Build Docker image with miner's train.py.
     
-    SECURITY: Code is sent to validator's API endpoint, not directly to storage.
-    This prevents miners from accessing or manipulating the storage layer.
-
     Args:
-        code_path: Path to train.py file
-        wallet: Bittensor wallet for signing
-        skip_validation: Skip local code validation
-        skip_payment: Skip payment (for testing only)
-        payment_recipient: Validator's payment address
-        validator_api_url: Validator API endpoint
-
+        train_path: Path to miner's train.py file
+        image_name: Docker image name (e.g., "templar-submission")
+        image_tag: Docker image tag (e.g., "v1" or "latest")
+        env_path: Path to environment files (defaults to environments/templar/)
+        no_cache: Force rebuild without cache
+        
     Returns:
-        Submission ID if successful, None otherwise
+        Tuple of (success, image_full_name or error_message)
     """
-    # Read code
-    if not code_path.exists():
-        print(f"Error: File not found: {code_path}")
-        return None
-
-    code = code_path.read_text()
-
-    # Validate code locally
-    if not skip_validation:
-        validator = CodeValidator()
-        result = validator.validate(code)
-        if not result.valid:
-            print("Code validation failed:")
-            for error in result.errors:
-                print(f"  - {error}")
-            return None
-        print("Code validation passed")
-
-    # Calculate code hash
-    code_hash = hashlib.sha256(code.encode()).hexdigest()
-    print(f"Code hash: {code_hash}")
-
-    # Initialize chain manager
-    hotkey = wallet.hotkey.ss58_address
+    if not train_path.exists():
+        return False, f"File not found: {train_path}"
     
-    if not skip_payment:
-        # Production: Verify registration on-chain
-        chain = ChainManager(wallet=wallet)
-        await chain.sync_metagraph()
-
-        if not chain.is_registered(hotkey):
-            print(f"Error: Hotkey {hotkey} is not registered on subnet {chain.netuid}")
-            return None
-
-        uid = chain.get_uid_for_hotkey(hotkey)
-        print(f"Miner UID: {uid}")
-    else:
-        # Testing mode: Use mock values
-        print("⚠️  Skipping blockchain verification (testing mode)")
-        uid = 1  # Mock UID for testing
-        print(f"Mock Miner UID: {uid}")
-
-    # Payment for submission (anti-spam)
-    payment_receipt = None
-    if not skip_payment:
-        if payment_recipient is None:
-            print("Error: Payment recipient address required (use --payment-recipient)")
-            print("For testing, use --skip-payment")
-            return None
-
-        payment_manager = PaymentManager(wallet=wallet, subtensor=chain.subtensor)
-        cost_rao, cost_tao = payment_manager.get_submission_cost()
-
-        # Confirm payment
-        print(f"\n💰 Submission Cost: {cost_rao:,} RAO ({cost_tao:.4f} TAO)")
-        print(f"📍 Payment Recipient: {payment_recipient}")
-
-        confirm = input("\nProceed with payment? (y/n): ").strip().lower()
-        if confirm != "y":
-            print("Payment cancelled. Submission aborted.")
-            return None
-
+    # Find environment directory
+    if env_path is None:
+        candidates = [
+            Path(__file__).parent.parent / "environments" / "templar",
+            Path.cwd() / "environments" / "templar",
+            Path.cwd().parent / "environments" / "templar",
+        ]
+        for candidate in candidates:
+            if candidate.exists() and (candidate / "Dockerfile").exists():
+                env_path = candidate
+                break
+        
+        if env_path is None:
+            return False, "Could not find environments/templar/ directory with Dockerfile"
+    
+    required_files = ["Dockerfile", "env.py", "requirements.txt"]
+    for f in required_files:
+        if not (env_path / f).exists():
+            return False, f"Missing required file: {env_path / f}"
+    
+    print(f"📦 Building Docker image: {image_name}:{image_tag}")
+    print(f"   Environment: {env_path}")
+    print(f"   Train.py: {train_path}")
+    
+    with tempfile.TemporaryDirectory(prefix="templar_build_") as tmp_dir:
+        build_ctx = Path(tmp_dir)
+        
+        # Copy environment files
+        for f in required_files:
+            shutil.copy(env_path / f, build_ctx / f)
+        
+        # Copy miner's train.py
+        shutil.copy(train_path, build_ctx / "train.py")
+        
+        # Calculate code hash
+        code = train_path.read_text()
+        code_hash = hashlib.sha256(code.encode()).hexdigest()
+        
+        # Add metadata labels
+        dockerfile_path = build_ctx / "Dockerfile"
+        dockerfile_content = dockerfile_path.read_text()
+        labels = f"""
+# Metadata labels
+LABEL templar.code_hash="{code_hash}"
+LABEL templar.build_time="{int(time.time())}"
+"""
+        dockerfile_path.write_text(dockerfile_content + labels)
+        
+        # Build Docker image
+        full_image_name = f"{image_name}:{image_tag}"
+        cmd = ["docker", "build", "-t", full_image_name]
+        
+        if no_cache:
+            cmd.append("--no-cache")
+        
+        cmd.append(str(build_ctx))
+        
+        print(f"\n🔨 Running: {' '.join(cmd)}")
+        print("-" * 60)
+        
         try:
-            print("Processing payment...")
-            payment_receipt = await payment_manager.make_payment(
-                recipient_address=payment_recipient,
+            result = subprocess.run(cmd, capture_output=False, text=True, cwd=build_ctx)
+            
+            if result.returncode != 0:
+                return False, f"Docker build failed with exit code {result.returncode}"
+            
+            print("-" * 60)
+            print(f"\n✅ Successfully built: {full_image_name}")
+            print(f"   Code hash: {code_hash[:16]}...")
+            
+            inspect_result = subprocess.run(
+                ["docker", "inspect", "--format", "{{.Id}}", full_image_name],
+                capture_output=True,
+                text=True,
             )
-            print("✅ Payment confirmed!")
-            print(f"   Block: {payment_receipt.block_hash}")
-            print(f"   Extrinsic: {payment_receipt.extrinsic_index}")
+            if inspect_result.returncode == 0:
+                image_id = inspect_result.stdout.strip()[:19]
+                print(f"   Image ID: {image_id}")
+            
+            return True, full_image_name
+            
+        except FileNotFoundError:
+            return False, "Docker not found. Please install Docker."
         except Exception as e:
-            print(f"Error: Payment failed: {e}")
-            return None
-    else:
-        print("⚠️  Skipping payment (testing mode)")
+            return False, f"Docker build error: {e}"
 
-    # ANTI-COPYING: Post code hash AND fingerprint to blockchain FIRST
-    # This prevents malicious validators from stealing code and claiming it as their own
-    # The fingerprint allows cross-validator copy detection even for modified code
-    fingerprint = compute_fingerprint(code)
-    fingerprint_chain = fingerprint.to_chain_format()
+
+# =============================================================================
+# PUSH TO REGISTRY COMMAND
+# =============================================================================
+
+def push_to_registry(
+    image_name: str,
+    registry: str | None = None,
+) -> tuple[bool, str]:
+    """Push Docker image to registry.
     
-    print(f"\n🔐 Posting code hash + fingerprint to blockchain for timestamp proof...")
-    print(f"   Hash: {code_hash}")
-    print(f"   Fingerprint: {fingerprint_chain}")
+    Args:
+        image_name: Local image name (e.g., "templar-submission:v1")
+        registry: Registry URL (e.g., "docker.io/username" or "localhost:5000")
+        
+    Returns:
+        Tuple of (success, remote_image_name or error_message)
+    """
+    if registry:
+        remote_name = f"{registry}/{image_name}"
+        
+        print(f"\n📤 Pushing to registry: {registry}")
+        print(f"   Local: {image_name}")
+        print(f"   Remote: {remote_name}")
+        
+        # Tag image
+        tag_cmd = ["docker", "tag", image_name, remote_name]
+        tag_result = subprocess.run(tag_cmd, capture_output=True, text=True)
+        
+        if tag_result.returncode != 0:
+            return False, f"Failed to tag image: {tag_result.stderr}"
+        
+        # Push image
+        push_cmd = ["docker", "push", remote_name]
+        push_result = subprocess.run(push_cmd, capture_output=False, text=True)
+        
+        if push_result.returncode != 0:
+            return False, f"Failed to push image"
+        
+        print(f"\n✅ Pushed: {remote_name}")
+        return True, remote_name
+    else:
+        print(f"\n📦 Local image (no registry push): {image_name}")
+        print(f"   For local testing, validators will use this image directly")
+        return True, image_name
+
+
+# =============================================================================
+# BLOCKCHAIN COMMIT COMMAND
+# =============================================================================
+
+def commit_to_chain(
+    wallet: bt.wallet,
+    image_name: str,
+    netuid: int,
+    network: str = "local",
+    blocks_until_reveal: int = 100,
+    local_mode: bool = False,
+) -> tuple[bool, dict | str]:
+    """Commit Docker image URL to blockchain using commit-reveal.
     
-    code_timestamp_block = None
-    code_timestamp_extrinsic = None
-    code_fingerprint = None
+    Args:
+        wallet: Bittensor wallet
+        image_name: Full Docker image name (e.g., "registry/name:tag")
+        netuid: Subnet ID
+        network: Subtensor network (local, test, finney)
+        blocks_until_reveal: Blocks until commitment is revealed
+        local_mode: Use local file instead of blockchain (for testing)
+        
+    Returns:
+        Tuple of (success, result_dict or error_message)
+    """
+    print(f"\n🔗 Committing image...")
+    print(f"   Image: {image_name}")
+    print(f"   Network: {network}")
+    print(f"   Subnet: {netuid}")
+    
+    image_hash = hashlib.sha256(image_name.encode()).hexdigest()[:16]
+    commitment_data = f"docker|{image_name}|{image_hash}"
     
     try:
-        # Post hash AND fingerprint to blockchain using commit extrinsic
-        # This creates immutable proof: "Miner X had code_hash Y at block Z"
-        # Fingerprint enables detection even if code is slightly modified
-        hparams = get_hparams()
-        netuid = hparams.netuid
-        
-        # Get network from chain manager if available, otherwise from config
-        app_config = get_config()
-        network = app_config.subtensor_network
-        if 'chain' in locals() and chain.subtensor:
-            network = chain.subtensor.network
-        
         subtensor = bt.subtensor(network=network)
-        
-        # Get current block number (will be the commit block)
         current_block = subtensor.get_current_block()
+        print(f"   Current block: {current_block}")
+    except Exception:
+        current_block = int(time.time())
+        print(f"   Using timestamp as block: {current_block}")
+    
+    # For local testing, use file-based commitments
+    if local_mode or network == "local":
+        print(f"\n📝 Using LOCAL FILE mode for testing...")
         
-        # Combine hash and fingerprint for commitment
-        # Format: "hash|fingerprint" so validators can parse both
-        commitment_data = f"{code_hash}|{fingerprint_chain}"
+        commit_block = current_block
+        reveal_block = commit_block + blocks_until_reveal
         
-        # Post commitment to blockchain (netuid required!)
-        print(f"   Posting to subnet {netuid} at block ~{current_block}...")
-        success = subtensor.commit(
-            wallet=wallet,
-            netuid=netuid,
-            data=commitment_data,
-        )
+        result = {
+            "image": image_name,
+            "image_hash": image_hash,
+            "commit_block": commit_block,
+            "reveal_block": reveal_block,
+            "hotkey": wallet.hotkey.ss58_address,
+            "uid": 1,  # Default UID for local testing
+            "netuid": netuid,
+            "data": commitment_data,
+        }
+        
+        # Save to local commitments directory
+        local_commits_dir = Path.cwd() / ".local_commitments"
+        local_commits_dir.mkdir(exist_ok=True)
+        
+        commit_file = local_commits_dir / f"{commit_block}_{wallet.hotkey.ss58_address[:8]}.json"
+        commit_file.write_text(json.dumps(result, indent=2))
+        
+        print(f"\n✅ Local commitment saved!")
+        print(f"   File: {commit_file}")
+        print(f"   Commit block: {commit_block}")
+        print(f"   Hotkey: {wallet.hotkey.ss58_address}")
+        
+        return True, result
+    
+    # Production: Use blockchain
+    print(f"\n📝 Commitment data: {commitment_data}")
+    
+    try:
+        success = False
+        if hasattr(subtensor, 'set_reveal_commitment'):
+            try:
+                print(f"   Trying set_reveal_commitment...")
+                success = subtensor.set_reveal_commitment(
+                    wallet=wallet,
+                    netuid=netuid,
+                    data=commitment_data,
+                    blocks_until_reveal=blocks_until_reveal,
+                )
+            except Exception as e:
+                print(f"   ⚠️  set_reveal_commitment failed: {e}")
+                success = False
+        
+        if not success and hasattr(subtensor, 'commit'):
+            print(f"   Using simple commit...")
+            try:
+                success = subtensor.commit(
+                    wallet=wallet,
+                    netuid=netuid,
+                    data=commitment_data,
+                )
+            except Exception as e:
+                return False, f"Commit failed: {e}"
         
         if success:
-            # Commitment posted! Get the block number
             commit_block = subtensor.get_current_block()
+            reveal_block = commit_block + blocks_until_reveal
             
-            print(f"   ✅ Code hash + fingerprint timestamped on blockchain")
-            print(f"   Block: {commit_block}")
-            print(f"   Hash: {code_hash[:32]}...")
-            print(f"   Fingerprint: {fingerprint_chain}")
-            print(f"   This proves you created this code at block {commit_block}!")
+            result = {
+                "image": image_name,
+                "image_hash": image_hash,
+                "commit_block": commit_block,
+                "reveal_block": reveal_block,
+                "hotkey": wallet.hotkey.ss58_address,
+                "netuid": netuid,
+            }
             
-            # Use block number as timestamp proof
-            code_timestamp_block = str(commit_block)
-            code_timestamp_extrinsic = 0  # Index within block (we don't have exact index)
-            code_fingerprint = fingerprint_chain
+            print(f"\n✅ Commitment successful!")
+            print(f"   Commit block: {commit_block}")
+            print(f"   Reveal block: {reveal_block}")
+            
+            return True, result
         else:
-            print(f"   ⚠️  Blockchain timestamp failed")
-            code_timestamp_block = None
-            code_timestamp_extrinsic = None
-            code_fingerprint = None
+            return False, "Commitment transaction failed"
+            
     except Exception as e:
-        print(f"   ⚠️  Could not post to blockchain: {e}")
-        print(f"   Proceeding without timestamp (reduced protection)")
-        code_timestamp_block = None
-        code_timestamp_extrinsic = None
-        code_fingerprint = fingerprint_chain  # Still include fingerprint in submission
+        return False, f"Blockchain error: {e}"
+
+
+# =============================================================================
+# CLI COMMANDS
+# =============================================================================
+
+def cmd_build(args):
+    """Build Docker image with miner's train.py."""
+    success, result = build_docker_image(
+        train_path=args.train_path,
+        image_name=args.image_name,
+        image_tag=args.image_tag,
+        no_cache=args.no_cache,
+    )
     
-    # Submit code to validator API
-    print(f"\nSubmitting code to validator API: {validator_api_url}")
+    if success:
+        print(f"\n🎉 Image ready: {result}")
+        print(f"\nNext steps:")
+        print(f"  1. (Optional) Push to registry:")
+        print(f"     python -m neurons.miner push {result} --registry docker.io/yourname")
+        print(f"  2. Commit to blockchain:")
+        print(f"     python -m neurons.miner commit --image {result} --wallet.name <name> --wallet.hotkey <hotkey>")
+        return 0
+    else:
+        print(f"\n❌ Build failed: {result}")
+        return 1
+
+
+def cmd_push(args):
+    """Push Docker image to registry."""
+    success, result = push_to_registry(
+        image_name=args.image_name,
+        registry=args.registry,
+    )
     
-    # Prepare submission data
-    # Sign timestamp with hotkey for authentication
-    timestamp = int(time.time())
-    signature = wallet.hotkey.sign(str(timestamp).encode()).hex()
+    if success:
+        print(f"\n🎉 Image pushed: {result}")
+        print(f"\nNext step:")
+        print(f"  python -m neurons.miner commit --image {result} --wallet.name <name> --wallet.hotkey <hotkey>")
+        return 0
+    else:
+        print(f"\n❌ Push failed: {result}")
+        return 1
+
+
+def cmd_commit(args):
+    """Commit Docker image to blockchain."""
+    wallet = bt.wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
     
-    submission_data = {
-        "code": code,
-        "code_hash": code_hash,
-        "miner_hotkey": hotkey,
-        "miner_uid": uid,
-        "timestamp": timestamp,
-        "signature": signature,
-        "payment_block_hash": payment_receipt.block_hash if payment_receipt else None,
-        "payment_extrinsic_index": payment_receipt.extrinsic_index if payment_receipt else None,
-        "payment_amount_rao": payment_receipt.amount_rao if payment_receipt else None,
-        "code_timestamp_block_hash": code_timestamp_block,
-        "code_timestamp_extrinsic_index": code_timestamp_extrinsic,
-        "code_fingerprint": code_fingerprint,  # Structural fingerprint for cross-validator copy detection
-    }
+    success, result = commit_to_chain(
+        wallet=wallet,
+        image_name=args.image_name,
+        netuid=args.netuid,
+        network=args.network,
+        blocks_until_reveal=args.reveal_blocks,
+    )
     
+    if success:
+        print(f"\n🎉 Commitment recorded on blockchain!")
+        print(f"\nValidators will evaluate your submission after block {result['reveal_block']}")
+        
+        # Save commitment info
+        commit_file = Path.home() / ".templar" / "commits" / f"{result['commit_block']}.json"
+        commit_file.parent.mkdir(parents=True, exist_ok=True)
+        commit_file.write_text(json.dumps(result, indent=2))
+        print(f"\nCommitment saved: {commit_file}")
+        
+        return 0
+    else:
+        print(f"\n❌ Commit failed: {result}")
+        return 1
+
+
+def cmd_status(args):
+    """Check commitment status on blockchain."""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{validator_api_url}/api/submissions",
-                json=submission_data,
-            )
+        subtensor = bt.subtensor(network=args.network)
+        current_block = subtensor.get_current_block()
+        
+        print(f"\n📊 Blockchain Status")
+        print(f"   Network: {args.network}")
+        print(f"   Current block: {current_block}")
+        
+        commits_dir = Path.home() / ".templar" / "commits"
+        if commits_dir.exists():
+            commits = sorted(commits_dir.glob("*.json"), reverse=True)[:5]
             
-            if response.status_code != 200:
-                print(f"Error: Validator API returned {response.status_code}")
-                print(f"       {response.text}")
-                return None
-            
-            result = response.json()
-            submission_id = result.get("submission_id")
-            
-            print("✅ Submission accepted by validator")
-            print(f"\n📋 Submission Details:")
-            print(f"   ID: {submission_id}")
-            print(f"   Code Hash: {code_hash[:16]}...")
-            print(f"   Status: pending")
-            
-            print(f"\n📊 Track your submission:")
-            print(f"   curl {validator_api_url}/api/submissions/{submission_id}")
-            
-            return submission_id
-            
-    except httpx.RequestError as e:
-        print(f"Error: Failed to connect to validator API")
-        print(f"       {e}")
-        print(f"\n💡 Make sure validator is running at: {validator_api_url}")
-        return None
+            if commits:
+                print(f"\n📝 Recent Commitments:")
+                for commit_file in commits:
+                    data = json.loads(commit_file.read_text())
+                    commit_block = data.get("commit_block", 0)
+                    reveal_block = data.get("reveal_block", 0)
+                    image = data.get("image", "unknown")
+                    
+                    if current_block >= reveal_block:
+                        status = "✅ REVEALED"
+                    else:
+                        blocks_left = reveal_block - current_block
+                        status = f"⏳ Hidden ({blocks_left} blocks left)"
+                    
+                    print(f"   Block {commit_block}: {image[:40]}... - {status}")
+        
+        return 0
+        
     except Exception as e:
-        print(f"Error: Submission failed: {e}")
-        return None
+        print(f"Error: {e}")
+        return 1
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Submit training code to templar-tournament")
-    parser.add_argument(
-        "code_path",
-        type=Path,
-        help="Path to train.py file",
-    )
-    parser.add_argument(
-        "--wallet.name",
-        dest="wallet_name",
-        type=str,
-        default="default",
-        help="Wallet name",
-    )
-    parser.add_argument(
-        "--wallet.hotkey",
-        dest="wallet_hotkey",
-        type=str,
-        default="default",
-        help="Wallet hotkey",
-    )
-    parser.add_argument(
-        "--skip-validation",
-        action="store_true",
-        help="Skip local code validation",
-    )
-    parser.add_argument(
-        "--skip-payment",
-        action="store_true",
-        help="Skip payment (for local testing only)",
-    )
-    parser.add_argument(
-        "--payment-recipient",
-        type=str,
-        default=None,
-        help="SS58 address to send payment to (validator address)",
-    )
-    parser.add_argument(
-        "--validator-api",
-        type=str,
-        required=True,
-        help="Validator API endpoint (e.g., http://validator.example.com:8000)",
-    )
+    parser = argparse.ArgumentParser(
+        description="Templar Tournament Miner CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Build Docker image with your optimized train.py
+  python -m neurons.miner build train.py --image templar-submission --tag v1
 
+  # Push to registry (optional, for production)
+  python -m neurons.miner push templar-submission:v1 --registry docker.io/myuser
+
+  # Commit to blockchain
+  python -m neurons.miner commit --image templar-submission:v1 --wallet.name miner --wallet.hotkey default
+
+  # Check commitment status
+  python -m neurons.miner status --network local
+        """
+    )
+    
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+    
+    # BUILD command
+    build_parser = subparsers.add_parser("build", help="Build Docker image with your train.py")
+    build_parser.add_argument("train_path", type=Path, help="Path to your train.py file")
+    build_parser.add_argument("--image", dest="image_name", default="templar-submission", help="Docker image name")
+    build_parser.add_argument("--tag", dest="image_tag", default="latest", help="Docker image tag")
+    build_parser.add_argument("--no-cache", action="store_true", help="Build without cache")
+    build_parser.set_defaults(func=cmd_build)
+    
+    # PUSH command
+    push_parser = subparsers.add_parser("push", help="Push image to registry")
+    push_parser.add_argument("image_name", help="Local image name (e.g., templar-submission:v1)")
+    push_parser.add_argument("--registry", help="Registry URL (e.g., docker.io/username)")
+    push_parser.set_defaults(func=cmd_push)
+    
+    # COMMIT command
+    commit_parser = subparsers.add_parser("commit", help="Commit image URL to blockchain")
+    commit_parser.add_argument("--image", dest="image_name", required=True, help="Docker image name")
+    commit_parser.add_argument("--wallet.name", dest="wallet_name", default="default", help="Wallet name")
+    commit_parser.add_argument("--wallet.hotkey", dest="wallet_hotkey", default="default", help="Wallet hotkey")
+    commit_parser.add_argument("--netuid", type=int, default=1, help="Subnet ID")
+    commit_parser.add_argument("--network", default="local", help="Subtensor network")
+    commit_parser.add_argument("--reveal-blocks", type=int, default=100, help="Blocks until reveal")
+    commit_parser.set_defaults(func=cmd_commit)
+    
+    # STATUS command
+    status_parser = subparsers.add_parser("status", help="Check commitment status")
+    status_parser.add_argument("--network", default="local", help="Subtensor network")
+    status_parser.set_defaults(func=cmd_status)
+    
     args = parser.parse_args()
-
-    # Initialize wallet
-    wallet = bt.wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
-
-    # Run submission
-    submission_id = asyncio.run(
-        submit_code(
-            code_path=args.code_path,
-            wallet=wallet,
-            skip_validation=args.skip_validation,
-            skip_payment=args.skip_payment,
-            payment_recipient=args.payment_recipient,
-            validator_api_url=args.validator_api,
-        )
-    )
-
-    if submission_id:
-        print("\nSubmission successful!")
-        print(f"Track status at: /submissions/{submission_id}/status")
-        sys.exit(0)
-    else:
-        print("\nSubmission failed")
-        sys.exit(1)
+    
+    if args.command is None:
+        parser.print_help()
+        return 1
+    
+    return args.func(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
