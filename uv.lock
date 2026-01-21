@@ -2224,6 +2224,15 @@ wheels = [
 ]
 
 [[package]]
+name = "substrateinterface"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/91/72/605eff00a284b732e6428e42b45ec7c0898da6cdf4f6cec5216a0951a963/substrateinterface-1.0.0.tar.gz", hash = "sha256:4a680528a7fcbea0632dfa2147a74029056c337466dd0803815955ece454634b", size = 4755, upload-time = "2022-01-27T14:16:50.171Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5e/04/39d10bc87b1873f567afc319b87b2b9385ea7668d3550d74ea89e77f8f75/substrateinterface-1.0.0-py3-none-any.whl", hash = "sha256:1998ddf51a2396aeedc0761e186bd23b252582ae85d437f83f12d1f898a3188c", size = 1818, upload-time = "2022-01-27T14:16:48.52Z" },
+]
+
+[[package]]
 name = "sympy"
 version = "1.14.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2252,6 +2261,7 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "rich" },
     { name = "sqlalchemy" },
+    { name = "substrateinterface" },
     { name = "torch" },
     { name = "transformers" },
     { name = "uvicorn" },
@@ -2285,6 +2295,7 @@ requires-dist = [
     { name = "rich", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "sqlalchemy", specifier = ">=2.0.0" },
+    { name = "substrateinterface", specifier = ">=1.0.0" },
     { name = "torch", specifier = ">=2.0.0" },
     { name = "transformers", specifier = ">=4.36.0" },
     { name = "uvicorn", specifier = ">=0.27.0" },

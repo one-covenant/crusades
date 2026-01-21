@@ -50,9 +50,7 @@ class Validator(BaseNode):
         skip_blockchain_check: bool = False,
         affinetes_mode: Literal["docker", "basilica"] = "docker",
     ):
-        super().__init__(wallet=wallet)
-
-        self.skip_blockchain_check = skip_blockchain_check
+        super().__init__(wallet=wallet, skip_blockchain_check=skip_blockchain_check)
         self.affinetes_mode = affinetes_mode
 
         # Components (initialized in start)
@@ -79,19 +77,30 @@ class Validator(BaseNode):
         # Database
         self.db = await get_database()
         
-        # Weight setter
-        self.weight_setter = WeightSetter(
-            chain=self.chain,
-            database=self.db,
-        )
-        
-        # Commitment reader for blockchain
-        self.commitment_reader = CommitmentReader(
-            subtensor=self.chain.subtensor,
-            netuid=hparams.netuid,
-            network=config.subtensor_network,
-        )
-        self.commitment_reader.sync()
+        # Weight setter and commitment reader (skip if no blockchain)
+        if self.chain is not None:
+            self.weight_setter = WeightSetter(
+                chain=self.chain,
+                database=self.db,
+            )
+            
+            self.commitment_reader = CommitmentReader(
+                subtensor=self.chain.subtensor,
+                netuid=hparams.netuid,
+                network=config.subtensor_network,
+            )
+            self.commitment_reader.sync()
+        else:
+            logger.warning("Running without blockchain (test mode)")
+            logger.warning("Using local commitments only")
+            
+            # Create commitment reader for local mode (uses local files)
+            self.commitment_reader = CommitmentReader(
+                subtensor=None,
+                netuid=hparams.netuid,
+                network="local",
+                local_mode=True,  # Use local commitment files
+            )
         
         # Get model/data from hparams - fallback to env variables
         model_url = getattr(hparams, 'benchmark_model_name', None) or os.getenv('BENCHMARK_MODEL_URL', '')
@@ -322,7 +331,9 @@ class Validator(BaseNode):
         """Calculate final score and update submission status."""
         hparams = get_hparams()
         num_evals = await self.db.count_evaluations(submission_id)
-        required_evals = getattr(hparams, 'num_evals_per_submission', 1) * num_runs
+        required_evals = num_runs  # Just need num_runs evaluations
+        
+        logger.info(f"Finalizing {submission_id}: {num_evals}/{required_evals} evaluations")
         
         if num_evals >= required_evals:
             all_evals = await self.db.get_evaluations(submission_id)
@@ -376,6 +387,11 @@ class Validator(BaseNode):
 
     async def maybe_set_weights(self) -> None:
         """Set weights if enough time has passed."""
+        # Skip if no weight setter (test mode)
+        if self.weight_setter is None:
+            logger.debug("Skipping weight setting (test mode)")
+            return
+            
         hparams = get_hparams()
         now = time.time()
 

@@ -9,6 +9,7 @@ For local testing, also supports reading from .local_commitments/ directory.
 """
 
 import json
+import time
 import logging
 import re
 from dataclasses import dataclass
@@ -144,6 +145,11 @@ class CommitmentReader:
     
     def sync(self) -> None:
         """Sync metagraph with blockchain."""
+        # Skip sync in local mode
+        if self.local_mode:
+            logger.info("Skipping metagraph sync (local mode)")
+            return
+            
         logger.info(f"Syncing metagraph for subnet {self.netuid}...")
         try:
             self.metagraph.sync(subtensor=self.subtensor)
@@ -153,6 +159,9 @@ class CommitmentReader:
     
     def get_current_block(self) -> int:
         """Get current blockchain block number."""
+        if self.local_mode:
+            # In local mode, use timestamp as mock block number
+            return int(time.time())
         return self.subtensor.get_current_block()
     
     def get_all_commitments(self) -> list[MinerCommitment]:

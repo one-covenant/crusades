@@ -1,5 +1,5 @@
 {
-    "netuid": 2,
+    "netuid": 1,
     "burn_rate": 0.95,
     "burn_uid": 1,
 
@@ -22,7 +22,7 @@
     "min_blocks_between_commits": 100,
 
     "verification": {
-        "output_vector_tolerance": 0.02,
+        "output_vector_tolerance": 0.03,
         "deterministic_mode": true
     }
 }

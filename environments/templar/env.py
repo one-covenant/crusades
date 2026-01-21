@@ -394,7 +394,17 @@ def _run_reference(
     num_steps: int,
     device: torch.device,
 ) -> InnerStepsResult:
-    """Run reference implementation for comparison."""
+    """Run reference implementation for comparison.
+    
+    Must match the expected behavior of miner's inner_steps exactly.
+    Uses same settings as baseline train.py to ensure deterministic comparison.
+    """
+    # Match miner's deterministic settings
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
     total_tokens = 0
     final_logits = None
     final_loss = 0.0
@@ -416,7 +426,7 @@ def _run_reference(
 
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)  # Match miner
 
         total_tokens += batch.numel()
         final_logits = logits.detach().float()
