@@ -240,13 +240,19 @@ class DatabaseClient:
         
         leaderboard = []
         for i, row in enumerate(rows, 1):
+            # Count evaluations for this submission
+            eval_count = self._query_one(
+                "SELECT COUNT(*) as count FROM evaluations WHERE submission_id = ?",
+                (row["submission_id"],)
+            )
             leaderboard.append({
                 "rank": i,
                 "submission_id": row["submission_id"],
                 "miner_hotkey": row["miner_hotkey"],
                 "miner_uid": row["miner_uid"],
-                "tps": row["final_score"],
-                "timestamp": row["created_at"],
+                "final_score": row["final_score"],  # Match app.py expectation
+                "num_evaluations": eval_count["count"] if eval_count else 0,
+                "created_at": row["created_at"],
             })
         return leaderboard
 
@@ -267,8 +273,8 @@ class DatabaseClient:
                 "miner_hotkey": row["miner_hotkey"],
                 "miner_uid": row["miner_uid"],
                 "status": row["status"],
-                "tps": row["final_score"] if row["final_score"] else 0,
-                "timestamp": row["created_at"],
+                "final_score": row["final_score"],  # Match app.py expectation
+                "created_at": row["created_at"],
                 "error": row["error_message"],
             })
         return recent
@@ -357,9 +363,51 @@ class DatabaseClient:
         )
 
     def get_submission_code(self, submission_id: str) -> str | None:
-        """Get code for a submission (not available in new architecture)."""
-        # In new architecture, code is in Docker image, not DB
-        return None
+        """Extract code from Docker image."""
+        import subprocess
+        
+        row = self._query_one(
+            "SELECT bucket_path, code_hash FROM submissions WHERE submission_id = ?",
+            (submission_id,)
+        )
+        if not row:
+            return None
+        
+        image = row.get("bucket_path", "")
+        fingerprint = row.get("code_hash", "N/A")
+        
+        if not image:
+            return "# No Docker image found for this submission"
+        
+        # Try to extract train.py from the Docker image
+        try:
+            result = subprocess.run(
+                ["docker", "run", "--rm", image, "cat", "/app/train.py"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                header = f"# Image: {image}\n# Fingerprint: {fingerprint}\n# " + "=" * 50 + "\n\n"
+                return header + result.stdout
+            else:
+                # Image might not be pulled yet
+                return f"""# Could not extract code from image
+# Image: {image}
+# Fingerprint: {fingerprint}
+#
+# The image may not be available locally.
+# Try pulling it first:
+#   docker pull {image}
+#
+# Error: {result.stderr.strip() if result.stderr else 'Unknown error'}
+"""
+        except subprocess.TimeoutExpired:
+            return f"# Timeout extracting code from {image}"
+        except FileNotFoundError:
+            return f"# Docker not available. Image: {image}"
+        except Exception as e:
+            return f"# Error: {e}\n# Image: {image}"
 
     def fetch_submission_detail(self, submission_id: str) -> SubmissionDetail:
         """Fetch all details for a submission."""
