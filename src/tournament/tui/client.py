@@ -391,31 +391,6 @@ class DatabaseClient:
         
         # Fallback: code not yet stored (still evaluating)
         return f"# Code not yet available\n# Submission may still be evaluating\n# code_hash: {row.get('code_hash', 'N/A')}"
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                header = f"# Image: {image}\n# Fingerprint: {fingerprint}\n# " + "=" * 50 + "\n\n"
-                return header + result.stdout
-            else:
-                # Image might not be pulled yet
-                return f"""# Could not extract code from image
-# Image: {image}
-# Fingerprint: {fingerprint}
-#
-# The image may not be available locally.
-# Try pulling it first:
-#   docker pull {image}
-#
-# Error: {result.stderr.strip() if result.stderr else 'Unknown error'}
-"""
-        except subprocess.TimeoutExpired:
-            return f"# Timeout extracting code from {image}"
-        except FileNotFoundError:
-            return f"# Docker not available. Image: {image}"
-        except Exception as e:
-            return f"# Error: {e}\n# Image: {image}"
 
     def fetch_submission_detail(self, submission_id: str) -> SubmissionDetail:
         """Fetch all details for a submission."""

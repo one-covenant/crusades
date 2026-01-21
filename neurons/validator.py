@@ -249,14 +249,20 @@ class Validator(BaseNode):
                 logger.info(f"Found {len(new_commitments)} new commitments")
                 
                 for commitment in new_commitments:
+                    logger.info(f"Processing commitment from UID {commitment.uid}, hotkey: {commitment.hotkey[:16]}...")
+                    logger.info(f"   R2 credentials: {commitment.has_r2_credentials()}")
+                    logger.info(f"   Code hash: {commitment.code_hash[:16] if commitment.code_hash else 'NONE'}...")
+                    
                     # Skip if no R2 credentials
                     if not commitment.has_r2_credentials():
-                        logger.debug(f"Skipping commitment without R2 credentials: UID {commitment.uid}")
+                        logger.warning(f"Skipping commitment without R2 credentials: UID {commitment.uid}")
+                        if commitment.r2_credentials:
+                            logger.warning(f"   R2 creds present but invalid: endpoint={commitment.r2_credentials.endpoint}, bucket={commitment.r2_credentials.bucket}")
                         continue
                     
                     # Skip if already evaluated this code
                     if commitment.code_hash in self.evaluated_hashes:
-                        logger.debug(f"Skipping already evaluated: {commitment.code_hash[:16]}...")
+                        logger.info(f"Skipping already evaluated: {commitment.code_hash[:16]}...")
                         continue
                     
                     await self._create_submission_from_commitment(commitment)
@@ -274,9 +280,14 @@ class Validator(BaseNode):
         hparams = get_hparams()
         submission_id = f"r2_{commitment.commit_block}_{commitment.uid}"
         
-        existing = await self.db.get_submission(submission_id)
-        if existing:
-            return
+        try:
+            existing = await self.db.get_submission(submission_id)
+            if existing:
+                logger.debug(f"Submission {submission_id} already exists")
+                return
+        except Exception as e:
+            logger.error(f"Database error checking existing submission: {e}")
+            # Continue - try to create anyway
         
         # Rate limiting
         min_blocks = getattr(hparams, 'min_blocks_between_commits', 100)
@@ -316,11 +327,17 @@ class Validator(BaseNode):
             payment_verified=True,
         )
         
-        await self.db.save_submission(submission)
-        logger.info(f"Created submission: {submission_id}")
-        logger.info(f"   R2 bucket: {commitment.r2_credentials.bucket}")
-        logger.info(f"   R2 key: {commitment.r2_credentials.key}")
-        logger.info(f"   UID: {commitment.uid}")
+        try:
+            await self.db.save_submission(submission)
+            logger.info(f"✓ Created submission: {submission_id}")
+            logger.info(f"   R2 bucket: {commitment.r2_credentials.bucket}")
+            logger.info(f"   R2 key: {commitment.r2_credentials.key}")
+            logger.info(f"   UID: {commitment.uid}")
+            logger.info(f"   Hotkey: {commitment.hotkey[:16]}...")
+        except Exception as e:
+            logger.error(f"Failed to save submission: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     async def evaluate_submissions(self) -> None:
         """Evaluate submissions by downloading from miner's R2.
@@ -331,6 +348,8 @@ class Validator(BaseNode):
         hparams = get_hparams()
         evaluating = await self.db.get_evaluating_submissions()
         num_runs = getattr(hparams, 'evaluation_runs', 5)
+        
+        logger.info(f"Found {len(evaluating)} submissions in EVALUATING status")
 
         for submission in evaluating:
             # Parse R2 info from bucket_path (miner's R2 credentials)

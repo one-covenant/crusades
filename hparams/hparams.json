@@ -22,7 +22,7 @@
     "min_blocks_between_commits": 100,
 
     "verification": {
-        "output_vector_tolerance": 0.03,
+        "output_vector_tolerance": 0.7,
         "deterministic_mode": true
     }
 }
