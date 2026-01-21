@@ -46,7 +46,10 @@ class MinerCommitment:
     ) -> "MinerCommitment | None":
         """Parse commitment from blockchain data.
         
-        Expected format: "docker|<image_name>|<hash>"
+        Supports multiple formats (for Chi compatibility):
+        1. Pipe format: "docker|<image_name>|<hash>"
+        2. JSON format: {"image": "...", "fingerprint": "..."}
+        3. Simple formats: "image=..." or "docker://..."
         
         Args:
             uid: Miner UID
@@ -62,19 +65,45 @@ class MinerCommitment:
         if not data:
             return None
         
-        # Parse "docker|<image>|<hash>" format
-        parts = data.split("|")
+        data = data.strip()
+        image_name = None
+        image_hash = None
         
-        if len(parts) != 3:
-            logger.debug(f"Invalid commitment format from UID {uid}: {data[:50]}...")
+        # Try JSON format first (Chi pattern)
+        if data.startswith("{"):
+            try:
+                parsed = json.loads(data)
+                image_name = parsed.get("image") or parsed.get("image_url")
+                image_hash = parsed.get("fingerprint") or parsed.get("fp") or parsed.get("hash")
+                if image_name:
+                    image_name = image_name.strip()
+                if image_hash and isinstance(image_hash, str):
+                    image_hash = image_hash.strip()
+            except json.JSONDecodeError:
+                pass
+        
+        # Try pipe format: "docker|<image>|<hash>"
+        if not image_name and "|" in data:
+            parts = data.split("|")
+            if len(parts) == 3 and parts[0] == "docker":
+                image_name = parts[1]
+                image_hash = parts[2]
+        
+        # Try "image=..." format
+        if not image_name and data.startswith("image="):
+            image_name = data.split("=", 1)[1].strip()
+        
+        # Try "docker://..." format
+        if not image_name and data.startswith("docker://"):
+            image_name = data.replace("docker://", "", 1).strip()
+        
+        # Last resort: treat entire string as image name
+        if not image_name and cls._is_valid_image_name(data):
+            image_name = data
+        
+        if not image_name:
+            logger.debug(f"Could not parse commitment from UID {uid}: {data[:50]}...")
             return None
-        
-        if parts[0] != "docker":
-            logger.debug(f"Non-docker commitment from UID {uid}: {parts[0]}")
-            return None
-        
-        image_name = parts[1]
-        image_hash = parts[2]
         
         # Validate image name format
         if not cls._is_valid_image_name(image_name):
@@ -85,7 +114,7 @@ class MinerCommitment:
             uid=uid,
             hotkey=hotkey,
             image_name=image_name,
-            image_hash=image_hash,
+            image_hash=image_hash or "",
             commit_block=commit_block,
             reveal_block=reveal_block,
             is_revealed=current_block >= reveal_block,
@@ -160,8 +189,19 @@ class CommitmentReader:
     def get_current_block(self) -> int:
         """Get current blockchain block number."""
         if self.local_mode:
-            # In local mode, use timestamp as mock block number
-            return int(time.time())
+            # In local mode, get max block from local commitments + 1000
+            # This ensures new commitments are detected
+            max_block = 0
+            if self.local_commits_dir.exists():
+                for commit_file in self.local_commits_dir.glob("*.json"):
+                    try:
+                        data = json.loads(commit_file.read_text())
+                        reveal_block = data.get("reveal_block", 0)
+                        max_block = max(max_block, reveal_block)
+                    except Exception:
+                        pass
+            # Return max reveal_block + 1 to mark commitments as revealed
+            return max_block + 1 if max_block > 0 else 0
         return self.subtensor.get_current_block()
     
     def get_all_commitments(self) -> list[MinerCommitment]:
@@ -325,10 +365,11 @@ class CommitmentReader:
         """
         all_commitments = self.get_all_commitments()
         
-        # Filter to only those revealed after last_block
+        # Filter to only those committed after last_block
+        # Use commit_block for ordering (when the miner submitted)
         new_commitments = [
             c for c in all_commitments
-            if c.reveal_block > last_block
+            if c.commit_block > last_block and c.is_revealed
         ]
         
         logger.info(f"Found {len(new_commitments)} new commitments since block {last_block}")

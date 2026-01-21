@@ -163,8 +163,12 @@ def create_validator_panel(data: TournamentData) -> Panel:
 
     current_eval = validator.get("current_evaluation")
     eval_text = "None"
-    if current_eval and current_eval.get("miner_uid") is not None:
-        eval_text = f"UID {current_eval['miner_uid']}"
+    if current_eval:
+        # Handle both dict (legacy) and string (new) formats
+        if isinstance(current_eval, dict) and current_eval.get("miner_uid") is not None:
+            eval_text = f"UID {current_eval['miner_uid']}"
+        elif isinstance(current_eval, str):
+            eval_text = current_eval[:20] + "..." if len(current_eval) > 20 else current_eval
 
     uptime = validator.get("uptime", "N/A")
     evals_1h = validator.get("evaluations_completed_1h", 0)

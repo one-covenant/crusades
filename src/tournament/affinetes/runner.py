@@ -344,40 +344,52 @@ asyncio.run(main())
         """Run evaluation remotely via Basilica.
         
         This uses the affinetes library to call Basilica's API.
+        Based on Chi validator pattern: https://github.com/one-covenant/Chi/blob/main/validator.py#L148
         """
         logger.info(f"Running Basilica evaluation: {image}")
         
-        if not self.basilica_endpoint:
-            return EvaluationResult.failure(
-                "Basilica endpoint not configured",
-                task_id=task_id,
-            )
-        
         try:
             # Try to import affinetes
-            import affinetes as af
+            from affinetes import env as af_env
             
-            # Load environment from Docker image
-            env = af.load_env(
+            # Build env_vars for the container
+            env_vars = {}
+            if self.basilica_api_key:
+                env_vars["BASILICA_API_KEY"] = self.basilica_api_key
+            env_vars["OUTPUT_VECTOR_TOLERANCE"] = str(self.output_tolerance)
+            
+            # Load environment from Docker image (Chi pattern)
+            env = af_env.load_env(
+                mode="basilica",
                 image=image,
-                endpoint=self.basilica_endpoint,
-                api_key=self.basilica_api_key,
+                cpu_limit=os.getenv("BASILICA_CPU_LIMIT", "2000m"),
+                mem_limit=os.getenv("BASILICA_MEM_LIMIT", "32Gi"),
+                env_vars=env_vars,
             )
             
             # Call evaluate method
-            result = await env.evaluate(
-                task_id=task_id,
-                seed=seed,
-                model_url=model_url,
-                data_url=data_url,
-                steps=steps,
-                batch_size=batch_size,
-                sequence_length=sequence_length,
-                data_samples=data_samples,
-                timeout=self.timeout,
-            )
-            
-            return EvaluationResult.from_dict(result)
+            try:
+                result = await asyncio.wait_for(
+                    env.evaluate(
+                        task_id=task_id,
+                        seed=seed,
+                        model_url=model_url,
+                        data_url=data_url,
+                        steps=steps,
+                        batch_size=batch_size,
+                        sequence_length=sequence_length,
+                        data_samples=data_samples,
+                        timeout=self.timeout,
+                    ),
+                    timeout=self.timeout + 30,
+                )
+                return EvaluationResult.from_dict(result)
+            finally:
+                # Cleanup (Chi pattern)
+                try:
+                    await env.cleanup()
+                except Exception as cleanup_err:
+                    logger.warning(f"Cleanup failed: {cleanup_err}")
             
         except ImportError:
             logger.warning("affinetes not installed, using HTTP fallback")
@@ -390,6 +402,11 @@ asyncio.run(main())
                 batch_size=batch_size,
                 sequence_length=sequence_length,
                 data_samples=data_samples,
+                task_id=task_id,
+            )
+        except asyncio.TimeoutError:
+            return EvaluationResult.failure(
+                f"Basilica timeout after {self.timeout}s",
                 task_id=task_id,
             )
         except Exception as e:
