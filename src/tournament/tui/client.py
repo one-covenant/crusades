@@ -320,21 +320,24 @@ class DatabaseClient:
         }
 
     def get_history(self) -> list[dict[str, Any]]:
-        """Get TPS history for chart."""
+        """Get TPS history for chart - includes individual evaluation runs."""
+        # Get individual evaluation runs for more granular chart data
         rows = self._query(
-            "SELECT submission_id, final_score, created_at FROM submissions "
-            "WHERE status = 'finished' AND final_score IS NOT NULL "
-            "ORDER BY created_at DESC LIMIT 50"
+            "SELECT e.submission_id, e.tokens_per_second as tps, e.created_at "
+            "FROM evaluations e "
+            "JOIN submissions s ON e.submission_id = s.submission_id "
+            "WHERE e.success = 1 "
+            "ORDER BY e.created_at ASC LIMIT 100"
         )
         
         history = []
         for row in rows:
             history.append({
                 "submission_id": row["submission_id"],
-                "tps": row["final_score"],
+                "tps": row["tps"],
                 "timestamp": row["created_at"],
             })
-        return list(reversed(history))  # Oldest first for chart
+        return history
 
     def fetch_all(self) -> TournamentData:
         """Fetch all tournament data."""
