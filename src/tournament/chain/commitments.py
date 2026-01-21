@@ -1,20 +1,26 @@
-"""Blockchain commitment reading for Chi/Affinetes architecture.
+"""Blockchain commitment reading for Templar Tournament.
 
-This module reads miner Docker image commitments from the Bittensor blockchain.
-Validators use this to discover which submissions to evaluate.
-
-Commitment format: "docker|<image_name>|<hash>"
+R2-Based Architecture:
+- Miners commit R2 credentials + link to blockchain
+- After reveal, validators can download train.py from miner's R2
+- Commitment format (JSON):
+  {
+    "r2_endpoint": "https://xxx.r2.cloudflarestorage.com",
+    "r2_bucket": "miner-bucket",
+    "r2_key": "submissions/xxx/train.py",
+    "r2_access_key": "...",
+    "r2_secret_key": "...",
+    "code_hash": "sha256..."
+  }
 
 For local testing, also supports reading from .local_commitments/ directory.
 """
 
 import json
-import time
 import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 import bittensor as bt
 
@@ -22,13 +28,34 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class R2Credentials:
+    """R2/S3 credentials from miner commitment."""
+    
+    endpoint: str
+    bucket: str
+    key: str
+    access_key: str
+    secret_key: str
+    
+    def is_valid(self) -> bool:
+        """Check if credentials are complete."""
+        return all([
+            self.endpoint,
+            self.bucket,
+            self.key,
+            self.access_key,
+            self.secret_key,
+        ])
+
+
+@dataclass
 class MinerCommitment:
-    """A miner's Docker image commitment from the blockchain."""
+    """A miner's R2 commitment from the blockchain."""
     
     uid: int
     hotkey: str
-    image_name: str
-    image_hash: str
+    r2_credentials: R2Credentials | None
+    code_hash: str
     commit_block: int
     reveal_block: int
     is_revealed: bool
@@ -46,10 +73,19 @@ class MinerCommitment:
     ) -> "MinerCommitment | None":
         """Parse commitment from blockchain data.
         
-        Supports multiple formats (for Chi compatibility):
-        1. Pipe format: "docker|<image_name>|<hash>"
-        2. JSON format: {"image": "...", "fingerprint": "..."}
-        3. Simple formats: "image=..." or "docker://..."
+        Expects JSON format with R2 credentials:
+        {
+            "r2_endpoint": "...",
+            "r2_bucket": "...",
+            "r2_key": "...",
+            "r2_access_key": "...",
+            "r2_secret_key": "...",
+            "code_hash": "..."
+        }
+        
+        Also supports legacy Docker format for backwards compatibility:
+        - "docker|<image_name>|<hash>"
+        - {"image": "...", "fingerprint": "..."}
         
         Args:
             uid: Miner UID
@@ -66,67 +102,65 @@ class MinerCommitment:
             return None
         
         data = data.strip()
-        image_name = None
-        image_hash = None
+        r2_credentials = None
+        code_hash = ""
         
-        # Try JSON format first (Chi pattern)
+        # Try JSON format (R2 credentials)
         if data.startswith("{"):
             try:
                 parsed = json.loads(data)
-                image_name = parsed.get("image") or parsed.get("image_url")
-                image_hash = parsed.get("fingerprint") or parsed.get("fp") or parsed.get("hash")
-                if image_name:
-                    image_name = image_name.strip()
-                if image_hash and isinstance(image_hash, str):
-                    image_hash = image_hash.strip()
+                
+                # New R2 format
+                if "r2_endpoint" in parsed or "r2_bucket" in parsed:
+                    r2_credentials = R2Credentials(
+                        endpoint=parsed.get("r2_endpoint", ""),
+                        bucket=parsed.get("r2_bucket", ""),
+                        key=parsed.get("r2_key", ""),
+                        access_key=parsed.get("r2_access_key", ""),
+                        secret_key=parsed.get("r2_secret_key", ""),
+                    )
+                    code_hash = parsed.get("code_hash", "")
+                    
+                    if not r2_credentials.is_valid():
+                        logger.warning(f"Incomplete R2 credentials from UID {uid}")
+                        # Still return commitment so it can be tracked
+                
+                # Legacy Docker format (Chi compatibility)
+                elif "image" in parsed:
+                    # Convert to legacy format for backwards compatibility
+                    image_name = parsed.get("image") or parsed.get("image_url", "")
+                    code_hash = parsed.get("fingerprint") or parsed.get("fp") or parsed.get("hash", "")
+                    logger.debug(f"Legacy Docker format from UID {uid}: {image_name}")
+                    
             except json.JSONDecodeError:
-                pass
+                logger.debug(f"Invalid JSON in commitment from UID {uid}")
         
-        # Try pipe format: "docker|<image>|<hash>"
-        if not image_name and "|" in data:
+        # Legacy pipe format: "docker|<image>|<hash>"
+        elif "|" in data:
             parts = data.split("|")
             if len(parts) == 3 and parts[0] == "docker":
-                image_name = parts[1]
-                image_hash = parts[2]
+                logger.debug(f"Legacy Docker pipe format from UID {uid}")
+                code_hash = parts[2]
         
-        # Try "image=..." format
-        if not image_name and data.startswith("image="):
-            image_name = data.split("=", 1)[1].strip()
-        
-        # Try "docker://..." format
-        if not image_name and data.startswith("docker://"):
-            image_name = data.replace("docker://", "", 1).strip()
-        
-        # Last resort: treat entire string as image name
-        if not image_name and cls._is_valid_image_name(data):
-            image_name = data
-        
-        if not image_name:
+        # If we couldn't parse anything useful, skip
+        if r2_credentials is None and not code_hash:
             logger.debug(f"Could not parse commitment from UID {uid}: {data[:50]}...")
-            return None
-        
-        # Validate image name format
-        if not cls._is_valid_image_name(image_name):
-            logger.warning(f"Invalid Docker image name from UID {uid}: {image_name}")
             return None
         
         return cls(
             uid=uid,
             hotkey=hotkey,
-            image_name=image_name,
-            image_hash=image_hash or "",
+            r2_credentials=r2_credentials,
+            code_hash=code_hash,
             commit_block=commit_block,
             reveal_block=reveal_block,
             is_revealed=current_block >= reveal_block,
             raw_data=data,
         )
     
-    @staticmethod
-    def _is_valid_image_name(name: str) -> bool:
-        """Validate Docker image name format."""
-        # Basic validation: alphanumeric, dashes, underscores, slashes, colons, dots
-        pattern = r'^[a-zA-Z0-9][a-zA-Z0-9._\-/:]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$'
-        return bool(re.match(pattern, name))
+    def has_r2_credentials(self) -> bool:
+        """Check if this commitment has valid R2 credentials."""
+        return self.r2_credentials is not None and self.r2_credentials.is_valid()
 
 
 class CommitmentReader:
@@ -143,7 +177,7 @@ class CommitmentReader:
         """Initialize commitment reader.
         
         Args:
-            subtensor: Bittensor subtensor instance (created if None)
+            subtensor: Bittensor subtensor instance
             netuid: Subnet ID
             network: Network name (local, test, finney)
             local_mode: Read from local files instead of blockchain
@@ -174,7 +208,6 @@ class CommitmentReader:
     
     def sync(self) -> None:
         """Sync metagraph with blockchain."""
-        # Skip sync in local mode
         if self.local_mode:
             logger.info("Skipping metagraph sync (local mode)")
             return
@@ -189,8 +222,7 @@ class CommitmentReader:
     def get_current_block(self) -> int:
         """Get current blockchain block number."""
         if self.local_mode:
-            # In local mode, get max block from local commitments + 1000
-            # This ensures new commitments are detected
+            # In local mode, get max block from local commitments + buffer
             max_block = 0
             if self.local_commits_dir.exists():
                 for commit_file in self.local_commits_dir.glob("*.json"):
@@ -205,19 +237,18 @@ class CommitmentReader:
         return self.subtensor.get_current_block()
     
     def get_all_commitments(self) -> list[MinerCommitment]:
-        """Get all miner commitments from blockchain.
+        """Get all miner commitments.
         
         Returns:
             List of MinerCommitment objects
         """
-        # For local testing, read from files
         if self.local_mode:
             return self._get_local_commitments()
         
         current_block = self.get_current_block()
         commitments = []
         
-        # Use get_all_commitments which returns {hotkey: data_string}
+        # Try get_all_commitments first
         if hasattr(self.subtensor, 'get_all_commitments'):
             try:
                 all_commits = self.subtensor.get_all_commitments(netuid=self.netuid)
@@ -229,7 +260,7 @@ class CommitmentReader:
                     for uid in range(self.metagraph.n):
                         hotkey_to_uid[self.metagraph.hotkeys[uid]] = uid
                 except Exception:
-                    pass  # Continue without UID mapping
+                    pass
                 
                 for hotkey, data in all_commits.items():
                     uid = hotkey_to_uid.get(hotkey, 0)
@@ -237,12 +268,12 @@ class CommitmentReader:
                         uid=uid,
                         hotkey=hotkey,
                         data=data,
-                        commit_block=0,  # Not available from this API
+                        commit_block=0,
                         reveal_block=0,
                         current_block=current_block,
                     )
                     if commitment:
-                        commitment.is_revealed = True  # All from get_all_commitments are visible
+                        commitment.is_revealed = True
                         commitments.append(commitment)
                 
                 logger.info(f"Found {len(commitments)} commitments from chain")
@@ -251,7 +282,7 @@ class CommitmentReader:
             except Exception as e:
                 logger.warning(f"get_all_commitments failed: {e}")
         
-        # Fallback: Read commitments from each UID
+        # Fallback: Read from each UID
         logger.info("Using fallback commitment reading...")
         
         for uid in range(self.metagraph.n):
@@ -283,17 +314,26 @@ class CommitmentReader:
             try:
                 data = json.loads(commit_file.read_text())
                 
+                # Build commitment data string (JSON format)
+                commitment_data = json.dumps({
+                    "r2_endpoint": data.get("r2_endpoint", ""),
+                    "r2_bucket": data.get("r2_bucket", ""),
+                    "r2_key": data.get("r2_key", ""),
+                    "r2_access_key": data.get("r2_access_key", ""),
+                    "r2_secret_key": data.get("r2_secret_key", ""),
+                    "code_hash": data.get("code_hash", ""),
+                })
+                
                 commitment = MinerCommitment.from_chain_data(
                     uid=data.get("uid", 1),
                     hotkey=data.get("hotkey", ""),
-                    data=data.get("data", ""),
+                    data=commitment_data,
                     commit_block=data.get("commit_block", 0),
                     reveal_block=data.get("reveal_block", 0),
                     current_block=current_block,
                 )
                 
                 if commitment:
-                    # For local testing, always consider revealed
                     commitment.is_revealed = True
                     commitments.append(commitment)
                     logger.debug(f"Loaded local commitment: {commit_file.name}")
@@ -321,13 +361,11 @@ class CommitmentReader:
         if current_block is None:
             current_block = self.get_current_block()
         
-        # Get hotkey for UID
         try:
             hotkey = self.metagraph.hotkeys[uid]
         except (IndexError, AttributeError):
             return None
         
-        # Try to get commitment data
         try:
             if hasattr(self.subtensor, 'get_commitment'):
                 result = self.subtensor.get_commitment(
@@ -355,8 +393,6 @@ class CommitmentReader:
     ) -> list[MinerCommitment]:
         """Get commitments revealed since a specific block.
         
-        Useful for validators to process only new submissions.
-        
         Args:
             last_block: Last processed block number
             
@@ -365,8 +401,7 @@ class CommitmentReader:
         """
         all_commitments = self.get_all_commitments()
         
-        # Filter to only those committed after last_block
-        # Use commit_block for ordering (when the miner submitted)
+        # Filter to only those committed after last_block and revealed
         new_commitments = [
             c for c in all_commitments
             if c.commit_block > last_block and c.is_revealed
@@ -375,14 +410,14 @@ class CommitmentReader:
         logger.info(f"Found {len(new_commitments)} new commitments since block {last_block}")
         return new_commitments
     
-    def iter_commitments(self) -> Iterator[MinerCommitment]:
-        """Iterate over all revealed commitments.
+    def get_r2_commitments(self) -> list[MinerCommitment]:
+        """Get only commitments with valid R2 credentials.
         
-        Yields:
-            MinerCommitment objects
+        Returns:
+            List of commitments with R2 credentials
         """
-        for commitment in self.get_all_commitments():
-            yield commitment
+        all_commitments = self.get_all_commitments()
+        return [c for c in all_commitments if c.has_r2_credentials()]
 
 
 def get_commitment_reader(
@@ -399,4 +434,3 @@ def get_commitment_reader(
         Configured CommitmentReader
     """
     return CommitmentReader(netuid=netuid, network=network)
-

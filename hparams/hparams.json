@@ -1,5 +1,5 @@
 {
-    "netuid": 3,
+    "netuid": 1,
     "burn_rate": 0.95,
     "burn_uid": 1,
 
@@ -10,7 +10,7 @@
     "benchmark_model_name": "Qwen/Qwen2.5-7B",
     "benchmark_dataset_name": "HuggingFaceFW/fineweb",
     "benchmark_dataset_split": "train",
-    "benchmark_data_samples": 1000,
+    "benchmark_data_samples": 10000,
     "benchmark_train_size": 100000,
     "benchmark_master_seed": 42,
     "benchmark_sequence_length": 1024,

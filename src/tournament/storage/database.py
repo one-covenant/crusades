@@ -74,6 +74,41 @@ class Database:
                 submission.status = SubmissionStatus.FINISHED
                 await session.commit()
 
+    async def update_submission_code(self, submission_id: str, code: str) -> None:
+        """Store miner's code content after evaluation.
+        
+        This is called by the validator after downloading and evaluating
+        the miner's code, so it can be displayed on the dashboard.
+        
+        Args:
+            submission_id: Submission ID
+            code: Miner's train.py code content
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SubmissionModel).where(SubmissionModel.submission_id == submission_id)
+            )
+            submission = result.scalar_one_or_none()
+            if submission:
+                submission.code_content = code
+                await session.commit()
+
+    async def get_submission_code(self, submission_id: str) -> str | None:
+        """Get miner's code content for a submission.
+        
+        Args:
+            submission_id: Submission ID
+            
+        Returns:
+            Code content or None if not stored
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SubmissionModel.code_content)
+                .where(SubmissionModel.submission_id == submission_id)
+            )
+            return result.scalar_one_or_none()
+
     async def get_all_submissions(self) -> list[SubmissionModel]:
         """Get all submissions."""
         async with self.session_factory() as session:
@@ -141,14 +176,13 @@ class Database:
             return list(result.scalars().all())
 
     async def count_evaluations(self, submission_id: str) -> int:
-        """Count successful evaluations for a submission."""
+        """Count ALL evaluations for a submission (including failed)."""
         async with self.session_factory() as session:
             result = await session.execute(
                 select(func.count())
                 .select_from(EvaluationModel)
                 .where(
                     EvaluationModel.submission_id == submission_id,
-                    EvaluationModel.success,
                 )
             )
             return result.scalar() or 0

@@ -28,10 +28,11 @@ class Base(DeclarativeBase):
 class SubmissionModel(Base):
     """Database model for code submissions.
     
-    Chi/Affinetes Architecture:
-    - submission_id: Format "chi_{block}_{uid}" for blockchain submissions
-    - code_hash: Hash of Docker image (from commitment)
-    - bucket_path: Docker image name (from commitment)
+    R2-Based Architecture:
+    - submission_id: Format "r2_{block}_{uid}" for R2 submissions
+    - code_hash: SHA256 hash of miner's code
+    - bucket_path: JSON with R2 credentials (miner's bucket)
+    - code_content: Actual miner code (stored after evaluation)
     """
 
     __tablename__ = "submissions"
@@ -42,7 +43,7 @@ class SubmissionModel(Base):
     miner_hotkey: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
     miner_uid: Mapped[int] = mapped_column(Integer, nullable=False)
     code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    bucket_path: Mapped[str] = mapped_column(String(256), nullable=False)
+    bucket_path: Mapped[str] = mapped_column(String(1024), nullable=False)  # JSON with R2 info
 
     status: Mapped[SubmissionStatus] = mapped_column(
         Enum(SubmissionStatus, values_callable=lambda obj: [e.value for e in obj]),
@@ -57,8 +58,10 @@ class SubmissionModel(Base):
     final_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Miner's actual code (stored after evaluation for dashboard display)
+    code_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Rate limiting handled by checking commit_block in submission_id
-    # No payment required - we use min_blocks_between_commits instead
     payment_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     # Relationships

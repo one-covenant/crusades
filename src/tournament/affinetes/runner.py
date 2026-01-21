@@ -1,6 +1,11 @@
-"""Affinetes runner for evaluating miner Docker images.
+"""Affinetes runner for evaluating miner submissions.
 
-Supports two execution modes:
+R2-Based Architecture:
+- Validator owns the evaluation environment (env.py in Docker image)
+- Miner's train.py is downloaded from their R2 at evaluation time
+- No miner-specific Docker images - single validator image
+
+Execution modes:
 1. Local Docker mode (for testing without Basilica)
 2. Basilica mode (production - remote GPU execution)
 """
@@ -31,6 +36,7 @@ class EvaluationResult:
     seed: str = ""
     task_id: int = 0
     diagnostics: dict = field(default_factory=dict)
+    code: str | None = None  # Miner's code for storage
     
     @classmethod
     def from_dict(cls, data: dict) -> "EvaluationResult":
@@ -44,6 +50,7 @@ class EvaluationResult:
             seed=str(data.get("seed", "")),
             task_id=int(data.get("task_id", 0)),
             diagnostics=data.get("diagnostics", {}),
+            code=data.get("code"),
         )
     
     @classmethod
@@ -52,20 +59,41 @@ class EvaluationResult:
         return cls(success=False, error=error, task_id=task_id)
 
 
+@dataclass
+class R2Info:
+    """R2 credentials for accessing miner's code."""
+    
+    endpoint: str
+    bucket: str
+    key: str
+    access_key: str
+    secret_key: str
+    
+    def is_valid(self) -> bool:
+        return all([self.endpoint, self.bucket, self.key, self.access_key, self.secret_key])
+
+
 class AffinetesRunner:
     """Runs evaluations via affinetes (Docker or Basilica).
+    
+    R2-Based Architecture:
+    - Uses a single validator-owned Docker image (templar-eval)
+    - Passes R2 credentials to env.py to download miner's train.py
+    - Returns miner's code for storage in validator's R2
     
     Example:
         runner = AffinetesRunner(mode="docker")
         result = await runner.evaluate(
-            image="templar-submission:v1",
+            r2_info=R2Info(endpoint="...", bucket="...", ...),
             seed="12345",
-            model_url="https://...",
-            data_url="https://...",
         )
         if result.success:
             print(f"TPS: {result.tps}")
+            # Store result.code in validator's R2
     """
+    
+    # Validator's standard evaluation image
+    VALIDATOR_IMAGE = os.getenv("VALIDATOR_EVAL_IMAGE", "templar-eval:latest")
     
     def __init__(
         self,
@@ -77,18 +105,20 @@ class AffinetesRunner:
         model_url: str | None = None,
         data_url: str | None = None,
         output_tolerance: float = 0.02,
+        validator_image: str | None = None,
     ):
         """Initialize the runner.
         
         Args:
             mode: Execution mode ("docker" for local, "basilica" for remote)
-            basilica_endpoint: Basilica API endpoint (required for basilica mode)
-            basilica_api_key: Basilica API key (required for basilica mode)
+            basilica_endpoint: Basilica API endpoint
+            basilica_api_key: Basilica API key
             docker_gpu: Enable GPU in local Docker mode
             timeout: Evaluation timeout in seconds
-            model_url: Default model URL for evaluations
-            data_url: Default data URL for evaluations
+            model_url: Default model URL (HuggingFace model ID)
+            data_url: Default data URL (HuggingFace dataset)
             output_tolerance: Verification tolerance (0.02 = 2%)
+            validator_image: Validator's Docker image name
         """
         self.mode = mode
         self.basilica_endpoint = basilica_endpoint or os.getenv("BASILICA_ENDPOINT")
@@ -98,13 +128,14 @@ class AffinetesRunner:
         self.default_model_url = model_url
         self.default_data_url = data_url
         self.output_tolerance = output_tolerance
+        self.validator_image = validator_image or self.VALIDATOR_IMAGE
         
         if mode == "basilica" and not self.basilica_endpoint:
             logger.warning("Basilica mode selected but no endpoint configured")
     
     async def evaluate(
         self,
-        image: str,
+        r2_info: R2Info,
         seed: str | int = 0,
         model_url: str | None = None,
         data_url: str | None = None,
@@ -114,21 +145,21 @@ class AffinetesRunner:
         data_samples: int = 10000,
         task_id: int = 0,
     ) -> EvaluationResult:
-        """Evaluate a miner's Docker image.
+        """Evaluate a miner's submission from their R2 bucket.
         
         Args:
-            image: Docker image name (e.g., "templar-submission:v1")
+            r2_info: Miner's R2 credentials and path
             seed: Random seed for evaluation
-            model_url: URL to benchmark model (or HuggingFace model ID)
-            data_url: URL to benchmark data (or HuggingFace dataset name)
+            model_url: HuggingFace model name
+            data_url: HuggingFace dataset name
             steps: Number of training steps
             batch_size: Batch size
-            sequence_length: Sequence length for evaluation
-            data_samples: Number of data samples to load
+            sequence_length: Sequence length
+            data_samples: Number of data samples
             task_id: Evaluation task identifier
             
         Returns:
-            EvaluationResult with TPS if successful
+            EvaluationResult with TPS and miner's code if successful
         """
         model_url = model_url or self.default_model_url
         data_url = data_url or self.default_data_url
@@ -139,9 +170,15 @@ class AffinetesRunner:
                 task_id=task_id,
             )
         
+        if not r2_info.is_valid():
+            return EvaluationResult.failure(
+                "Invalid R2 credentials",
+                task_id=task_id,
+            )
+        
         if self.mode == "docker":
             return await self._evaluate_docker(
-                image=image,
+                r2_info=r2_info,
                 seed=str(seed),
                 model_url=model_url,
                 data_url=data_url,
@@ -153,7 +190,7 @@ class AffinetesRunner:
             )
         elif self.mode == "basilica":
             return await self._evaluate_basilica(
-                image=image,
+                r2_info=r2_info,
                 seed=str(seed),
                 model_url=model_url,
                 data_url=data_url,
@@ -171,7 +208,7 @@ class AffinetesRunner:
     
     async def _evaluate_docker(
         self,
-        image: str,
+        r2_info: R2Info,
         seed: str,
         model_url: str,
         data_url: str,
@@ -183,22 +220,25 @@ class AffinetesRunner:
     ) -> EvaluationResult:
         """Run evaluation locally using Docker.
         
-        This creates a container from the miner's image and calls
-        the Actor.evaluate() method via a Python script.
+        Uses the validator's standard image, passes R2 credentials to download
+        miner's train.py at runtime.
         """
-        logger.info(f"Running Docker evaluation: {image}")
+        logger.info(f"Running Docker evaluation with R2 download")
+        logger.info(f"   R2 bucket: {r2_info.bucket}")
+        logger.info(f"   R2 key: {r2_info.key}")
         
-        # Check if image exists
-        check_cmd = ["docker", "image", "inspect", image]
+        # Check if validator image exists
+        check_cmd = ["docker", "image", "inspect", self.validator_image]
         check_result = subprocess.run(check_cmd, capture_output=True)
         
         if check_result.returncode != 0:
             return EvaluationResult.failure(
-                f"Docker image not found: {image}",
+                f"Validator image not found: {self.validator_image}. "
+                f"Build it first: cd environments/templar && docker build -t {self.validator_image} .",
                 task_id=task_id,
             )
         
-        # Create evaluation script to run inside container
+        # Create evaluation script
         eval_script = f'''
 import asyncio
 import json
@@ -219,6 +259,11 @@ async def main():
         sequence_length={sequence_length},
         data_samples={data_samples},
         timeout={self.timeout},
+        r2_endpoint="{r2_info.endpoint}",
+        r2_bucket="{r2_info.bucket}",
+        r2_key="{r2_info.key}",
+        r2_access_key="{r2_info.access_key}",
+        r2_secret_key="{r2_info.secret_key}",
     )
     print("EVAL_RESULT:" + json.dumps(result))
 
@@ -242,33 +287,33 @@ asyncio.run(main())
                 "-v", f"{script_path}:/tmp/eval_script.py:ro",
             ]
             
-            # Add GPU if available and requested
+            # Add GPU if available
             if self.docker_gpu:
                 docker_cmd.extend(["--gpus", "all"])
             
-            # Add memory limits
+            # Memory limits
             docker_cmd.extend([
                 "--memory", "32g",
                 "--shm-size", "8g",
             ])
             
-            # Pass verification tolerance via env var
+            # Environment variables
             docker_cmd.extend([
                 "-e", f"OUTPUT_VECTOR_TOLERANCE={self.output_tolerance}",
             ])
             
-            # Set timeout
+            # Timeout
             docker_cmd.extend([
                 "--stop-timeout", str(self.timeout),
             ])
             
             # Image and command
             docker_cmd.extend([
-                image,
+                self.validator_image,
                 "python", "/tmp/eval_script.py",
             ])
             
-            logger.info(f"Running: {' '.join(docker_cmd[:10])}...")
+            logger.info(f"Running evaluation in {self.validator_image}...")
             
             # Run with timeout
             start_time = time.perf_counter()
@@ -282,7 +327,7 @@ asyncio.run(main())
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=self.timeout + 30,  # Extra buffer for container startup
+                    timeout=self.timeout + 60,  # Buffer for download
                 )
             except asyncio.TimeoutError:
                 process.kill()
@@ -303,7 +348,7 @@ asyncio.run(main())
                     task_id=task_id,
                 )
             
-            # Parse result from output
+            # Parse result
             for line in stdout_text.split('\n'):
                 if line.startswith("EVAL_RESULT:"):
                     result_json = line[len("EVAL_RESULT:"):]
@@ -316,14 +361,12 @@ asyncio.run(main())
                             task_id=task_id,
                         )
             
-            # No result found in output
             return EvaluationResult.failure(
                 f"No evaluation result in output. stdout: {stdout_text[:200]}",
                 task_id=task_id,
             )
             
         finally:
-            # Clean up temp script
             try:
                 os.unlink(script_path)
             except Exception:
@@ -331,7 +374,7 @@ asyncio.run(main())
     
     async def _evaluate_basilica(
         self,
-        image: str,
+        r2_info: R2Info,
         seed: str,
         model_url: str,
         data_url: str,
@@ -341,33 +384,27 @@ asyncio.run(main())
         data_samples: int,
         task_id: int,
     ) -> EvaluationResult:
-        """Run evaluation remotely via Basilica.
-        
-        This uses the affinetes library to call Basilica's API.
-        Based on Chi validator pattern: https://github.com/one-covenant/Chi/blob/main/validator.py#L148
-        """
-        logger.info(f"Running Basilica evaluation: {image}")
+        """Run evaluation remotely via Basilica."""
+        logger.info(f"Running Basilica evaluation with R2 download")
         
         try:
-            # Try to import affinetes
             from affinetes import env as af_env
             
-            # Build env_vars for the container
-            env_vars = {}
+            env_vars = {
+                "OUTPUT_VECTOR_TOLERANCE": str(self.output_tolerance),
+            }
             if self.basilica_api_key:
                 env_vars["BASILICA_API_KEY"] = self.basilica_api_key
-            env_vars["OUTPUT_VECTOR_TOLERANCE"] = str(self.output_tolerance)
             
-            # Load environment from Docker image (Chi pattern)
+            # Load validator's environment
             env = af_env.load_env(
                 mode="basilica",
-                image=image,
+                image=self.validator_image,
                 cpu_limit=os.getenv("BASILICA_CPU_LIMIT", "2000m"),
                 mem_limit=os.getenv("BASILICA_MEM_LIMIT", "32Gi"),
                 env_vars=env_vars,
             )
             
-            # Call evaluate method
             try:
                 result = await asyncio.wait_for(
                     env.evaluate(
@@ -380,12 +417,16 @@ asyncio.run(main())
                         sequence_length=sequence_length,
                         data_samples=data_samples,
                         timeout=self.timeout,
+                        r2_endpoint=r2_info.endpoint,
+                        r2_bucket=r2_info.bucket,
+                        r2_key=r2_info.key,
+                        r2_access_key=r2_info.access_key,
+                        r2_secret_key=r2_info.secret_key,
                     ),
-                    timeout=self.timeout + 30,
+                    timeout=self.timeout + 60,
                 )
                 return EvaluationResult.from_dict(result)
             finally:
-                # Cleanup (Chi pattern)
                 try:
                     await env.cleanup()
                 except Exception as cleanup_err:
@@ -394,7 +435,7 @@ asyncio.run(main())
         except ImportError:
             logger.warning("affinetes not installed, using HTTP fallback")
             return await self._evaluate_basilica_http(
-                image=image,
+                r2_info=r2_info,
                 seed=seed,
                 model_url=model_url,
                 data_url=data_url,
@@ -417,7 +458,7 @@ asyncio.run(main())
     
     async def _evaluate_basilica_http(
         self,
-        image: str,
+        r2_info: R2Info,
         seed: str,
         model_url: str,
         data_url: str,
@@ -437,7 +478,7 @@ asyncio.run(main())
             )
         
         payload = {
-            "image": image,
+            "image": self.validator_image,
             "method": "evaluate",
             "params": {
                 "task_id": task_id,
@@ -449,6 +490,11 @@ asyncio.run(main())
                 "sequence_length": sequence_length,
                 "data_samples": data_samples,
                 "timeout": self.timeout,
+                "r2_endpoint": r2_info.endpoint,
+                "r2_bucket": r2_info.bucket,
+                "r2_key": r2_info.key,
+                "r2_access_key": r2_info.access_key,
+                "r2_secret_key": r2_info.secret_key,
             },
         }
         
@@ -479,44 +525,45 @@ asyncio.run(main())
                 task_id=task_id,
             )
     
-    async def check_image_exists(self, image: str) -> bool:
-        """Check if a Docker image exists (locally or in registry).
+    async def build_validator_image(self, env_path: Path | None = None) -> bool:
+        """Build the validator's evaluation Docker image.
         
         Args:
-            image: Docker image name
+            env_path: Path to environments/templar directory
             
         Returns:
-            True if image exists
+            True if build succeeded
         """
-        if self.mode == "docker":
-            # Check local Docker
-            cmd = ["docker", "image", "inspect", image]
-            result = subprocess.run(cmd, capture_output=True)
-            return result.returncode == 0
-        else:
-            # For Basilica, assume image exists (Basilica will pull it)
-            return True
-    
-    async def pull_image(self, image: str) -> bool:
-        """Pull Docker image from registry.
+        if env_path is None:
+            candidates = [
+                Path(__file__).parent.parent.parent.parent / "environments" / "templar",
+                Path.cwd() / "environments" / "templar",
+            ]
+            for candidate in candidates:
+                if candidate.exists() and (candidate / "Dockerfile").exists():
+                    env_path = candidate
+                    break
         
-        Args:
-            image: Docker image name
-            
-        Returns:
-            True if pull succeeded
-        """
-        if self.mode != "docker":
-            return True  # Basilica handles pulling
-        
-        logger.info(f"Pulling image: {image}")
-        cmd = ["docker", "pull", image]
-        result = subprocess.run(cmd, capture_output=True)
-        
-        if result.returncode != 0:
-            logger.error(f"Failed to pull {image}: {result.stderr.decode()}")
+        if env_path is None or not env_path.exists():
+            logger.error("Could not find environments/templar directory")
             return False
         
+        logger.info(f"Building validator image: {self.validator_image}")
+        logger.info(f"   From: {env_path}")
+        
+        cmd = [
+            "docker", "build",
+            "-t", self.validator_image,
+            str(env_path),
+        ]
+        
+        result = subprocess.run(cmd, capture_output=False)
+        
+        if result.returncode != 0:
+            logger.error(f"Failed to build validator image")
+            return False
+        
+        logger.info(f"Successfully built: {self.validator_image}")
         return True
 
 
@@ -528,15 +575,13 @@ def create_runner(
     
     Args:
         mode: "docker" or "basilica"
-        **kwargs: Additional arguments for AffinetesRunner
+        **kwargs: Additional arguments
         
     Returns:
         Configured AffinetesRunner
     """
-    # Load defaults from environment
     if mode == "basilica":
         kwargs.setdefault("basilica_endpoint", os.getenv("BASILICA_ENDPOINT"))
         kwargs.setdefault("basilica_api_key", os.getenv("BASILICA_API_KEY"))
     
     return AffinetesRunner(mode=mode, **kwargs)
-

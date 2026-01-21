@@ -1,12 +1,11 @@
 """Affinetes integration for Templar Tournament.
 
-This module provides a bridge to affinetes for running evaluations.
-Supports two modes:
-1. docker - Run locally using Docker (for testing)
-2. basilica - Run remotely on Basilica GPUs (production)
+R2-Based Architecture:
+- Validator owns the evaluation image (templar-eval)
+- Miner's code is downloaded from their R2 at evaluation time
+- Supports docker (local) and basilica (remote) modes
 """
 
-from .runner import AffinetesRunner, EvaluationResult
+from .runner import AffinetesRunner, EvaluationResult, R2Info
 
-__all__ = ["AffinetesRunner", "EvaluationResult"]
-
+__all__ = ["AffinetesRunner", "EvaluationResult", "R2Info"]

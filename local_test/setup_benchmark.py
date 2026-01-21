@@ -3,18 +3,23 @@
 Setup benchmark data and model for local miner testing.
 
 This script downloads and caches:
-1. The benchmark model (Qwen/Qwen2.5-7B)
-2. Pre-tokenized data samples (100k samples from FineWeb)
+1. The benchmark model (Qwen/Qwen2.5-7B) defined in hparams.json "benchmark_model_name"
+2. Pre-tokenized data samples defined in hparams.json "benchmark_dataset_name"
+3. Number of samples defined in hparams.json "benchmark_data_samples"
+4. Sequence length defined in hparams.json "benchmark_sequence_length"
+5. Master seed defined in hparams.json "benchmark_master_seed"
 
 Run once before testing your train.py locally:
-    uv run python scripts/setup_benchmark.py
+    uv run python local_test/setup_benchmark.py
 """
 
-import os
 import sys
 import json
 import torch
 from pathlib import Path
+
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -31,8 +36,6 @@ def setup_model(model_name: str, output_dir: Path):
     """Download and cache the benchmark model."""
     print(f"Downloading model: {model_name}")
     print(f"   Output: {output_dir}")
-    
-    from transformers import AutoModelForCausalLM, AutoTokenizer
     
     # Download tokenizer
     print("   Downloading tokenizer...")
@@ -65,9 +68,6 @@ def setup_data(
     print(f"   Sequence length: {sequence_length}")
     print(f"   Output: {output_path}")
     
-    from datasets import load_dataset
-    from transformers import AutoTokenizer
-    
     # Load tokenizer
     print("   Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -82,8 +82,9 @@ def setup_data(
         streaming=True,
     )
     
-    # Fixed seed for reproducible miner testing
-    BENCHMARK_SEED = 42
+    # Fixed seed for reproducible miner testing (from hparams)
+    hparams = load_hparams()
+    BENCHMARK_SEED = hparams.get("benchmark_master_seed", 42)
     print(f"   Using fixed seed: {BENCHMARK_SEED}")
     
     # Shuffle with buffer_size for efficiency
@@ -173,7 +174,7 @@ def main():
     print("=" * 60)
     print()
     print("You can now run local tests:")
-    print("   uv run python train.py")
+    print("   cd local_test && uv run python train.py")
     print()
 
 

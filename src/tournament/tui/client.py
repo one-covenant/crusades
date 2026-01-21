@@ -320,21 +320,27 @@ class DatabaseClient:
         }
 
     def get_history(self) -> list[dict[str, Any]]:
-        """Get TPS history for chart - includes individual evaluation runs."""
-        # Get individual evaluation runs for more granular chart data
+        """Get TPS history for chart - shows top TPS progression over time."""
+        # Get finished submissions ordered by time, tracking best score
         rows = self._query(
-            "SELECT e.submission_id, e.tokens_per_second as tps, e.created_at "
-            "FROM evaluations e "
-            "JOIN submissions s ON e.submission_id = s.submission_id "
-            "WHERE e.success = 1 "
-            "ORDER BY e.created_at ASC LIMIT 100"
+            "SELECT submission_id, final_score as tps, created_at "
+            "FROM submissions "
+            "WHERE status = 'finished' AND final_score IS NOT NULL "
+            "ORDER BY created_at ASC LIMIT 100"
         )
         
         history = []
+        running_best = 0.0
+        
         for row in rows:
+            tps = row["tps"] or 0.0
+            # Track the running best TPS
+            if tps > running_best:
+                running_best = tps
+            
             history.append({
                 "submission_id": row["submission_id"],
-                "tps": row["tps"],
+                "tps": running_best,  # Show best TPS so far
                 "timestamp": row["created_at"],
             })
         return history
@@ -366,26 +372,25 @@ class DatabaseClient:
         )
 
     def get_submission_code(self, submission_id: str) -> str | None:
-        """Extract code from Docker image."""
-        import subprocess
+        """Get code content from database (stored after evaluation).
         
+        R2-Based Architecture:
+        - Code is stored in code_content column after validator evaluates
+        - No need to extract from Docker image
+        """
         row = self._query_one(
-            "SELECT bucket_path, code_hash FROM submissions WHERE submission_id = ?",
+            "SELECT code_content, code_hash FROM submissions WHERE submission_id = ?",
             (submission_id,)
         )
         if not row:
             return None
         
-        image = row.get("bucket_path", "")
-        fingerprint = row.get("code_hash", "N/A")
+        code = row.get("code_content")
+        if code:
+            return code
         
-        if not image:
-            return "# No Docker image found for this submission"
-        
-        # Try to extract train.py from the Docker image
-        try:
-            result = subprocess.run(
-                ["docker", "run", "--rm", image, "cat", "/app/train.py"],
+        # Fallback: code not yet stored (still evaluating)
+        return f"# Code not yet available\n# Submission may still be evaluating\n# code_hash: {row.get('code_hash', 'N/A')}"
                 capture_output=True,
                 text=True,
                 timeout=10,
