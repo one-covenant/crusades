@@ -11,6 +11,7 @@ R2-Based Architecture:
 import argparse
 import asyncio
 import gc
+import json
 import logging
 import os
 import statistics
@@ -68,7 +69,7 @@ class Validator(BaseNode):
         
         # State
         self.last_processed_block: int = 0
-        self.evaluated_hashes: set[str] = set()  # code_hash, not image
+        self.evaluated_hashes: set[str] = set()  # r2_key to track evaluated submissions
 
         # Timing
         self.last_weight_set_time: float = 0
@@ -98,14 +99,13 @@ class Validator(BaseNode):
             )
             self.commitment_reader.sync()
         else:
-            logger.warning("Running without blockchain (test mode)")
-            logger.warning("Using local commitments only")
-            
+            logger.warning("Running without blockchain connection")
+            logger.warning("Weight setting will be disabled")
+            # Still create commitment reader - will connect lazily
             self.commitment_reader = CommitmentReader(
                 subtensor=None,
                 netuid=hparams.netuid,
-                network="local",
-                local_mode=True,
+                network=config.subtensor_network,
             )
         
         # Get model/data from hparams
@@ -250,19 +250,19 @@ class Validator(BaseNode):
                 
                 for commitment in new_commitments:
                     logger.info(f"Processing commitment from UID {commitment.uid}, hotkey: {commitment.hotkey[:16]}...")
-                    logger.info(f"   R2 credentials: {commitment.has_r2_credentials()}")
-                    logger.info(f"   Code hash: {commitment.code_hash[:16] if commitment.code_hash else 'NONE'}...")
+                    logger.info(f"   R2 credentials valid: {commitment.has_valid_credentials()}")
                     
                     # Skip if no R2 credentials
-                    if not commitment.has_r2_credentials():
-                        logger.warning(f"Skipping commitment without R2 credentials: UID {commitment.uid}")
+                    if not commitment.has_valid_credentials():
+                        logger.warning(f"Skipping commitment without valid R2 credentials: UID {commitment.uid}")
                         if commitment.r2_credentials:
-                            logger.warning(f"   R2 creds present but invalid: endpoint={commitment.r2_credentials.endpoint}, bucket={commitment.r2_credentials.bucket}")
+                            logger.warning(f"   R2 creds present but invalid: bucket={commitment.r2_credentials.bucket}, key={commitment.r2_credentials.key}")
                         continue
                     
-                    # Skip if already evaluated this code
-                    if commitment.code_hash in self.evaluated_hashes:
-                        logger.info(f"Skipping already evaluated: {commitment.code_hash[:16]}...")
+                    # Use R2 key as unique identifier
+                    r2_key = commitment.r2_credentials.key
+                    if r2_key in self.evaluated_hashes:
+                        logger.info(f"Skipping already evaluated: {r2_key}...")
                         continue
                     
                     await self._create_submission_from_commitment(commitment)
@@ -308,7 +308,6 @@ class Validator(BaseNode):
                 pass
         
         # Store R2 info as JSON in bucket_path
-        import json
         r2_info = {
             "endpoint": commitment.r2_credentials.endpoint,
             "bucket": commitment.r2_credentials.bucket,
@@ -321,7 +320,7 @@ class Validator(BaseNode):
             submission_id=submission_id,
             miner_hotkey=commitment.hotkey,
             miner_uid=commitment.uid,
-            code_hash=commitment.code_hash,
+            code_hash=commitment.r2_credentials.key,  # Use R2 key as identifier
             bucket_path=json.dumps(r2_info),  # Store R2 info as JSON
             status=SubmissionStatus.EVALUATING,
             payment_verified=True,
@@ -353,7 +352,6 @@ class Validator(BaseNode):
 
         for submission in evaluating:
             # Parse R2 info from bucket_path (miner's R2 credentials)
-            import json
             try:
                 r2_data = json.loads(submission.bucket_path)
                 

@@ -24,9 +24,9 @@ class VerificationConfig(BaseModel):
 class HParams(BaseModel):
     """Hyperparameters loaded from hparams.json.
     
-    Chi/Affinetes Architecture:
-    - Miners build Docker images and commit to blockchain
-    - Validators read commitments and evaluate via Docker/Basilica
+    R2-Based Architecture:
+    - Miners upload train.py to R2 and commit credentials to blockchain
+    - Validators download from miner's R2 and evaluate via Docker/Basilica
     - All settings for evaluation are defined here
     """
 
@@ -66,7 +66,8 @@ class HParams(BaseModel):
         """Load hyperparameters from JSON file."""
         if path is None:
             # Default to hparams/hparams.json relative to project root
-            path = Path(__file__).parent.parent.parent.parent / "hparams" / "hparams.json"
+            # config.py is at src/tournament/config.py, so 3 parents gets to project root
+            path = Path(__file__).parent.parent.parent / "hparams" / "hparams.json"
         else:
             path = Path(path)
 
@@ -92,7 +93,7 @@ class Config(BaseSettings):
     # Bittensor settings
     wallet_name: str = "default"
     wallet_hotkey: str = "default"
-     subtensor_network: str = "finney"  # Default to mainnet for production safety
+    subtensor_network: str = "finney"  # Default to mainnet for production safety
 
     # Paths
     hparams_path: str = "hparams/hparams.json"

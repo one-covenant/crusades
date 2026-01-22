@@ -13,8 +13,6 @@ Environment Variables (R2 config from .env):
 """
 
 import argparse
-import ast
-import hashlib
 import json
 import os
 import sys
@@ -22,6 +20,8 @@ import time
 from pathlib import Path
 
 import bittensor as bt
+
+from tournament.config import HParams
 
 try:
     import boto3
@@ -112,9 +112,6 @@ def upload_to_r2(
     if "def inner_steps" not in code:
         return False, "train.py must contain 'def inner_steps' function"
     
-    # Calculate hash
-    code_hash = hashlib.sha256(code.encode()).hexdigest()
-    
     # Generate unique key per miner
     timestamp = int(time.time())
     hotkey_short = hotkey[:16] if len(hotkey) > 16 else hotkey
@@ -123,7 +120,6 @@ def upload_to_r2(
     print(f"Uploading to R2...")
     print(f"   Bucket: {r2_config['bucket']}")
     print(f"   Key: {r2_key}")
-    print(f"   Code hash: {code_hash[:16]}...")
     
     try:
         # Create S3 client for R2
@@ -155,7 +151,6 @@ def upload_to_r2(
             "r2_key": r2_key,
             "r2_access_key": r2_config["access_key"],
             "r2_secret_key": r2_config["secret_key"],
-            "code_hash": code_hash,
         }
         
         return True, result
@@ -178,7 +173,6 @@ def commit_to_chain(
     The commitment contains all info needed for validator to download your code:
     - R2 endpoint, bucket, key
     - R2 credentials (access_key, secret_key)
-    - Code hash for verification
     
     After reveal_blocks (from hparams.json), this info becomes visible to validators.
     netuid and reveal_blocks are read from hparams.json (not user-controlled).
@@ -192,7 +186,6 @@ def commit_to_chain(
         Tuple of (success, result_dict or error_message)
     """
     # Load netuid and reveal_blocks from hparams (not user-controlled)
-    from tournament.config import HParams
     hparams = HParams.load()
     netuid = hparams.netuid
     blocks_until_reveal = hparams.reveal_blocks
@@ -203,15 +196,17 @@ def commit_to_chain(
     print(f"   Hotkey: {wallet.hotkey.ss58_address}")
     print(f"   Reveal blocks: {blocks_until_reveal} (from hparams.json)")
     
-    # Create commitment data (JSON format)
+    # Create commitment data with R2 credentials
+    # Validator will use these to download train.py from miner's R2
     commitment_data = json.dumps({
         "r2_endpoint": r2_info["r2_endpoint"],
         "r2_bucket": r2_info["r2_bucket"],
         "r2_key": r2_info["r2_key"],
         "r2_access_key": r2_info["r2_access_key"],
         "r2_secret_key": r2_info["r2_secret_key"],
-        "code_hash": r2_info["code_hash"],
-    })
+    }, separators=(',', ':'))
+    
+    print(f"   Commitment size: {len(commitment_data)} bytes")
     
     # Connect to blockchain
     print(f"\nConnecting to {network}...")
@@ -222,16 +217,15 @@ def commit_to_chain(
     except Exception as e:
         return False, f"Failed to connect to {network}: {e}"
     
-    # Committing to blockchain (always, even for local network)
+    # Committing to blockchain using set_reveal_commitment (timelock encrypted)
+    # Data is encrypted until reveal_block, then validators can read it
     print(f"\nCommitting to chain...")
     
     try:
         success = False
         
-        # Try set_reveal_commitment first
         if hasattr(subtensor, 'set_reveal_commitment'):
             try:
-                print(f"   Using set_reveal_commitment...")
                 success = subtensor.set_reveal_commitment(
                     wallet=wallet,
                     netuid=netuid,
@@ -239,20 +233,9 @@ def commit_to_chain(
                     blocks_until_reveal=blocks_until_reveal,
                 )
             except Exception as e:
-                print(f"   set_reveal_commitment failed: {e}")
-                success = False
-        
-        # Fallback to simple commit
-        if not success and hasattr(subtensor, 'commit'):
-            print(f"   Using simple commit...")
-            try:
-                success = subtensor.commit(
-                    wallet=wallet,
-                    netuid=netuid,
-                    data=commitment_data,
-                )
-            except Exception as e:
                 return False, f"Commit failed: {e}"
+        else:
+            return False, "Subtensor does not support set_reveal_commitment()"
         
         if success:
             commit_block = subtensor.get_current_block()
@@ -282,65 +265,6 @@ def commit_to_chain(
 # =============================================================================
 # CLI COMMANDS
 # =============================================================================
-
-def cmd_test(args):
-    """Test your train.py locally before submitting."""
-    train_path = args.train_path
-    
-    if not train_path.exists():
-        print(f"Error: File not found: {train_path}")
-        return 1
-    
-    print(f"Testing: {train_path}")
-    print("=" * 60)
-    
-    # Validate code structure
-    code = train_path.read_text()
-    
-    if "def inner_steps" not in code:
-        print("FAIL: Missing 'def inner_steps' function")
-        return 1
-    
-    print("PASS: inner_steps function found")
-    
-    # Check syntax
-    try:
-        tree = ast.parse(code)
-    except SyntaxError as e:
-        print(f"FAIL: Syntax error at line {e.lineno}: {e.msg}")
-        return 1
-    
-    print("PASS: No syntax errors")
-    
-    # Check required parameters
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "inner_steps":
-            args_found = [arg.arg for arg in node.args.args]
-            required = ["model", "data_iterator", "optimizer", "num_steps", "device"]
-            
-            missing = [r for r in required if r not in args_found]
-            if missing:
-                print(f"FAIL: inner_steps missing parameters: {missing}")
-                return 1
-            
-            print(f"PASS: inner_steps has required parameters")
-            break
-    
-    # Check for InnerStepsResult return
-    if "InnerStepsResult" not in code:
-        print("WARN: Consider using InnerStepsResult for return type")
-    else:
-        print("PASS: Uses InnerStepsResult")
-    
-    print("=" * 60)
-    print("Validation PASSED!")
-    print("\nTo test TPS locally:")
-    print("   cd local_test && uv run python train.py")
-    print("\nTo submit:")
-    print("   uv run python -m neurons.miner upload train.py")
-    
-    return 0
-
 
 def cmd_upload(args):
     """Upload train.py to R2."""
@@ -491,7 +415,6 @@ def cmd_status(args):
         current_block = subtensor.get_current_block()
         
         # Load hparams for netuid
-        from tournament.config import HParams
         hparams = HParams.load()
         
         print(f"\n✓ Connected to blockchain")
@@ -525,20 +448,19 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Test your train.py locally
-  uv run python -m neurons.miner test train.py
+  # Test locally first (in local_test directory)
+  cd local_test && uv run python train.py
 
-  # Upload to R2 bucket
-  uv run python -m neurons.miner upload train.py --wallet.name miner --wallet.hotkey default
+  # Submit to blockchain (uploads to R2 and commits)
+  uv run python -m neurons.miner submit local_test/train.py \\
+      --wallet.name miner --wallet.hotkey default --network finney
 
-  # Commit to blockchain
-  uv run python -m neurons.miner commit --wallet.name miner --wallet.hotkey default
+  # Check blockchain status
+  uv run python -m neurons.miner status --network finney
 
-  # Or do both in one step
-  uv run python -m neurons.miner submit train.py --wallet.name miner --wallet.hotkey default
-
-  # Check status
-  uv run python -m neurons.miner status
+Settings from hparams.json (not user-controlled):
+  netuid        - Subnet ID
+  reveal_blocks - Blocks until commitment revealed
 
 Environment Variables (set in .env):
   TOURNAMENT_R2_ACCOUNT_ID        - Cloudflare account ID
@@ -556,11 +478,6 @@ Environment Variables (set in .env):
         p.add_argument("--r2-bucket", help="Bucket name (override .env)")
         p.add_argument("--r2-access-key", help="Access key ID (override .env)")
         p.add_argument("--r2-secret-key", help="Secret access key (override .env)")
-    
-    # TEST command
-    test_parser = subparsers.add_parser("test", help="Test train.py locally")
-    test_parser.add_argument("train_path", type=Path, help="Path to train.py")
-    test_parser.set_defaults(func=cmd_test)
     
     # UPLOAD command
     upload_parser = subparsers.add_parser("upload", help="Upload train.py to R2")

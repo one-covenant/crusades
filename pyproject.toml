@@ -39,6 +39,7 @@ dependencies = [
     "datasets>=2.14.0",
     "rich>=13.0.0",
     "substrateinterface>=1.0.0",
+    "substrate-interface>=1.8.1",
 ]
 
 [project.optional-dependencies]

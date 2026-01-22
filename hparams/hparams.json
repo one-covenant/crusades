@@ -1,10 +1,10 @@
 {
-    "netuid": 3,
+    "netuid": 1,
     "burn_rate": 0.95,
     "burn_uid": 1,
 
     "evaluation_runs": 2,
-    "eval_steps": 5,
+    "eval_steps": 3,
     "eval_timeout": 600,
 
     "benchmark_model_name": "Qwen/Qwen2.5-7B",
@@ -19,7 +19,7 @@
     "set_weights_interval_seconds": 600,
 
     "reveal_blocks": 100,
-    "min_blocks_between_commits": 100,
+    "min_blocks_between_commits": 500,
 
     "verification": {
         "output_vector_tolerance": 0.7,
