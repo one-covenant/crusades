@@ -171,9 +171,7 @@ def upload_to_r2(
 def commit_to_chain(
     wallet: bt.wallet,
     r2_info: dict,
-    netuid: int,
-    network: str = "local",
-    blocks_until_reveal: int = 100,
+    network: str = "finney",
 ) -> tuple[bool, dict | str]:
     """Commit R2 credentials + link to blockchain.
     
@@ -182,22 +180,28 @@ def commit_to_chain(
     - R2 credentials (access_key, secret_key)
     - Code hash for verification
     
-    After reveal_blocks, this info becomes visible to validators.
+    After reveal_blocks (from hparams.json), this info becomes visible to validators.
+    netuid and reveal_blocks are read from hparams.json (not user-controlled).
     
     Args:
         wallet: Bittensor wallet
         r2_info: Dict with R2 upload info from upload_to_r2()
-        netuid: Subnet ID
-        network: Subtensor network
-        blocks_until_reveal: Blocks until commitment is revealed
+        network: Subtensor network (finney, test, or local)
         
     Returns:
         Tuple of (success, result_dict or error_message)
     """
+    # Load netuid and reveal_blocks from hparams (not user-controlled)
+    from tournament.config import HParams
+    hparams = HParams.load()
+    netuid = hparams.netuid
+    blocks_until_reveal = hparams.reveal_blocks
+    
     print(f"\nCommitting to blockchain...")
     print(f"   Network: {network}")
-    print(f"   Subnet: {netuid}")
+    print(f"   Subnet: {netuid} (from hparams.json)")
     print(f"   Hotkey: {wallet.hotkey.ss58_address}")
+    print(f"   Reveal blocks: {blocks_until_reveal} (from hparams.json)")
     
     # Create commitment data (JSON format)
     commitment_data = json.dumps({
@@ -209,52 +213,16 @@ def commit_to_chain(
         "code_hash": r2_info["code_hash"],
     })
     
-    # Get current block
+    # Connect to blockchain
+    print(f"\nConnecting to {network}...")
     try:
         subtensor = bt.subtensor(network=network)
         current_block = subtensor.get_current_block()
         print(f"   Current block: {current_block}")
-    except Exception:
-        current_block = int(time.time())
-        print(f"   Using timestamp as block: {current_block}")
+    except Exception as e:
+        return False, f"Failed to connect to {network}: {e}"
     
-    # For local testing, use file-based commitments
-    if network == "local":
-        print(f"\nUsing LOCAL FILE mode for testing...")
-        
-        commit_block = current_block
-        reveal_block = commit_block + blocks_until_reveal
-        
-        result = {
-            "r2_endpoint": r2_info["r2_endpoint"],
-            "r2_bucket": r2_info["r2_bucket"],
-            "r2_key": r2_info["r2_key"],
-            "r2_access_key": r2_info["r2_access_key"],
-            "r2_secret_key": r2_info["r2_secret_key"],
-            "code_hash": r2_info["code_hash"],
-            "commit_block": commit_block,
-            "reveal_block": reveal_block,
-            "hotkey": wallet.hotkey.ss58_address,
-            "uid": 1,
-            "netuid": netuid,
-            "data": commitment_data,
-        }
-        
-        # Save to local commitments directory
-        local_commits_dir = Path.cwd() / ".local_commitments"
-        local_commits_dir.mkdir(exist_ok=True)
-        
-        commit_file = local_commits_dir / f"{commit_block}_{wallet.hotkey.ss58_address[:8]}.json"
-        commit_file.write_text(json.dumps(result, indent=2))
-        
-        print(f"\nLocal commitment saved!")
-        print(f"   File: {commit_file}")
-        print(f"   Commit block: {commit_block}")
-        print(f"   Reveal block: {reveal_block}")
-        
-        return True, result
-    
-    # Production: Use blockchain
+    # Committing to blockchain (always, even for local network)
     print(f"\nCommitting to chain...")
     
     try:
@@ -404,14 +372,9 @@ def cmd_upload(args):
     )
     
     if success:
-        # Save upload info for commit command
-        upload_info_file = Path.home() / ".templar" / "last_upload.json"
-        upload_info_file.parent.mkdir(parents=True, exist_ok=True)
-        upload_info_file.write_text(json.dumps(result, indent=2))
-        
-        print(f"\nUpload info saved: {upload_info_file}")
-        print(f"\nNext step:")
-        print(f"  uv run python -m neurons.miner commit --wallet.name {args.wallet_name} --wallet.hotkey {args.wallet_hotkey}")
+        print(f"\n✓ Upload complete!")
+        print(f"\nTo commit, use the submit command which uploads and commits in one step:")
+        print(f"  uv run python -m neurons.miner submit <train.py> --wallet.name {args.wallet_name} --wallet.hotkey {args.wallet_hotkey}")
         return 0
     else:
         print(f"\nUpload failed: {result}")
@@ -419,16 +382,21 @@ def cmd_upload(args):
 
 
 def cmd_commit(args):
-    """Commit R2 info to blockchain."""
-    # Load upload info
-    upload_info_file = Path.home() / ".templar" / "last_upload.json"
+    """Commit R2 info to blockchain.
     
-    if args.upload_info:
-        upload_info_file = Path(args.upload_info)
+    Note: This command requires --upload-info with the upload result JSON.
+    For most users, use 'submit' command instead which handles upload + commit.
+    """
+    if not args.upload_info:
+        print("Error: --upload-info is required")
+        print("\nFor easier usage, use the 'submit' command which uploads and commits in one step:")
+        print("  uv run python -m neurons.miner submit <train.py> --wallet.name <name> --wallet.hotkey <hotkey>")
+        return 1
+    
+    upload_info_file = Path(args.upload_info)
     
     if not upload_info_file.exists():
-        print(f"Error: No upload info found at {upload_info_file}")
-        print("Run 'miner upload' first, or specify --upload-info path")
+        print(f"Error: Upload info file not found: {upload_info_file}")
         return 1
     
     try:
@@ -442,17 +410,13 @@ def cmd_commit(args):
     success, result = commit_to_chain(
         wallet=wallet,
         r2_info=r2_info,
-        netuid=args.netuid,
         network=args.network,
-        blocks_until_reveal=args.reveal_blocks,
     )
     
     if success:
-        # Save commitment info
-        commit_file = Path.home() / ".templar" / "commits" / f"{result['commit_block']}.json"
-        commit_file.parent.mkdir(parents=True, exist_ok=True)
-        commit_file.write_text(json.dumps(result, indent=2))
-        print(f"\nCommitment saved: {commit_file}")
+        print(f"\n✓ Commitment successful!")
+        print(f"   Commit block: {result['commit_block']}")
+        print(f"   Reveal block: {result['reveal_block']}")
         return 0
     else:
         print(f"\nCommit failed: {result}")
@@ -504,9 +468,7 @@ def cmd_submit(args):
     success, result = commit_to_chain(
         wallet=wallet,
         r2_info=r2_info,
-        netuid=args.netuid,
         network=args.network,
-        blocks_until_reveal=args.reveal_blocks,
     )
     
     if success:
@@ -522,39 +484,34 @@ def cmd_submit(args):
 
 
 def cmd_status(args):
-    """Check commitment status."""
+    """Check blockchain status and connection."""
     try:
+        print(f"\nConnecting to {args.network}...")
         subtensor = bt.subtensor(network=args.network)
         current_block = subtensor.get_current_block()
         
-        print(f"\nBlockchain Status")
+        # Load hparams for netuid
+        from tournament.config import HParams
+        hparams = HParams.load()
+        
+        print(f"\n✓ Connected to blockchain")
         print(f"   Network: {args.network}")
         print(f"   Current block: {current_block}")
+        print(f"   Subnet: {hparams.netuid}")
+        print(f"   Reveal blocks: {hparams.reveal_blocks}")
         
-        commits_dir = Path.home() / ".templar" / "commits"
-        if commits_dir.exists():
-            commits = sorted(commits_dir.glob("*.json"), reverse=True)[:5]
-            
-            if commits:
-                print(f"\nRecent Commitments:")
-                for commit_file in commits:
-                    data = json.loads(commit_file.read_text())
-                    commit_block = data.get("commit_block", 0)
-                    reveal_block = data.get("reveal_block", 0)
-                    code_hash = data.get("code_hash", "unknown")[:16]
-                    
-                    if current_block >= reveal_block:
-                        status = "REVEALED"
-                    else:
-                        blocks_left = reveal_block - current_block
-                        status = f"Hidden ({blocks_left} blocks left)"
-                    
-                    print(f"   Block {commit_block}: {code_hash}... - {status}")
+        # Check if subnet exists
+        if subtensor.subnet_exists(hparams.netuid):
+            print(f"\n✓ Subnet {hparams.netuid} exists")
+            meta = bt.metagraph(netuid=hparams.netuid, network=args.network)
+            print(f"   Neurons: {meta.n.item()}")
+        else:
+            print(f"\n⚠ Subnet {hparams.netuid} does not exist on {args.network}")
         
         return 0
         
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"\n✗ Error: {e}")
         return 1
 
 
@@ -618,9 +575,7 @@ Environment Variables (set in .env):
     commit_parser.add_argument("--upload-info", help="Path to upload info JSON")
     commit_parser.add_argument("--wallet.name", dest="wallet_name", default="default")
     commit_parser.add_argument("--wallet.hotkey", dest="wallet_hotkey", default="default")
-    commit_parser.add_argument("--netuid", type=int, default=1)
-    commit_parser.add_argument("--network", default="local")
-    commit_parser.add_argument("--reveal-blocks", type=int, default=100)
+    commit_parser.add_argument("--network", default="finney", help="Network: finney (mainnet), test, or local")
     commit_parser.set_defaults(func=cmd_commit)
     
     # SUBMIT command (upload + commit)
@@ -629,14 +584,12 @@ Environment Variables (set in .env):
     add_r2_args(submit_parser)
     submit_parser.add_argument("--wallet.name", dest="wallet_name", default="default")
     submit_parser.add_argument("--wallet.hotkey", dest="wallet_hotkey", default="default")
-    submit_parser.add_argument("--netuid", type=int, default=1)
-    submit_parser.add_argument("--network", default="local")
-    submit_parser.add_argument("--reveal-blocks", type=int, default=100)
+    submit_parser.add_argument("--network", default="finney", help="Network: finney (mainnet), test, or local")
     submit_parser.set_defaults(func=cmd_submit)
     
     # STATUS command
     status_parser = subparsers.add_parser("status", help="Check commitment status")
-    status_parser.add_argument("--network", default="local")
+    status_parser.add_argument("--network", default="finney", help="Network: finney (mainnet), test, or local")
     status_parser.set_defaults(func=cmd_status)
     
     args = parser.parse_args()

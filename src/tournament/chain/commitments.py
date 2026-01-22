@@ -164,15 +164,13 @@ class MinerCommitment:
 
 
 class CommitmentReader:
-    """Reads miner commitments from the Bittensor blockchain or local files."""
+    """Reads miner commitments from the Bittensor blockchain."""
     
     def __init__(
         self,
         subtensor: bt.subtensor | None = None,
         netuid: int = 1,
-        network: str = "local",
-        local_mode: bool = False,
-        local_commits_dir: Path | None = None,
+        network: str = "finney",
     ):
         """Initialize commitment reader.
         
@@ -180,17 +178,11 @@ class CommitmentReader:
             subtensor: Bittensor subtensor instance
             netuid: Subnet ID
             network: Network name (local, test, finney)
-            local_mode: Read from local files instead of blockchain
-            local_commits_dir: Directory for local commitments
         """
         self.netuid = netuid
         self.network = network
         self._subtensor = subtensor
         self._metagraph = None
-        
-        # Enable local mode for "local" network by default
-        self.local_mode = local_mode or (network == "local")
-        self.local_commits_dir = local_commits_dir or Path.cwd() / ".local_commitments"
     
     @property
     def subtensor(self) -> bt.subtensor:
@@ -208,10 +200,6 @@ class CommitmentReader:
     
     def sync(self) -> None:
         """Sync metagraph with blockchain."""
-        if self.local_mode:
-            logger.info("Skipping metagraph sync (local mode)")
-            return
-            
         logger.info(f"Syncing metagraph for subnet {self.netuid}...")
         try:
             self.metagraph.sync(subtensor=self.subtensor)
@@ -221,19 +209,6 @@ class CommitmentReader:
     
     def get_current_block(self) -> int:
         """Get current blockchain block number."""
-        if self.local_mode:
-            # In local mode, get max block from local commitments + buffer
-            max_block = 0
-            if self.local_commits_dir.exists():
-                for commit_file in self.local_commits_dir.glob("*.json"):
-                    try:
-                        data = json.loads(commit_file.read_text())
-                        reveal_block = data.get("reveal_block", 0)
-                        max_block = max(max_block, reveal_block)
-                    except Exception:
-                        pass
-            # Return max reveal_block + 1 to mark commitments as revealed
-            return max_block + 1 if max_block > 0 else 0
         return self.subtensor.get_current_block()
     
     def get_all_commitments(self) -> list[MinerCommitment]:
@@ -421,7 +396,7 @@ class CommitmentReader:
 
 
 def get_commitment_reader(
-    network: str = "local",
+    network: str = "finney",
     netuid: int = 1,
 ) -> CommitmentReader:
     """Factory function to create a commitment reader.
