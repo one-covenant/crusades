@@ -217,23 +217,22 @@ def commit_to_chain(
     except Exception as e:
         return False, f"Failed to connect to {network}: {e}"
     
-    # Committing to blockchain using set_reveal_commitment (timelock encrypted)
-    # Data is encrypted until reveal_block, then validators can read it
+    # Commit to blockchain using set_reveal_commitment (timelock encrypted via drand)
+    # Note: Localnet doesn't have drand - use MOCK_COMMITMENTS=1 for local testing
     print(f"\nCommitting to chain...")
+    print(f"   Using set_reveal_commitment (timelock encrypted)")
     
     try:
         success = False
+        reveal_round = None
         
         if hasattr(subtensor, 'set_reveal_commitment'):
-            try:
-                success = subtensor.set_reveal_commitment(
-                    wallet=wallet,
-                    netuid=netuid,
-                    data=commitment_data,
-                    blocks_until_reveal=blocks_until_reveal,
-                )
-            except Exception as e:
-                return False, f"Commit failed: {e}"
+            success, reveal_round = subtensor.set_reveal_commitment(
+                wallet=wallet,
+                netuid=netuid,
+                data=commitment_data,
+                blocks_until_reveal=blocks_until_reveal,
+            )
         else:
             return False, "Subtensor does not support set_reveal_commitment()"
         
@@ -245,14 +244,21 @@ def commit_to_chain(
                 **r2_info,
                 "commit_block": commit_block,
                 "reveal_block": reveal_block,
+                "reveal_round": reveal_round,
                 "hotkey": wallet.hotkey.ss58_address,
                 "netuid": netuid,
             }
             
-            print(f"\nCommitment successful!")
+            print(f"\n✓ Commitment successful!")
             print(f"   Commit block: {commit_block}")
             print(f"   Reveal block: {reveal_block}")
-            print(f"\nValidators will evaluate after block {reveal_block}")
+            print(f"   Reveal round: {reveal_round}")
+            
+            if network == "local":
+                print(f"\n⚠️  Note: Localnet doesn't have drand - commitment won't decrypt.")
+                print(f"   For local testing, run validator with MOCK_COMMITMENTS=1")
+            else:
+                print(f"\nValidators will evaluate after block {reveal_block}")
             
             return True, result
         else:

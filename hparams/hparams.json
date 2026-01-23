@@ -1,5 +1,5 @@
 {
-    "netuid": 1,
+    "netuid": 3,
     "burn_rate": 0.95,
     "burn_uid": 1,
 
@@ -19,7 +19,7 @@
     "set_weights_interval_seconds": 600,
 
     "reveal_blocks": 100,
-    "min_blocks_between_commits": 500,
+    "min_blocks_between_commits": 10,
 
     "verification": {
         "output_vector_tolerance": 0.7,

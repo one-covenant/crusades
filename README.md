@@ -2,183 +2,172 @@
 
 **TPS Competition on Bittensor** - Miners compete to optimize training code for maximum Tokens Per Second.
 
-## Flow Diagram
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          TOURNAMENT FLOW                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│   MINER                      BLOCKCHAIN                  VALIDATOR      │
-│                                                                         │
-│   1. Setup                                                              │
-│      └─▶ local_test/setup_benchmark.py                                  │
-│          (downloads model + data)                                       │
-│                                                                         │
-│   2. Optimize train.py                                                  │
-│      └─▶ local_test/train.py                                            │
-│          (test locally, maximize TPS)                                   │
-│                                                                         │
-│   3. Upload to R2                                                       │
-│      └─▶ miner upload train.py ──────▶ R2 bucket                        │
-│                                                                         │
-│   4. Commit                                                             │
-│      └─▶ miner commit ───────────────▶ Blockchain                       │
-│                                        (hidden 100 blocks)              │
-│                                              │                          │
-│                                              ▼                          │
-│                                        5. Revealed ──▶ 6. Validator     │
-│                                                          reads commit   │
-│                                                              │          │
-│                                                              ▼          │
-│                                                       7. Downloads      │
-│                                                          from R2        │
-│                                                              │          │
-│                                                              ▼          │
-│                                                       8. Evaluates      │
-│                                                          ( runs)       │
-│                                                          Median TPS     │
-│                                                              │          │
-│   ┌────────┐                                                 ▼          │
-│   │ WINNER │ ◀──── 5% ◀────────────────────────── 9. set_weights        │
-│   └────────┘                                         (95% validator)    │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+MINER                           BLOCKCHAIN                      VALIDATOR
+  │                                                                  │
+  ├─▶ Upload train.py to R2                                          │
+  │                                                                  │
+  ├─▶ Commit R2 credentials ──────▶ set_reveal_commitment            │
+  │                                 (timelock encrypted)             │
+  │                                        │                         │
+  │                                        ▼ (after reveal_blocks)   │
+  │                                   Decrypted ◀────────────────────┤ Read commitments
+  │                                                                  │
+  │                                                           Download from R2
+  │                                                                  │
+  │                                                           Evaluate in Docker
+  │                                                                  │
+  │                                                           Set weights
+  │                                                                  ▼
+  └──────────────────────── Rewards ◀────────────────────────── Winner gets 5%
 ```
 
-## Quick Start (Miner)
+## Quick Start
 
-### Step 1: Setup Environment
+### Prerequisites
 
 ```bash
+# Clone and setup
 cd templar-tournament
+uv sync
 
-# Create .env with R2 credentials
+# Create .env
 cat > .env << 'EOF'
 TOURNAMENT_R2_ACCOUNT_ID=your_cloudflare_account_id
 TOURNAMENT_R2_BUCKET_NAME=your_bucket_name
 TOURNAMENT_R2_ACCESS_KEY_ID=your_access_key
 TOURNAMENT_R2_SECRET_ACCESS_KEY=your_secret_key
-HF_TOKEN=hf_your_token_here
+HF_TOKEN=hf_your_token
 EOF
 
-# Load environment
 export $(cat .env | grep -v '^#' | xargs)
 ```
 
-### Step 2: Download Model & Data
+### Miner
 
 ```bash
+# 1. Download model & data
 uv run python local_test/setup_benchmark.py
-```
 
-Creates:
-- `benchmark/model/` - Qwen2.5-7B model
-- `benchmark/data/train.pt` - Pre-tokenized data (10,000 samples)
-
-### Step 3: Optimize train.py
-
-Edit `local_test/train.py` - the key function to optimize:
-
-```python
-def inner_steps(model, data_iterator, optimizer, num_steps, device):
-    """Optimize this function for maximum TPS."""
-    # Your optimizations here!
-    return InnerStepsResult(
-        final_logits=logits,
-        total_tokens=total_tokens,
-        final_loss=loss,
-    )
-```
-
-Test locally:
-```bash
+# 2. Optimize train.py and test locally
 cd local_test && uv run python train.py
-```
 
-### Step 4: Upload to R2
-
-```bash
-uv run python -m neurons.miner upload local_test/train.py \
-    --wallet.name your_wallet \
-    --wallet.hotkey your_hotkey
-```
-
-### Step 5: Commit to Blockchain
-
-```bash
-uv run python -m neurons.miner commit \
-    --wallet.name your_wallet \
-    --wallet.hotkey your_hotkey \
-    --network finney \
-    --netuid 3
-```
-
-Or do both in one step:
-```bash
+# 3. Submit to tournament
 uv run python -m neurons.miner submit local_test/train.py \
     --wallet.name your_wallet \
-    --wallet.hotkey your_hotkey \
-    --network finney \
-    --netuid 3
+    --wallet.hotkey your_hotkey
+
+# 4. Check status
+uv run python -m neurons.miner status
 ```
 
-### Step 6: Check Status
+### Validator
 
 ```bash
-uv run python -m neurons.miner status --network finney
+uv run python -m neurons.validator \
+    --wallet.name your_wallet \
+    --wallet.hotkey your_hotkey \
+    --affinetes-mode docker
 ```
 
 ## Miner Commands
 
 | Command | Description |
 |---------|-------------|
-| `miner test train.py` | Validate train.py structure |
-| `miner upload train.py` | Upload to R2 bucket |
-| `miner commit` | Commit R2 info to blockchain |
-| `miner submit train.py` | Upload + commit in one step |
+| `miner upload <file>` | Upload train.py to R2 |
+| `miner commit` | Commit to blockchain |
+| `miner submit <file>` | Upload + commit (recommended) |
 | `miner status` | Check commitment status |
 
-## Configuration (hparams.json)
+**Parameters**: `--wallet.name`, `--wallet.hotkey`, `--network` (default: finney)
 
-| Setting | Value | Description |
-|---------|-------|-------------|
-| `benchmark_model_name` | Qwen/Qwen2.5-7B | Model used for evaluation |
-| `benchmark_batch_size` | 16 | Batch size |
-| `eval_steps` | 5 | Steps per evaluation run |
-| `evaluation_runs` | 2 | Number of runs (median = score) |
-| `reveal_blocks` | 100 | Blocks before commit revealed |
-| `min_blocks_between_commits` | 100 | Rate limit between submissions |
+Note: `netuid` and `reveal_blocks` are controlled by `hparams.json`, not CLI.
 
-## Local Testing (No Blockchain)
+## Configuration
 
-```bash
-# Upload
-export $(cat .env | grep -v '^#' | xargs)
-uv run python -m neurons.miner upload local_test/train.py \
-    --wallet.name templar_test --wallet.hotkey M1
+Key settings in `hparams/hparams.json`:
 
-# Commit locally (saves to .local_commitments/)
-uv run python -m neurons.miner commit \
-    --wallet.name templar_test --wallet.hotkey M1 \
-    --network local --netuid 3
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `netuid` | 3 | Subnet ID (production) |
+| `reveal_blocks` | 100 | Blocks before reveal |
+| `min_blocks_between_commits` | 500 | Rate limit |
+| `evaluation_runs` | 2 | Runs per submission |
+| `benchmark_model_name` | Qwen/Qwen2.5-7B | Evaluation model |
+
+## train.py Requirements
+
+Your `train.py` must implement:
+
+```python
+def inner_steps(model, data_iterator, optimizer, num_steps, device):
+    """Optimize this function for maximum TPS."""
+    # Your optimizations here
+    return InnerStepsResult(
+        final_logits=logits,      # Last step logits
+        total_tokens=total_tokens, # Total tokens processed
+        final_loss=loss,          # Final loss value
+    )
 ```
 
 ## Project Structure
 
 ```
 templar-tournament/
-├── local_test/
-│   ├── setup_benchmark.py   # Download model + data
-│   └── train.py             # Your optimized code
 ├── neurons/
-│   ├── miner.py             # Miner CLI
-│   └── validator.py         # Validator (coming next)
+│   ├── miner.py          # Miner CLI
+│   └── validator.py      # Validator
+├── local_test/
+│   ├── setup_benchmark.py
+│   └── train.py          # Template to optimize
+├── environments/templar/
+│   └── env.py            # Docker evaluation environment
 ├── hparams/
-│   └── hparams.json         # Configuration
-└── .env                     # R2 credentials (not in git)
+│   └── hparams.json      # Configuration
+└── src/tournament/
+    ├── chain/            # Blockchain interactions
+    ├── affinetes/        # Docker evaluation
+    └── storage/          # Database
 ```
 
-## Validator Setup
+## TUI Dashboard
 
-*Coming in next section...*
+```bash
+uv run python -m tournament.tui --db tournament.db
+```
+
+## Local Testing
+
+Localnet doesn't have drand integration, so commit-reveal won't decrypt. Use mock mode:
+
+```bash
+# Start localnet with 12-second blocks
+docker run -d --name subtensor-localnet \
+    -p 9944:9944 -p 9945:9945 \
+    ghcr.io/opentensor/subtensor-localnet:v2.0.11 False
+
+# Run validator with mock commitments (bypasses drand)
+export MOCK_COMMITMENTS=1
+uv run python -m neurons.validator \
+    --wallet.name your_wallet \
+    --wallet.hotkey your_hotkey \
+    --skip-blockchain-check \
+    --affinetes-mode docker
+```
+
+Update `MOCK_COMMITMENT_DATA` in `src/tournament/chain/commitments.py` with your R2 credentials.
+
+## Testing on Testnet
+
+For full E2E testing with real commit-reveal, use testnet (has drand):
+
+```bash
+uv run python -m neurons.miner submit local_test/train.py \
+    --wallet.name your_wallet --wallet.hotkey your_hotkey --network test
+```
+
+## License
+
+MIT

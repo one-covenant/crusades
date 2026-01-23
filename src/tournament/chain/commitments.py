@@ -10,7 +10,7 @@ Commitment format:
   {
     "r2_endpoint": "https://xxx.r2.cloudflarestorage.com",
     "r2_bucket": "miner-bucket",
-    "r2_key": "submissions/hotkey/timestamp/train.py",
+    "r2_key": "submissions/5CX7WS4S2PyXCkBr/1769152885/train.py",
     "r2_access_key": "...",
     "r2_secret_key": "..."
   }
@@ -18,11 +18,31 @@ Commitment format:
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 
 import bittensor as bt
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# TEST MODE: Hardcoded credentials to bypass drand/commit-reveal
+# Set MOCK_COMMITMENTS=1 to enable
+# =============================================================================
+MOCK_COMMITMENTS_ENABLED = os.getenv("MOCK_COMMITMENTS", "0") == "1"
+
+# Hardcoded test credentials (update these with your actual R2 data)
+MOCK_COMMITMENT_DATA = {
+    "r2_endpoint": "https://dc1ac72b395ec87f6caa8ef3df3d56a4.r2.cloudflarestorage.com",
+    "r2_bucket": "dc1ac72b395ec87f6caa8ef3df3d56a4",
+    "r2_key": "submissions/5CX7WS4S2PyXCkBr/1769152885/train.py",
+    "r2_access_key": os.getenv("TOURNAMENT_R2_ACCESS_KEY_ID", ""),
+    "r2_secret_key": os.getenv("TOURNAMENT_R2_SECRET_ACCESS_KEY", ""),
+}
+MOCK_MINER_HOTKEY = "5CX7WS4S2PyXCkBrmg8LZ38Xs5JkZXRBCtXAWyT3h5THH6oH"
+MOCK_MINER_UID = 1
+# =============================================================================
 
 
 @dataclass
@@ -185,9 +205,38 @@ class CommitmentReader:
         
         Uses simple commit API (get_all_commitments) which works on all networks.
         
+        If MOCK_COMMITMENTS=1 is set, returns hardcoded test data to bypass
+        drand/commit-reveal for local testing.
+        
         Returns:
             List of MinerCommitment objects
         """
+        # TEST MODE: Return hardcoded mock commitments
+        if MOCK_COMMITMENTS_ENABLED:
+            logger.info("*** MOCK MODE: Returning hardcoded test commitments ***")
+            current_block = self.get_current_block()
+            
+            # Create mock commitment from hardcoded data
+            mock_commitment = MinerCommitment.from_chain_data(
+                uid=MOCK_MINER_UID,
+                hotkey=MOCK_MINER_HOTKEY,
+                data=json.dumps(MOCK_COMMITMENT_DATA),
+                commit_block=current_block - 100,  # Fake commit block
+                reveal_block=current_block - 50,   # Fake reveal block
+                current_block=current_block,
+            )
+            
+            if mock_commitment:
+                mock_commitment.is_revealed = True
+                logger.info(f"   Mock UID: {MOCK_MINER_UID}")
+                logger.info(f"   Mock hotkey: {MOCK_MINER_HOTKEY[:16]}...")
+                logger.info(f"   Mock R2 key: {MOCK_COMMITMENT_DATA['r2_key']}")
+                return [mock_commitment]
+            else:
+                logger.error("Failed to create mock commitment!")
+                return []
+        
+        # PRODUCTION MODE: Read from blockchain
         current_block = self.get_current_block()
         commitments = []
         
@@ -302,6 +351,11 @@ class CommitmentReader:
             List of newly revealed commitments
         """
         all_commitments = self.get_all_commitments()
+        
+        # In mock mode, always return all commitments as "new" (for testing)
+        if MOCK_COMMITMENTS_ENABLED:
+            logger.info(f"MOCK MODE: Returning all {len(all_commitments)} commitments as new")
+            return all_commitments
         
         # Filter to only those committed after last_block and revealed
         new_commitments = [
