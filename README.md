@@ -91,11 +91,14 @@ Key settings in `hparams/hparams.json`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `netuid` | 3 | Subnet ID (production) |
-| `reveal_blocks` | 100 | Blocks before reveal |
-| `min_blocks_between_commits` | 500 | Rate limit |
-| `evaluation_runs` | 2 | Runs per submission |
-| `benchmark_model_name` | Qwen/Qwen2.5-7B | Evaluation model |
+| `netuid` | 3 | Subnet ID |
+| `reveal_blocks` | 100 | Blocks before reveal (~20 min) |
+| `min_blocks_between_commits` | 10 | Rate limit between submissions |
+| `evaluation_runs` | 2 | Runs per submission (median taken) |
+| `eval_steps` | 3 | Training steps per evaluation |
+| `benchmark_model_name` | Qwen/Qwen2.5-7B | Model for evaluation |
+| `benchmark_batch_size` | 16 | Batch size for evaluation |
+| `burn_rate` | 0.95 | Emissions to validator (95%) |
 
 ## train.py Requirements
 
