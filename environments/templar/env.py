@@ -315,12 +315,7 @@ def _verify_outputs(
     expected_tokens: int,
 ) -> tuple[bool, str | None]:
     """Verify candidate outputs are valid.
-    
-    We verify CORRECTNESS, not exact output matching with a reference.
-    Comparing different code paths (reference vs miner's inner_steps) will always
-    diverge due to floating point non-determinism, even if mathematically equivalent.
-    
-    Instead, we verify:
+
     1. Token count matches expected (miner processed correct amount of data)
     2. Loss is reasonable (not NaN/Inf, decreased from initial ~11 to ~2)
     3. Logits are valid tensors (not NaN/Inf)

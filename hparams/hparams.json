@@ -29,7 +29,7 @@
     },
 
     "verification": {
-        "output_vector_tolerance": 0.5,
+        "output_vector_tolerance": 0.05,
         "deterministic_mode": true
     }
 }
