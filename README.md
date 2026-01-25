@@ -35,11 +35,19 @@ uv sync
 
 # Create .env
 cat > .env << 'EOF'
+# R2 Storage (required for miners)
 TOURNAMENT_R2_ACCOUNT_ID=your_cloudflare_account_id
 TOURNAMENT_R2_BUCKET_NAME=your_bucket_name
 TOURNAMENT_R2_ACCESS_KEY_ID=your_access_key
 TOURNAMENT_R2_SECRET_ACCESS_KEY=your_secret_key
+
+# HuggingFace (required)
 HF_TOKEN=hf_your_token
+
+# Basilica (optional - for remote GPU rental)
+# Get these from Basilica team: https://github.com/AffineFoundation/affinetes
+# BASILICA_ENDPOINT=https://api.basilica.cloud
+# BASILICA_API_KEY=your_api_key
 EOF
 
 export $(cat .env | grep -v '^#' | xargs)
@@ -65,12 +73,32 @@ uv run python -m neurons.miner status
 
 ### Validator
 
+**Option 1: Docker Mode (local GPU)**
 ```bash
 uv run python -m neurons.validator \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --affinetes-mode docker
 ```
+
+**Option 2: Basilica Mode (rent remote GPU)**
+```bash
+# Add to .env (get these from Basilica team)
+BASILICA_ENDPOINT=https://api.basilica.cloud
+BASILICA_API_KEY=your_api_key
+
+# Run with basilica mode
+export $(cat .env | grep -v '^#' | xargs)
+uv run python -m neurons.validator \
+    --wallet.name your_wallet \
+    --wallet.hotkey your_hotkey \
+    --affinetes-mode basilica
+```
+
+| Mode | Requirements | Use When |
+|------|--------------|----------|
+| `docker` | Local GPU + Docker | You have a GPU |
+| `basilica` | BASILICA_ENDPOINT + API_KEY | Rent remote GPU |
 
 ## Miner Commands
 

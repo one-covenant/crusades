@@ -1,11 +1,11 @@
 """Affinetes integration for Templar Tournament.
 
-R2-Based Architecture:
+URL-Based Architecture:
 - Validator owns the evaluation image (templar-eval)
-- Miner's code is downloaded from their R2 at evaluation time
+- Miner's code is downloaded from their committed URL
 - Supports docker (local) and basilica (remote) modes
 """
 
-from .runner import AffinetesRunner, EvaluationResult, R2Info
+from .runner import AffinetesRunner, EvaluationResult
 
-__all__ = ["AffinetesRunner", "EvaluationResult", "R2Info"]
+__all__ = ["AffinetesRunner", "EvaluationResult"]

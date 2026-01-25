@@ -21,49 +21,83 @@ class VerificationConfig(BaseModel):
     deterministic_mode: bool = True
 
 
+class DockerConfig(BaseModel):
+    """Docker execution settings for validator evaluations.
+    
+    GPU device options:
+    - "all": Use all available GPUs (default)
+    - "0": Use only GPU 0
+    - "0,1": Use GPUs 0 and 1
+    - "none": Disable GPU (CPU only)
+    """
+
+    gpu_devices: str = "all"  # "all", "0", "0,1", "none"
+    memory_limit: str = "32g"  # Docker memory limit
+    shm_size: str = "8g"  # Shared memory size (important for PyTorch)
+
+
 class HParams(BaseModel):
     """Hyperparameters loaded from hparams.json.
     
-    R2-Based Architecture:
-    - Miners upload train.py to R2 and commit credentials to blockchain
-    - Validators download from miner's R2 and evaluate via Docker/Basilica
-    - All settings for evaluation are defined here
+    URL-Based Architecture:
+    - Miners host train.py at any URL and commit the URL to blockchain
+    - Validators download from miner's URL and evaluate via Docker/Basilica
+    - All settings are defined in hparams.json (no hardcoded defaults)
     """
 
-    netuid: int = 2
+    # Network settings
+    netuid: int
     
-    # Emissions distribution (winner-takes-some)
-    burn_rate: float = 0.95  # 95% to validator, 5% to winner
-    burn_uid: int = 1  # UID that receives burn portion (validator)
+    # Emissions distribution
+    burn_rate: float
+    burn_uid: int
 
     # Evaluation settings
-    evaluation_runs: int = 5  # Number of runs per submission (median taken)
-    eval_steps: int = 5  # Training steps per evaluation
-    eval_timeout: int = 600  # Max seconds per evaluation
+    evaluation_runs: int
+    eval_steps: int
+    eval_timeout: int
 
-    # Benchmark settings - model and data for evaluation
-    benchmark_model_name: str = "Qwen/Qwen2.5-7B"
-    benchmark_dataset_name: str = "HuggingFaceFW/fineweb"
-    benchmark_data_samples: int = 10000  # Number of samples to load
-    benchmark_sequence_length: int = 1024
-    benchmark_batch_size: int = 8
+    # Benchmark settings
+    benchmark_model_name: str
+    benchmark_dataset_name: str
+    benchmark_dataset_split: str
+    benchmark_data_samples: int
+    benchmark_train_size: int
+    benchmark_master_seed: int
+    benchmark_sequence_length: int
+    benchmark_batch_size: int
 
     # Timing settings
-    set_weights_interval_seconds: int = 600  # 10 minutes
+    set_weights_interval_seconds: int
 
-    # Commitment settings
-    reveal_blocks: int = 100  # Blocks until commitment is revealed
-    min_blocks_between_commits: int = 100  # Rate limit: ~20 min between commits
+    # Commitment settings (timelock encrypted via drand)
+    reveal_blocks: int
+    min_blocks_between_commits: int
+    block_time: int
 
-    # Verification
+    # Docker execution settings
+    docker: DockerConfig = Field(default_factory=DockerConfig)
+
+    # Verification (nested config with defaults from JSON)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
 
-    # Storage (for evaluation records)
+    # Storage (for evaluation records - not in hparams.json)
     storage: StorageConfig = Field(default_factory=StorageConfig)
 
     @classmethod
     def load(cls, path: Path | str | None = None) -> Self:
-        """Load hyperparameters from JSON file."""
+        """Load hyperparameters from JSON file.
+        
+        Args:
+            path: Path to hparams.json file
+            
+        Returns:
+            HParams instance with all values from JSON
+            
+        Raises:
+            FileNotFoundError: If hparams.json doesn't exist
+            ValidationError: If required fields are missing
+        """
         if path is None:
             # Default to hparams/hparams.json relative to project root
             # config.py is at src/tournament/config.py, so 3 parents gets to project root
@@ -72,7 +106,7 @@ class HParams(BaseModel):
             path = Path(path)
 
         if not path.exists():
-            return cls()
+            raise FileNotFoundError(f"hparams.json not found at {path}")
 
         with open(path) as f:
             data = json.load(f)

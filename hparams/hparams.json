@@ -1,7 +1,7 @@
 {
-    "netuid": 3,
+    "netuid": 1,
     "burn_rate": 0.95,
-    "burn_uid": 1,
+    "burn_uid": 0,
 
     "evaluation_runs": 2,
     "eval_steps": 3,
@@ -18,8 +18,15 @@
 
     "set_weights_interval_seconds": 600,
 
-    "reveal_blocks": 100,
-    "min_blocks_between_commits": 10,
+    "reveal_blocks": 10,
+    "min_blocks_between_commits": 5,
+    "block_time": 12,
+
+    "docker": {
+        "gpu_devices": "0,1,2,3",
+        "memory_limit": "32g",
+        "shm_size": "8g"
+    },
 
     "verification": {
         "output_vector_tolerance": 0.7,

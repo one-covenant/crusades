@@ -23,7 +23,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "bittensor>=7.0.0",
+    "bittensor>=9.10.1,<9.11.0",  # Pin to 9.10.x like templar for localnet compatibility
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
     "sqlalchemy>=2.0.0",

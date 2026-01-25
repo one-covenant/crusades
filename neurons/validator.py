@@ -1,11 +1,10 @@
 """Tournament validator - evaluates miner submissions and sets weights.
 
-R2-Based Architecture:
-1. Reads R2 commitments from blockchain (miner's R2 credentials)
-2. Downloads miner's train.py from their R2 at evaluation time
+URL-Based Architecture:
+1. Reads code URL commitments from blockchain (timelock decrypted)
+2. Downloads miner's train.py from the committed URL
 3. Evaluates via affinetes (Docker locally or Basilica remotely)
-4. Stores miner's code in validator's R2 for dashboard
-5. Sets weights based on TPS scores
+4. Sets weights based on TPS scores
 """
 
 import argparse
@@ -16,6 +15,8 @@ import logging
 import os
 import statistics
 import time
+import urllib.request
+import urllib.error
 from typing import Literal
 
 import bittensor as bt
@@ -26,7 +27,6 @@ from tournament.chain.weights import WeightSetter
 from tournament.config import get_config, get_hparams
 from tournament.core.protocols import SubmissionStatus
 from tournament.affinetes import AffinetesRunner, EvaluationResult
-from tournament.affinetes.runner import R2Info
 from tournament.storage.database import Database, get_database
 from tournament.storage.models import EvaluationModel, SubmissionModel
 
@@ -40,13 +40,12 @@ logger = logging.getLogger(__name__)
 
 
 class Validator(BaseNode):
-    """Tournament validator node (R2-Based Architecture).
+    """Tournament validator node (URL-Based Architecture).
 
     Responsibilities:
-    1. Read miner R2 commitments from blockchain
-    2. Download and evaluate miner's train.py via affinetes
-    3. Store miner's code in validator's R2 for dashboard
-    4. Calculate and set weights (winner-takes-all)
+    1. Read miner code URL commitments from blockchain
+    2. Download train.py from URL and evaluate via affinetes
+    3. Calculate and set weights (winner-takes-all)
     """
 
     def __init__(
@@ -64,12 +63,9 @@ class Validator(BaseNode):
         self.commitment_reader: CommitmentReader | None = None
         self.affinetes_runner: AffinetesRunner | None = None
         
-        # Validator's R2 for storing code (optional)
-        self.validator_r2_client = None
-        
         # State
         self.last_processed_block: int = 0
-        self.evaluated_hashes: set[str] = set()  # r2_key to track evaluated submissions
+        self.evaluated_code_urls: set[str] = set()  # Code URLs already evaluated
 
         # Timing
         self.last_weight_set_time: float = 0
@@ -80,7 +76,7 @@ class Validator(BaseNode):
         config = get_config()
         hparams = get_hparams()
 
-        logger.info("Initializing validator (R2-Based Architecture)")
+        logger.info("Initializing validator (URL-Based Architecture)")
         
         # Database
         self.db = await get_database()
@@ -118,7 +114,7 @@ class Validator(BaseNode):
         if not data_url:
             logger.warning("benchmark_dataset_name not set in hparams.json")
         
-        # Affinetes runner (uses validator's standard image)
+        # Affinetes runner
         basilica_endpoint = os.getenv('BASILICA_ENDPOINT')
         basilica_api_key = os.getenv('BASILICA_API_KEY')
         
@@ -128,82 +124,40 @@ class Validator(BaseNode):
         if verification:
             output_tolerance = getattr(verification, 'output_vector_tolerance', 0.02)
         
+        # Docker configuration from hparams
+        docker_config = getattr(hparams, 'docker', None)
+        docker_gpu_devices = "all"
+        docker_memory_limit = "32g"
+        docker_shm_size = "8g"
+        if docker_config:
+            docker_gpu_devices = getattr(docker_config, 'gpu_devices', 'all')
+            docker_memory_limit = getattr(docker_config, 'memory_limit', '32g')
+            docker_shm_size = getattr(docker_config, 'shm_size', '8g')
+        
         self.affinetes_runner = AffinetesRunner(
             mode=self.affinetes_mode,
             basilica_endpoint=basilica_endpoint,
             basilica_api_key=basilica_api_key,
+            docker_gpu_devices=docker_gpu_devices,
+            docker_memory_limit=docker_memory_limit,
+            docker_shm_size=docker_shm_size,
             model_url=model_url,
             data_url=data_url,
             timeout=getattr(hparams, 'eval_timeout', 600),
             output_tolerance=output_tolerance,
         )
         
-        # Initialize validator's R2 for code storage (optional, from .env)
-        self._init_validator_r2()
-        
         self.last_processed_block = 0
         
         logger.info(f"   Affinetes mode: {self.affinetes_mode}")
         logger.info(f"   Model URL: {model_url or 'NOT SET'}")
         logger.info(f"   Data URL: {data_url or 'NOT SET'}")
-        if self.affinetes_mode == "basilica":
+        if self.affinetes_mode == "docker":
+            logger.info(f"   Docker GPU devices: {docker_gpu_devices}")
+            logger.info(f"   Docker memory limit: {docker_memory_limit}")
+            logger.info(f"   Docker shm size: {docker_shm_size}")
+        elif self.affinetes_mode == "basilica":
             logger.info(f"   Basilica endpoint: {basilica_endpoint or 'NOT SET'}")
-    
-    def _init_validator_r2(self) -> None:
-        """Initialize validator's R2 client for storing evaluated code.
-        
-        All R2 config comes from .env:
-        - VALIDATOR_R2_* (production: validator's own bucket)
-        - TOURNAMENT_R2_* (testing: shared bucket fallback)
-        
-        Note: Miner R2 credentials come from commitments, not environment.
-        """
-        # Primary: Validator's own R2
-        endpoint = os.getenv('VALIDATOR_R2_ENDPOINT', '')
-        bucket = os.getenv('VALIDATOR_R2_BUCKET', '')
-        access_key = os.getenv('VALIDATOR_R2_ACCESS_KEY', '')
-        secret_key = os.getenv('VALIDATOR_R2_SECRET_KEY', '')
-        
-        # Fallback: Shared tournament R2 (for testing)
-        if not all([endpoint, bucket, access_key, secret_key]):
-            account_id = os.getenv('TOURNAMENT_R2_ACCOUNT_ID', '')
-            bucket = bucket or os.getenv('TOURNAMENT_R2_BUCKET_NAME', '')
-            access_key = access_key or os.getenv('TOURNAMENT_R2_ACCESS_KEY_ID', '')
-            secret_key = secret_key or os.getenv('TOURNAMENT_R2_SECRET_ACCESS_KEY', '')
-            
-            if account_id and not endpoint:
-                endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
-        
-        if not all([endpoint, bucket, access_key, secret_key]):
-            logger.info("R2 credentials incomplete - using commitments only")
-            return
-        
-        try:
-            import boto3
-            from botocore.config import Config as BotoConfig
-            
-            self.validator_r2_client = boto3.client(
-                "s3",
-                endpoint_url=endpoint,
-                aws_access_key_id=access_key,
-                aws_secret_access_key=secret_key,
-                config=BotoConfig(signature_version="s3v4"),
-            )
-            self.validator_r2_bucket = bucket
-            
-            # Store R2 config for downloading miner submissions
-            self.r2_config = {
-                "endpoint": endpoint,
-                "bucket": bucket,
-                "access_key": access_key,
-                "secret_key": secret_key,
-            }
-            
-            logger.info(f"R2 configured: {bucket}")
-        except ImportError:
-            logger.warning("boto3 not installed - R2 disabled")
-        except Exception as e:
-            logger.warning(f"Failed to init R2: {e}")
 
     async def start(self) -> None:
         """Start the validator."""
@@ -237,7 +191,7 @@ class Validator(BaseNode):
         await asyncio.sleep(10)
     
     async def process_blockchain_commitments(self) -> None:
-        """Read and process new R2 commitments from blockchain."""
+        """Read and process new gist commitments from blockchain."""
         try:
             new_commitments = self.commitment_reader.get_new_commitments_since(
                 self.last_processed_block
@@ -250,19 +204,17 @@ class Validator(BaseNode):
                 
                 for commitment in new_commitments:
                     logger.info(f"Processing commitment from UID {commitment.uid}, hotkey: {commitment.hotkey[:16]}...")
-                    logger.info(f"   R2 credentials valid: {commitment.has_valid_credentials()}")
+                    logger.info(f"   Has valid URL: {commitment.has_valid_code_url()}")
                     
-                    # Skip if no R2 credentials
-                    if not commitment.has_valid_credentials():
-                        logger.warning(f"Skipping commitment without valid R2 credentials: UID {commitment.uid}")
-                        if commitment.r2_credentials:
-                            logger.warning(f"   R2 creds present but invalid: bucket={commitment.r2_credentials.bucket}, key={commitment.r2_credentials.key}")
+                    # Skip if no valid code URL
+                    if not commitment.has_valid_code_url():
+                        logger.warning(f"Skipping commitment without valid code URL: UID {commitment.uid}")
                         continue
                     
-                    # Use R2 key as unique identifier
-                    r2_key = commitment.r2_credentials.key
-                    if r2_key in self.evaluated_hashes:
-                        logger.info(f"Skipping already evaluated: {r2_key}...")
+                    # Use code URL as unique identifier
+                    code_url = commitment.code_url_info.url
+                    if code_url in self.evaluated_code_urls:
+                        logger.info(f"Skipping already evaluated URL: {code_url[:50]}...")
                         continue
                     
                     await self._create_submission_from_commitment(commitment)
@@ -278,7 +230,7 @@ class Validator(BaseNode):
     ) -> None:
         """Create a submission record from a blockchain commitment."""
         hparams = get_hparams()
-        submission_id = f"r2_{commitment.commit_block}_{commitment.uid}"
+        submission_id = f"commit_{commitment.reveal_block}_{commitment.uid}"
         
         try:
             existing = await self.db.get_submission(submission_id)
@@ -287,7 +239,6 @@ class Validator(BaseNode):
                 return
         except Exception as e:
             logger.error(f"Database error checking existing submission: {e}")
-            # Continue - try to create anyway
         
         # Rate limiting
         min_blocks = getattr(hparams, 'min_blocks_between_commits', 100)
@@ -296,7 +247,7 @@ class Validator(BaseNode):
         if last_submission:
             try:
                 last_block = int(last_submission.submission_id.split('_')[1])
-                blocks_since = commitment.commit_block - last_block
+                blocks_since = commitment.reveal_block - last_block
                 
                 if blocks_since < min_blocks:
                     logger.warning(
@@ -307,21 +258,12 @@ class Validator(BaseNode):
             except (IndexError, ValueError):
                 pass
         
-        # Store R2 info as JSON in bucket_path
-        r2_info = {
-            "endpoint": commitment.r2_credentials.endpoint,
-            "bucket": commitment.r2_credentials.bucket,
-            "key": commitment.r2_credentials.key,
-            "access_key": commitment.r2_credentials.access_key,
-            "secret_key": commitment.r2_credentials.secret_key,
-        }
-        
         submission = SubmissionModel(
             submission_id=submission_id,
             miner_hotkey=commitment.hotkey,
             miner_uid=commitment.uid,
-            code_hash=commitment.r2_credentials.key,  # Use R2 key as identifier
-            bucket_path=json.dumps(r2_info),  # Store R2 info as JSON
+            code_hash=commitment.code_url_info.url,  # Use code URL as identifier
+            bucket_path=commitment.code_url_info.url,  # Store code URL
             status=SubmissionStatus.EVALUATING,
             payment_verified=True,
         )
@@ -329,8 +271,7 @@ class Validator(BaseNode):
         try:
             await self.db.save_submission(submission)
             logger.info(f"✓ Created submission: {submission_id}")
-            logger.info(f"   R2 bucket: {commitment.r2_credentials.bucket}")
-            logger.info(f"   R2 key: {commitment.r2_credentials.key}")
+            logger.info(f"   Code URL: {commitment.code_url_info.url[:60]}...")
             logger.info(f"   UID: {commitment.uid}")
             logger.info(f"   Hotkey: {commitment.hotkey[:16]}...")
         except Exception as e:
@@ -338,11 +279,51 @@ class Validator(BaseNode):
             import traceback
             logger.error(traceback.format_exc())
     
-    async def evaluate_submissions(self) -> None:
-        """Evaluate submissions by downloading from miner's R2.
+    def _download_from_url(self, code_url: str) -> tuple[bool, str]:
+        """Download train.py code from a URL.
         
-        Uses R2 credentials from the miner's commitment (stored in bucket_path).
-        Each miner provides their own R2 credentials in their commitment.
+        Validates that the response is a single Python file, not HTML/folder.
+        
+        Args:
+            code_url: The URL containing train.py code
+            
+        Returns:
+            Tuple of (success, code_or_error)
+        """
+        try:
+            req = urllib.request.Request(code_url, headers={"User-Agent": "templar-validator"})
+            with urllib.request.urlopen(req, timeout=30) as response:
+                code = response.read().decode("utf-8")
+                
+                # Reject HTML (folder page, not raw file)
+                if "<html" in code.lower()[:500] or "<!doctype html" in code.lower()[:500]:
+                    return False, "URL returns HTML page, not a code file"
+                
+                # Reject JSON file listings
+                if code.strip().startswith("{") and '"files"' in code[:500]:
+                    return False, "URL returns JSON (file listing), not code"
+                
+                # Size limit (500KB)
+                if len(code) > 500_000:
+                    return False, f"File too large ({len(code)} bytes). Max 500KB"
+                
+                # Must contain inner_steps
+                if "def inner_steps" not in code:
+                    return False, "Code does not contain 'def inner_steps' function"
+                
+                return True, code
+                
+        except urllib.error.HTTPError as e:
+            return False, f"HTTP error {e.code}: {e.reason}"
+        except urllib.error.URLError as e:
+            return False, f"URL error: {e.reason}"
+        except Exception as e:
+            return False, f"Error downloading code: {e}"
+    
+    async def evaluate_submissions(self) -> None:
+        """Evaluate submissions by downloading from code URL.
+        
+        The code URL is stored in bucket_path field.
         """
         hparams = get_hparams()
         evaluating = await self.db.get_evaluating_submissions()
@@ -351,24 +332,10 @@ class Validator(BaseNode):
         logger.info(f"Found {len(evaluating)} submissions in EVALUATING status")
 
         for submission in evaluating:
-            # Parse R2 info from bucket_path (miner's R2 credentials)
-            try:
-                r2_data = json.loads(submission.bucket_path)
-                
-                # Use miner's R2 credentials from commitment
-                r2_info = R2Info(
-                    endpoint=r2_data.get("r2_endpoint", r2_data.get("endpoint", "")),
-                    bucket=r2_data.get("r2_bucket", r2_data.get("bucket", "")),
-                    key=r2_data.get("r2_key", r2_data.get("key", "")),
-                    access_key=r2_data.get("r2_access_key", r2_data.get("access_key", "")),
-                    secret_key=r2_data.get("r2_secret_key", r2_data.get("secret_key", "")),
-                )
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.error(f"Invalid R2 info for {submission.submission_id}: {e}")
-                continue
+            code_url = submission.bucket_path
             
-            if not r2_info.is_valid():
-                logger.warning(f"Invalid R2 credentials for {submission.submission_id}")
+            if not code_url or not code_url.startswith("http"):
+                logger.error(f"Invalid code URL for {submission.submission_id}: {code_url}")
                 continue
             
             existing_evals = await self.db.get_evaluations(submission.submission_id)
@@ -379,12 +346,25 @@ class Validator(BaseNode):
 
             runs_remaining = num_runs - len(my_evals)
             logger.info(f"Evaluating {submission.submission_id}")
-            logger.info(f"   R2: {r2_info.bucket}/{r2_info.key}")
+            logger.info(f"   URL: {code_url[:60]}...")
             logger.info(f"   Runs: {len(my_evals)+1}/{num_runs}")
 
-            # Run evaluations
-            miner_code = None  # Will store code from first successful run
+            # Download code from URL
+            success, code_or_error = self._download_from_url(code_url)
             
+            if not success:
+                logger.error(f"Failed to download code: {code_or_error}")
+                await self.db.update_submission_status(
+                    submission.submission_id,
+                    SubmissionStatus.FAILED_EVALUATION,
+                    error_message=f"Failed to download code: {code_or_error}",
+                )
+                continue
+            
+            miner_code = code_or_error
+            logger.info(f"   Downloaded {len(miner_code)} bytes")
+
+            # Run evaluations
             for run_idx in range(runs_remaining):
                 current_run = len(my_evals) + run_idx + 1
                 seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}"
@@ -392,7 +372,7 @@ class Validator(BaseNode):
                 logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
                 
                 result = await self.affinetes_runner.evaluate(
-                    r2_info=r2_info,
+                    code=miner_code,  # Pass code directly
                     seed=seed,
                     steps=getattr(hparams, 'eval_steps', 5),
                     batch_size=getattr(hparams, 'benchmark_batch_size', 8),
@@ -403,9 +383,6 @@ class Validator(BaseNode):
 
                 if result.success:
                     logger.info(f"Run {current_run} PASSED: {result.tps:,.2f} TPS")
-                    # Store code from first successful run
-                    if miner_code is None and result.code:
-                        miner_code = result.code
                 else:
                     logger.warning(f"Run {current_run} FAILED: {result.error}")
 
@@ -421,35 +398,15 @@ class Validator(BaseNode):
                 await self.db.save_evaluation(evaluation)
                 self._cleanup_memory()
 
-            # Mark code hash as evaluated
-            self.evaluated_hashes.add(submission.code_hash)
+            # Mark code URL as evaluated
+            self.evaluated_code_urls.add(code_url)
             
-            # Store miner's code in database and validator's R2
-            if miner_code:
-                await self._store_miner_code(submission, miner_code)
+            # Store miner's code in database
+            await self.db.update_submission_code(submission.submission_id, miner_code)
+            logger.info(f"Stored code for {submission.submission_id} in database")
             
             # Finalize submission
             await self._finalize_submission(submission.submission_id, num_runs)
-    
-    async def _store_miner_code(self, submission: SubmissionModel, code: str) -> None:
-        """Store miner's code in database and optionally in validator's R2."""
-        # Store in database
-        await self.db.update_submission_code(submission.submission_id, code)
-        logger.info(f"Stored code for {submission.submission_id} in database")
-        
-        # Optionally store in validator's R2
-        if self.validator_r2_client:
-            try:
-                key = f"submissions/{submission.submission_id}/train.py"
-                self.validator_r2_client.put_object(
-                    Bucket=self.validator_r2_bucket,
-                    Key=key,
-                    Body=code.encode(),
-                    ContentType="text/x-python",
-                )
-                logger.info(f"Stored code for {submission.submission_id} in validator R2")
-            except Exception as e:
-                logger.warning(f"Failed to store code in validator R2: {e}")
     
     async def _finalize_submission(self, submission_id: str, num_runs: int) -> None:
         """Calculate final score and update submission status."""
@@ -539,7 +496,7 @@ class Validator(BaseNode):
 def main():
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     
-    parser = argparse.ArgumentParser(description="Tournament Validator (R2-Based)")
+    parser = argparse.ArgumentParser(description="Tournament Validator (URL-Based)")
     parser.add_argument(
         "--wallet.name",
         dest="wallet_name",

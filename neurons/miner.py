@@ -1,209 +1,142 @@
 """Miner CLI for Templar Tournament.
 
-R2-Based Architecture:
-1. miner upload <train.py>  - Upload your code to R2 bucket
-2. miner commit             - Commit R2 credentials + link to blockchain
-3. Validator downloads from R2 and evaluates
+URL-Based Architecture:
+1. Host your train.py code at any URL (Gist, Pastebin, raw GitHub, etc.)
+2. Run: miner submit <code_url>
+3. The URL is timelock encrypted on blockchain
+4. After reveal, validators fetch and evaluate your code
 
-Environment Variables (R2 config from .env):
-  TOURNAMENT_R2_ACCOUNT_ID      - Cloudflare account ID
-  TOURNAMENT_R2_BUCKET_NAME     - Bucket name
-  TOURNAMENT_R2_ACCESS_KEY_ID   - Access key ID
-  TOURNAMENT_R2_SECRET_ACCESS_KEY - Secret access key
+The URL acts as a secret - only those who know it can access.
+Timelock encryption keeps it hidden until reveal_blocks pass.
 """
 
 import argparse
 import json
-import os
 import sys
-import time
-from pathlib import Path
+import urllib.request
+import urllib.error
 
 import bittensor as bt
 
 from tournament.config import HParams
 
-try:
-    import boto3
-    from botocore.config import Config as BotoConfig
-    HAS_BOTO3 = True
-except ImportError:
-    HAS_BOTO3 = False
 
-
-# =============================================================================
-# R2 CONFIG
-# =============================================================================
-
-def get_r2_config() -> dict | None:
-    """Get R2 configuration from environment variables (.env file).
+def validate_code_url(url: str) -> tuple[bool, str]:
+    """Validate that the URL points to a SINGLE valid train.py file.
     
-    Reads from TOURNAMENT_R2_* environment variables.
+    Accepts ANY URL that returns valid Python code with inner_steps function.
+    Examples: GitHub Gist, raw GitHub, Pastebin, any HTTP/HTTPS URL.
     
-    Returns:
-        Dict with R2 config or None if not configured
-    """
-    account_id = os.getenv("TOURNAMENT_R2_ACCOUNT_ID")
-    bucket = os.getenv("TOURNAMENT_R2_BUCKET_NAME")
-    access_key = os.getenv("TOURNAMENT_R2_ACCESS_KEY_ID")
-    secret_key = os.getenv("TOURNAMENT_R2_SECRET_ACCESS_KEY")
-    
-    # Build endpoint from account ID
-    endpoint = None
-    if account_id:
-        endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
-    
-    if not all([endpoint, bucket, access_key, secret_key]):
-        return None
-    
-    return {
-        "endpoint": endpoint,
-        "bucket": bucket,
-        "access_key": access_key,
-        "secret_key": secret_key,
-    }
-
-
-# =============================================================================
-# R2 UPLOAD
-# =============================================================================
-
-def upload_to_r2(
-    file_path: Path,
-    hotkey: str,
-    r2_config: dict | None = None,
-) -> tuple[bool, str | dict]:
-    """Upload train.py to R2 bucket.
+    IMPORTANT: Must be a single file URL, not a folder/directory or repo.
     
     Args:
-        file_path: Path to train.py file
-        hotkey: Miner's hotkey (for unique path)
-        r2_config: R2 config dict (from get_r2_config)
+        url: The URL to validate
         
     Returns:
-        Tuple of (success, result_dict or error_message)
+        Tuple of (is_valid, error_message_or_validated_url)
     """
-    if not HAS_BOTO3:
-        return False, "boto3 not installed. Run: pip install boto3"
+    if not url:
+        return False, "URL cannot be empty"
     
-    if not file_path.exists():
-        return False, f"File not found: {file_path}"
+    # Must be HTTP or HTTPS
+    if not url.startswith("http://") and not url.startswith("https://"):
+        return False, "URL must start with http:// or https://"
     
-    # Get R2 config from env if not provided
-    if r2_config is None:
-        r2_config = get_r2_config()
+    # Block obvious directory/folder URLs
+    blocked_patterns = [
+        "/tree/",      # GitHub repo tree
+        "/blob/",      # GitHub blob without raw - redirect to raw
+        "?tab=",       # GitHub tab navigation  
+        "/commits",    # GitHub commits page
+        "/pulls",      # GitHub PRs
+        "/issues",     # GitHub issues
+        "/actions",    # GitHub actions
+    ]
+    for pattern in blocked_patterns:
+        if pattern in url.lower():
+            return False, f"URL appears to be a folder/page, not a single file. Use raw file URL."
     
-    if r2_config is None:
-        return False, (
-            "R2 not configured. Set in .env file:\n"
-            "  TOURNAMENT_R2_ACCOUNT_ID\n"
-            "  TOURNAMENT_R2_BUCKET_NAME\n"
-            "  TOURNAMENT_R2_ACCESS_KEY_ID\n"
-            "  TOURNAMENT_R2_SECRET_ACCESS_KEY"
-        )
+    # For GitHub blob URLs, suggest raw format
+    if "github.com" in url and "/blob/" in url:
+        return False, "Use raw.githubusercontent.com URL instead of github.com/blob/"
     
-    # Read and validate file
+    # For GitHub Gist URLs, convert to raw format
+    final_url = url
+    if "gist.github.com" in url and "/raw" not in url:
+        final_url = url.replace("gist.github.com", "gist.githubusercontent.com")
+        if not final_url.endswith("/raw"):
+            final_url = final_url.rstrip("/") + "/raw"
+    
+    # Verify the URL is accessible and contains valid code
     try:
-        code = file_path.read_text()
+        req = urllib.request.Request(final_url, headers={"User-Agent": "templar-tournament"})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            code = response.read().decode("utf-8")
+            
+            # Check it's not HTML (indicates folder/page, not file)
+            if "<html" in code.lower()[:500] or "<!doctype html" in code.lower()[:500]:
+                return False, "URL returns HTML page, not a code file. Use raw file URL."
+            
+            # Check it's not JSON (could be API response listing files)
+            if code.strip().startswith("{") and '"files"' in code[:500]:
+                return False, "URL returns JSON (possibly file listing), not a single code file."
+            
+            # Basic validation - must contain inner_steps
+            if "def inner_steps" not in code:
+                return False, "Code must contain 'def inner_steps' function"
+            
+            # Size sanity check (single file should be < 100KB typically)
+            if len(code) > 500_000:  # 500KB max
+                return False, f"File too large ({len(code)} bytes). Max 500KB for single train.py"
+            
+            print(f"   ✓ URL accessible ({len(code)} bytes)")
+            print(f"   ✓ Single file detected")
+            print(f"   ✓ Contains inner_steps function")
+            
+    except urllib.error.HTTPError as e:
+        return False, f"Cannot access URL: HTTP {e.code}"
+    except urllib.error.URLError as e:
+        return False, f"Cannot access URL: {e.reason}"
     except Exception as e:
-        return False, f"Failed to read file: {e}"
+        return False, f"Error validating URL: {e}"
     
-    # Basic validation
-    if "def inner_steps" not in code:
-        return False, "train.py must contain 'def inner_steps' function"
-    
-    # Generate unique key per miner
-    timestamp = int(time.time())
-    hotkey_short = hotkey[:16] if len(hotkey) > 16 else hotkey
-    r2_key = f"submissions/{hotkey_short}/{timestamp}/train.py"
-    
-    print(f"Uploading to R2...")
-    print(f"   Bucket: {r2_config['bucket']}")
-    print(f"   Key: {r2_key}")
-    
-    try:
-        # Create S3 client for R2
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=r2_config["endpoint"],
-            aws_access_key_id=r2_config["access_key"],
-            aws_secret_access_key=r2_config["secret_key"],
-            config=BotoConfig(
-                signature_version="s3v4",
-                retries={"max_attempts": 3},
-            ),
-        )
-        
-        # Upload file
-        s3.put_object(
-            Bucket=r2_config["bucket"],
-            Key=r2_key,
-            Body=code.encode(),
-            ContentType="text/x-python",
-        )
-        
-        print(f"\nUpload successful!")
-        
-        # Result includes all info needed for commitment
-        result = {
-            "r2_endpoint": r2_config["endpoint"],
-            "r2_bucket": r2_config["bucket"],
-            "r2_key": r2_key,
-            "r2_access_key": r2_config["access_key"],
-            "r2_secret_key": r2_config["secret_key"],
-        }
-        
-        return True, result
-        
-    except Exception as e:
-        return False, f"R2 upload failed: {e}"
+    return True, final_url
 
-
-# =============================================================================
-# BLOCKCHAIN COMMIT
-# =============================================================================
 
 def commit_to_chain(
     wallet: bt.wallet,
-    r2_info: dict,
+    code_url: str,
     network: str = "finney",
 ) -> tuple[bool, dict | str]:
-    """Commit R2 credentials + link to blockchain.
+    """Commit code URL to blockchain (timelock encrypted).
     
-    The commitment contains all info needed for validator to download your code:
-    - R2 endpoint, bucket, key
-    - R2 credentials (access_key, secret_key)
-    
-    After reveal_blocks (from hparams.json), this info becomes visible to validators.
-    netuid and reveal_blocks are read from hparams.json (not user-controlled).
+    The URL is encrypted via drand and only revealed after reveal_blocks.
+    This keeps your code location private until evaluation time.
     
     Args:
         wallet: Bittensor wallet
-        r2_info: Dict with R2 upload info from upload_to_r2()
+        code_url: URL containing train.py code
         network: Subtensor network (finney, test, or local)
         
     Returns:
         Tuple of (success, result_dict or error_message)
     """
-    # Load netuid and reveal_blocks from hparams (not user-controlled)
+    # Load settings from hparams
     hparams = HParams.load()
     netuid = hparams.netuid
     blocks_until_reveal = hparams.reveal_blocks
+    block_time = hparams.block_time
     
     print(f"\nCommitting to blockchain...")
     print(f"   Network: {network}")
     print(f"   Subnet: {netuid} (from hparams.json)")
     print(f"   Hotkey: {wallet.hotkey.ss58_address}")
     print(f"   Reveal blocks: {blocks_until_reveal} (from hparams.json)")
+    print(f"   Block time: {block_time}s (from hparams.json)")
     
-    # Create commitment data with R2 credentials
-    # Validator will use these to download train.py from miner's R2
+    # Commitment data - just the code URL!
     commitment_data = json.dumps({
-        "r2_endpoint": r2_info["r2_endpoint"],
-        "r2_bucket": r2_info["r2_bucket"],
-        "r2_key": r2_info["r2_key"],
-        "r2_access_key": r2_info["r2_access_key"],
-        "r2_secret_key": r2_info["r2_secret_key"],
+        "code_url": code_url,
     }, separators=(',', ':'))
     
     print(f"   Commitment size: {len(commitment_data)} bytes")
@@ -217,31 +150,28 @@ def commit_to_chain(
     except Exception as e:
         return False, f"Failed to connect to {network}: {e}"
     
-    # Commit to blockchain using set_reveal_commitment (timelock encrypted via drand)
-    # Note: Localnet doesn't have drand - use MOCK_COMMITMENTS=1 for local testing
+    # Commit using timelock encryption (drand)
     print(f"\nCommitting to chain...")
     print(f"   Using set_reveal_commitment (timelock encrypted)")
     
     try:
-        success = False
-        reveal_round = None
-        
-        if hasattr(subtensor, 'set_reveal_commitment'):
-            success, reveal_round = subtensor.set_reveal_commitment(
-                wallet=wallet,
-                netuid=netuid,
-                data=commitment_data,
-                blocks_until_reveal=blocks_until_reveal,
-            )
-        else:
+        if not hasattr(subtensor, 'set_reveal_commitment'):
             return False, "Subtensor does not support set_reveal_commitment()"
+        
+        success, reveal_round = subtensor.set_reveal_commitment(
+            wallet=wallet,
+            netuid=netuid,
+            data=commitment_data,
+            blocks_until_reveal=blocks_until_reveal,
+            block_time=block_time,
+        )
         
         if success:
             commit_block = subtensor.get_current_block()
             reveal_block = commit_block + blocks_until_reveal
             
             result = {
-                **r2_info,
+                "code_url": code_url,
                 "commit_block": commit_block,
                 "reveal_block": reveal_block,
                 "reveal_round": reveal_round,
@@ -253,12 +183,7 @@ def commit_to_chain(
             print(f"   Commit block: {commit_block}")
             print(f"   Reveal block: {reveal_block}")
             print(f"   Reveal round: {reveal_round}")
-            
-            if network == "local":
-                print(f"\n⚠️  Note: Localnet doesn't have drand - commitment won't decrypt.")
-                print(f"   For local testing, run validator with MOCK_COMMITMENTS=1")
-            else:
-                print(f"\nValidators will evaluate after block {reveal_block}")
+            print(f"\nValidators will evaluate after block {reveal_block}")
             
             return True, result
         else:
@@ -268,136 +193,35 @@ def commit_to_chain(
         return False, f"Blockchain error: {e}"
 
 
-# =============================================================================
-# CLI COMMANDS
-# =============================================================================
-
-def cmd_upload(args):
-    """Upload train.py to R2."""
-    # Get wallet for hotkey
-    wallet = bt.wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
-    hotkey = wallet.hotkey.ss58_address
-    
-    # Get R2 config from .env
-    r2_config = get_r2_config()
-    
-    # Override with CLI args if provided
-    if args.r2_endpoint:
-        r2_config = r2_config or {}
-        r2_config["endpoint"] = args.r2_endpoint
-    if args.r2_bucket:
-        r2_config = r2_config or {}
-        r2_config["bucket"] = args.r2_bucket
-    if args.r2_access_key:
-        r2_config = r2_config or {}
-        r2_config["access_key"] = args.r2_access_key
-    if args.r2_secret_key:
-        r2_config = r2_config or {}
-        r2_config["secret_key"] = args.r2_secret_key
-    
-    success, result = upload_to_r2(
-        file_path=args.train_path,
-        hotkey=hotkey,
-        r2_config=r2_config,
-    )
-    
-    if success:
-        print(f"\n✓ Upload complete!")
-        print(f"\nTo commit, use the submit command which uploads and commits in one step:")
-        print(f"  uv run python -m neurons.miner submit <train.py> --wallet.name {args.wallet_name} --wallet.hotkey {args.wallet_hotkey}")
-        return 0
-    else:
-        print(f"\nUpload failed: {result}")
-        return 1
-
-
-def cmd_commit(args):
-    """Commit R2 info to blockchain.
-    
-    Note: This command requires --upload-info with the upload result JSON.
-    For most users, use 'submit' command instead which handles upload + commit.
-    """
-    if not args.upload_info:
-        print("Error: --upload-info is required")
-        print("\nFor easier usage, use the 'submit' command which uploads and commits in one step:")
-        print("  uv run python -m neurons.miner submit <train.py> --wallet.name <name> --wallet.hotkey <hotkey>")
-        return 1
-    
-    upload_info_file = Path(args.upload_info)
-    
-    if not upload_info_file.exists():
-        print(f"Error: Upload info file not found: {upload_info_file}")
-        return 1
-    
-    try:
-        r2_info = json.loads(upload_info_file.read_text())
-    except Exception as e:
-        print(f"Error reading upload info: {e}")
-        return 1
-    
-    wallet = bt.wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
-    
-    success, result = commit_to_chain(
-        wallet=wallet,
-        r2_info=r2_info,
-        network=args.network,
-    )
-    
-    if success:
-        print(f"\n✓ Commitment successful!")
-        print(f"   Commit block: {result['commit_block']}")
-        print(f"   Reveal block: {result['reveal_block']}")
-        return 0
-    else:
-        print(f"\nCommit failed: {result}")
-        return 1
-
-
 def cmd_submit(args):
-    """Upload and commit in one step."""
+    """Submit a code URL to the tournament."""
     wallet = bt.wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
-    hotkey = wallet.hotkey.ss58_address
     
-    # Get R2 config from .env
-    r2_config = get_r2_config()
-    
-    # Override with CLI args if provided
-    if args.r2_endpoint:
-        r2_config = r2_config or {}
-        r2_config["endpoint"] = args.r2_endpoint
-    if args.r2_bucket:
-        r2_config = r2_config or {}
-        r2_config["bucket"] = args.r2_bucket
-    if args.r2_access_key:
-        r2_config = r2_config or {}
-        r2_config["access_key"] = args.r2_access_key
-    if args.r2_secret_key:
-        r2_config = r2_config or {}
-        r2_config["secret_key"] = args.r2_secret_key
-    
-    # Upload
     print("=" * 60)
-    print("STEP 1: UPLOAD TO R2")
+    print("TEMPLAR TOURNAMENT - SUBMIT CODE")
     print("=" * 60)
+    print(f"\nWallet: {args.wallet_name}/{args.wallet_hotkey}")
+    print(f"Hotkey: {wallet.hotkey.ss58_address}")
     
-    success, r2_info = upload_to_r2(
-        file_path=args.train_path,
-        hotkey=hotkey,
-        r2_config=r2_config,
-    )
+    # Validate code URL
+    print(f"\n--- STEP 1: VALIDATE CODE URL ---")
+    print(f"Validating URL...")
+    print(f"   URL: {args.code_url}")
     
-    if not success:
-        print(f"\nUpload failed: {r2_info}")
+    valid, result = validate_code_url(args.code_url)
+    if not valid:
+        print(f"\n✗ Invalid URL: {result}")
         return 1
     
-    # Commit
-    print("\n" + "=" * 60)
-    print("STEP 2: COMMIT TO BLOCKCHAIN")
-    print("=" * 60)
+    final_url = result
+    print(f"   Final URL: {final_url}")
+    
+    # Commit to blockchain
+    print(f"\n--- STEP 2: COMMIT TO BLOCKCHAIN ---")
     
     success, result = commit_to_chain(
         wallet=wallet,
-        r2_info=r2_info,
+        code_url=final_url,
         network=args.network,
     )
     
@@ -405,11 +229,15 @@ def cmd_submit(args):
         print("\n" + "=" * 60)
         print("SUBMISSION COMPLETE!")
         print("=" * 60)
-        print(f"\nYour code is committed to the blockchain.")
-        print(f"Validators will evaluate after block {result['reveal_block']}")
+        print(f"\nYour code URL is now timelock encrypted on the blockchain.")
+        print(f"After block {result['reveal_block']}, validators will:")
+        print(f"  1. Decrypt and retrieve your code URL")
+        print(f"  2. Fetch your train.py code")
+        print(f"  3. Evaluate and score your submission")
+        print(f"\n⚠️  Do NOT delete or modify your code until evaluation is complete!")
         return 0
     else:
-        print(f"\nCommit failed: {result}")
+        print(f"\n✗ Commit failed: {result}")
         return 1
 
 
@@ -420,7 +248,7 @@ def cmd_status(args):
         subtensor = bt.subtensor(network=args.network)
         current_block = subtensor.get_current_block()
         
-        # Load hparams for netuid
+        # Load hparams
         hparams = HParams.load()
         
         print(f"\n✓ Connected to blockchain")
@@ -428,12 +256,16 @@ def cmd_status(args):
         print(f"   Current block: {current_block}")
         print(f"   Subnet: {hparams.netuid}")
         print(f"   Reveal blocks: {hparams.reveal_blocks}")
+        print(f"   Block time: {hparams.block_time}s")
         
         # Check if subnet exists
         if subtensor.subnet_exists(hparams.netuid):
             print(f"\n✓ Subnet {hparams.netuid} exists")
-            meta = bt.metagraph(netuid=hparams.netuid, network=args.network)
-            print(f"   Neurons: {meta.n.item()}")
+            try:
+                meta = bt.metagraph(netuid=hparams.netuid, network=args.network)
+                print(f"   Neurons: {meta.n.item()}")
+            except Exception as e:
+                print(f"   (Could not fetch neuron count: {e})")
         else:
             print(f"\n⚠ Subnet {hparams.netuid} does not exist on {args.network}")
         
@@ -444,74 +276,81 @@ def cmd_status(args):
         return 1
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
+def cmd_validate(args):
+    """Validate a code URL without submitting."""
+    print("=" * 60)
+    print("VALIDATE CODE URL")
+    print("=" * 60)
+    print(f"\nValidating: {args.code_url}")
+    
+    valid, result = validate_code_url(args.code_url)
+    
+    if valid:
+        print(f"\n✓ URL is valid!")
+        print(f"   Final URL: {result}")
+        print(f"\nTo submit, run:")
+        print(f"  uv run python -m neurons.miner submit '{result}' --wallet.name <name> --wallet.hotkey <hotkey>")
+        return 0
+    else:
+        print(f"\n✗ Invalid: {result}")
+        return 1
+
 
 def main():
     parser = argparse.ArgumentParser(
         description="Templar Tournament Miner CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Test locally first (in local_test directory)
-  cd local_test && uv run python train.py
+How to Submit:
 
-  # Submit to blockchain (uploads to R2 and commits)
-  uv run python -m neurons.miner submit local_test/train.py \\
+  1. Host your train.py code at any URL:
+     - GitHub Gist (secret recommended)
+     - Raw GitHub file
+     - Pastebin or any paste service
+     - Any HTTP/HTTPS URL that returns the code
+
+  2. Submit to the tournament:
+     uv run python -m neurons.miner submit <code_url> \\
+         --wallet.name miner --wallet.hotkey default --network finney
+
+  3. Your code URL is timelock encrypted - validators can only see it
+     after reveal_blocks pass.
+
+Examples:
+  # Validate a URL without submitting
+  uv run python -m neurons.miner validate https://example.com/train.py
+
+  # Submit to mainnet
+  uv run python -m neurons.miner submit https://example.com/train.py \\
       --wallet.name miner --wallet.hotkey default --network finney
 
   # Check blockchain status
   uv run python -m neurons.miner status --network finney
 
-Settings from hparams.json (not user-controlled):
+Settings from hparams.json:
   netuid        - Subnet ID
   reveal_blocks - Blocks until commitment revealed
-
-Environment Variables (set in .env):
-  TOURNAMENT_R2_ACCOUNT_ID        - Cloudflare account ID
-  TOURNAMENT_R2_BUCKET_NAME       - Bucket name  
-  TOURNAMENT_R2_ACCESS_KEY_ID     - Access key ID
-  TOURNAMENT_R2_SECRET_ACCESS_KEY - Secret access key
+  block_time    - Seconds per block (for drand calculation)
         """
     )
     
     subparsers = parser.add_subparsers(dest="command", help="Commands")
     
-    # R2 credential arguments (shared helper)
-    def add_r2_args(p):
-        p.add_argument("--r2-endpoint", help="R2/S3 endpoint URL (override .env)")
-        p.add_argument("--r2-bucket", help="Bucket name (override .env)")
-        p.add_argument("--r2-access-key", help="Access key ID (override .env)")
-        p.add_argument("--r2-secret-key", help="Secret access key (override .env)")
-    
-    # UPLOAD command
-    upload_parser = subparsers.add_parser("upload", help="Upload train.py to R2")
-    upload_parser.add_argument("train_path", type=Path, help="Path to train.py")
-    upload_parser.add_argument("--wallet.name", dest="wallet_name", default="default")
-    upload_parser.add_argument("--wallet.hotkey", dest="wallet_hotkey", default="default")
-    add_r2_args(upload_parser)
-    upload_parser.set_defaults(func=cmd_upload)
-    
-    # COMMIT command
-    commit_parser = subparsers.add_parser("commit", help="Commit R2 info to blockchain")
-    commit_parser.add_argument("--upload-info", help="Path to upload info JSON")
-    commit_parser.add_argument("--wallet.name", dest="wallet_name", default="default")
-    commit_parser.add_argument("--wallet.hotkey", dest="wallet_hotkey", default="default")
-    commit_parser.add_argument("--network", default="finney", help="Network: finney (mainnet), test, or local")
-    commit_parser.set_defaults(func=cmd_commit)
-    
-    # SUBMIT command (upload + commit)
-    submit_parser = subparsers.add_parser("submit", help="Upload and commit in one step")
-    submit_parser.add_argument("train_path", type=Path, help="Path to train.py")
-    add_r2_args(submit_parser)
+    # SUBMIT command
+    submit_parser = subparsers.add_parser("submit", help="Submit a code URL to the tournament")
+    submit_parser.add_argument("code_url", help="URL containing your train.py code")
     submit_parser.add_argument("--wallet.name", dest="wallet_name", default="default")
     submit_parser.add_argument("--wallet.hotkey", dest="wallet_hotkey", default="default")
     submit_parser.add_argument("--network", default="finney", help="Network: finney (mainnet), test, or local")
     submit_parser.set_defaults(func=cmd_submit)
     
+    # VALIDATE command
+    validate_parser = subparsers.add_parser("validate", help="Validate a code URL without submitting")
+    validate_parser.add_argument("code_url", help="URL to validate")
+    validate_parser.set_defaults(func=cmd_validate)
+    
     # STATUS command
-    status_parser = subparsers.add_parser("status", help="Check commitment status")
+    status_parser = subparsers.add_parser("status", help="Check blockchain status")
     status_parser.add_argument("--network", default="finney", help="Network: finney (mainnet), test, or local")
     status_parser.set_defaults(func=cmd_status)
     

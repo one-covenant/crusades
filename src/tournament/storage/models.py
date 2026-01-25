@@ -28,11 +28,18 @@ class Base(DeclarativeBase):
 class SubmissionModel(Base):
     """Database model for code submissions.
     
-    R2-Based Architecture:
-    - submission_id: Format "r2_{block}_{uid}" for R2 submissions
-    - code_hash: SHA256 hash of miner's code
-    - bucket_path: JSON with R2 credentials (miner's bucket)
-    - code_content: Actual miner code (stored after evaluation)
+    URL-Based Architecture:
+    - submission_id: Format "commit_{block}_{uid}" for submissions
+    - code_hash: Code URL (used as unique identifier)
+    - bucket_path: Code URL (source location)
+    - code_content: Actual miner code (stored after evaluation for conflict resolution)
+    
+    All fields are preserved for future conflict resolution:
+    - miner identity (hotkey, uid)
+    - source location (code URL)
+    - actual code content
+    - timestamps
+    - evaluation results
     """
 
     __tablename__ = "submissions"
@@ -43,7 +50,7 @@ class SubmissionModel(Base):
     miner_hotkey: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
     miner_uid: Mapped[int] = mapped_column(Integer, nullable=False)
     code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    bucket_path: Mapped[str] = mapped_column(String(1024), nullable=False)  # JSON with R2 info
+    bucket_path: Mapped[str] = mapped_column(String(1024), nullable=False)  # Code URL
 
     status: Mapped[SubmissionStatus] = mapped_column(
         Enum(SubmissionStatus, values_callable=lambda obj: [e.value for e in obj]),

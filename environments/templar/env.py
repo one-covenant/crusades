@@ -1,18 +1,17 @@
 """
 Templar TPS Evaluation Environment (Validator-Owned)
 
-R2-Based Architecture:
+URL-Based Architecture:
 - This env.py is owned by the VALIDATOR, not the miner
-- Miner submits train.py to their R2 bucket
-- Validator downloads train.py from miner's R2 at evaluation time
+- Miner commits a URL pointing to their train.py code
+- Validator downloads code from URL and passes it to this env
 - This ensures miners can't tamper with evaluation logic
 
 Flow:
-1. Validator reads miner commitment (contains R2 credentials)
-2. Validator calls env.evaluate(r2_endpoint, r2_bucket, r2_key, ...)
-3. This Actor downloads train.py from miner's R2
-4. Runs benchmark and returns TPS
-5. Validator stores miner's code in its own R2 for dashboard
+1. Validator reads miner commitment (contains code URL)
+2. Validator downloads train.py from URL
+3. Validator calls env.evaluate(code="...", ...)
+4. This Actor runs benchmark and returns TPS
 """
 
 import ast
@@ -54,54 +53,6 @@ _CACHE = {
     "model_path": None,
     "initial_state": None,
 }
-
-
-def _download_from_r2(
-    r2_endpoint: str,
-    r2_bucket: str,
-    r2_key: str,
-    r2_access_key: str,
-    r2_secret_key: str,
-    dest_path: Path,
-) -> tuple[bool, str | None]:
-    """Download file from miner's R2 bucket.
-    
-    Args:
-        r2_endpoint: R2/S3 endpoint URL
-        r2_bucket: Bucket name
-        r2_key: Object key
-        r2_access_key: Access key ID
-        r2_secret_key: Secret access key
-        dest_path: Destination path
-        
-    Returns:
-        Tuple of (success, error_message or None)
-    """
-    try:
-        import boto3
-        from botocore.config import Config as BotoConfig
-    except ImportError:
-        return False, "boto3 not installed"
-    
-    try:
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=r2_endpoint,
-            aws_access_key_id=r2_access_key,
-            aws_secret_access_key=r2_secret_key,
-            config=BotoConfig(
-                signature_version="s3v4",
-                retries={"max_attempts": 3},
-            ),
-        )
-        
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        s3.download_file(r2_bucket, r2_key, str(dest_path))
-        
-        return True, None
-        
-    except Exception as e:
-        return False, f"R2 download failed: {e}"
 
 
 def _load_miner_module(train_path: Path):
@@ -412,7 +363,7 @@ class Actor:
     """Templar TPS Evaluation Actor for Affinetes (Validator-Owned).
     
     This Actor is owned by the validator, not the miner.
-    It downloads the miner's train.py from their R2 bucket and evaluates it.
+    Code is passed directly from the validator (downloaded from URL).
     """
     
     async def evaluate(
@@ -426,15 +377,10 @@ class Actor:
         timeout: int = 600,
         sequence_length: int | None = None,
         data_samples: int = 10000,
-        # R2 credentials for miner's code
-        r2_endpoint: str = "",
-        r2_bucket: str = "",
-        r2_key: str = "",
-        r2_access_key: str = "",
-        r2_secret_key: str = "",
+        code: str = "",  # Miner's code passed directly
     ) -> dict:
         """
-        Download miner's train.py from R2 and run TPS evaluation.
+        Run TPS evaluation on miner's code.
         
         Args:
             task_id: Evaluation run identifier
@@ -446,24 +392,20 @@ class Actor:
             timeout: Maximum seconds
             sequence_length: Sequence length
             data_samples: Number of data samples
-            r2_endpoint: Miner's R2 endpoint
-            r2_bucket: Miner's R2 bucket
-            r2_key: Miner's R2 key (path to train.py)
-            r2_access_key: Miner's R2 access key
-            r2_secret_key: Miner's R2 secret key
+            code: Miner's train.py code (passed directly from validator)
             
         Returns:
             Dict with: tps, total_tokens, wall_time_seconds, success, error, code
         """
-        # Validate R2 credentials
-        if not all([r2_endpoint, r2_bucket, r2_key, r2_access_key, r2_secret_key]):
+        # Validate code
+        if not code:
             return {
                 "task_id": task_id,
                 "tps": 0.0,
                 "total_tokens": 0,
                 "wall_time_seconds": 0.0,
                 "success": False,
-                "error": "Missing R2 credentials",
+                "error": "No code provided",
                 "seed": seed,
             }
         
@@ -484,48 +426,7 @@ class Actor:
         seed_value = abs(hash(seed)) % (2**32)
         _set_deterministic(seed_value)
         
-        # Download miner's train.py from R2
-        train_path = CACHE_DIR / "miner_train.py"
-        
-        print(f"Downloading miner code from R2...")
-        print(f"   Endpoint: {r2_endpoint}")
-        print(f"   Bucket: {r2_bucket}")
-        print(f"   Key: {r2_key}")
-        
-        success, error = _download_from_r2(
-            r2_endpoint=r2_endpoint,
-            r2_bucket=r2_bucket,
-            r2_key=r2_key,
-            r2_access_key=r2_access_key,
-            r2_secret_key=r2_secret_key,
-            dest_path=train_path,
-        )
-        
-        if not success:
-            return {
-                "task_id": task_id,
-                "tps": 0.0,
-                "total_tokens": 0,
-                "wall_time_seconds": 0.0,
-                "success": False,
-                "error": f"R2 download failed: {error}",
-                "seed": seed,
-            }
-        
-        # Read and validate code
-        try:
-            code = train_path.read_text()
-        except Exception as e:
-            return {
-                "task_id": task_id,
-                "tps": 0.0,
-                "total_tokens": 0,
-                "wall_time_seconds": 0.0,
-                "success": False,
-                "error": f"Failed to read train.py: {e}",
-                "seed": seed,
-            }
-        
+        # Validate code structure
         code_ok, code_error = _validate_code_structure(code)
         if not code_ok:
             return {
@@ -536,7 +437,22 @@ class Actor:
                 "success": False,
                 "error": code_error,
                 "seed": seed,
-                "code": code,  # Return code for debugging
+                "code": code,
+            }
+        
+        # Write code to temp file for loading as module
+        train_path = CACHE_DIR / "miner_train.py"
+        try:
+            train_path.write_text(code)
+        except Exception as e:
+            return {
+                "task_id": task_id,
+                "tps": 0.0,
+                "total_tokens": 0,
+                "wall_time_seconds": 0.0,
+                "success": False,
+                "error": f"Failed to write train.py: {e}",
+                "seed": seed,
             }
         
         if time.monotonic() > deadline:
@@ -546,7 +462,7 @@ class Actor:
                 "total_tokens": 0,
                 "wall_time_seconds": 0.0,
                 "success": False,
-                "error": "Timeout after downloading code",
+                "error": "Timeout before evaluation",
                 "seed": seed,
             }
         
@@ -629,8 +545,6 @@ class Actor:
                 }
             
             # Calculate expected tokens
-            expected_tokens = batch_size * (seq_len - 1) * steps  # seq_len-1 because we drop last token for labels
-            # Actually, miners typically count full batch tokens
             expected_tokens = batch_size * seq_len * steps
             
             # Verify outputs (correctness check, not exact match)
@@ -656,7 +570,7 @@ class Actor:
                 "error": verify_error,
                 "seed": seed,
                 "diagnostics": diagnostics,
-                "code": code,  # Return code so validator can store it
+                "code": code,
             }
             
         except Exception as e:
@@ -669,7 +583,7 @@ class Actor:
                 "success": False,
                 "error": f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}",
                 "seed": seed,
-                "code": code if 'code' in dir() else None,
+                "code": code,
             }
         
         finally:

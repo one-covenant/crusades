@@ -1,24 +1,20 @@
 """Blockchain commitment reading for Templar Tournament.
 
-R2-Based Architecture:
-- Miners upload train.py to their own R2 bucket
-- Miners commit R2 credentials + path to blockchain (timelock encrypted)
-- After reveal, validators download using miner's R2 credentials
-- Validator stores evaluated code in database (no validator R2 needed)
+URL-Based Architecture with Timelock Encryption:
+- Miners host their train.py code at any URL (Gist, raw GitHub, etc.)
+- Miners commit the code URL to blockchain using set_reveal_commitment()
+- Commitments are timelock encrypted via drand
+- After reveal_blocks, validators can read decrypted URL
+- Validator fetches code from URL and evaluates
 
 Commitment format:
   {
-    "r2_endpoint": "https://xxx.r2.cloudflarestorage.com",
-    "r2_bucket": "miner-bucket",
-    "r2_key": "submissions/5CX7WS4S2PyXCkBr/1769152885/train.py",
-    "r2_access_key": "...",
-    "r2_secret_key": "..."
+    "code_url": "https://example.com/train.py"
   }
 """
 
 import json
 import logging
-import os
 from dataclasses import dataclass
 
 import bittensor as bt
@@ -26,51 +22,27 @@ import bittensor as bt
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# TEST MODE: Hardcoded credentials to bypass drand/commit-reveal
-# Set MOCK_COMMITMENTS=1 to enable
-# =============================================================================
-MOCK_COMMITMENTS_ENABLED = os.getenv("MOCK_COMMITMENTS", "0") == "1"
-
-# Hardcoded test credentials (update these with your actual R2 data)
-MOCK_COMMITMENT_DATA = {
-    "r2_endpoint": "https://dc1ac72b395ec87f6caa8ef3df3d56a4.r2.cloudflarestorage.com",
-    "r2_bucket": "dc1ac72b395ec87f6caa8ef3df3d56a4",
-    "r2_key": "submissions/5CX7WS4S2PyXCkBr/1769152885/train.py",
-    "r2_access_key": os.getenv("TOURNAMENT_R2_ACCESS_KEY_ID", ""),
-    "r2_secret_key": os.getenv("TOURNAMENT_R2_SECRET_ACCESS_KEY", ""),
-}
-MOCK_MINER_HOTKEY = "5CX7WS4S2PyXCkBrmg8LZ38Xs5JkZXRBCtXAWyT3h5THH6oH"
-MOCK_MINER_UID = 1
-# =============================================================================
-
-
 @dataclass
-class R2Credentials:
-    """R2/S3 credentials from miner commitment."""
+class CodeUrlInfo:
+    """Code URL information from miner commitment."""
     
-    endpoint: str
-    bucket: str
-    key: str
-    access_key: str
-    secret_key: str
+    url: str
     
     def is_valid(self) -> bool:
-        """Check if credentials are complete."""
-        return all([self.bucket, self.key, self.access_key, self.secret_key])
+        """Check if code URL is valid."""
+        return bool(self.url) and (self.url.startswith("http://") or self.url.startswith("https://"))
 
 
 @dataclass
 class MinerCommitment:
     """A miner's commitment from the blockchain.
     
-    Contains R2 credentials for validator to download miner's train.py.
+    Contains code URL for validator to fetch miner's train.py.
     """
     
     uid: int
     hotkey: str
-    r2_credentials: R2Credentials | None
-    commit_block: int
+    code_url_info: CodeUrlInfo | None
     reveal_block: int
     is_revealed: bool
     raw_data: str
@@ -81,27 +53,26 @@ class MinerCommitment:
         uid: int,
         hotkey: str,
         data: str,
-        commit_block: int,
         reveal_block: int,
         current_block: int,
     ) -> "MinerCommitment | None":
         """Parse commitment from blockchain data.
         
-        Expects JSON format with R2 credentials:
+        Expects JSON format with code URL:
         {
-            "r2_endpoint": "...",
-            "r2_bucket": "...",
-            "r2_key": "...",
-            "r2_access_key": "...",
-            "r2_secret_key": "..."
+            "code_url": "https://example.com/train.py"
+        }
+        
+        Also supports legacy format:
+        {
+            "gist_url": "https://gist.githubusercontent.com/user/abc123/raw"
         }
         
         Args:
             uid: Miner UID
             hotkey: Miner hotkey address
-            data: Raw commitment data string
-            commit_block: Block when committed
-            reveal_block: Block when revealed
+            data: Raw commitment data string (decrypted JSON)
+            reveal_block: Block when commitment was revealed
             current_block: Current blockchain block
             
         Returns:
@@ -111,49 +82,50 @@ class MinerCommitment:
             return None
         
         data = data.strip()
-        r2_credentials = None
+        code_url_info = None
         
-        # Try JSON format
+        # Parse JSON format
         if data.startswith("{"):
             try:
                 parsed = json.loads(data)
                 
-                # R2 credentials format
-                if "r2_bucket" in parsed or "r2_key" in parsed:
-                    r2_credentials = R2Credentials(
-                        endpoint=parsed.get("r2_endpoint", ""),
-                        bucket=parsed.get("r2_bucket", ""),
-                        key=parsed.get("r2_key", ""),
-                        access_key=parsed.get("r2_access_key", ""),
-                        secret_key=parsed.get("r2_secret_key", ""),
-                    )
-                    logger.debug(f"R2 credentials from UID {uid}: bucket={r2_credentials.bucket}")
+                # New format: code_url
+                if "code_url" in parsed:
+                    code_url_info = CodeUrlInfo(url=parsed["code_url"])
+                    logger.debug(f"Code URL from UID {uid}: {code_url_info.url[:50]}...")
+                # Legacy format: gist_url
+                elif "gist_url" in parsed:
+                    code_url_info = CodeUrlInfo(url=parsed["gist_url"])
+                    logger.debug(f"Legacy gist URL from UID {uid}: {code_url_info.url[:50]}...")
                     
             except json.JSONDecodeError:
                 logger.debug(f"Invalid JSON in commitment from UID {uid}")
         
-        # If we couldn't parse R2 credentials, skip
-        if r2_credentials is None:
+        # If we couldn't parse code URL info, skip
+        if code_url_info is None:
             logger.debug(f"Could not parse commitment from UID {uid}: {data[:50]}...")
             return None
         
         return cls(
             uid=uid,
             hotkey=hotkey,
-            r2_credentials=r2_credentials,
-            commit_block=commit_block,
+            code_url_info=code_url_info,
             reveal_block=reveal_block,
             is_revealed=current_block >= reveal_block,
             raw_data=data,
         )
     
-    def has_valid_credentials(self) -> bool:
-        """Check if this commitment has valid R2 credentials."""
-        return self.r2_credentials is not None and self.r2_credentials.is_valid()
+    def has_valid_code_url(self) -> bool:
+        """Check if this commitment has a valid code URL."""
+        return self.code_url_info is not None and self.code_url_info.is_valid()
 
 
 class CommitmentReader:
-    """Reads miner commitments from the Bittensor blockchain."""
+    """Reads timelock-encrypted miner commitments from the Bittensor blockchain.
+    
+    Uses get_all_revealed_commitments() to read commitments that have been
+    decrypted after their reveal block (set via set_reveal_commitment).
+    """
     
     def __init__(
         self,
@@ -182,166 +154,161 @@ class CommitmentReader:
     
     @property
     def metagraph(self) -> bt.metagraph:
-        """Lazy-load metagraph."""
+        """Lazy-load metagraph using subtensor (like templar)."""
         if self._metagraph is None:
-            self._metagraph = bt.metagraph(netuid=self.netuid, network=self.network)
+            self._metagraph = self.subtensor.metagraph(netuid=self.netuid)
         return self._metagraph
     
     def sync(self) -> None:
         """Sync metagraph with blockchain."""
         logger.info(f"Syncing metagraph for subnet {self.netuid}...")
-        try:
-            self.metagraph.sync(subtensor=self.subtensor)
-            logger.info(f"Metagraph synced: {self.metagraph.n} neurons")
-        except Exception as e:
-            logger.warning(f"Metagraph sync failed: {e}")
+        self.metagraph.sync(subtensor=self.subtensor)
+        logger.info(f"Metagraph synced: {self.metagraph.n} neurons")
     
     def get_current_block(self) -> int:
         """Get current blockchain block number."""
         return self.subtensor.get_current_block()
     
-    def get_all_commitments(self) -> list[MinerCommitment]:
-        """Get all miner commitments from blockchain.
+    def _build_hotkey_to_uid_map(self) -> dict[str, int]:
+        """Build mapping from hotkey to UID."""
+        hotkey_to_uid: dict[str, int] = {}
+        self.sync()
+        for uid in range(self.metagraph.n):
+            hotkey_to_uid[self.metagraph.hotkeys[uid]] = uid
+        return hotkey_to_uid
+    
+    def _parse_revealed_result(self, result) -> tuple[int, str]:
+        """Parse result from get_revealed_commitment APIs.
         
-        Uses simple commit API (get_all_commitments) which works on all networks.
-        
-        If MOCK_COMMITMENTS=1 is set, returns hardcoded test data to bypass
-        drand/commit-reveal for local testing.
+        Result format: ((reveal_block1, data1), (reveal_block2, data2), ...) 
+        - Tuple of tuples, one per commitment
+        - Returns the LATEST commitment (highest block number)
         
         Returns:
-            List of MinerCommitment objects
+            Tuple of (reveal_block, data) for the latest commitment
         """
-        # TEST MODE: Return hardcoded mock commitments
-        if MOCK_COMMITMENTS_ENABLED:
-            logger.info("*** MOCK MODE: Returning hardcoded test commitments ***")
-            current_block = self.get_current_block()
-            
-            # Create mock commitment from hardcoded data
-            mock_commitment = MinerCommitment.from_chain_data(
-                uid=MOCK_MINER_UID,
-                hotkey=MOCK_MINER_HOTKEY,
-                data=json.dumps(MOCK_COMMITMENT_DATA),
-                commit_block=current_block - 100,  # Fake commit block
-                reveal_block=current_block - 50,   # Fake reveal block
-                current_block=current_block,
-            )
-            
-            if mock_commitment:
-                mock_commitment.is_revealed = True
-                logger.info(f"   Mock UID: {MOCK_MINER_UID}")
-                logger.info(f"   Mock hotkey: {MOCK_MINER_HOTKEY[:16]}...")
-                logger.info(f"   Mock R2 key: {MOCK_COMMITMENT_DATA['r2_key']}")
-                return [mock_commitment]
-            else:
-                logger.error("Failed to create mock commitment!")
-                return []
+        if not result:
+            return 0, ""
         
-        # PRODUCTION MODE: Read from blockchain
+        if isinstance(result, tuple):
+            # Find the latest commitment (highest block number)
+            latest_block = 0
+            latest_data = ""
+            
+            for item in result:
+                if isinstance(item, tuple) and len(item) >= 2:
+                    block = item[0]
+                    data = item[1] if item[1] else ""
+                    if block > latest_block:
+                        latest_block = block
+                        latest_data = data
+            
+            if latest_block > 0:
+                return latest_block, latest_data
+        
+        return 0, str(result) if result else ""
+    
+    def get_all_commitments(self) -> list[MinerCommitment]:
+        """Get all revealed miner commitments from blockchain.
+        
+        Uses get_all_revealed_commitments() to read timelock-encrypted commits
+        that have been decrypted after their reveal block.
+        
+        Returns:
+            List of MinerCommitment objects with valid code URLs
+        """
         current_block = self.get_current_block()
         commitments = []
         
-        # Build hotkey to UID mapping
-        hotkey_to_uid = {}
-        try:
-            self.sync()
-            for uid in range(self.metagraph.n):
-                hotkey_to_uid[self.metagraph.hotkeys[uid]] = uid
-        except Exception:
-            pass
+        # Build hotkey to UID mapping (may fail on some localnet versions)
+        hotkey_to_uid = self._build_hotkey_to_uid_map()
         
-        # Get all simple commitments
-        if hasattr(self.subtensor, 'get_all_commitments'):
+        # Get all revealed commitments (timelock decrypted)
+        if hasattr(self.subtensor, 'get_all_revealed_commitments'):
             try:
-                all_commits = self.subtensor.get_all_commitments(netuid=self.netuid)
-                logger.info(f"get_all_commitments returned {len(all_commits)} entries")
+                logger.info("Reading revealed commitments from blockchain...")
+                all_revealed = self.subtensor.get_all_revealed_commitments(netuid=self.netuid)
+                logger.info(f"Found {len(all_revealed)} revealed commitments on chain")
                 
-                for hotkey, data in all_commits.items():
+                for hotkey, result in all_revealed.items():
                     uid = hotkey_to_uid.get(hotkey, 0)
+                    reveal_block, data = self._parse_revealed_result(result)
+                    
                     commitment = MinerCommitment.from_chain_data(
                         uid=uid,
                         hotkey=hotkey,
                         data=data,
-                        commit_block=0,
-                        reveal_block=0,
+                        reveal_block=reveal_block,
                         current_block=current_block,
                     )
-                    if commitment:
+                    if commitment and commitment.has_valid_code_url():
                         commitment.is_revealed = True
                         commitments.append(commitment)
+                        logger.debug(f"Valid commitment from {hotkey[:16]}... (UID {uid})")
                 
-                logger.info(f"Found {len(commitments)} commitments")
+                logger.info(f"Found {len(commitments)} valid commitments with code URLs")
                 return commitments
-                
+                    
             except Exception as e:
-                logger.warning(f"get_all_commitments failed: {e}")
+                logger.error(f"Failed to read revealed commitments: {e}")
+        else:
+            logger.error("Subtensor does not support get_all_revealed_commitments()")
         
-        # Fallback: read from each UID individually
-        logger.info("Using per-UID fallback commitment reading...")
-        
-        for uid in range(self.metagraph.n):
-            try:
-                commitment = self.get_commitment_for_uid(uid, current_block)
-                if commitment:
-                    commitments.append(commitment)
-            except Exception as e:
-                logger.debug(f"Error reading commitment for UID {uid}: {e}")
-        
-        logger.info(f"Found {len(commitments)} commitments via fallback")
         return commitments
     
-    def get_commitment_for_uid(
+    def get_commitment_for_hotkey(
         self,
-        uid: int,
+        hotkey: str,
         current_block: int | None = None,
     ) -> MinerCommitment | None:
-        """Get commitment for a specific UID.
-        
-        Uses simple commit API (get_commitment) which works on all networks.
+        """Get revealed commitment for a specific hotkey.
         
         Args:
-            uid: Miner UID
+            hotkey: Miner hotkey address
             current_block: Current block (fetched if None)
             
         Returns:
-            MinerCommitment if found, None otherwise
+            MinerCommitment if found and valid, None otherwise
         """
         if current_block is None:
             current_block = self.get_current_block()
         
+        # Get UID from metagraph
+        uid = 0
         try:
-            hotkey = self.metagraph.hotkeys[uid]
-        except (IndexError, AttributeError):
-            return None
+            hotkey_to_uid = self._build_hotkey_to_uid_map()
+            uid = hotkey_to_uid.get(hotkey, 0)
+        except Exception:
+            pass
         
-        try:
-            if hasattr(self.subtensor, 'get_commitment'):
-                result = self.subtensor.get_commitment(
+        # Get revealed commitment
+        if hasattr(self.subtensor, 'get_revealed_commitment_by_hotkey'):
+            try:
+                result = self.subtensor.get_revealed_commitment_by_hotkey(
                     netuid=self.netuid,
-                    uid=uid,
+                    hotkey_ss58_address=hotkey,
                 )
                 
                 if result:
-                    data = result if isinstance(result, str) else result.get("data", "")
+                    reveal_block, data = self._parse_revealed_result(result)
+                    
                     commitment = MinerCommitment.from_chain_data(
                         uid=uid,
                         hotkey=hotkey,
                         data=data,
-                        commit_block=current_block,
-                        reveal_block=current_block,
+                        reveal_block=reveal_block,
                         current_block=current_block,
                     )
                     if commitment:
                         commitment.is_revealed = True
                         return commitment
-        except Exception as e:
-            logger.debug(f"get_commitment failed for UID {uid}: {e}")
+                        
+            except Exception as e:
+                logger.debug(f"get_revealed_commitment_by_hotkey failed for {hotkey[:16]}...: {e}")
         
         return None
     
-    def get_new_commitments_since(
-        self,
-        last_block: int,
-    ) -> list[MinerCommitment]:
+    def get_new_commitments_since(self, last_block: int) -> list[MinerCommitment]:
         """Get commitments revealed since a specific block.
         
         Args:
@@ -352,28 +319,14 @@ class CommitmentReader:
         """
         all_commitments = self.get_all_commitments()
         
-        # In mock mode, always return all commitments as "new" (for testing)
-        if MOCK_COMMITMENTS_ENABLED:
-            logger.info(f"MOCK MODE: Returning all {len(all_commitments)} commitments as new")
-            return all_commitments
-        
-        # Filter to only those committed after last_block and revealed
+        # Filter to only those revealed after last_block
         new_commitments = [
             c for c in all_commitments
-            if c.commit_block > last_block and c.is_revealed
+            if c.reveal_block > last_block
         ]
         
         logger.info(f"Found {len(new_commitments)} new commitments since block {last_block}")
         return new_commitments
-    
-    def get_valid_commitments(self) -> list[MinerCommitment]:
-        """Get only commitments with valid R2 credentials.
-        
-        Returns:
-            List of commitments with valid R2 credentials
-        """
-        all_commitments = self.get_all_commitments()
-        return [c for c in all_commitments if c.has_valid_credentials()]
 
 
 def get_commitment_reader(
