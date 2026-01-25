@@ -53,7 +53,6 @@ dev = [
 
 [project.scripts]
 tournament-validator = "neurons.validator:main"
-tournament-screener = "neurons.screener:main"
 tournament-miner = "neurons.miner:main"
 tplr = "tournament.tui.app:main"
 

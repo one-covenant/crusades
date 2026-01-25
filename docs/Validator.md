@@ -135,7 +135,7 @@ Edit `hparams/hparams.json` for your setup:
 ## Manage
 
 ```bash
-# View logs
+# View logs (includes Docker evaluation progress)
 tail -f logs/validator.log
 
 # Check if running
@@ -144,6 +144,22 @@ ps aux | grep neurons.validator
 # Stop
 pkill -f neurons.validator
 # or Ctrl+C if running in foreground
+```
+
+### Log Output Example
+
+During evaluation, you'll see Docker container logs streamed in real-time:
+
+```
+INFO | Running Docker evaluation
+INFO |    Code size: 9876 bytes
+INFO |    Docker command: docker run --rm -v /tmp/train_abc.py...
+INFO |    [DOCKER] Loading model: Qwen/Qwen2.5-7B
+INFO |    [DOCKER] Loading dataset: HuggingFaceFW/fineweb (samples=10000)
+INFO |    [DOCKER] Validator mode: seed=12345678 (from 1:3:1737...)
+INFO |    [DOCKER] Loaded data: shape=torch.Size([10000, 1024])
+INFO |    [DOCKER] Running miner's inner_steps...
+INFO | Run 1 PASSED: 3,622.26 TPS
 ```
 
 ---

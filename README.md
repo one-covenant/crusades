@@ -61,9 +61,12 @@ echo "HF_TOKEN=hf_your_token" > .env
 # Download model & data for local testing
 uv run python local_test/setup_benchmark.py
 
-# Test your train.py locally
+# Test your train.py locally (runs directly, NOT sandboxed)
 cd local_test && uv run python train.py
 ```
+
+> **Note**: Local testing runs directly on your machine for fast iteration.
+> Validator evaluations run in a secure Docker sandbox.
 
 ### 2. Host Your Code
 

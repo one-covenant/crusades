@@ -324,23 +324,37 @@ asyncio.run(main())
             ])
             
             logger.info(f"Running evaluation in {self.validator_image}...")
-            logger.debug(f"Docker command: {' '.join(docker_cmd)}")
-            logger.debug(f"Script path: {script_path}, Train path: {train_path}")
+            logger.info(f"   Docker command: {' '.join(docker_cmd[:6])}...")
             
-            # Run with timeout
+            # Run with timeout - stream logs in real-time
             start_time = time.perf_counter()
             
             process = await asyncio.create_subprocess_exec(
                 *docker_cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,  # Merge stderr into stdout for unified logging
             )
             
+            # Stream logs in real-time and collect for parsing
+            stdout_lines = []
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.timeout + 60,
-                )
+                async def read_stream():
+                    while True:
+                        line = await asyncio.wait_for(
+                            process.stdout.readline(),
+                            timeout=self.timeout + 60,
+                        )
+                        if not line:
+                            break
+                        decoded = line.decode().rstrip()
+                        stdout_lines.append(decoded)
+                        # Log Docker output with prefix for visibility
+                        if decoded and not decoded.startswith("EVAL_RESULT:"):
+                            logger.info(f"   [DOCKER] {decoded}")
+                
+                await read_stream()
+                await process.wait()
+                
             except asyncio.TimeoutError:
                 process.kill()
                 return EvaluationResult.failure(
@@ -350,8 +364,8 @@ asyncio.run(main())
             
             wall_time = time.perf_counter() - start_time
             
-            stdout_text = stdout.decode() if stdout else ""
-            stderr_text = stderr.decode() if stderr else ""
+            stdout_text = "\n".join(stdout_lines)
+            stderr_text = ""  # Already merged into stdout
             
             if process.returncode != 0:
                 error_msg = stderr_text[:500] if stderr_text else f"Exit code: {process.returncode}"

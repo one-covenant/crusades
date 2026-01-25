@@ -374,9 +374,7 @@ class DatabaseClient:
     def get_submission_code(self, submission_id: str) -> str | None:
         """Get code content from database (stored after evaluation).
         
-        R2-Based Architecture:
-        - Code is stored in code_content column after validator evaluates
-        - No need to extract from Docker image
+        Code is stored in code_content column after validator evaluates.
         """
         row = self._query_one(
             "SELECT code_content, code_hash FROM submissions WHERE submission_id = ?",

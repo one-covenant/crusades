@@ -38,7 +38,7 @@ class ValidationError(TournamentError):
 
 
 class StorageError(TournamentError):
-    """Error accessing storage (database or R2)."""
+    """Error accessing storage (database)."""
 
     pass
 
