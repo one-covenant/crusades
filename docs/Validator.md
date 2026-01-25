@@ -195,3 +195,53 @@ nvidia-smi
 # Check Docker GPU support
 docker run --rm --gpus all nvidia/cuda:12.1-base nvidia-smi
 ```
+
+---
+
+## View Submission Code
+
+Miner code is stored in the database after evaluation for verification purposes.
+
+### List All Submissions
+
+```bash
+uv run python scripts/view_submission.py
+```
+
+Output:
+```
+================================================================================
+SUBMISSION           UID   STATUS     TPS          CODE       SUBMITTED
+================================================================================
+commit_15118_3       3     evaluating N/A          N/A        2026-01-25 09:34:06
+commit_14954_1       1     finished   3616.38      9791 bytes 2026-01-25 09:01:13
+commit_9303_1        1     finished   3622.26      10042 bytes 2026-01-25 08:46:29
+```
+
+### View Specific Submission
+
+```bash
+# View submission details and code
+uv run python scripts/view_submission.py commit_9303_1
+```
+
+### Save Code to File
+
+```bash
+# Save miner's code to a file for review
+uv run python scripts/view_submission.py commit_9303_1 --save
+# Creates: commit_9303_1_train.py
+```
+
+### Direct Database Query
+
+```bash
+# Using Python
+uv run python -c "
+import sqlite3
+conn = sqlite3.connect('tournament.db')
+cur = conn.cursor()
+cur.execute('SELECT code_content FROM submissions WHERE submission_id=?', ('commit_9303_1',))
+print(cur.fetchone()[0])
+"
+```

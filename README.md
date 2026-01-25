@@ -114,16 +114,6 @@ uv run python -m neurons.miner status --network finney
 
 See [docs/Validator.md](docs/Validator.md) for detailed validator setup.
 
-**Quick Start:**
-
-```bash
-# Docker mode (local GPU)
-SUBTENSOR_NETWORK=finney uv run python -m neurons.validator \
-    --wallet.name your_wallet \
-    --wallet.hotkey your_hotkey \
-    --affinetes-mode docker
-```
-
 ---
 
 ## train.py Requirements
@@ -200,13 +190,10 @@ Key settings in `hparams/hparams.json`:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `netuid` | 1 | Subnet ID |
-| `reveal_blocks` | 10 | Blocks until commitment revealed |
 | `evaluation_runs` | 2 | Runs per submission (median taken) |
 | `eval_steps` | 5 | Training steps per evaluation |
 | `benchmark_model_name` | Qwen/Qwen2.5-7B | Model for evaluation |
 | `benchmark_batch_size` | 16 | Batch size for evaluation |
-| `burn_rate` | 0.95 | Emissions to validator (95%) |
-| `burn_uid` | 0 | Validator UID receiving burn_rate |
 
 ---
 

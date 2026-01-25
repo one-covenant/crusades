@@ -25,7 +25,7 @@ console = Console(force_terminal=True)
 
 
 def create_chart(history: list[dict], width: int = 50, height: int = 8) -> Text:
-    """Create an ASCII chart of TPS over time."""
+    """Create an ASCII LINE chart of TPS over time."""
     if not history:
         return Text("No data available", style="dim italic", justify="center")
 
@@ -38,76 +38,102 @@ def create_chart(history: list[dict], width: int = 50, height: int = 8) -> Text:
 
     min_tps = min(tps_values)
     max_tps = max(tps_values)
-    tps_range = max_tps - min_tps if max_tps != min_tps else 1
+    
+    # Add padding to min/max for better visualization
+    if max_tps == min_tps:
+        # All values same - show horizontal line in middle
+        padding = max_tps * 0.1 if max_tps > 0 else 100
+        min_tps = max_tps - padding
+        max_tps = max_tps + padding
+    
+    tps_range = max_tps - min_tps
 
-    # Unicode block characters for different heights
-    blocks = " ▁▂▃▄▅▆▇█"
-
-    # Build the chart
+    # Chart dimensions
+    chart_width = width - 7  # Account for y-axis label
+    
+    # Create a 2D grid for the chart
+    grid = [[" " for _ in range(chart_width)] for _ in range(height)]
+    
+    # Calculate positions for each data point
+    if len(tps_values) == 1:
+        # Single point - show in middle
+        x_positions = [chart_width // 2]
+    else:
+        x_positions = [int(i * (chart_width - 1) / (len(tps_values) - 1)) for i in range(len(tps_values))]
+    
+    y_positions = []
+    for tps in tps_values:
+        normalized = (tps - min_tps) / tps_range
+        y = int(normalized * (height - 1))
+        y = max(0, min(height - 1, y))
+        y_positions.append(y)
+    
+    # Draw connecting lines between points
+    for i in range(len(tps_values) - 1):
+        x1, y1 = x_positions[i], y_positions[i]
+        x2, y2 = x_positions[i + 1], y_positions[i + 1]
+        
+        # Draw line between points using Bresenham-like approach
+        dx = x2 - x1
+        dy = y2 - y1
+        steps = max(abs(dx), abs(dy), 1)
+        
+        for step in range(steps + 1):
+            t = step / steps if steps > 0 else 0
+            x = int(x1 + t * dx)
+            y = int(y1 + t * dy)
+            if 0 <= x < chart_width and 0 <= y < height:
+                # Use different characters based on slope
+                if dy > 0 and step > 0 and step < steps:
+                    grid[height - 1 - y][x] = "╱"
+                elif dy < 0 and step > 0 and step < steps:
+                    grid[height - 1 - y][x] = "╲"
+                else:
+                    grid[height - 1 - y][x] = "─"
+    
+    # Draw data points (overwrite lines at point locations)
+    for i, (x, y) in enumerate(zip(x_positions, y_positions)):
+        if 0 <= x < chart_width and 0 <= y < height:
+            grid[height - 1 - y][x] = "●"
+    
+    # Build output lines with y-axis labels
     lines = []
-
-    # Y-axis labels and chart area
-    for row in range(height, 0, -1):
-        threshold = min_tps + (tps_range * row / height)
-        if row == height:
+    for row in range(height):
+        if row == 0:
             label = f"{int(max_tps):>5} │"
-        elif row == 1:
+        elif row == height - 1:
             label = f"{int(min_tps):>5} │"
         elif row == height // 2:
             mid_val = int(min_tps + tps_range / 2)
             label = f"{mid_val:>5} │"
         else:
             label = "      │"
-
-        # Build the row
-        row_chars = []
-        for i, tps in enumerate(tps_values):
-            normalized = (tps - min_tps) / tps_range
-            bar_height = normalized * height
-
-            if bar_height >= row:
-                row_chars.append("█")
-            elif bar_height >= row - 1:
-                # Partial block
-                partial = bar_height - (row - 1)
-                block_idx = int(partial * 8)
-                row_chars.append(blocks[min(block_idx, 8)])
-            else:
-                row_chars.append(" ")
-
-        # Pad or truncate to fit width
-        chart_width = width - 7  # Account for y-axis label
-        if len(row_chars) > chart_width:
-            # Sample evenly
-            step = len(row_chars) / chart_width
-            row_chars = [row_chars[int(i * step)] for i in range(chart_width)]
-        else:
-            # Stretch to fill
-            if row_chars:
-                stretched = []
-                step = chart_width / len(row_chars)
-                for i in range(chart_width):
-                    stretched.append(row_chars[min(int(i / step), len(row_chars) - 1)])
-                row_chars = stretched
-
-        lines.append(label + "".join(row_chars))
+        lines.append(label + "".join(grid[row]))
 
     # X-axis
-    x_axis = "      └" + "─" * (width - 7)
+    x_axis = "      └" + "─" * chart_width
     lines.append(x_axis)
 
     # Time labels
     if sorted_history:
         first_time = sorted_history[0].get("timestamp", "")[:10]
         last_time = sorted_history[-1].get("timestamp", "")[:10]
-        time_label = f"       {first_time}" + " " * (width - 18 - len(first_time)) + last_time
+        time_label = f"       {first_time}" + " " * (chart_width - len(first_time) - len(last_time)) + last_time
         lines.append(time_label)
 
     chart_text = Text()
     for i, line in enumerate(lines):
-        if i < len(lines) - 2:  # Chart bars
+        if i < len(lines) - 2:  # Chart area
             chart_text.append(line[:7])  # Y-axis label
-            chart_text.append(line[7:], style="green")
+            # Color the line chart
+            chart_line = line[7:]
+            for char in chart_line:
+                if char in "●":
+                    chart_text.append(char, style="bold cyan")
+                elif char in "─╱╲":
+                    chart_text.append(char, style="green")
+                else:
+                    chart_text.append(char)
         else:
             chart_text.append(line, style="dim")
         if i < len(lines) - 1:
