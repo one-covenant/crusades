@@ -4,7 +4,7 @@
     "burn_uid": 0,
 
     "evaluation_runs": 2,
-    "eval_steps": 3,
+    "eval_steps": 5,
     "eval_timeout": 600,
 
     "benchmark_model_name": "Qwen/Qwen2.5-7B",

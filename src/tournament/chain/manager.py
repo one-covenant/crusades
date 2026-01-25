@@ -75,11 +75,12 @@ class ChainManager:
         """
         loop = asyncio.get_event_loop()
         try:
+            # Use subtensor.metagraph() for proper localnet compatibility
             self._metagraph = await loop.run_in_executor(
                 None,
-                lambda: bt.metagraph(netuid=self.netuid, network=self.config.subtensor_network),
+                lambda: self.subtensor.metagraph(netuid=self.netuid),
             )
-            logger.info(f"Metagraph synced: {len(self._metagraph.hotkeys)} neurons")
+            logger.info(f"Metagraph synced: {self._metagraph.n} neurons")
         except Exception as e:
             logger.error(f"Metagraph sync failed: {e}")
             logger.error("Weight setting will be unavailable until metagraph syncs")

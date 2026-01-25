@@ -1,0 +1,197 @@
+# Validator Guide
+
+## How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           VALIDATOR (always runs locally)                    │
+│                                                                              │
+│   ┌────────────────────────────────────────────────────────────────────┐    │
+│   │                    validator.py main loop                           │    │
+│   │                                                                     │    │
+│   │  1. Read commitments from blockchain                               │    │
+│   │  2. Download miner code from committed URLs                        │    │
+│   │  3. Call affinetes_runner.evaluate(code=...)                       │    │
+│   │  4. Set weights based on TPS scores                                │    │
+│   └───────────────────────────┬────────────────────────────────────────┘    │
+│                               │                                              │
+│                     ┌─────────┴─────────┐                                   │
+│                     │  --affinetes-mode │                                   │
+│                     └─────────┬─────────┘                                   │
+│                               │                                              │
+│           ┌───────────────────┴───────────────────┐                         │
+│           │                                       │                         │
+│           ▼                                       ▼                         │
+│   ┌───────────────┐                      ┌───────────────┐                  │
+│   │    DOCKER     │                      │   BASILICA    │                  │
+│   │    MODE       │                      │     MODE      │                  │
+│   └───────┬───────┘                      └───────┬───────┘                  │
+│           │                                       │                         │
+└───────────┼───────────────────────────────────────┼─────────────────────────┘
+            │                                       │
+            ▼                                       ▼
+   ┌─────────────────┐                    ┌─────────────────────┐
+   │  LOCAL DOCKER   │                    │   BASILICA CLOUD    │
+   │                 │                    │                     │
+   │  • Spawns       │                    │  • Sends code to    │
+   │    container    │                    │    remote API       │
+   │  • Uses YOUR    │                    │  • Remote GPUs run  │
+   │    GPU          │                    │    evaluation       │
+   │  • Runs         │                    │  • Returns TPS      │
+   │    templar-eval │                    │    score            │
+   │    image        │                    │                     │
+   └─────────────────┘                    └─────────────────────┘
+```
+
+| Mode | Where evaluation runs | Best for |
+|------|----------------------|----------|
+| `docker` | Your local GPU | Self-hosted, full control |
+| `basilica` | Remote cloud GPU | No local GPU (requires API key) |
+
+---
+
+## Run Validator
+
+### Mainnet (Production)
+
+```bash
+cd /path/to/templar-tournament
+
+# Start validator
+SUBTENSOR_NETWORK=finney uv run python -m neurons.validator \
+    --wallet.name your_wallet \
+    --wallet.hotkey your_hotkey \
+    --affinetes-mode docker \
+    2>&1 | tee logs/validator.log
+```
+
+### Localnet (Testing)
+
+```bash
+cd /path/to/templar-tournament
+
+# Start validator on localnet
+SUBTENSOR_NETWORK=local uv run python -m neurons.validator \
+    --wallet.name templar_test \
+    --wallet.hotkey V1 \
+    --affinetes-mode docker \
+    2>&1 | tee logs/validator.log
+```
+
+### Testnet
+
+```bash
+cd /path/to/templar-tournament
+
+# Start validator on testnet
+SUBTENSOR_NETWORK=test uv run python -m neurons.validator \
+    --wallet.name your_wallet \
+    --wallet.hotkey your_hotkey \
+    --affinetes-mode docker \
+    2>&1 | tee logs/validator.log
+```
+
+---
+
+## Prerequisites
+
+### 1. Build Evaluation Image
+
+```bash
+cd environments/templar
+docker build -t templar-eval:latest .
+```
+
+### 2. Verify GPU Access
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.1-base nvidia-smi
+```
+
+### 3. Configure hparams.json
+
+Edit `hparams/hparams.json` for your setup:
+
+```json
+{
+    "netuid": 1,
+    "burn_uid": 0,
+    "docker": {
+        "gpu_devices": "0,1,2,3",
+        "memory_limit": "32g",
+        "shm_size": "8g"
+    }
+}
+```
+
+| Setting | Description |
+|---------|-------------|
+| `gpu_devices` | GPUs to use: `"0"`, `"0,1"`, `"all"`, or `"none"` |
+| `memory_limit` | Container memory limit |
+| `shm_size` | Shared memory for PyTorch DataLoader |
+
+---
+
+## Manage
+
+```bash
+# View logs
+tail -f logs/validator.log
+
+# Check if running
+ps aux | grep neurons.validator
+
+# Stop
+pkill -f neurons.validator
+# or Ctrl+C if running in foreground
+```
+
+---
+
+## Monitor (TUI)
+
+```bash
+uv run python -m tournament.tui --db tournament.db
+```
+
+Shows:
+- Leaderboard with TPS scores
+- Recent submissions
+- TPS history chart
+- Evaluation queue
+
+---
+
+## Networks Summary
+
+| Network | Environment Variable | Use Case |
+|---------|---------------------|----------|
+| Mainnet | `SUBTENSOR_NETWORK=finney` | Production |
+| Testnet | `SUBTENSOR_NETWORK=test` | Testing with real commit-reveal |
+| Localnet | `SUBTENSOR_NETWORK=local` | Development |
+
+---
+
+## Troubleshooting
+
+### "Too soon to commit weights"
+
+Normal rate limiting. Validators can only set weights once every ~100-360 blocks.
+
+### Docker permission denied
+
+```bash
+# Add user to docker group
+sudo usermod -aG docker $USER
+# Log out and back in
+```
+
+### GPU not detected
+
+```bash
+# Check NVIDIA driver
+nvidia-smi
+
+# Check Docker GPU support
+docker run --rm --gpus all nvidia/cuda:12.1-base nvidia-smi
+```

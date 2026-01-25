@@ -237,6 +237,9 @@ class AffinetesRunner:
             f.write(code)
             train_path = f.name
         
+        # Make readable by container's non-root user
+        os.chmod(train_path, 0o644)
+        
         # Create evaluation script that reads code from mounted file
         eval_script = f'''
 import asyncio
@@ -278,6 +281,9 @@ asyncio.run(main())
             f.write(eval_script)
             script_path = f.name
         
+        # Make readable by container's non-root user
+        os.chmod(script_path, 0o644)
+        
         try:
             # Build Docker run command
             docker_cmd = [
@@ -318,6 +324,8 @@ asyncio.run(main())
             ])
             
             logger.info(f"Running evaluation in {self.validator_image}...")
+            logger.debug(f"Docker command: {' '.join(docker_cmd)}")
+            logger.debug(f"Script path: {script_path}, Train path: {train_path}")
             
             # Run with timeout
             start_time = time.perf_counter()

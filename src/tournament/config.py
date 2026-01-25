@@ -127,7 +127,10 @@ class Config(BaseSettings):
     # Bittensor settings
     wallet_name: str = "default"
     wallet_hotkey: str = "default"
-    subtensor_network: str = "finney"  # Default to mainnet for production safety
+    subtensor_network: str = Field(
+        default="finney",
+        validation_alias="SUBTENSOR_NETWORK",  # Accept SUBTENSOR_NETWORK env var directly
+    )
 
     # Paths
     hparams_path: str = "hparams/hparams.json"

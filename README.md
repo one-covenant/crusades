@@ -2,26 +2,39 @@
 
 **TPS Competition on Bittensor** - Miners compete to optimize training code for maximum Tokens Per Second.
 
-## Architecture
+## How It Works
 
 ```
-MINER                           BLOCKCHAIN                      VALIDATOR
-  │                                                                  │
-  ├─▶ Upload train.py to R2                                          │
-  │                                                                  │
-  ├─▶ Commit R2 credentials ──────▶ set_reveal_commitment            │
-  │                                 (timelock encrypted)             │
-  │                                        │                         │
-  │                                        ▼ (after reveal_blocks)   │
-  │                                   Decrypted ◀────────────────────┤ Read commitments
-  │                                                                  │
-  │                                                           Download from R2
-  │                                                                  │
-  │                                                           Evaluate in Docker
-  │                                                                  │
-  │                                                           Set weights
-  │                                                                  ▼
-  └──────────────────────── Rewards ◀────────────────────────── Winner gets 5%
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              TOURNAMENT FLOW                                     │
+│                                                                                  │
+│   MINER                        BLOCKCHAIN                      VALIDATOR         │
+│     │                                                              │             │
+│     │  1. Host train.py at URL                                     │             │
+│     │     (Gist, Pastebin, etc)                                    │             │
+│     │                                                              │             │
+│     ├──▶ 2. Submit URL ─────────▶ set_reveal_commitment            │             │
+│     │                             (timelock encrypted)             │             │
+│     │                                    │                         │             │
+│     │                                    │ (wait reveal_blocks)    │             │
+│     │                                    ▼                         │             │
+│     │                              3. Decrypted ◀─────────────────┤ Read        │
+│     │                                                              │             │
+│     │                                                     4. Download code       │
+│     │                                                        from URL            │
+│     │                                                              │             │
+│     │                                                     5. Run in Docker       │
+│     │                                                        (2 eval runs)       │
+│     │                                                              │             │
+│     │                                                     6. Calculate TPS       │
+│     │                                                        (median score)      │
+│     │                                                              │             │
+│     │                                                     7. Set weights         │
+│     │                                                              │             │
+│     └◀─────────────────── 8. Rewards ◀────────────────────────────┘             │
+│                              (5% to winner)                                      │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Quick Start
@@ -30,88 +43,155 @@ MINER                           BLOCKCHAIN                      VALIDATOR
 
 ```bash
 # Clone and setup
+git clone <repo>
 cd templar-tournament
 uv sync
 
-# Create .env
-cat > .env << 'EOF'
-# R2 Storage (required for miners)
-TOURNAMENT_R2_ACCOUNT_ID=your_cloudflare_account_id
-TOURNAMENT_R2_BUCKET_NAME=your_bucket_name
-TOURNAMENT_R2_ACCESS_KEY_ID=your_access_key
-TOURNAMENT_R2_SECRET_ACCESS_KEY=your_secret_key
-
-# HuggingFace (required)
-HF_TOKEN=hf_your_token
-
-# Basilica (optional - for remote GPU rental)
-# Get these from Basilica team: https://github.com/AffineFoundation/affinetes
-# BASILICA_ENDPOINT=https://api.basilica.cloud
-# BASILICA_API_KEY=your_api_key
-EOF
-
-export $(cat .env | grep -v '^#' | xargs)
+# Create .env (for HuggingFace access)
+echo "HF_TOKEN=hf_your_token" > .env
 ```
 
-### Miner
+---
+
+## For Miners
+
+### 1. Setup & Test Locally
 
 ```bash
-# 1. Download model & data
+# Download model & data for local testing
 uv run python local_test/setup_benchmark.py
 
-# 2. Optimize train.py and test locally
+# Test your train.py locally
 cd local_test && uv run python train.py
-
-# 3. Submit to tournament
-uv run python -m neurons.miner submit local_test/train.py \
-    --wallet.name your_wallet \
-    --wallet.hotkey your_hotkey
-
-# 4. Check status
-uv run python -m neurons.miner status
 ```
 
-### Validator
+### 2. Host Your Code
 
-**Option 1: Docker Mode (local GPU)**
+Host your `train.py` at any URL that returns raw code:
+- **GitHub Gist** (recommended - use secret gist for privacy)
+- **Raw GitHub file** (use raw.githubusercontent.com)
+- **Pastebin** or any paste service
+- Any HTTP/HTTPS URL
+
+### 3. Submit to Tournament
+
 ```bash
-uv run python -m neurons.validator \
+# Validate your URL first (optional)
+uv run python -m neurons.miner validate "https://gist.github.com/user/gist_id"
+
+# Submit to mainnet
+uv run python -m neurons.miner submit "https://gist.github.com/user/gist_id" \
+    --wallet.name your_wallet \
+    --wallet.hotkey your_hotkey \
+    --network finney
+
+# Submit to localnet (testing)
+uv run python -m neurons.miner submit "https://gist.github.com/user/gist_id" \
+    --wallet.name your_wallet \
+    --wallet.hotkey your_hotkey \
+    --network local
+```
+
+### 4. Check Status
+
+```bash
+uv run python -m neurons.miner status --network finney
+```
+
+### Miner Commands
+
+| Command | Description |
+|---------|-------------|
+| `miner validate <url>` | Validate URL without submitting |
+| `miner submit <url>` | Submit code URL to tournament |
+| `miner status` | Check blockchain connection |
+
+**Parameters**: `--wallet.name`, `--wallet.hotkey`, `--network` (finney/test/local)
+
+---
+
+## For Validators
+
+See [docs/Validator.md](docs/Validator.md) for detailed validator setup.
+
+**Quick Start:**
+
+```bash
+# Docker mode (local GPU)
+SUBTENSOR_NETWORK=finney uv run python -m neurons.validator \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --affinetes-mode docker
 ```
 
-**Option 2: Basilica Mode (rent remote GPU)**
-```bash
-# Add to .env (get these from Basilica team)
-BASILICA_ENDPOINT=https://api.basilica.cloud
-BASILICA_API_KEY=your_api_key
+---
 
-# Run with basilica mode
-export $(cat .env | grep -v '^#' | xargs)
-uv run python -m neurons.validator \
-    --wallet.name your_wallet \
-    --wallet.hotkey your_hotkey \
-    --affinetes-mode basilica
+## train.py Requirements
+
+Your `train.py` must implement the `inner_steps` function:
+
+```python
+from dataclasses import dataclass
+import torch
+
+@dataclass
+class InnerStepsResult:
+    final_logits: torch.Tensor  # Output logits from last forward pass
+    total_tokens: int           # Total tokens processed across all steps
+    final_loss: float           # Loss value from last training step
+
+def inner_steps(model, data_iterator, optimizer, num_steps, device):
+    """Optimize this function for maximum TPS.
+    
+    Args:
+        model: Pre-loaded 7B model (already on device, in train mode)
+        data_iterator: Iterator yielding batches of shape (batch_size, seq_len)
+        optimizer: Pre-configured AdamW optimizer
+        num_steps: Number of training steps to run (typically 5)
+        device: Target device (cuda or cpu)
+    
+    Returns:
+        InnerStepsResult with outputs for verification
+    """
+    total_tokens = 0
+    final_logits = None
+    final_loss = 0.0
+    
+    for step in range(num_steps):
+        batch = next(data_iterator).to(device)
+        input_ids = batch[:, :-1]
+        labels = batch[:, 1:]
+        
+        outputs = model(input_ids)
+        logits = outputs.logits
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.reshape(-1)
+        )
+        
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        
+        total_tokens += batch.numel()
+        final_logits = logits.detach()
+        final_loss = loss.item()
+    
+    return InnerStepsResult(
+        final_logits=final_logits,
+        total_tokens=total_tokens,
+        final_loss=final_loss,
+    )
 ```
 
-| Mode | Requirements | Use When |
-|------|--------------|----------|
-| `docker` | Local GPU + Docker | You have a GPU |
-| `basilica` | BASILICA_ENDPOINT + API_KEY | Rent remote GPU |
+**Optimization Tips:**
+- Use `torch.compile()` for faster execution
+- Enable TF32: `torch.backends.cuda.matmul.allow_tf32 = True`
+- Use `torch.autocast` for mixed precision
+- Pre-fetch batches to hide data transfer latency
+- Use fused optimizer: `AdamW(..., fused=True)`
 
-## Miner Commands
-
-| Command | Description |
-|---------|-------------|
-| `miner upload <file>` | Upload train.py to R2 |
-| `miner commit` | Commit to blockchain |
-| `miner submit <file>` | Upload + commit (recommended) |
-| `miner status` | Check commitment status |
-
-**Parameters**: `--wallet.name`, `--wallet.hotkey`, `--network` (default: finney)
-
-Note: `netuid` and `reveal_blocks` are controlled by `hparams.json`, not CLI.
+---
 
 ## Configuration
 
@@ -119,85 +199,68 @@ Key settings in `hparams/hparams.json`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `netuid` | 3 | Subnet ID |
-| `reveal_blocks` | 100 | Blocks before reveal (~20 min) |
-| `min_blocks_between_commits` | 10 | Rate limit between submissions |
+| `netuid` | 1 | Subnet ID |
+| `reveal_blocks` | 10 | Blocks until commitment revealed |
 | `evaluation_runs` | 2 | Runs per submission (median taken) |
-| `eval_steps` | 3 | Training steps per evaluation |
+| `eval_steps` | 5 | Training steps per evaluation |
 | `benchmark_model_name` | Qwen/Qwen2.5-7B | Model for evaluation |
 | `benchmark_batch_size` | 16 | Batch size for evaluation |
 | `burn_rate` | 0.95 | Emissions to validator (95%) |
+| `burn_uid` | 0 | Validator UID receiving burn_rate |
 
-## train.py Requirements
-
-Your `train.py` must implement:
-
-```python
-def inner_steps(model, data_iterator, optimizer, num_steps, device):
-    """Optimize this function for maximum TPS."""
-    # Your optimizations here
-    return InnerStepsResult(
-        final_logits=logits,      # Last step logits
-        total_tokens=total_tokens, # Total tokens processed
-        final_loss=loss,          # Final loss value
-    )
-```
+---
 
 ## Project Structure
 
 ```
 templar-tournament/
 ├── neurons/
-│   ├── miner.py          # Miner CLI
-│   └── validator.py      # Validator
+│   ├── miner.py              # Miner CLI (submit, validate, status)
+│   └── validator.py          # Validator main loop
 ├── local_test/
-│   ├── setup_benchmark.py
-│   └── train.py          # Template to optimize
+│   ├── setup_benchmark.py    # Download model & data
+│   └── train.py              # Template to optimize
 ├── environments/templar/
-│   └── env.py            # Docker evaluation environment
+│   ├── Dockerfile            # Evaluation container
+│   └── env.py                # Evaluation environment
 ├── hparams/
-│   └── hparams.json      # Configuration
+│   └── hparams.json          # Configuration
+├── docs/
+│   └── Validator.md          # Validator documentation
 └── src/tournament/
-    ├── chain/            # Blockchain interactions
-    ├── affinetes/        # Docker evaluation
-    └── storage/          # Database
+    ├── chain/                # Blockchain interactions
+    ├── affinetes/            # Docker/Basilica evaluation
+    ├── storage/              # Database models
+    └── tui/                  # Terminal dashboard
 ```
 
+---
+
 ## TUI Dashboard
+
+Monitor tournament activity:
 
 ```bash
 uv run python -m tournament.tui --db tournament.db
 ```
 
-## Local Testing
+Shows:
+- Leaderboard with TPS scores
+- Recent submissions
+- TPS history chart
+- Validator status
 
-Localnet doesn't have drand integration, so commit-reveal won't decrypt. Use mock mode:
+---
 
-```bash
-# Start localnet with 12-second blocks
-docker run -d --name subtensor-localnet \
-    -p 9944:9944 -p 9945:9945 \
-    ghcr.io/opentensor/subtensor-localnet:v2.0.11 False
+## Networks
 
-# Run validator with mock commitments (bypasses drand)
-export MOCK_COMMITMENTS=1
-uv run python -m neurons.validator \
-    --wallet.name your_wallet \
-    --wallet.hotkey your_hotkey \
-    --skip-blockchain-check \
-    --affinetes-mode docker
-```
+| Network | Use Case | Command Flag |
+|---------|----------|--------------|
+| Mainnet | Production | `--network finney` |
+| Testnet | Testing with real commit-reveal | `--network test` |
+| Localnet | Development | `--network local` |
 
-Update `MOCK_COMMITMENT_DATA` in `src/tournament/chain/commitments.py` with your R2 credentials.
-
-## Testing on Testnet
-
-For full E2E testing with real commit-reveal, use testnet (has drand):
-
-```bash
-uv run python -m neurons.miner submit local_test/train.py \
-    --wallet.name your_wallet --wallet.hotkey your_hotkey --network test
-```
+---
 
 ## License
 

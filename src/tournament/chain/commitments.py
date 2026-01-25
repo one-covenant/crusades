@@ -162,8 +162,9 @@ class CommitmentReader:
     def sync(self) -> None:
         """Sync metagraph with blockchain."""
         logger.info(f"Syncing metagraph for subnet {self.netuid}...")
-        self.metagraph.sync(subtensor=self.subtensor)
-        logger.info(f"Metagraph synced: {self.metagraph.n} neurons")
+        # Re-fetch metagraph for fresh data (don't use .sync() - unreliable on localnet)
+        self._metagraph = self.subtensor.metagraph(netuid=self.netuid)
+        logger.info(f"Metagraph synced: {self._metagraph.n} neurons")
     
     def get_current_block(self) -> int:
         """Get current blockchain block number."""
