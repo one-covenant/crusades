@@ -5,7 +5,7 @@
 ## How It Works
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────────────────────────── ┐
 │                              TOURNAMENT FLOW                                     │
 │                                                                                  │
 │   MINER                        BLOCKCHAIN                      VALIDATOR         │
@@ -18,23 +18,23 @@
 │     │                                    │                         │             │
 │     │                                    │ (wait reveal_blocks)    │             │
 │     │                                    ▼                         │             │
-│     │                              3. Decrypted ◀─────────────────┤ Read        │
+│     │                              3. Decrypted ◀───────────────── ┤ Read        │
 │     │                                                              │             │
 │     │                                                     4. Download code       │
 │     │                                                        from URL            │
 │     │                                                              │             │
 │     │                                                     5. Run in Docker       │
-│     │                                                        (2 eval runs)       │
+│     │                                                        (X eval runs)       │
 │     │                                                              │             │
 │     │                                                     6. Calculate TPS       │
 │     │                                                        (median score)      │
 │     │                                                              │             │
 │     │                                                     7. Set weights         │
 │     │                                                              │             │
-│     └◀─────────────────── 8. Rewards ◀────────────────────────────┘             │
+│     └◀─────────────────── 8. Rewards ◀──────────────────────────── ┘              │
 │                              (5% to winner)                                      │
 │                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────────────────── ┘
 ```
 
 ## Quick Start
@@ -61,12 +61,9 @@ echo "HF_TOKEN=hf_your_token" > .env
 # Download model & data for local testing
 uv run python local_test/setup_benchmark.py
 
-# Test your train.py locally (runs directly, NOT sandboxed)
+# Test your train.py locally
 cd local_test && uv run python train.py
 ```
-
-> **Note**: Local testing runs directly on your machine for fast iteration.
-> Validator evaluations run in a secure Docker sandbox.
 
 ### 2. Host Your Code
 
@@ -79,8 +76,6 @@ Host your `train.py` at any URL that returns raw code:
 ### 3. Submit to Tournament
 
 ```bash
-# Validate your URL first (optional)
-uv run python -m neurons.miner validate "https://gist.github.com/user/gist_id"
 
 # Submit to mainnet
 uv run python -m neurons.miner submit "https://gist.github.com/user/gist_id" \
@@ -94,20 +89,6 @@ uv run python -m neurons.miner submit "https://gist.github.com/user/gist_id" \
     --wallet.hotkey your_hotkey \
     --network local
 ```
-
-### 4. Check Status
-
-```bash
-uv run python -m neurons.miner status --network finney
-```
-
-### Miner Commands
-
-| Command | Description |
-|---------|-------------|
-| `miner validate <url>` | Validate URL without submitting |
-| `miner submit <url>` | Submit code URL to tournament |
-| `miner status` | Check blockchain connection |
 
 **Parameters**: `--wallet.name`, `--wallet.hotkey`, `--network` (finney/test/local)
 
@@ -177,13 +158,6 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
     )
 ```
 
-**Optimization Tips:**
-- Use `torch.compile()` for faster execution
-- Enable TF32: `torch.backends.cuda.matmul.allow_tf32 = True`
-- Use `torch.autocast` for mixed precision
-- Pre-fetch batches to hide data transfer latency
-- Use fused optimizer: `AdamW(..., fused=True)`
-
 ---
 
 ## Configuration
@@ -192,10 +166,10 @@ Key settings in `hparams/hparams.json`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `netuid` | 1 | Subnet ID |
-| `evaluation_runs` | 2 | Runs per submission (median taken) |
+| `netuid` | 3 | Subnet ID |
+| `evaluation_runs` | 5 | Runs per submission (median taken) |
 | `eval_steps` | 5 | Training steps per evaluation |
-| `benchmark_model_name` | Qwen/Qwen2.5-7B | Model for evaluation |
+| `benchmark_model_name` | Qwen/Qwen2.5-3B | Model for evaluation |
 | `benchmark_batch_size` | 16 | Batch size for evaluation |
 
 ---
@@ -247,7 +221,7 @@ Shows:
 | Network | Use Case | Command Flag |
 |---------|----------|--------------|
 | Mainnet | Production | `--network finney` |
-| Testnet | Testing with real commit-reveal | `--network test` |
+| Testnet | Testing | `--network test` |
 | Localnet | Development | `--network local` |
 
 ---
