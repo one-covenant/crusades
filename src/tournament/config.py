@@ -36,6 +36,31 @@ class DockerConfig(BaseModel):
     shm_size: str = "8g"  # Shared memory size (important for PyTorch)
 
 
+class BasilicaConfig(BaseModel):
+    """Basilica cloud GPU settings for remote evaluation.
+    
+    Basilica is used for production evaluation when local GPUs
+    are not available or for distributed validator setups.
+    
+    Prerequisites:
+    1. Build and push image: docker push ghcr.io/org/templar-eval:latest
+    2. Set BASILICA_API_TOKEN environment variable
+    
+    GPU Configuration:
+    - gpu_count: Number of GPUs (1-8)
+    - gpu_models: Acceptable GPU types (e.g., ["A100", "H100"])
+    - min_gpu_memory_gb: Minimum GPU VRAM in GB
+    """
+
+    image: str = "ghcr.io/one-covenant/templar-eval:latest"  # Docker image in registry
+    ttl_seconds: int = 3600  # Deployment TTL (1 hour default)
+    gpu_count: int = 1  # Number of GPUs (1-8)
+    gpu_models: list[str] = ["A100"]  # GPU types
+    min_gpu_memory_gb: int = 40  # Minimum GPU memory in GB
+    cpu: str = "4"  # CPU cores
+    memory: str = "32Gi"  # Memory limit
+
+
 class HParams(BaseModel):
     """Hyperparameters loaded from hparams.json.
     
@@ -75,8 +100,11 @@ class HParams(BaseModel):
     min_blocks_between_commits: int
     block_time: int
 
-    # Docker execution settings
+    # Docker execution settings (local GPU)
     docker: DockerConfig = Field(default_factory=DockerConfig)
+
+    # Basilica settings (remote GPU)
+    basilica: BasilicaConfig = Field(default_factory=BasilicaConfig)
 
     # Verification (nested config with defaults from JSON)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)

@@ -1,13 +1,18 @@
 """Affinetes runner for evaluating miner submissions.
 
 URL-Based Architecture:
-- Validator downloads train.py from miner's committed URL
+- Miners host train.py at any URL (Gist, raw GitHub, etc.)
+- Validator downloads code from committed URL
 - Code is passed directly to the evaluation environment
-- No R2 credentials needed - just HTTP access to the URL
 
 Execution modes:
-1. Local Docker mode (for testing without Basilica)
-2. Basilica mode (production - remote GPU execution)
+1. Docker mode - Local GPU evaluation via Docker container
+2. Basilica mode - Remote cloud GPU evaluation via Basilica SDK
+
+Environment Variables:
+- BASILICA_API_TOKEN: API token for Basilica cloud GPU service
+- VALIDATOR_EVAL_IMAGE: Docker image for local evaluation (default: templar-eval:latest)
+- BASILICA_EVAL_IMAGE: Docker image for Basilica (default: ghcr.io/one-covenant/templar-eval:latest)
 """
 
 import asyncio
@@ -17,11 +22,26 @@ import os
 import subprocess
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+import httpx
+
+# Optional: Basilica SDK for cloud GPU evaluation
+try:
+    from basilica import BasilicaClient
+    BASILICA_AVAILABLE = True
+except ImportError:
+    BasilicaClient = None
+    BASILICA_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+# Basilica deployment cache (reuse deployments within TTL)
+_basilica_deployment = None
+_basilica_deployment_time = 0
 
 
 @dataclass
@@ -60,12 +80,12 @@ class EvaluationResult:
 
 
 class AffinetesRunner:
-    """Runs evaluations via affinetes (Docker or Basilica).
+    """Runs evaluations via Docker or Basilica.
     
     URL-Based Architecture:
-    - Validator downloads code from miner's committed URL
+    - Miner hosts train.py at any URL
+    - Validator downloads code from committed URL
     - Code is passed directly to the evaluation container
-    - No R2 credentials or downloads inside container
     
     Example:
         runner = AffinetesRunner(mode="docker")
@@ -77,8 +97,11 @@ class AffinetesRunner:
             print(f"TPS: {result.tps}")
     """
     
-    # Validator's standard evaluation image
-    VALIDATOR_IMAGE = os.getenv("VALIDATOR_EVAL_IMAGE", "templar-eval:latest")
+    # Default Docker image for local evaluation
+    DEFAULT_DOCKER_IMAGE = os.getenv("VALIDATOR_EVAL_IMAGE", "templar-eval:latest")
+    
+    # Default Basilica image (must be pushed to registry like ghcr.io)
+    DEFAULT_BASILICA_IMAGE = os.getenv("BASILICA_EVAL_IMAGE", "ghcr.io/one-covenant/templar-eval:latest")
     
     def __init__(
         self,
@@ -93,13 +116,21 @@ class AffinetesRunner:
         data_url: str | None = None,
         output_tolerance: float = 0.02,
         validator_image: str | None = None,
+        # Basilica-specific settings
+        basilica_image: str | None = None,
+        basilica_ttl_seconds: int = 3600,
+        basilica_gpu_count: int = 1,
+        basilica_gpu_models: list[str] | None = None,
+        basilica_min_gpu_memory_gb: int = 40,
+        basilica_cpu: str = "4",
+        basilica_memory: str = "32Gi",
     ):
         """Initialize the runner.
         
         Args:
             mode: Execution mode ("docker" for local, "basilica" for remote)
-            basilica_endpoint: Basilica API endpoint
-            basilica_api_key: Basilica API key
+            basilica_endpoint: Basilica API endpoint (not needed with SDK)
+            basilica_api_key: Basilica API key (or BASILICA_API_TOKEN env var)
             docker_gpu_devices: GPU devices for Docker ("all", "0", "0,1", "none")
             docker_memory_limit: Docker memory limit (e.g., "32g")
             docker_shm_size: Shared memory size for Docker (e.g., "8g")
@@ -107,11 +138,18 @@ class AffinetesRunner:
             model_url: Default model URL (HuggingFace model ID)
             data_url: Default data URL (HuggingFace dataset)
             output_tolerance: Verification tolerance (0.02 = 2%)
-            validator_image: Validator's Docker image name
+            validator_image: Docker image for local evaluation
+            basilica_image: Docker image for Basilica (must be in registry)
+            basilica_ttl_seconds: TTL for Basilica deployment (default 1 hour)
+            basilica_gpu_count: Number of GPUs (1-8)
+            basilica_gpu_models: Acceptable GPU models (e.g., ["A100", "H100"])
+            basilica_min_gpu_memory_gb: Minimum GPU memory in GB
+            basilica_cpu: CPU limit (e.g., "4")
+            basilica_memory: Memory limit (e.g., "32Gi")
         """
         self.mode = mode
         self.basilica_endpoint = basilica_endpoint or os.getenv("BASILICA_ENDPOINT")
-        self.basilica_api_key = basilica_api_key or os.getenv("BASILICA_API_KEY")
+        self.basilica_api_key = basilica_api_key or os.getenv("BASILICA_API_TOKEN")
         self.docker_gpu_devices = docker_gpu_devices
         self.docker_memory_limit = docker_memory_limit
         self.docker_shm_size = docker_shm_size
@@ -119,10 +157,24 @@ class AffinetesRunner:
         self.default_model_url = model_url
         self.default_data_url = data_url
         self.output_tolerance = output_tolerance
-        self.validator_image = validator_image or self.VALIDATOR_IMAGE
+        self.validator_image = validator_image or self.DEFAULT_DOCKER_IMAGE
+        self.basilica_image = basilica_image or self.DEFAULT_BASILICA_IMAGE
+        self.basilica_ttl_seconds = basilica_ttl_seconds
+        self.basilica_gpu_count = basilica_gpu_count
+        self.basilica_gpu_models = basilica_gpu_models or ["A100", "H100"]
+        self.basilica_min_gpu_memory_gb = basilica_min_gpu_memory_gb
+        self.basilica_cpu = basilica_cpu
+        self.basilica_memory = basilica_memory
         
-        if mode == "basilica" and not self.basilica_endpoint:
-            logger.warning("Basilica mode selected but no endpoint configured")
+        if mode == "basilica":
+            if not self.basilica_api_key:
+                logger.warning("Basilica mode: BASILICA_API_TOKEN not set")
+            logger.info(f"Basilica mode initialized")
+            logger.info(f"   Image: {self.basilica_image}")
+            logger.info(f"   TTL: {self.basilica_ttl_seconds}s")
+            logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
+            logger.info(f"   Min GPU Memory: {self.basilica_min_gpu_memory_gb}GB")
+            logger.info(f"   CPU/Memory: {self.basilica_cpu} / {self.basilica_memory}")
     
     async def evaluate(
         self,
@@ -413,142 +465,202 @@ asyncio.run(main())
         data_samples: int,
         task_id: int,
     ) -> EvaluationResult:
-        """Run evaluation remotely via Basilica."""
-        logger.info(f"Running Basilica evaluation")
+        """Run evaluation remotely via Basilica SDK.
+        
+        Uses BasilicaClient to deploy a custom Docker image and call
+        the /evaluate endpoint for TPS evaluation.
+        
+        Flow:
+        1. Deploy image to Basilica (or reuse existing deployment)
+        2. Wait for deployment to be ready (/health endpoint)
+        3. POST to /evaluate with miner's code
+        4. Return TPS results
+        """
+        logger.info("=" * 60)
+        logger.info("[BASILICA] Starting remote GPU evaluation")
+        logger.info("=" * 60)
+        logger.info(f"[BASILICA] Configuration:")
+        logger.info(f"   Image: {self.basilica_image}")
+        logger.info(f"   Model: {model_url}")
+        logger.info(f"   Dataset: {data_url}")
+        logger.info(f"   Steps: {steps}, Batch size: {batch_size}")
+        logger.info(f"   Task ID: {task_id}, Seed: {seed}")
+        logger.info(f"   Code size: {len(code)} bytes")
+        
+        if not BASILICA_AVAILABLE:
+            logger.error("[BASILICA] SDK not installed!")
+            return EvaluationResult.failure(
+                "basilica SDK not installed. Run: uv add basilica",
+                task_id=task_id,
+            )
         
         try:
-            from affinetes import env as af_env
+            # Get or create Basilica deployment
+            logger.info("[BASILICA] Acquiring deployment...")
+            deployment = await self._get_basilica_deployment()
             
-            env_vars = {
-                "OUTPUT_VECTOR_TOLERANCE": str(self.output_tolerance),
-            }
-            if self.basilica_api_key:
-                env_vars["BASILICA_API_KEY"] = self.basilica_api_key
-            
-            # Load validator's environment
-            env = af_env.load_env(
-                mode="basilica",
-                image=self.validator_image,
-                cpu_limit=os.getenv("BASILICA_CPU_LIMIT", "2000m"),
-                mem_limit=os.getenv("BASILICA_MEM_LIMIT", "32Gi"),
-                env_vars=env_vars,
-            )
-            
-            try:
-                result = await asyncio.wait_for(
-                    env.evaluate(
-                        task_id=task_id,
-                        seed=seed,
-                        model_url=model_url,
-                        data_url=data_url,
-                        steps=steps,
-                        batch_size=batch_size,
-                        sequence_length=sequence_length,
-                        data_samples=data_samples,
-                        timeout=self.timeout,
-                        code=code,
-                    ),
-                    timeout=self.timeout + 60,
+            if deployment is None:
+                logger.error("[BASILICA] Failed to create deployment!")
+                return EvaluationResult.failure(
+                    "Failed to create Basilica deployment",
+                    task_id=task_id,
                 )
-                result_obj = EvaluationResult.from_dict(result)
-                result_obj.code = code
-                return result_obj
-            finally:
-                try:
-                    await env.cleanup()
-                except Exception as cleanup_err:
-                    logger.warning(f"Cleanup failed: {cleanup_err}")
             
-        except ImportError:
-            logger.warning("affinetes not installed, using HTTP fallback")
-            return await self._evaluate_basilica_http(
-                code=code,
-                seed=seed,
-                model_url=model_url,
-                data_url=data_url,
-                steps=steps,
-                batch_size=batch_size,
-                sequence_length=sequence_length,
-                data_samples=data_samples,
-                task_id=task_id,
-            )
-        except asyncio.TimeoutError:
-            return EvaluationResult.failure(
-                f"Basilica timeout after {self.timeout}s",
-                task_id=task_id,
-            )
-        except Exception as e:
-            return EvaluationResult.failure(
-                f"Basilica error: {e}",
-                task_id=task_id,
-            )
-    
-    async def _evaluate_basilica_http(
-        self,
-        code: str,
-        seed: str,
-        model_url: str,
-        data_url: str,
-        steps: int,
-        batch_size: int,
-        sequence_length: int,
-        data_samples: int,
-        task_id: int,
-    ) -> EvaluationResult:
-        """Fallback: Call Basilica directly via HTTP."""
-        try:
-            import httpx
-        except ImportError:
-            return EvaluationResult.failure(
-                "httpx not installed for Basilica HTTP fallback",
-                task_id=task_id,
-            )
-        
-        payload = {
-            "image": self.validator_image,
-            "method": "evaluate",
-            "params": {
+            logger.info("-" * 60)
+            logger.info(f"[BASILICA] Deployment ready!")
+            logger.info(f"   URL: {deployment.url}")
+            if hasattr(deployment, 'id'):
+                logger.info(f"   Deployment ID: {deployment.id}")
+            logger.info("-" * 60)
+            
+            # Check health endpoint first
+            logger.info("[BASILICA] Checking health endpoint...")
+            async with httpx.AsyncClient(timeout=30) as client:
+                try:
+                    health_response = await client.get(f"{deployment.url}/health")
+                    if health_response.status_code == 200:
+                        logger.info(f"[BASILICA] Health check: ✅ OK")
+                    else:
+                        logger.warning(f"[BASILICA] Health check: {health_response.status_code}")
+                except Exception as e:
+                    logger.warning(f"[BASILICA] Health check failed: {e}")
+            
+            # Call the /evaluate endpoint
+            payload = {
                 "task_id": task_id,
                 "seed": seed,
                 "model_url": model_url,
                 "data_url": data_url,
                 "steps": steps,
                 "batch_size": batch_size,
+                "timeout": self.timeout,
                 "sequence_length": sequence_length,
                 "data_samples": data_samples,
-                "timeout": self.timeout,
                 "code": code,
-            },
-        }
-        
-        headers = {}
-        if self.basilica_api_key:
-            headers["Authorization"] = f"Bearer {self.basilica_api_key}"
-        
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout + 60) as client:
+            }
+            
+            logger.info("[BASILICA] Sending evaluation request...")
+            logger.info(f"   POST {deployment.url}/evaluate")
+            logger.info(f"   Timeout: {self.timeout + 120}s")
+            
+            start_time = time.time()
+            
+            async with httpx.AsyncClient(timeout=self.timeout + 120) as client:
                 response = await client.post(
-                    f"{self.basilica_endpoint}/v1/evaluate",
+                    f"{deployment.url}/evaluate",
                     json=payload,
-                    headers=headers,
                 )
                 
+                elapsed = time.time() - start_time
+                logger.info(f"[BASILICA] Response received in {elapsed:.1f}s")
+                logger.info(f"   Status code: {response.status_code}")
+                
                 if response.status_code != 200:
+                    error_text = response.text[:500]
+                    logger.error(f"[BASILICA] Evaluation failed!")
+                    logger.error(f"   Error: {error_text}")
                     return EvaluationResult.failure(
-                        f"Basilica API error: {response.status_code} - {response.text[:200]}",
+                        f"Basilica /evaluate error: {response.status_code} - {error_text}",
                         task_id=task_id,
                     )
                 
                 result_data = response.json()
                 result = EvaluationResult.from_dict(result_data)
                 result.code = code
+                
+                logger.info("=" * 60)
+                logger.info("[BASILICA] Evaluation complete!")
+                logger.info(f"   Success: {result.success}")
+                logger.info(f"   TPS: {result.tps:,.2f} tokens/second")
+                logger.info(f"   Total tokens: {result.total_tokens:,}")
+                logger.info(f"   Wall time: {result.wall_time_seconds:.2f}s")
+                if result.diagnostics:
+                    logger.info(f"   Diagnostics: {result.diagnostics}")
+                if result.error:
+                    logger.error(f"   Error: {result.error}")
+                logger.info("=" * 60)
+                
                 return result
                 
-        except Exception as e:
+        except asyncio.TimeoutError:
+            logger.error(f"[BASILICA] Timeout after {self.timeout}s!")
             return EvaluationResult.failure(
-                f"Basilica HTTP error: {e}",
+                f"Basilica timeout after {self.timeout}s",
                 task_id=task_id,
             )
+        except Exception as e:
+            logger.error(f"[BASILICA] Error: {e}")
+            logger.error(traceback.format_exc())
+            return EvaluationResult.failure(
+                f"Basilica error: {e}",
+                task_id=task_id,
+            )
+    
+    async def _get_basilica_deployment(self):
+        """Get or create a Basilica deployment.
+        
+        Reuses existing deployment if within TTL, otherwise creates new one.
+        """
+        global _basilica_deployment, _basilica_deployment_time
+        
+        # Check if existing deployment is still valid
+        now = time.time()
+        ttl_buffer = 300  # 5 minute buffer before TTL expires
+        
+        if (_basilica_deployment is not None and 
+            now - _basilica_deployment_time < self.basilica_ttl_seconds - ttl_buffer):
+            remaining = self.basilica_ttl_seconds - (now - _basilica_deployment_time)
+            logger.info(f"[BASILICA] Reusing existing deployment")
+            logger.info(f"   URL: {_basilica_deployment.url}")
+            logger.info(f"   TTL remaining: {remaining:.0f}s ({remaining/60:.1f} min)")
+            return _basilica_deployment
+        
+        # Create new deployment
+        logger.info("[BASILICA] Creating NEW deployment (no valid cached deployment)")
+        logger.info(f"   Image: {self.basilica_image}")
+        logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
+        logger.info(f"   Min GPU memory: {self.basilica_min_gpu_memory_gb}GB")
+        logger.info(f"   CPU: {self.basilica_cpu}, Memory: {self.basilica_memory}")
+        logger.info(f"   TTL: {self.basilica_ttl_seconds}s ({self.basilica_ttl_seconds/60:.0f} min)")
+        logger.info("[BASILICA] Requesting GPU from Basilica... (this may take 2-5 minutes)")
+        
+        try:
+            deploy_start = time.time()
+            client = BasilicaClient()
+            
+            deployment = client.deploy(
+                name="templar-eval",
+                image=self.basilica_image,
+                port=8000,
+                ttl_seconds=self.basilica_ttl_seconds,
+                timeout=300,  # Wait up to 5 min for deployment (GPU provisioning can be slow)
+                # GPU configuration
+                gpu_count=self.basilica_gpu_count,
+                gpu_models=self.basilica_gpu_models,
+                min_gpu_memory_gb=self.basilica_min_gpu_memory_gb,
+                # Resource limits
+                cpu=self.basilica_cpu,
+                memory=self.basilica_memory,
+            )
+            
+            deploy_time = time.time() - deploy_start
+            logger.info(f"[BASILICA] ✅ Deployment created in {deploy_time:.1f}s!")
+            logger.info(f"   Deployment URL: {deployment.url}")
+            if hasattr(deployment, 'id'):
+                logger.info(f"   Deployment ID: {deployment.id}")
+            logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
+            logger.info(f"   TTL: {self.basilica_ttl_seconds}s (expires in {self.basilica_ttl_seconds/60:.0f} min)")
+            
+            _basilica_deployment = deployment
+            _basilica_deployment_time = now
+            
+            return deployment
+            
+        except Exception as e:
+            logger.error(f"[BASILICA] ❌ Failed to deploy!")
+            logger.error(f"   Error: {e}")
+            logger.error(traceback.format_exc())
+            return None
     
     async def build_validator_image(self, env_path: Path | None = None) -> bool:
         """Build the validator's evaluation Docker image.

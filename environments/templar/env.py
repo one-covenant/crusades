@@ -22,12 +22,15 @@ import os
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
 import torch
 import torch.nn.functional as F
+from fastapi import FastAPI
+from pydantic import BaseModel
 
 # Configuration from environment variables
 OUTPUT_VECTOR_TOLERANCE = float(os.getenv("OUTPUT_VECTOR_TOLERANCE", "0.02"))
@@ -569,7 +572,6 @@ class Actor:
             }
             
         except Exception as e:
-            import traceback
             return {
                 "task_id": task_id,
                 "tps": 0.0,
@@ -585,3 +587,96 @@ class Actor:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+
+# =============================================================================
+# FastAPI HTTP Server (for Basilica custom Docker deployment)
+# =============================================================================
+
+app = FastAPI(title="Templar TPS Evaluation", version="1.0.0")
+
+# Global actor instance (reused for efficiency)
+_actor: Actor | None = None
+
+
+def get_actor() -> Actor:
+    """Get or create singleton Actor instance."""
+    global _actor
+    if _actor is None:
+        _actor = Actor()
+    return _actor
+
+
+class EvaluateRequest(BaseModel):
+    """Request body for /evaluate endpoint."""
+    task_id: int = 0
+    seed: str = "0:0:0"
+    model_url: str
+    data_url: str
+    steps: int = 5
+    batch_size: int = 8
+    timeout: int = 600
+    sequence_length: int | None = None
+    data_samples: int = 10000
+    code: str  # Miner's train.py code
+
+
+class EvaluateResponse(BaseModel):
+    """Response body from /evaluate endpoint."""
+    task_id: int
+    tps: float
+    total_tokens: int
+    wall_time_seconds: float
+    success: bool
+    error: str | None = None
+    seed: str
+    diagnostics: dict = {}
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint for Basilica."""
+    return {
+        "status": "healthy",
+        "gpu_available": torch.cuda.is_available(),
+        "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+    }
+
+
+@app.post("/evaluate", response_model=EvaluateResponse)
+async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
+    """Evaluate miner's train.py code and return TPS score.
+    
+    This endpoint is called by the validator via Basilica.
+    """
+    actor = get_actor()
+    
+    result = await actor.evaluate(
+        task_id=request.task_id,
+        seed=request.seed,
+        model_url=request.model_url,
+        data_url=request.data_url,
+        steps=request.steps,
+        batch_size=request.batch_size,
+        timeout=request.timeout,
+        sequence_length=request.sequence_length,
+        data_samples=request.data_samples,
+        code=request.code,
+    )
+    
+    return EvaluateResponse(
+        task_id=result.get("task_id", request.task_id),
+        tps=result.get("tps", 0.0),
+        total_tokens=result.get("total_tokens", 0),
+        wall_time_seconds=result.get("wall_time_seconds", 0.0),
+        success=result.get("success", False),
+        error=result.get("error"),
+        seed=result.get("seed", request.seed),
+        diagnostics=result.get("diagnostics", {}),
+    )
+
+
+# Entry point when running directly (for local testing)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

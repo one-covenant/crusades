@@ -134,6 +134,24 @@ class Validator(BaseNode):
             docker_memory_limit = getattr(docker_config, 'memory_limit', '32g')
             docker_shm_size = getattr(docker_config, 'shm_size', '8g')
         
+        # Basilica configuration from hparams
+        basilica_config = getattr(hparams, 'basilica', None)
+        basilica_image = "ghcr.io/one-covenant/templar-eval:latest"
+        basilica_ttl_seconds = 3600
+        basilica_gpu_count = 1
+        basilica_gpu_models = ["A100"]
+        basilica_min_gpu_memory_gb = 40
+        basilica_cpu = "4"
+        basilica_memory = "32Gi"
+        if basilica_config:
+            basilica_image = getattr(basilica_config, 'image', basilica_image)
+            basilica_ttl_seconds = getattr(basilica_config, 'ttl_seconds', basilica_ttl_seconds)
+            basilica_gpu_count = getattr(basilica_config, 'gpu_count', basilica_gpu_count)
+            basilica_gpu_models = getattr(basilica_config, 'gpu_models', basilica_gpu_models)
+            basilica_min_gpu_memory_gb = getattr(basilica_config, 'min_gpu_memory_gb', basilica_min_gpu_memory_gb)
+            basilica_cpu = getattr(basilica_config, 'cpu', basilica_cpu)
+            basilica_memory = getattr(basilica_config, 'memory', basilica_memory)
+        
         self.affinetes_runner = AffinetesRunner(
             mode=self.affinetes_mode,
             basilica_endpoint=basilica_endpoint,
@@ -145,6 +163,13 @@ class Validator(BaseNode):
             data_url=data_url,
             timeout=getattr(hparams, 'eval_timeout', 600),
             output_tolerance=output_tolerance,
+            basilica_image=basilica_image,
+            basilica_ttl_seconds=basilica_ttl_seconds,
+            basilica_gpu_count=basilica_gpu_count,
+            basilica_gpu_models=basilica_gpu_models,
+            basilica_min_gpu_memory_gb=basilica_min_gpu_memory_gb,
+            basilica_cpu=basilica_cpu,
+            basilica_memory=basilica_memory,
         )
         
         self.last_processed_block = 0
@@ -157,7 +182,10 @@ class Validator(BaseNode):
             logger.info(f"   Docker memory limit: {docker_memory_limit}")
             logger.info(f"   Docker shm size: {docker_shm_size}")
         elif self.affinetes_mode == "basilica":
-            logger.info(f"   Basilica endpoint: {basilica_endpoint or 'NOT SET'}")
+            logger.info(f"   Basilica image: {basilica_image}")
+            logger.info(f"   Basilica TTL: {basilica_ttl_seconds}s")
+            logger.info(f"   Basilica GPU: {basilica_gpu_count}x {basilica_gpu_models}")
+            logger.info(f"   Basilica min GPU memory: {basilica_min_gpu_memory_gb}GB")
 
     async def start(self) -> None:
         """Start the validator."""

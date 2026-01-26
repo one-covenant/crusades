@@ -1,14 +1,5 @@
 # Templar TPS Evaluation Environment (VALIDATOR-OWNED)
 #
-# URL-Based Architecture:
-# - This is the VALIDATOR's evaluation image
-# - Miner's train.py is downloaded from their committed URL at runtime
-# - Miners do NOT build their own Docker images
-#
-# Security:
-# - Runs as non-root user (appuser) for container security
-# - Root user is disabled per Basilica requirements
-#
 # Usage (for validators):
 #   docker build -t templar-eval:latest .
 #
@@ -56,5 +47,9 @@ ENV EVAL_SEQUENCE_LENGTH=1024
 ENV EVAL_BATCH_SIZE=8
 ENV PATH="/home/appuser/.local/bin:${PATH}"
 
-# Note: HTTP server is auto-injected by affinetes framework
-# The Actor class in env.py will be exposed as an HTTP endpoint
+# Expose HTTP port for Basilica
+EXPOSE 8000
+
+# Default command: Run FastAPI server for Basilica mode
+# Docker mode overrides this by passing: python /tmp/eval_script.py
+CMD ["python", "-m", "uvicorn", "env:app", "--host", "0.0.0.0", "--port", "8000"]

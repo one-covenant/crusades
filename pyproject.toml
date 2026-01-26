@@ -40,6 +40,7 @@ dependencies = [
     "rich>=13.0.0",
     "substrateinterface>=1.0.0",
     "substrate-interface>=1.8.1",
+    "basilica-sdk>=0.13.0",  # Basilica cloud GPU SDK
 ]
 
 [project.optional-dependencies]

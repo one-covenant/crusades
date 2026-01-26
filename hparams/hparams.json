@@ -1,13 +1,13 @@
 {
-    "netuid": 3,
+    "netuid": 1,
     "burn_rate": 0.95,
-    "burn_uid": 1,
+    "burn_uid": 2,
 
     "evaluation_runs": 2,
     "eval_steps": 5,
     "eval_timeout": 600,
 
-    "benchmark_model_name": "Qwen/Qwen2.5-7B",
+    "benchmark_model_name": "Qwen/Qwen2.5-3B",
     "benchmark_dataset_name": "HuggingFaceFW/fineweb",
     "benchmark_dataset_split": "train",
     "benchmark_data_samples": 10000,
@@ -26,6 +26,16 @@
         "gpu_devices": "0,1,2,3",
         "memory_limit": "32g",
         "shm_size": "8g"
+    },
+
+    "basilica": {
+        "image": "ghcr.io/one-covenant/templar-eval:latest",
+        "ttl_seconds": 3600,
+        "gpu_count": 1,
+        "gpu_models": ["A100"],
+        "min_gpu_memory_gb": 40,
+        "cpu": "4",
+        "memory": "32Gi"
     },
 
     "verification": {
