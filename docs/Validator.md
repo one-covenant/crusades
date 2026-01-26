@@ -4,29 +4,28 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────┐
-│                              YOUR LOCAL MACHINE                                   │
-│                                                                                   │
+│                              YOUR LOCAL MACHINE                                  │
+│                                                                                  │
 │   ┌─────────────────────────────────────────────────────────────────────────┐    │
-│   │                         validator.py main loop                           │    │
-│   │                                                                          │    │
+│   │                         validator.py main loop                          │    │
+│   │                                                                         │    │
 │   │   1. Read miner commitments from Bittensor blockchain                   │    │
 │   │   2. Decrypt timelock-encrypted code URLs                               │    │
 │   │   3. Download miner's train.py from URL                                 │    │
 │   │   4. Evaluate via affinetes_runner.evaluate(code=...)                   │    │
 │   │   5. Calculate median TPS from multiple runs                            │    │
-│   │   6. Set weights on blockchain (winner-takes-all)                      │    │
+│   │   6. Set weights on blockchain (winner-takes-all)                       │    │
 │   └─────────────────────────────────┬───────────────────────────────────────┘    │
-│                                     │                                             │
+│                                     │                                            │
 │                           ┌─────────┴─────────┐                                  │
 │                           │  --affinetes-mode │                                  │
 │                           └─────────┬─────────┘                                  │
-│                                     │                                             │
+│                                     │                                            │
 │               ┌─────────────────────┴─────────────────────┐                      │
 │               │                                           │                      │
 │               ▼                                           ▼                      │
 │      ┌────────────────┐                         ┌────────────────┐               │
 │      │  DOCKER MODE   │                         │ BASILICA MODE  │               │
-│      │  (default)     │                         │                │               │
 │      └───────┬────────┘                         └───────┬────────┘               │
 │              │                                          │                        │
 └──────────────┼──────────────────────────────────────────┼────────────────────────┘
@@ -130,7 +129,7 @@ Edit `hparams/hparams.json`:
 
 | Setting | Description | Examples |
 |---------|-------------|----------|
-| `gpu_devices` | Which GPUs to use | `"0"`, `"0,1"`, `"all"`, `"none"` |
+| `gpu_devices` | Which GPUs to use | `"0"`, `"0,1"`, `"all"` |
 | `memory_limit` | Container memory limit | `"32g"`, `"64g"` |
 | `shm_size` | Shared memory (PyTorch) | `"8g"`, `"16g"` |
 
@@ -381,46 +380,8 @@ Shows:
 | Network | Environment Variable | Use Case |
 |---------|---------------------|----------|
 | Mainnet | `SUBTENSOR_NETWORK=finney` | Production |
-| Testnet | `SUBTENSOR_NETWORK=test` | Testing |
 | Localnet | `SUBTENSOR_NETWORK=local` | Development |
 
----
-
-## Troubleshooting
-
-### Logs Not Appearing
-
-Add `PYTHONUNBUFFERED=1` and use `python -u`:
-
-```bash
-PYTHONUNBUFFERED=1 uv run python -u -m neurons.validator ...
-```
-
-### "Too soon to commit weights"
-
-Normal rate limiting. Validators can only set weights every ~100-360 blocks.
-
-### Docker Permission Denied
-
-```bash
-sudo usermod -aG docker $USER
-# Log out and back in
-```
-
-### GPU Not Detected
-
-```bash
-nvidia-smi
-docker run --rm --gpus all nvidia/cuda:12.1-base nvidia-smi
-```
-
-### Basilica Deployment Fails
-
-1. Check image is **public** in ghcr.io settings
-2. Verify `BASILICA_API_TOKEN` is set
-3. Check CPU requirement (A100 needs at least 6 cores)
-
----
 
 ## View Submission Code
 
