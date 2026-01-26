@@ -23,7 +23,7 @@
 │     │                                                     4. Download code       │
 │     │                                                        from URL            │
 │     │                                                              │             │
-│     │                                                     5. Run in Docker       │
+│     │                                                     5. Runs in Container   │
 │     │                                                        (X eval runs)       │
 │     │                                                              │             │
 │     │                                                     6. Calculate TPS       │
