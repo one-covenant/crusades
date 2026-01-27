@@ -18,6 +18,7 @@ import ast
 import gc
 import hashlib
 import importlib.util
+import logging
 import os
 import sys
 import time
@@ -30,6 +31,13 @@ import torch
 import torch.nn.functional as F
 from fastapi import FastAPI
 from pydantic import BaseModel
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # Configuration from environment variables
 DETERMINISTIC_MODE = os.getenv("DETERMINISTIC_MODE", "1") == "1"
@@ -105,12 +113,12 @@ def _load_hf_dataset(
     if validator_seed:
         seed_hash = hashlib.sha256(validator_seed.encode()).hexdigest()
         actual_seed = int(seed_hash[:8], 16)
-        print(f"Validator mode: seed={actual_seed} (from {validator_seed})")
+        logger.info(f"Validator mode: seed={actual_seed} (from {validator_seed})")
     else:
         actual_seed = 42
-        print(f"Test mode: fixed seed={actual_seed}")
+        logger.info(f"Test mode: fixed seed={actual_seed}")
 
-    print(f"Loading dataset: {dataset_name} (samples={num_samples})")
+    logger.info(f"Loading dataset: {dataset_name} (samples={num_samples})")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -144,7 +152,7 @@ def _load_hf_dataset(
         raise ValueError(f"No samples loaded from {dataset_name}")
 
     data = torch.stack(tokens_list)
-    print(f"Loaded data: shape={data.shape}, seed={actual_seed}")
+    logger.info(f"Loaded data: shape={data.shape}, seed={actual_seed}")
     return data
 
 
@@ -318,50 +326,192 @@ def _verify_outputs(
     reference: InnerStepsResult,
     candidate: InnerStepsResult,
     expected_tokens: int,
-) -> tuple[bool, str | None]:
-    """Verify candidate outputs are valid.
+    output_tolerance: float = 0.05,
+) -> tuple[bool, str | None, dict]:
+    """Verify candidate outputs match reference within tolerance.
 
+    Verification checks:
     1. Token count matches expected (miner processed correct amount of data)
-    2. Loss is reasonable (not NaN/Inf, decreased from initial ~11 to ~2)
+    2. Loss is reasonable (not NaN/Inf) and matches reference within 20%
     3. Logits are valid tensors (not NaN/Inf)
+    4. Logits match reference within tolerance (prevents cheating)
+
+    Args:
+        reference: Reference implementation results
+        candidate: Miner's implementation results
+        expected_tokens: Expected token count (batch_size * seq_len * steps)
+        output_tolerance: Maximum allowed relative difference for logits (default 5%)
+
+    Returns:
+        Tuple of (success, error_message, verification_details)
     """
-    # Verify token count matches expected
+    # Collect detailed verification info for logging
+    details = {
+        "expected_tokens": expected_tokens,
+        "candidate_tokens": candidate.total_tokens,
+        "candidate_loss": candidate.final_loss,
+        "reference_loss": reference.final_loss if reference else None,
+        "output_tolerance": output_tolerance,
+        "checks_passed": [],
+        "checks_failed": [],
+    }
+
+    logger.info("=" * 60)
+    logger.info("VERIFICATION: Starting output verification")
+    logger.info("=" * 60)
+
+    # 1. Verify token count matches expected
+    logger.info(
+        f"[CHECK 1/4] Token count: expected={expected_tokens}, got={candidate.total_tokens}"
+    )
     if candidate.total_tokens != expected_tokens:
-        return (
-            False,
-            f"Token count mismatch: expected {expected_tokens}, got {candidate.total_tokens}",
-        )
+        error = f"Token count mismatch: expected {expected_tokens}, got {candidate.total_tokens}"
+        details["checks_failed"].append({"check": "token_count", "error": error})
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
+    details["checks_passed"].append("token_count")
+    logger.info("[PASSED] Token count matches")
 
-    # Verify loss is reasonable (typical loss range is 1.5-3 for trained LLMs)
+    # 2. Verify loss is reasonable (typical loss range is 1.5-3 for trained LLMs)
+    logger.info(f"[CHECK 2/4] Loss validity: candidate_loss={candidate.final_loss:.6f}")
     if candidate.final_loss != candidate.final_loss:  # NaN check
-        return False, "Loss is NaN"
+        error = "Loss is NaN"
+        details["checks_failed"].append({"check": "loss_validity", "error": error})
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
     if abs(candidate.final_loss) > 100:
-        return False, f"Loss unreasonable: {candidate.final_loss:.4f} (expected 1-10)"
+        error = f"Loss unreasonable: {candidate.final_loss:.4f} (expected 1-10)"
+        details["checks_failed"].append({"check": "loss_validity", "error": error})
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
+    details["checks_passed"].append("loss_validity")
+    logger.info("[PASSED] Loss is valid (not NaN/Inf, in reasonable range)")
 
-    # Verify logits are valid
+    # 3. Verify logits are valid
+    logger.info("[CHECK 3/4] Logits validity")
     cand_logits = candidate.final_logits
     if cand_logits is None:
-        return False, "No logits returned"
+        error = "No logits returned"
+        details["checks_failed"].append({"check": "logits_validity", "error": error})
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
 
     if isinstance(cand_logits, str):
         cand_logits = torch.load(cand_logits, weights_only=True)
 
-    if torch.isnan(cand_logits).any():
-        return False, "Logits contain NaN values"
-    if torch.isinf(cand_logits).any():
-        return False, "Logits contain Inf values"
+    details["candidate_logits_shape"] = list(cand_logits.shape)
+    logger.info(f"   Candidate logits shape: {cand_logits.shape}")
 
-    # Optional: Compare losses if reference provided (sanity check, not strict)
-    # Losses should be in the same ballpark (within 50%)
+    if torch.isnan(cand_logits).any():
+        nan_count = torch.isnan(cand_logits).sum().item()
+        error = f"Logits contain {nan_count} NaN values"
+        details["checks_failed"].append(
+            {"check": "logits_validity", "error": error, "nan_count": nan_count}
+        )
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
+    if torch.isinf(cand_logits).any():
+        inf_count = torch.isinf(cand_logits).sum().item()
+        error = f"Logits contain {inf_count} Inf values"
+        details["checks_failed"].append(
+            {"check": "logits_validity", "error": error, "inf_count": inf_count}
+        )
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
+    details["checks_passed"].append("logits_validity")
+    logger.info("[PASSED] Logits are valid (no NaN/Inf)")
+
+    # 4. Compare with reference
+    logger.info("[CHECK 4/4] Reference comparison")
+
+    # 4a. Compare losses - they should be within 20% of each other
     if reference is not None and reference.final_loss > 0:
         loss_ratio = candidate.final_loss / reference.final_loss
-        if loss_ratio < 0.5 or loss_ratio > 2.0:
-            # Just warn, don't fail - different optimizations can affect loss
-            print(
-                f"Warning: Loss differs significantly from reference ({candidate.final_loss:.4f} vs {reference.final_loss:.4f})"
-            )
+        details["loss_ratio"] = loss_ratio
+        logger.info(
+            f"   Loss comparison: candidate={candidate.final_loss:.6f}, reference={reference.final_loss:.6f}"
+        )
+        logger.info(f"   Loss ratio: {loss_ratio:.4f} (allowed: 0.8-1.2)")
 
-    return True, None
+        if loss_ratio < 0.8 or loss_ratio > 1.2:
+            error = (
+                f"Loss mismatch: candidate={candidate.final_loss:.4f}, "
+                f"reference={reference.final_loss:.4f}, ratio={loss_ratio:.2f} (allowed: 0.8-1.2)"
+            )
+            details["checks_failed"].append(
+                {"check": "loss_comparison", "error": error, "loss_ratio": loss_ratio}
+            )
+            logger.error(f"[FAILED] {error}")
+            return False, error, details
+        details["checks_passed"].append("loss_comparison")
+        logger.info("[PASSED] Loss matches reference within 20%")
+
+    # 4b. Compare logits against reference
+    if reference is not None and reference.final_logits is not None:
+        ref_logits = reference.final_logits
+        if isinstance(ref_logits, str):
+            ref_logits = torch.load(ref_logits, weights_only=True)
+
+        details["reference_logits_shape"] = list(ref_logits.shape)
+        logger.info(f"   Reference logits shape: {ref_logits.shape}")
+
+        # Ensure same device for comparison
+        if cand_logits.device != ref_logits.device:
+            cand_logits = cand_logits.to(ref_logits.device)
+
+        # Check shape match
+        if cand_logits.shape != ref_logits.shape:
+            error = f"Logits shape mismatch: candidate={cand_logits.shape}, reference={ref_logits.shape}"
+            details["checks_failed"].append({"check": "logits_shape", "error": error})
+            logger.error(f"[FAILED] {error}")
+            return False, error, details
+        details["checks_passed"].append("logits_shape")
+
+        # Calculate relative difference using mean absolute error
+        # Normalize by the scale of the reference logits
+        abs_diff = torch.abs(cand_logits - ref_logits)
+        ref_scale = torch.abs(ref_logits).mean() + 1e-8  # Avoid division by zero
+        relative_diff = (abs_diff.mean() / ref_scale).item()
+        max_diff = abs_diff.max().item()
+
+        details["logits_relative_diff"] = relative_diff
+        details["logits_max_diff"] = max_diff
+        details["logits_ref_scale"] = ref_scale.item()
+
+        logger.info("   Logits comparison:")
+        logger.info(f"      Reference scale (mean abs): {ref_scale.item():.6f}")
+        logger.info(f"      Mean absolute difference: {abs_diff.mean().item():.6f}")
+        logger.info(f"      Max absolute difference: {max_diff:.6f}")
+        logger.info(f"      Relative difference: {relative_diff:.6f}")
+        logger.info(f"      Tolerance: {output_tolerance}")
+
+        if relative_diff > output_tolerance:
+            error = (
+                f"Logits mismatch: relative_diff={relative_diff:.6f} "
+                f"exceeds tolerance={output_tolerance} (max_diff={max_diff:.6f})"
+            )
+            details["checks_failed"].append(
+                {
+                    "check": "logits_comparison",
+                    "error": error,
+                    "relative_diff": relative_diff,
+                    "max_diff": max_diff,
+                }
+            )
+            logger.error(f"[FAILED] {error}")
+            return False, error, details
+
+        details["checks_passed"].append("logits_comparison")
+        logger.info(
+            f"[PASSED] Logits match reference (relative_diff={relative_diff:.6f} <= {output_tolerance})"
+        )
+
+    logger.info("=" * 60)
+    logger.info("VERIFICATION: ALL CHECKS PASSED")
+    logger.info(f"   Checks passed: {details['checks_passed']}")
+    logger.info("=" * 60)
+
+    return True, None, details
 
 
 class Actor:
@@ -383,6 +533,7 @@ class Actor:
         sequence_length: int | None = None,
         data_samples: int = 10000,
         code: str = "",  # Miner's code passed directly
+        output_tolerance: float = 0.05,  # Tolerance for logits comparison
     ) -> dict:
         """
         Run TPS evaluation on miner's code.
@@ -398,6 +549,7 @@ class Actor:
             sequence_length: Sequence length
             data_samples: Number of data samples
             code: Miner's train.py code (passed directly from validator)
+            output_tolerance: Maximum allowed relative difference for logits verification
 
         Returns:
             Dict with: tps, total_tokens, wall_time_seconds, success, error, code
@@ -552,11 +704,14 @@ class Actor:
             # Calculate expected tokens
             expected_tokens = batch_size * seq_len * steps
 
-            # Verify outputs (correctness check, not exact match)
-            verified, verify_error = _verify_outputs(reference, parsed, expected_tokens)
+            # Verify outputs against reference (correctness check with tolerance)
+            verified, verify_error, verify_details = _verify_outputs(
+                reference, parsed, expected_tokens, output_tolerance
+            )
 
-            # Diagnostics
+            # Diagnostics (include verification details)
             diagnostics = {
+                "verification": verify_details,
                 "reference_loss": reference.final_loss,
                 "candidate_loss": parsed.final_loss,
                 "expected_tokens": expected_tokens,
@@ -627,6 +782,7 @@ class EvaluateRequest(BaseModel):
     sequence_length: int | None = None
     data_samples: int = 10000
     code: str  # Miner's train.py code
+    output_tolerance: float = 0.05  # Tolerance for logits comparison
 
 
 class EvaluateResponse(BaseModel):
@@ -671,6 +827,7 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         sequence_length=request.sequence_length,
         data_samples=request.data_samples,
         code=request.code,
+        output_tolerance=request.output_tolerance,
     )
 
     return EvaluateResponse(

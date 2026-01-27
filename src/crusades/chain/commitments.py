@@ -13,9 +13,12 @@ Commitment format:
   }
 """
 
+import ipaddress
 import json
 import logging
+import socket
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import bittensor as bt
 
@@ -23,6 +26,70 @@ logger = logging.getLogger(__name__)
 
 # Maximum size for commitment data to prevent DoS via huge JSON payloads
 MAX_COMMITMENT_SIZE = 4096  # 4KB should be plenty for a URL
+
+# Private/internal IP ranges to block (SSRF protection)
+BLOCKED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),  # Loopback
+    ipaddress.ip_network("10.0.0.0/8"),  # Private Class A
+    ipaddress.ip_network("172.16.0.0/12"),  # Private Class B
+    ipaddress.ip_network("192.168.0.0/16"),  # Private Class C
+    ipaddress.ip_network("169.254.0.0/16"),  # Link-local / Cloud metadata
+    ipaddress.ip_network("::1/128"),  # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),  # IPv6 private
+    ipaddress.ip_network("fe80::/10"),  # IPv6 link-local
+]
+
+# Allowlisted domains for code hosting (for future use - domain allowlisting)
+# Currently not enforced, but available for stricter security if needed
+ALLOWED_DOMAINS = [
+    "gist.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "gist.github.com",
+    "github.com",
+    "gitlab.com",
+    "bitbucket.org",
+    "pastebin.com",
+]
+
+
+def is_ip_blocked(ip_str: str) -> bool:
+    """Check if an IP address is in a blocked private/internal range.
+
+    Args:
+        ip_str: IP address as string
+
+    Returns:
+        True if the IP is blocked, False if allowed
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return any(ip in network for network in BLOCKED_NETWORKS)
+    except ValueError:
+        # Invalid IP address format
+        return True
+
+
+def resolve_and_validate_host(hostname: str) -> tuple[bool, str]:
+    """Resolve hostname to IP and validate it's not a blocked address.
+
+    Args:
+        hostname: The hostname to resolve
+
+    Returns:
+        Tuple of (is_valid, error_message_or_ip)
+    """
+    try:
+        # Resolve hostname to IP address
+        ip = socket.gethostbyname(hostname)
+
+        if is_ip_blocked(ip):
+            return False, f"Host {hostname} resolves to blocked IP range ({ip})"
+
+        return True, ip
+    except socket.gaierror as e:
+        return False, f"Failed to resolve hostname {hostname}: {e}"
+    except Exception as e:
+        return False, f"Error validating host {hostname}: {e}"
 
 
 @dataclass
@@ -32,10 +99,54 @@ class CodeUrlInfo:
     url: str
 
     def is_valid(self) -> bool:
-        """Check if code URL is valid."""
+        """Check if code URL is valid (basic format check only).
+
+        Note: Full SSRF validation is done by validate_url_security() which
+        resolves the hostname and checks for blocked IP ranges.
+        """
         return bool(self.url) and (
             self.url.startswith("http://") or self.url.startswith("https://")
         )
+
+    def validate_url_security(self) -> tuple[bool, str]:
+        """Validate URL for SSRF protection by resolving hostname and checking IP ranges.
+
+        This performs DNS resolution and checks that the resolved IP is not in
+        a private/internal network range that could be used for SSRF attacks.
+
+        Returns:
+            Tuple of (is_safe, error_message). If is_safe is True, error_message
+            contains the resolved IP. If is_safe is False, error_message contains
+            the reason for rejection.
+        """
+        if not self.url:
+            return False, "URL is empty"
+
+        if not (self.url.startswith("http://") or self.url.startswith("https://")):
+            return False, "URL must start with http:// or https://"
+
+        try:
+            parsed = urlparse(self.url)
+            hostname = parsed.hostname
+
+            if not hostname:
+                return False, "URL has no hostname"
+
+            # Check if hostname is already an IP address
+            try:
+                ip = ipaddress.ip_address(hostname)
+                if is_ip_blocked(str(ip)):
+                    return False, f"Direct IP {ip} is in blocked range"
+                return True, str(ip)
+            except ValueError:
+                # Not an IP address, need to resolve hostname
+                pass
+
+            # Resolve and validate the hostname
+            return resolve_and_validate_host(hostname)
+
+        except Exception as e:
+            return False, f"URL validation error: {e}"
 
 
 @dataclass

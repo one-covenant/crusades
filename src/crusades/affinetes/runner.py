@@ -321,6 +321,7 @@ async def main():
         data_samples={data_samples},
         timeout={self.timeout},
         code=code,
+        output_tolerance={self.output_tolerance},
     )
     print("EVAL_RESULT:" + json.dumps(result))
 
@@ -357,7 +358,7 @@ asyncio.run(main())
                     docker_cmd.extend(["--gpus", "all"])
                 else:
                     # Specific devices like "0" or "0,1"
-                    docker_cmd.extend(["--gpus", f'"device={self.docker_gpu_devices}"'])
+                    docker_cmd.extend(["--gpus", f"device={self.docker_gpu_devices}"])
 
             # Memory limits (from hparams.json docker config)
             docker_cmd.extend(
@@ -423,8 +424,6 @@ asyncio.run(main())
             logger.info(f"   Docker command: {' '.join(docker_cmd[:6])}...")
 
             # Run with timeout - stream logs in real-time
-            start_time = time.perf_counter()
-
             process = await asyncio.create_subprocess_exec(
                 *docker_cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -459,15 +458,11 @@ asyncio.run(main())
                     task_id=task_id,
                 )
 
-            time.perf_counter() - start_time
-
             stdout_text = "\n".join(stdout_lines)
-            stderr_text = ""  # Already merged into stdout
 
             if process.returncode != 0:
-                error_msg = stderr_text[:500] if stderr_text else f"Exit code: {process.returncode}"
                 return EvaluationResult.failure(
-                    f"Container failed: {error_msg}",
+                    f"Container failed with exit code: {process.returncode}",
                     task_id=task_id,
                 )
 
@@ -582,6 +577,7 @@ asyncio.run(main())
                 "sequence_length": sequence_length,
                 "data_samples": data_samples,
                 "code": code,
+                "output_tolerance": self.output_tolerance,
             }
 
             logger.info("[BASILICA] Sending evaluation request...")

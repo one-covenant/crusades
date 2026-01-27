@@ -23,7 +23,11 @@ import bittensor as bt
 import torch
 
 from crusades.affinetes import AffinetesRunner
-from crusades.chain.commitments import CommitmentReader, MinerCommitment
+from crusades.chain.commitments import (
+    CodeUrlInfo,
+    CommitmentReader,
+    MinerCommitment,
+)
 from crusades.chain.weights import WeightSetter
 from crusades.config import get_config, get_hparams
 from crusades.core.protocols import SubmissionStatus
@@ -286,14 +290,15 @@ class Validator(BaseNode):
             logger.info(f"   Hotkey: {commitment.hotkey[:16]}...")
         except Exception as e:
             logger.error(f"Failed to save submission: {e}")
-            import traceback
-
-            logger.error(traceback.format_exc())
+            logger.exception("Traceback:")
 
     def _download_from_url(self, code_url: str) -> tuple[bool, str]:
-        """Download train.py code from a URL.
+        """Download train.py code from a URL with SSRF protection.
 
-        Validates that the response is a single Python file, not HTML/folder.
+        Validates that:
+        1. URL resolves to a non-private IP address (SSRF protection)
+        2. Redirects don't lead to private IP addresses
+        3. Response is a single Python file, not HTML/folder
 
         Args:
             code_url: The URL containing train.py code
@@ -301,9 +306,43 @@ class Validator(BaseNode):
         Returns:
             Tuple of (success, code_or_error)
         """
+        # SSRF Protection: Validate URL before making request
+        code_url_info = CodeUrlInfo(url=code_url)
+        is_safe, validation_result = code_url_info.validate_url_security()
+
+        if not is_safe:
+            logger.warning(f"SSRF protection blocked URL: {validation_result}")
+            return False, f"URL blocked for security: {validation_result}"
+
+        logger.debug(f"URL validated, resolved to IP: {validation_result}")
+
         try:
+            # Use a custom opener that validates redirect destinations
+            class SSRFSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+                """Custom redirect handler that validates redirect destinations for SSRF."""
+
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    """Validate redirect destination before following."""
+                    # Validate the redirect URL
+                    redirect_info = CodeUrlInfo(url=newurl)
+                    is_redirect_safe, redirect_result = redirect_info.validate_url_security()
+
+                    if not is_redirect_safe:
+                        logger.warning(
+                            f"SSRF protection blocked redirect to: {newurl} - {redirect_result}"
+                        )
+                        raise urllib.error.URLError(
+                            f"Redirect blocked for security: {redirect_result}"
+                        )
+
+                    logger.debug(f"Redirect validated: {newurl} -> {redirect_result}")
+                    return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+            # Build opener with SSRF-safe redirect handler
+            opener = urllib.request.build_opener(SSRFSafeRedirectHandler())
+
             req = urllib.request.Request(code_url, headers={"User-Agent": "templar-crusades"})
-            with urllib.request.urlopen(req, timeout=30) as response:
+            with opener.open(req, timeout=30) as response:
                 code = response.read().decode("utf-8")
 
                 # Reject HTML (folder page, not raw file)
