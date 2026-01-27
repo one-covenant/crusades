@@ -384,8 +384,9 @@ asyncio.run(main())
                     # Read-only root filesystem
                     "--read-only",
                     # Limit number of processes (prevent fork bombs)
+                    # PyTorch with OpenMP needs many threads, 1024 is reasonable
                     "--pids-limit",
-                    "256",
+                    "1024",
                     # Writable /tmp for temporary files (limited size)
                     "--tmpfs",
                     "/tmp:rw,noexec,nosuid,size=4g",
@@ -431,22 +432,74 @@ asyncio.run(main())
             )
 
             # Stream logs in real-time and collect for parsing
+            # Use chunk-based reading to handle long lines (progress bars, etc.)
             stdout_lines = []
+
+            def _should_log(line: str) -> bool:
+                """Filter out noisy logs, only show important ones."""
+                # Always skip these
+                if not line or line.startswith("EVAL_RESULT:"):
+                    return False
+                # Skip HTTP request logs
+                if "HTTP Request:" in line or "httpx" in line:
+                    return False
+                # Skip progress bars
+                if "Loading weights:" in line or "Fetching" in line:
+                    return False
+                # Skip deprecation/warning noise
+                if "is deprecated" in line or "UserWarning" in line:
+                    return False
+                # Skip HuggingFace download noise
+                if "huggingface" in line.lower() and "INFO" in line:
+                    return False
+                # Always show important logs
+                if any(
+                    kw in line
+                    for kw in [
+                        "VERIFICATION",
+                        "CHECK",
+                        "PASSED",
+                        "FAILED",
+                        "ERROR",
+                        "error",
+                        "Exception",
+                        "Traceback",
+                        "env |",  # env.py logs
+                    ]
+                ):
+                    return True
+                # Show other logs at debug level only
+                return False
+
             try:
 
                 async def read_stream():
+                    buffer = ""
                     while True:
-                        line = await asyncio.wait_for(
-                            process.stdout.readline(),
+                        # Read in chunks to avoid buffer limit issues with long lines
+                        chunk = await asyncio.wait_for(
+                            process.stdout.read(8192),  # 8KB chunks
                             timeout=self.timeout + 60,
                         )
-                        if not line:
+                        if not chunk:
+                            # Process remaining buffer at end
+                            if buffer:
+                                for line in buffer.split("\n"):
+                                    line = line.rstrip()
+                                    if line:
+                                        stdout_lines.append(line)
+                                        if _should_log(line):
+                                            logger.info(f"   [DOCKER] {line}")
                             break
-                        decoded = line.decode().rstrip()
-                        stdout_lines.append(decoded)
-                        # Log Docker output with prefix for visibility
-                        if decoded and not decoded.startswith("EVAL_RESULT:"):
-                            logger.info(f"   [DOCKER] {decoded}")
+
+                        buffer += chunk.decode()
+                        # Process complete lines as they arrive
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.rstrip()
+                            stdout_lines.append(line)
+                            if _should_log(line):
+                                logger.info(f"   [DOCKER] {line}")
 
                 await read_stream()
                 await process.wait()

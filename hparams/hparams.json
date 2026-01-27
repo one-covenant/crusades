@@ -1,7 +1,7 @@
 {
-    "netuid": 1,
+    "netuid": 3,
     "burn_rate": 0.95,
-    "burn_uid": 2,
+    "burn_uid": 1,
 
     "evaluation_runs": 5,
     "eval_steps": 5,
@@ -23,9 +23,9 @@
     "block_time": 12,
 
     "docker": {
-        "gpu_devices": "0,1,2,3",
-        "memory_limit": "32g",
-        "shm_size": "8g"
+        "gpu_devices": "0",
+        "memory_limit": "64g",
+        "shm_size": "16g"
     },
 
     "basilica": {
