@@ -3,16 +3,16 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "templar-tournament"
+name = "templar-crusades"
 version = "0.1.0"
-description = "Bittensor subnet for training code efficiency competition"
+description = "Bittensor subnet for training code efficiency crusades"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.12"
 authors = [
     { name = "Templar Team" }
 ]
-keywords = ["bittensor", "machine-learning", "optimization", "competition"]
+keywords = ["bittensor", "machine-learning", "optimization", "crusades"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -53,17 +53,17 @@ dev = [
 ]
 
 [project.scripts]
-tournament-validator = "neurons.validator:main"
-tournament-miner = "neurons.miner:main"
-tournament-api = "tournament.api.server:main"
-tplr = "tournament.tui.app:main"
+crusades-validator = "neurons.validator:main"
+crusades-miner = "neurons.miner:main"
+crusades-api = "crusades.api.server:main"
+tplr = "crusades.tui.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src", "."]
-include = ["tournament*", "neurons*"]
+include = ["crusades*", "neurons*"]
 
 [tool.setuptools.package-dir]
-tournament = "src/tournament"
+crusades = "src/crusades"
 
 [tool.ruff]
 line-length = 100

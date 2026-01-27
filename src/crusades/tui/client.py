@@ -1,4 +1,4 @@
-"""API client for tournament endpoints."""
+"""API client for crusades endpoints."""
 
 import sqlite3
 from dataclasses import dataclass
@@ -8,10 +8,12 @@ from typing import Any
 
 import httpx
 
+from crusades.core.protocols import SubmissionStatus
+
 
 @dataclass
-class TournamentData:
-    """Container for all tournament data."""
+class CrusadesData:
+    """Container for all crusades data."""
 
     overview: dict[str, Any]
     validator: dict[str, Any]
@@ -34,7 +36,7 @@ class MockClient:
     """Mock client that returns demo data."""
 
     def __init__(self):
-        from tournament.tui.mock_data import (
+        from crusades.tui.mock_data import (
             MOCK_CODE,
             MOCK_EVALUATIONS,
             MOCK_HISTORY,
@@ -87,8 +89,8 @@ class MockClient:
     def get_history(self) -> list[dict[str, Any]]:
         return self._history
 
-    def fetch_all(self) -> TournamentData:
-        return TournamentData(
+    def fetch_all(self) -> CrusadesData:
+        return CrusadesData(
             overview=self.get_overview(),
             validator=self.get_validator_status(),
             leaderboard=self.get_leaderboard(),
@@ -117,7 +119,7 @@ class MockClient:
 class DatabaseClient:
     """Client that reads directly from validator's SQLite database."""
 
-    def __init__(self, db_path: str = "tournament.db"):
+    def __init__(self, db_path: str = "crusades.db"):
         self.db_path = Path(db_path)
         if not self.db_path.exists():
             raise FileNotFoundError(f"Database not found: {db_path}")
@@ -229,19 +231,18 @@ class DatabaseClient:
     def get_leaderboard(self, limit: int = 10) -> list[dict[str, Any]]:
         """Get leaderboard entries."""
         rows = self._query(
-            "SELECT submission_id, miner_hotkey, miner_uid, final_score, created_at "
-            "FROM submissions WHERE status = 'finished' AND final_score IS NOT NULL "
-            "ORDER BY final_score DESC LIMIT ?",
-            (limit,),
+            """SELECT s.submission_id, s.miner_hotkey, s.miner_uid, s.final_score,
+                      s.created_at, COUNT(e.evaluation_id) as eval_count
+               FROM submissions s
+               LEFT JOIN evaluations e ON s.submission_id = e.submission_id
+               WHERE s.status = ? AND s.final_score IS NOT NULL
+               GROUP BY s.submission_id
+               ORDER BY s.final_score DESC LIMIT ?""",
+            (SubmissionStatus.FINISHED, limit),
         )
 
         leaderboard = []
         for i, row in enumerate(rows, 1):
-            # Count evaluations for this submission
-            eval_count = self._query_one(
-                "SELECT COUNT(*) as count FROM evaluations WHERE submission_id = ?",
-                (row["submission_id"],),
-            )
             leaderboard.append(
                 {
                     "rank": i,
@@ -249,7 +250,7 @@ class DatabaseClient:
                     "miner_hotkey": row["miner_hotkey"],
                     "miner_uid": row["miner_uid"],
                     "final_score": row["final_score"],  # Match app.py expectation
-                    "num_evaluations": eval_count["count"] if eval_count else 0,
+                    "num_evaluations": row["eval_count"],
                     "created_at": row["created_at"],
                 }
             )
@@ -299,8 +300,12 @@ class DatabaseClient:
 
         # All failures
         failed = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions "
-            "WHERE status IN ('failed_validation', 'failed_evaluation', 'failed_copy', 'error')"
+            "SELECT COUNT(*) as count FROM submissions WHERE status IN (?, ?, ?)",
+            (
+                SubmissionStatus.FAILED_VALIDATION,
+                SubmissionStatus.FAILED_EVALUATION,
+                SubmissionStatus.ERROR,
+            ),
         )
 
         # Average score
@@ -347,9 +352,9 @@ class DatabaseClient:
             )
         return history
 
-    def fetch_all(self) -> TournamentData:
-        """Fetch all tournament data."""
-        return TournamentData(
+    def fetch_all(self) -> CrusadesData:
+        """Fetch all crusades data."""
+        return CrusadesData(
             overview=self.get_overview(),
             validator=self.get_validator_status(),
             leaderboard=self.get_leaderboard(),
@@ -398,8 +403,8 @@ class DatabaseClient:
         )
 
 
-class TournamentClient:
-    """Client for fetching tournament data from API."""
+class CrusadesClient:
+    """Client for fetching crusades data from API."""
 
     def __init__(self, base_url: str = "http://localhost:8000"):
         self.base_url = base_url.rstrip("/")
@@ -484,9 +489,9 @@ class TournamentClient:
             return []
         return data
 
-    def fetch_all(self) -> TournamentData:
-        """Fetch all tournament data."""
-        return TournamentData(
+    def fetch_all(self) -> CrusadesData:
+        """Fetch all crusades data."""
+        return CrusadesData(
             overview=self.get_overview(),
             validator=self.get_validator_status(),
             leaderboard=self.get_leaderboard(),

@@ -10,6 +10,7 @@ URL-Based Architecture:
 import argparse
 import asyncio
 import gc
+import json
 import logging
 import os
 import statistics
@@ -21,13 +22,13 @@ from typing import Literal
 import bittensor as bt
 import torch
 
-from tournament.affinetes import AffinetesRunner
-from tournament.chain.commitments import CommitmentReader, MinerCommitment
-from tournament.chain.weights import WeightSetter
-from tournament.config import get_config, get_hparams
-from tournament.core.protocols import SubmissionStatus
-from tournament.storage.database import Database, get_database
-from tournament.storage.models import EvaluationModel, SubmissionModel
+from crusades.affinetes import AffinetesRunner
+from crusades.chain.commitments import CommitmentReader, MinerCommitment
+from crusades.chain.weights import WeightSetter
+from crusades.config import get_config, get_hparams
+from crusades.core.protocols import SubmissionStatus
+from crusades.storage.database import Database, get_database
+from crusades.storage.models import EvaluationModel, SubmissionModel
 
 from .base_node import BaseNode
 
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 class Validator(BaseNode):
-    """Tournament validator node (URL-Based Architecture).
+    """Crusades validator node (URL-Based Architecture).
 
     Responsibilities:
     1. Read miner code URL commitments from blockchain
@@ -64,7 +65,8 @@ class Validator(BaseNode):
 
         # State
         self.last_processed_block: int = 0
-        self.evaluated_code_urls: set[str] = set()  # Code URLs already evaluated
+        # Map URL -> (reveal_block, hotkey) to track first committer
+        self.evaluated_code_urls: dict[str, tuple[int, str]] = {}
 
         # Timing
         self.last_weight_set_time: float = 0
@@ -107,7 +109,7 @@ class Validator(BaseNode):
         self.affinetes_runner = AffinetesRunner(
             mode=self.affinetes_mode,
             basilica_endpoint=os.getenv("BASILICA_ENDPOINT"),
-            basilica_api_key=os.getenv("BASILICA_API_KEY"),
+            basilica_api_key=os.getenv("BASILICA_API_TOKEN"),
             # Docker config
             docker_gpu_devices=hparams.docker.gpu_devices,
             docker_memory_limit=hparams.docker.memory_limit,
@@ -127,7 +129,8 @@ class Validator(BaseNode):
             basilica_memory=hparams.basilica.memory,
         )
 
-        self.last_processed_block = 0
+        # Load persisted state
+        await self._load_state()
 
         logger.info(f"   Affinetes mode: {self.affinetes_mode}")
         logger.info(f"   Model: {hparams.benchmark_model_name}")
@@ -200,15 +203,33 @@ class Validator(BaseNode):
                         )
                         continue
 
-                    # Use code URL as unique identifier
+                    # Use code URL as unique identifier - first committer wins
                     code_url = commitment.code_url_info.url
                     if code_url in self.evaluated_code_urls:
-                        logger.info(f"Skipping already evaluated URL: {code_url[:50]}...")
-                        continue
+                        first_block, first_hotkey = self.evaluated_code_urls[code_url]
+                        if commitment.reveal_block >= first_block:
+                            logger.info(
+                                f"Skipping duplicate URL from UID {commitment.uid} "
+                                f"(first committed at block {first_block} by {first_hotkey[:16]}...)"
+                            )
+                            continue
+                        else:
+                            # This commitment is earlier - it should have priority
+                            # This shouldn't happen if we process in order, but log it
+                            logger.warning(
+                                f"Found earlier commitment for URL from UID {commitment.uid} "
+                                f"at block {commitment.reveal_block} (previously saw block {first_block})"
+                            )
 
                     await self._create_submission_from_commitment(commitment)
+                    # Record this URL with the committer info
+                    self.evaluated_code_urls[code_url] = (
+                        commitment.reveal_block,
+                        commitment.hotkey,
+                    )
 
             self.last_processed_block = current_block
+            await self._save_state()
 
         except Exception as e:
             logger.error(f"Error processing commitments: {e}")
@@ -281,7 +302,7 @@ class Validator(BaseNode):
             Tuple of (success, code_or_error)
         """
         try:
-            req = urllib.request.Request(code_url, headers={"User-Agent": "templar-validator"})
+            req = urllib.request.Request(code_url, headers={"User-Agent": "templar-crusades"})
             with urllib.request.urlopen(req, timeout=30) as response:
                 code = response.read().decode("utf-8")
 
@@ -388,8 +409,8 @@ class Validator(BaseNode):
                 await self.db.save_evaluation(evaluation)
                 self._cleanup_memory()
 
-            # Mark code URL as evaluated
-            self.evaluated_code_urls.add(code_url)
+            # Persist state (URL already recorded during commitment processing)
+            await self._save_state()
 
             # Store miner's code in database
             await self.db.update_submission_code(submission.submission_id, miner_code)
@@ -411,13 +432,14 @@ class Validator(BaseNode):
 
             if successful_evals:
                 tps_scores = [e.tokens_per_second for e in successful_evals]
-                median_tps = statistics.median(tps_scores)
+                # Use median_low to always return an actual run value (not average of two)
+                median_tps = statistics.median_low(tps_scores)
 
                 logger.info(
                     f"Final score for {submission_id}:\n"
                     f"   Successful runs: {len(tps_scores)}\n"
                     f"   Scores: {[f'{s:.1f}' for s in sorted(tps_scores)]}\n"
-                    f"   Median TPS: {median_tps:,.2f}"
+                    f"   Median TPS (low): {median_tps:,.2f}"
                 )
 
                 await self.db.update_submission_score(submission_id, median_tps)
@@ -476,8 +498,50 @@ class Validator(BaseNode):
         else:
             logger.warning(f"Failed to set weights: {message}")
 
+    async def _load_state(self) -> None:
+        """Load persisted validator state from database."""
+        try:
+            # Load last processed block
+            block_str = await self.db.get_validator_state("last_processed_block")
+            if block_str:
+                self.last_processed_block = int(block_str)
+                logger.info(f"Loaded state: last_processed_block={self.last_processed_block}")
+
+            # Load evaluated code URLs
+            urls_json = await self.db.get_validator_state("evaluated_code_urls")
+            if urls_json:
+                loaded = json.loads(urls_json)
+                # Handle both old format (list of URLs) and new format (dict)
+                if isinstance(loaded, list):
+                    # Old format: convert to dict with placeholder values
+                    self.evaluated_code_urls = {url: (0, "unknown") for url in loaded}
+                elif isinstance(loaded, dict):
+                    # New format: dict mapping URL -> [reveal_block, hotkey]
+                    self.evaluated_code_urls = {url: tuple(info) for url, info in loaded.items()}
+                else:
+                    self.evaluated_code_urls = {}
+                logger.info(f"Loaded state: {len(self.evaluated_code_urls)} evaluated URLs")
+        except Exception as e:
+            logger.warning(f"Failed to load state (starting fresh): {e}")
+            self.last_processed_block = 0
+            self.evaluated_code_urls = {}
+
+    async def _save_state(self) -> None:
+        """Persist validator state to database."""
+        try:
+            await self.db.set_validator_state(
+                "last_processed_block", str(self.last_processed_block)
+            )
+            await self.db.set_validator_state(
+                "evaluated_code_urls",
+                json.dumps({url: list(info) for url, info in self.evaluated_code_urls.items()}),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save state: {e}")
+
     async def cleanup(self) -> None:
         """Cleanup resources."""
+        await self._save_state()
         await super().cleanup()
         if self.db:
             await self.db.close()
@@ -486,7 +550,7 @@ class Validator(BaseNode):
 def main():
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-    parser = argparse.ArgumentParser(description="Tournament Validator (URL-Based)")
+    parser = argparse.ArgumentParser(description="Crusades Validator (URL-Based)")
     parser.add_argument(
         "--wallet.name",
         dest="wallet_name",

@@ -10,7 +10,7 @@
 # - Runs as non-root user (appuser) for container security
 #
 # Build:
-#   docker build -t templar-tournament:latest .
+#   docker build -t templar-crusades:latest .
 #
 # Usage:
 #   docker-compose up -d

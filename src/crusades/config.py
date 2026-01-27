@@ -1,4 +1,4 @@
-"""Configuration management for templar-tournament (Chi/Affinetes Architecture)."""
+"""Configuration management for templar-crusades (Chi/Affinetes Architecture)."""
 
 import json
 from functools import cache
@@ -22,7 +22,7 @@ def get_project_root() -> Path:
 class StorageConfig(BaseModel):
     """Storage settings."""
 
-    database_url: str = "sqlite+aiosqlite:///tournament.db"
+    database_url: str = "sqlite+aiosqlite:///crusades.db"
 
 
 class VerificationConfig(BaseModel):
@@ -156,7 +156,7 @@ class Config(BaseSettings):
     """Runtime configuration from environment variables."""
 
     model_config = SettingsConfigDict(
-        env_prefix="TOURNAMENT_",
+        env_prefix="CRUSADES_",
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",

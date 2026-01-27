@@ -18,7 +18,7 @@ import urllib.request
 
 import bittensor as bt
 
-from tournament.config import HParams
+from crusades.config import HParams
 
 
 def validate_code_url(url: str) -> tuple[bool, str]:
@@ -62,14 +62,14 @@ def validate_code_url(url: str) -> tuple[bool, str]:
 
     # For GitHub Gist URLs, convert to raw format
     final_url = url
-    if "gist.github.com" in url and "/raw" not in url:
+    if "gist.github.com" in url.lower() and "/raw" not in url.lower():
         final_url = url.replace("gist.github.com", "gist.githubusercontent.com")
         if not final_url.endswith("/raw"):
             final_url = final_url.rstrip("/") + "/raw"
 
     # Verify the URL is accessible and contains valid code
     try:
-        req = urllib.request.Request(final_url, headers={"User-Agent": "templar-tournament"})
+        req = urllib.request.Request(final_url, headers={"User-Agent": "templar-crusades"})
         with urllib.request.urlopen(req, timeout=10) as response:
             code = response.read().decode("utf-8")
 
@@ -127,6 +127,24 @@ def commit_to_chain(
     blocks_until_reveal = hparams.reveal_blocks
     block_time = hparams.block_time
 
+    # Connect to blockchain first to check registration
+    print(f"\nConnecting to {network}...")
+    try:
+        subtensor = bt.subtensor(network=network)
+        current_block = subtensor.get_current_block()
+        print(f"   Current block: {current_block}")
+    except Exception as e:
+        return False, f"Failed to connect to {network}: {e}"
+
+    # Check if hotkey is registered on subnet
+    hotkey = wallet.hotkey.ss58_address
+    if not subtensor.is_hotkey_registered(netuid=netuid, hotkey_ss58=hotkey):
+        return False, f"Hotkey {hotkey} is not registered on subnet {netuid}"
+
+    # Get miner UID
+    uid = subtensor.get_uid_for_hotkey_on_subnet(hotkey_ss58=hotkey, netuid=netuid)
+    print(f"   Miner UID: {uid}")
+
     print("\nCommitting to blockchain...")
     print(f"   Network: {network}")
     print(f"   Subnet: {netuid} (from hparams.json)")
@@ -143,15 +161,6 @@ def commit_to_chain(
     )
 
     print(f"   Commitment size: {len(commitment_data)} bytes")
-
-    # Connect to blockchain
-    print(f"\nConnecting to {network}...")
-    try:
-        subtensor = bt.subtensor(network=network)
-        current_block = subtensor.get_current_block()
-        print(f"   Current block: {current_block}")
-    except Exception as e:
-        return False, f"Failed to connect to {network}: {e}"
 
     # Commit using timelock encryption (drand)
     print("\nCommitting to chain...")
@@ -197,11 +206,11 @@ def commit_to_chain(
 
 
 def cmd_submit(args):
-    """Submit a code URL to the tournament."""
+    """Submit a code URL to the crusades."""
     wallet = bt.wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
 
     print("=" * 60)
-    print("TEMPLAR TOURNAMENT - SUBMIT CODE")
+    print("TEMPLAR CRUSADES - SUBMIT CODE")
     print("=" * 60)
     print(f"\nWallet: {args.wallet_name}/{args.wallet_hotkey}")
     print(f"Hotkey: {wallet.hotkey.ss58_address}")
@@ -303,7 +312,7 @@ def cmd_validate(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Templar Tournament Miner CLI",
+        description="Templar Crusades Miner CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 How to Submit:
@@ -314,7 +323,7 @@ How to Submit:
      - Pastebin or any paste service
      - Any HTTP/HTTPS URL that returns the code
 
-  2. Submit to the tournament:
+  2. Submit to the crusades:
      uv run -m neurons.miner submit <code_url> \\
          --wallet.name miner --wallet.hotkey default --network finney
 
@@ -342,7 +351,7 @@ Settings from hparams.json:
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # SUBMIT command
-    submit_parser = subparsers.add_parser("submit", help="Submit a code URL to the tournament")
+    submit_parser = subparsers.add_parser("submit", help="Submit a code URL to the crusades")
     submit_parser.add_argument("code_url", help="URL containing your train.py code")
     submit_parser.add_argument("--wallet.name", dest="wallet_name", default="default")
     submit_parser.add_argument("--wallet.hotkey", dest="wallet_hotkey", default="default")

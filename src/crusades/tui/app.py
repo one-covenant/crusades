@@ -1,4 +1,4 @@
-"""Tournament TUI - Terminal dashboard for miners."""
+"""Crusades TUI - Terminal dashboard for miners."""
 
 import argparse
 import sys
@@ -12,12 +12,12 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from tournament.tui.client import (
+from crusades.tui.client import (
+    CrusadesClient,
+    CrusadesData,
     DatabaseClient,
     MockClient,
     SubmissionDetail,
-    TournamentClient,
-    TournamentData,
     format_time_ago,
 )
 
@@ -148,7 +148,7 @@ def create_chart(history: list[dict], width: int = 50, height: int = 8) -> Text:
     return chart_text
 
 
-def create_chart_panel(data: TournamentData) -> Panel:
+def create_chart_panel(data: CrusadesData) -> Panel:
     """Create the TPS history chart panel."""
     # Use full width - get console width dynamically
     chart = create_chart(data.history, width=90, height=6)
@@ -159,7 +159,7 @@ def create_chart_panel(data: TournamentData) -> Panel:
     )
 
 
-def create_stats_panel(data: TournamentData) -> Panel:
+def create_stats_panel(data: CrusadesData) -> Panel:
     """Create the stats overview panel."""
     overview = data.overview
 
@@ -179,7 +179,7 @@ def create_stats_panel(data: TournamentData) -> Panel:
     return Panel(Align.center(stats), title="[bold]Stats[/bold]", border_style="blue")
 
 
-def create_validator_panel(data: TournamentData) -> Panel:
+def create_validator_panel(data: CrusadesData) -> Panel:
     """Create the validator status panel."""
     validator = data.validator
     queue = data.queue
@@ -230,7 +230,7 @@ def create_validator_panel(data: TournamentData) -> Panel:
 
 
 def create_leaderboard_table(
-    data: TournamentData, selected_idx: int | None = None, active: bool = True
+    data: CrusadesData, selected_idx: int | None = None, active: bool = True
 ) -> Panel:
     """Create the leaderboard table with selection highlight."""
     table = Table(expand=True, box=None, show_header=True, header_style="bold")
@@ -276,7 +276,7 @@ def create_leaderboard_table(
 
 
 def create_recent_table(
-    data: TournamentData, selected_idx: int | None = None, active: bool = False
+    data: CrusadesData, selected_idx: int | None = None, active: bool = False
 ) -> Panel:
     """Create the recent submissions table with selection highlight."""
     table = Table(expand=True, box=None, show_header=True, header_style="bold")
@@ -294,7 +294,6 @@ def create_recent_table(
         "finished": "green",
         "failed_validation": "red",
         "failed_evaluation": "red",
-        "failed_copy": "magenta",
         "error": "red",
     }
 
@@ -325,7 +324,7 @@ def create_recent_table(
 
 
 def create_dashboard_layout(
-    data: TournamentData,
+    data: CrusadesData,
     leaderboard_idx: int | None = None,
     recent_idx: int | None = None,
     active_panel: str = "leaderboard",
@@ -404,7 +403,6 @@ def create_submission_header(detail: SubmissionDetail) -> Panel:
         "finished": "green",
         "failed_validation": "red",
         "failed_evaluation": "red",
-        "failed_copy": "magenta",
         "error": "red",
     }
     status_color = status_colors.get(status, "white")
@@ -607,7 +605,7 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False, db_path: s
         client_class = DatabaseClient
         client_args = (db_path,)
     else:
-        client_class = TournamentClient
+        client_class = CrusadesClient
         client_args = (base_url,)
 
     # Hide cursor and set up alternate screen buffer
@@ -806,21 +804,22 @@ Controls:
     q              Quit
 
 Examples:
+  tplr                     # Auto-detect crusades.db if it exists
   tplr --demo              # Run with mock data for demo
-  tplr --db tournament.db  # Read from validator's database (recommended)
+  tplr --db crusades.db    # Read from validator's database
   tplr --url http://...    # Connect to API (legacy)
         """,
     )
 
     parser.add_argument(
         "--db",
-        default="tournament.db",
-        help="Path to validator's SQLite database (default: tournament.db)",
+        default="crusades.db",
+        help="Path to validator's SQLite database (default: crusades.db)",
     )
     parser.add_argument(
         "--url",
         default="http://localhost:8000",
-        help="Tournament API base URL (legacy mode)",
+        help="Crusades API base URL (legacy mode)",
     )
     parser.add_argument(
         "--refresh",
@@ -835,7 +834,16 @@ Examples:
     )
 
     args = parser.parse_args()
-    run_tui(args.url, args.refresh, demo=args.demo, db_path=args.db)
+
+    # Default to database mode if crusades.db exists and no explicit mode selected
+    db_path = args.db
+    if not args.demo and db_path is None:
+        from pathlib import Path
+
+        if Path("crusades.db").exists():
+            db_path = "crusades.db"
+
+    run_tui(args.url, args.refresh, demo=args.demo, db_path=db_path)
 
 
 if __name__ == "__main__":

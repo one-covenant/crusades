@@ -1,4 +1,4 @@
-"""Storage layer for templar-tournament."""
+"""Storage layer for templar-crusades."""
 
 from .database import Database, get_database
 from .models import EvaluationModel, SubmissionModel

@@ -1,11 +1,11 @@
 #!/bin/bash
-# Setup script for Tournament API systemd service
+# Setup script for Crusades API systemd service
 # 
 # Usage:
 #   ./scripts/setup-api-service.sh
 #
 # This script:
-# 1. Creates a systemd service for the Tournament API
+# 1. Creates a systemd service for the Crusades API
 # 2. Enables it to start on boot
 # 3. Starts the service
 #
@@ -21,7 +21,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}=== Tournament API Service Setup ===${NC}"
+echo -e "${GREEN}=== Crusades API Service Setup ===${NC}"
 echo ""
 
 # Get the directory where this script is located
@@ -40,9 +40,9 @@ if [ ! -d "$PROJECT_DIR/.venv" ]; then
     exit 1
 fi
 
-# Check if tournament-api is available
-if [ ! -f "$PROJECT_DIR/.venv/bin/tournament-api" ]; then
-    echo -e "${RED}Error: tournament-api not found in venv${NC}"
+# Check if crusades-api is available
+if [ ! -f "$PROJECT_DIR/.venv/bin/crusades-api" ]; then
+    echo -e "${RED}Error: crusades-api not found in venv${NC}"
     echo "Please run 'uv sync' to install dependencies."
     exit 1
 fi
@@ -50,8 +50,8 @@ fi
 echo -e "${GREEN}✓ Virtual environment found${NC}"
 
 # Create service file from template
-SERVICE_FILE="/tmp/tournament-api.service"
-cp "$SCRIPT_DIR/tournament-api.service" "$SERVICE_FILE"
+SERVICE_FILE="/tmp/crusades-api.service"
+cp "$SCRIPT_DIR/crusades-api.service" "$SERVICE_FILE"
 
 # Replace placeholders
 sed -i "s|REPLACE_USER|$CURRENT_USER|g" "$SERVICE_FILE"
@@ -69,27 +69,27 @@ echo ""
 
 # Install the service
 echo "Installing systemd service (requires sudo)..."
-sudo cp "$SERVICE_FILE" /etc/systemd/system/tournament-api.service
+sudo cp "$SERVICE_FILE" /etc/systemd/system/crusades-api.service
 sudo systemctl daemon-reload
 
 echo -e "${GREEN}✓ Service installed${NC}"
 
 # Enable the service
-sudo systemctl enable tournament-api
+sudo systemctl enable crusades-api
 echo -e "${GREEN}✓ Service enabled (will start on boot)${NC}"
 
 # Start the service
 echo ""
 echo "Starting the service..."
-sudo systemctl start tournament-api
+sudo systemctl start crusades-api
 sleep 2
 
 # Check status
-if sudo systemctl is-active --quiet tournament-api; then
+if sudo systemctl is-active --quiet crusades-api; then
     echo -e "${GREEN}✓ Service is running${NC}"
 else
     echo -e "${RED}✗ Service failed to start${NC}"
-    echo "Check logs with: sudo journalctl -u tournament-api -n 50"
+    echo "Check logs with: sudo journalctl -u crusades-api -n 50"
     exit 1
 fi
 
@@ -115,12 +115,12 @@ echo "API URL (local):  http://localhost:8080"
 echo "API URL (public): http://$PUBLIC_IP:8080"
 echo ""
 echo "Useful commands:"
-echo "  sudo systemctl status tournament-api   # Check status"
-echo "  sudo systemctl restart tournament-api  # Restart"
-echo "  sudo systemctl stop tournament-api     # Stop"
-echo "  sudo journalctl -u tournament-api -f   # View logs"
+echo "  sudo systemctl status crusades-api   # Check status"
+echo "  sudo systemctl restart crusades-api  # Restart"
+echo "  sudo systemctl stop crusades-api     # Stop"
+echo "  sudo journalctl -u crusades-api -f   # View logs"
 echo ""
-echo -e "${GREEN}Remember to set TOURNAMENT_API_URL in Vercel:${NC}"
-echo "  TOURNAMENT_API_URL=http://$PUBLIC_IP:8080"
+echo -e "${GREEN}Remember to set CRUSADES_API_URL in Vercel:${NC}"
+echo "  CRUSADES_API_URL=http://$PUBLIC_IP:8080"
 
 

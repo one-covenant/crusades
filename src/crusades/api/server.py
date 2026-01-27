@@ -1,14 +1,14 @@
-"""FastAPI server for tournament dashboard.
+"""FastAPI server for crusades dashboard.
 
-Provides HTTP endpoints for the web dashboard to fetch tournament data.
-Reads from the local SQLite database (tournament.db).
+Provides HTTP endpoints for the web dashboard to fetch crusades data.
+Reads from the local SQLite database (crusades.db).
 
 Usage:
     # Run the API server
-    uv run -m tournament.api --port 8080
+    uv run -m crusades.api --port 8080
 
     # Or use the CLI
-    tournament-api --port 8080
+    crusades-api --port 8080
 
 Endpoints:
     GET /health              - Health check
@@ -33,7 +33,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from tournament.tui.client import DatabaseClient, MockClient
+from crusades.tui.client import DatabaseClient, MockClient
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ def get_db_client():
     """Get or create database client."""
     global _db_client
     if _db_client is None:
-        db_path = os.getenv("TOURNAMENT_DB_PATH", "tournament.db")
+        db_path = os.getenv("CRUSADES_DB_PATH", "crusades.db")
         if Path(db_path).exists():
             logger.info(f"Using database: {db_path}")
             _db_client = DatabaseClient(db_path)
@@ -59,7 +59,7 @@ def get_db_client():
 async def lifespan(app: FastAPI):
     """Manage app lifecycle."""
     # Startup
-    logger.info("Tournament API starting...")
+    logger.info("Crusades API starting...")
     get_db_client()
     yield
     # Shutdown
@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
     if _db_client:
         _db_client.close()
         _db_client = None
-    logger.info("Tournament API shutdown")
+    logger.info("Crusades API shutdown")
 
 
 def create_app(api_key: str | None = None) -> FastAPI:
@@ -78,8 +78,8 @@ def create_app(api_key: str | None = None) -> FastAPI:
                  must include X-API-Key header.
     """
     app = FastAPI(
-        title="Templar Tournament API",
-        description="API for the Templar Tournament web dashboard",
+        title="Templar Crusades API",
+        description="API for the Templar Crusades web dashboard",
         version="1.0.0",
         lifespan=lifespan,
     )
@@ -302,16 +302,16 @@ def main():
 
     import uvicorn
 
-    parser = argparse.ArgumentParser(description="Tournament API Server")
+    parser = argparse.ArgumentParser(description="Crusades API Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8080, help="Port to bind to")
-    parser.add_argument("--db", default="tournament.db", help="Path to database")
+    parser.add_argument("--db", default="crusades.db", help="Path to database")
     parser.add_argument("--api-key", help="API key for authentication (optional)")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
     args = parser.parse_args()
 
     # Set environment variables
-    os.environ["TOURNAMENT_DB_PATH"] = args.db
+    os.environ["CRUSADES_DB_PATH"] = args.db
     if args.api_key:
         os.environ["DASHBOARD_API_KEY"] = args.api_key
 
@@ -320,12 +320,12 @@ def main():
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    logger.info(f"Starting Tournament API on {args.host}:{args.port}")
+    logger.info(f"Starting Crusades API on {args.host}:{args.port}")
     logger.info(f"Database: {args.db}")
     logger.info(f"API Key: {'configured' if args.api_key else 'not configured (open access)'}")
 
     uvicorn.run(
-        "tournament.api.server:app",
+        "crusades.api.server:app",
         host=args.host,
         port=args.port,
         reload=args.reload,

@@ -1,4 +1,4 @@
-"""Tournament API server for the web dashboard."""
+"""Crusades API server for the web dashboard."""
 
 from .server import app, create_app
 

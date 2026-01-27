@@ -1,6 +1,6 @@
 [Unit]
-Description=Templar Tournament API Server
-Documentation=https://github.com/one-covenant/templar-tournament
+Description=Templar Crusades API Server
+Documentation=https://github.com/one-covenant/templar-crusades
 After=network.target
 
 [Service]
@@ -8,10 +8,10 @@ Type=simple
 User=REPLACE_USER
 WorkingDirectory=REPLACE_WORKDIR
 Environment="PATH=REPLACE_WORKDIR/.venv/bin:/usr/local/bin:/usr/bin:/bin"
-Environment="TOURNAMENT_DB_PATH=REPLACE_WORKDIR/tournament.db"
+Environment="CRUSADES_DB_PATH=REPLACE_WORKDIR/crusades.db"
 # Optional: Add API key for authentication
 # Environment="DASHBOARD_API_KEY=your-secret-key"
-ExecStart=REPLACE_WORKDIR/.venv/bin/tournament-api --port 8080
+ExecStart=REPLACE_WORKDIR/.venv/bin/crusades-api --port 8080
 Restart=always
 RestartSec=10
 StandardOutput=journal

@@ -369,6 +369,31 @@ asyncio.run(main())
                 ]
             )
 
+            # =================================================================
+            # SECURITY SANDBOX - Protect against malicious miner code
+            # =================================================================
+            docker_cmd.extend(
+                [
+                    # Drop all Linux capabilities
+                    "--cap-drop",
+                    "ALL",
+                    # Prevent privilege escalation
+                    "--security-opt",
+                    "no-new-privileges",
+                    # Read-only root filesystem
+                    "--read-only",
+                    # Limit number of processes (prevent fork bombs)
+                    "--pids-limit",
+                    "256",
+                    # Writable /tmp for temporary files (limited size)
+                    "--tmpfs",
+                    "/tmp:rw,noexec,nosuid,size=4g",
+                    # Writable cache for HuggingFace downloads
+                    "--tmpfs",
+                    "/home/appuser/.cache:rw,nosuid,size=20g",
+                ]
+            )
+
             # Environment variables
             docker_cmd.extend(
                 [
@@ -747,6 +772,6 @@ def create_runner(
     """
     if mode == "basilica":
         kwargs.setdefault("basilica_endpoint", os.getenv("BASILICA_ENDPOINT"))
-        kwargs.setdefault("basilica_api_key", os.getenv("BASILICA_API_KEY"))
+        kwargs.setdefault("basilica_api_key", os.getenv("BASILICA_API_TOKEN"))
 
     return AffinetesRunner(mode=mode, **kwargs)

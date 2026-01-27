@@ -1,13 +1,13 @@
-"""Custom exceptions for templar-tournament."""
+"""Custom exceptions for templar-crusades."""
 
 
-class TournamentError(Exception):
-    """Base exception for all tournament errors."""
+class CrusadesError(Exception):
+    """Base exception for all crusades errors."""
 
     pass
 
 
-class SandboxError(TournamentError):
+class SandboxError(CrusadesError):
     """Error during sandbox execution."""
 
     pass
@@ -25,25 +25,25 @@ class SandboxCrashError(SandboxError):
     pass
 
 
-class EvaluationError(TournamentError):
+class EvaluationError(CrusadesError):
     """Error during evaluation."""
 
     pass
 
 
-class ValidationError(TournamentError):
+class ValidationError(CrusadesError):
     """Code validation failed."""
 
     pass
 
 
-class StorageError(TournamentError):
+class StorageError(CrusadesError):
     """Error accessing storage (database)."""
 
     pass
 
 
-class ChainError(TournamentError):
+class ChainError(CrusadesError):
     """Error interacting with Bittensor chain."""
 
     pass

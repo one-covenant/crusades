@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from ..config import get_hparams
 from ..core.protocols import SubmissionStatus
-from .models import Base, EvaluationModel, SubmissionModel
+from .models import Base, EvaluationModel, SubmissionModel, ValidatorStateModel
 
 
 class Database:
@@ -241,6 +241,29 @@ class Database:
                 .limit(limit)
             )
             return list(result.scalars().all())
+
+    # Validator state operations
+
+    async def get_validator_state(self, key: str) -> str | None:
+        """Get a validator state value."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ValidatorStateModel.value).where(ValidatorStateModel.key == key)
+            )
+            return result.scalar_one_or_none()
+
+    async def set_validator_state(self, key: str, value: str) -> None:
+        """Set a validator state value (upsert)."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ValidatorStateModel).where(ValidatorStateModel.key == key)
+            )
+            state = result.scalar_one_or_none()
+            if state:
+                state.value = value
+            else:
+                session.add(ValidatorStateModel(key=key, value=value))
+            await session.commit()
 
 
 # Global instance

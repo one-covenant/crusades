@@ -1,4 +1,4 @@
-"""Affinetes integration for Templar Tournament.
+"""Affinetes integration for Templar Crusades.
 
 URL-Based Architecture:
 - Validator owns the evaluation image (templar-eval)

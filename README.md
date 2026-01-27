@@ -1,6 +1,6 @@
 # Templar Crusades
 
-**TPS Competition on Bittensor** - Miners compete to optimize training code for maximum Tokens Per Second.
+**TPS Crusades on Bittensor** - Miners compete to optimize training code for maximum Tokens Per Second.
 
 ## How It Works
 
@@ -70,7 +70,7 @@ Host your `train.py` at any URL that returns raw code:
 - **Pastebin** or any paste service
 - Any HTTP/HTTPS URL
 
-### 3. Submit to Tournament
+### 3. Submit to Crusades
 
 ```bash
 
@@ -174,7 +174,7 @@ Key settings in `hparams/hparams.json`:
 ## Project Structure
 
 ```
-templar-tournament/
+templar-crusades/
 ├── neurons/
 │   ├── miner.py              # Miner CLI (submit, validate, status)
 │   └── validator.py          # Validator main loop
@@ -188,7 +188,7 @@ templar-tournament/
 │   └── hparams.json          # Configuration
 ├── docs/
 │   └── Validator.md          # Validator documentation
-└── src/tournament/
+└── src/crusades/
     ├── chain/                # Blockchain interactions
     ├── affinetes/            # Docker/Basilica evaluation
     ├── storage/              # Database models
@@ -199,10 +199,10 @@ templar-tournament/
 
 ## TUI Dashboard
 
-Monitor tournament activity:
+Monitor crusades activity:
 
 ```bash
-uv run -m tournament.tui --db tournament.db
+uv run -m crusades.tui --db crusades.db
 ```
 
 Shows:
@@ -210,19 +210,3 @@ Shows:
 - Recent submissions
 - TPS history chart
 - Validator status
-
----
-
-## Networks
-
-| Network | Use Case | Command Flag |
-|---------|----------|--------------|
-| Mainnet | Production | `--network finney` |
-| Testnet | Testing | `--network test` |
-| Localnet | Development | `--network local` |
-
----
-
-## License
-
-MIT

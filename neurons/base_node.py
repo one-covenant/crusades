@@ -7,14 +7,14 @@ from abc import ABC, abstractmethod
 
 import bittensor as bt
 
-from tournament.chain.manager import ChainManager
-from tournament.config import get_config, get_hparams
+from crusades.chain.manager import ChainManager
+from crusades.config import get_config, get_hparams
 
 logger = logging.getLogger(__name__)
 
 
 class BaseNode(ABC):
-    """Base class for tournament nodes (validators).
+    """Base class for crusades nodes (validators).
 
     Provides:
     - Signal handling for graceful shutdown

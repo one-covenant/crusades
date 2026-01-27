@@ -1,4 +1,4 @@
-"""Blockchain commitment reading for Templar Tournament.
+"""Blockchain commitment reading for Templar Crusades.
 
 URL-Based Architecture with Timelock Encryption:
 - Miners host their train.py code at any URL (Gist, raw GitHub, etc.)
@@ -20,6 +20,9 @@ from dataclasses import dataclass
 import bittensor as bt
 
 logger = logging.getLogger(__name__)
+
+# Maximum size for commitment data to prevent DoS via huge JSON payloads
+MAX_COMMITMENT_SIZE = 4096  # 4KB should be plenty for a URL
 
 
 @dataclass
@@ -65,11 +68,6 @@ class MinerCommitment:
             "code_url": "https://example.com/train.py"
         }
 
-        Also supports legacy format:
-        {
-            "gist_url": "https://gist.githubusercontent.com/user/abc123/raw"
-        }
-
         Args:
             uid: Miner UID
             hotkey: Miner hotkey address
@@ -84,6 +82,14 @@ class MinerCommitment:
             return None
 
         data = data.strip()
+
+        # Limit commitment size to prevent DoS via huge JSON payloads
+        if len(data) > MAX_COMMITMENT_SIZE:
+            logger.warning(
+                f"Commitment from UID {uid} exceeds max size ({len(data)} > {MAX_COMMITMENT_SIZE}), skipping"
+            )
+            return None
+
         code_url_info = None
 
         # Parse JSON format
@@ -91,14 +97,9 @@ class MinerCommitment:
             try:
                 parsed = json.loads(data)
 
-                # New format: code_url
                 if "code_url" in parsed:
                     code_url_info = CodeUrlInfo(url=parsed["code_url"])
                     logger.debug(f"Code URL from UID {uid}: {code_url_info.url[:50]}...")
-                # Legacy format: gist_url
-                elif "gist_url" in parsed:
-                    code_url_info = CodeUrlInfo(url=parsed["gist_url"])
-                    logger.debug(f"Legacy gist URL from UID {uid}: {code_url_info.url[:50]}...")
 
             except json.JSONDecodeError:
                 logger.debug(f"Invalid JSON in commitment from UID {uid}")
@@ -234,7 +235,12 @@ class CommitmentReader:
                 logger.info(f"Found {len(all_revealed)} revealed commitments on chain")
 
                 for hotkey, result in all_revealed.items():
-                    uid = hotkey_to_uid.get(hotkey, 0)
+                    uid = hotkey_to_uid.get(hotkey)
+                    if uid is None:
+                        logger.warning(
+                            f"Hotkey {hotkey[:16]}... not found in metagraph, skipping commitment"
+                        )
+                        continue
                     reveal_block, data = self._parse_revealed_result(result)
 
                     commitment = MinerCommitment.from_chain_data(
@@ -277,12 +283,16 @@ class CommitmentReader:
             current_block = self.get_current_block()
 
         # Get UID from metagraph
-        uid = 0
+        uid = None
         try:
             hotkey_to_uid = self._build_hotkey_to_uid_map()
-            uid = hotkey_to_uid.get(hotkey, 0)
-        except Exception:
-            pass
+            uid = hotkey_to_uid.get(hotkey)
+            if uid is None:
+                logger.warning(f"Hotkey {hotkey[:16]}... not found in metagraph")
+                return None
+        except Exception as e:
+            logger.warning(f"Failed to get UID for hotkey {hotkey[:16]}...: {e}")
+            return None
 
         # Get revealed commitment
         if hasattr(self.subtensor, "get_revealed_commitment_by_hotkey"):

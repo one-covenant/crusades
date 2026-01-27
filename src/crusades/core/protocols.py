@@ -1,15 +1,15 @@
-"""Protocol definitions for templar-tournament.
+"""Protocol definitions for templar-crusades.
 
 These protocols define contracts between components, enabling loose coupling
 and easy testing/mocking.
 """
 
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 
-class SubmissionStatus(str, Enum):
+class SubmissionStatus(StrEnum):
     """Status of a code submission."""
 
     # In-progress statuses (hidden from dashboard for security)
@@ -25,7 +25,6 @@ class SubmissionStatus(str, Enum):
     FAILED_EVALUATION = (
         "failed_evaluation"  #  Sandbox ran but verification failed (logits mismatch, timeout)
     )
-    FAILED_COPY = "failed_copy"  #  Rejected as duplicate or too similar to existing code
     ERROR = "error"  #  Unexpected system error
 
 

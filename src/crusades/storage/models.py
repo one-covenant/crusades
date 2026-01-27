@@ -83,6 +83,23 @@ class SubmissionModel(Base):
     )
 
 
+class ValidatorStateModel(Base):
+    """Database model for validator state persistence.
+
+    Stores state that should survive validator restarts:
+    - last_processed_block: To avoid re-processing old commitments
+    - evaluated_code_urls: To avoid duplicate evaluations (stored as JSON)
+    """
+
+    __tablename__ = "validator_state"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
 class EvaluationModel(Base):
     """Database model for evaluation results."""
 

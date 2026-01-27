@@ -1,4 +1,4 @@
-# Templar Tournament - Docker Compose with Watchtower
+# Templar Crusades - Docker Compose with Watchtower
 #
 # Features:
 # - Auto-restart on crash (restart: unless-stopped)
@@ -14,8 +14,8 @@
 
 services:
   validator:
-    image: ghcr.io/one-covenant/templar-tournament:latest
-    container_name: templar-tournament-validator
+    image: ghcr.io/one-covenant/templar-crusades:latest
+    container_name: templar-crusades-validator
     restart: unless-stopped
     runtime: nvidia
     
@@ -37,7 +37,7 @@ services:
       - NETUID=${NETUID:-1}
       - NETWORK=${NETWORK:-finney}
       - AFFINETES_MODE=${AFFINETES_MODE:-docker}
-      - DATABASE_PATH=/app/data/tournament.db
+      - DATABASE_PATH=/app/data/crusades.db
       # GPU settings (passed to evaluation containers)
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       # Logging
@@ -64,8 +64,8 @@ services:
 
   # TUI Dashboard (optional, for monitoring)
   tui:
-    image: ghcr.io/one-covenant/templar-tournament:latest
-    container_name: templar-tournament-tui
+    image: ghcr.io/one-covenant/templar-crusades:latest
+    container_name: templar-crusades-tui
     profiles:
       - monitoring
     restart: unless-stopped
@@ -74,9 +74,9 @@ services:
       - ./data:/app/data:ro
     
     environment:
-      - DATABASE_PATH=/app/data/tournament.db
+      - DATABASE_PATH=/app/data/crusades.db
     
-    command: ["python", "-m", "tournament.tui", "--db", "/app/data/tournament.db"]
+    command: ["python", "-m", "crusades.tui", "--db", "/app/data/crusades.db"]
     
     # TUI needs interactive terminal
     stdin_open: true
@@ -85,7 +85,7 @@ services:
   # Watchtower - Auto-updates containers when new images are pushed
   watchtower:
     image: containrrr/watchtower
-    container_name: templar-tournament-watchtower
+    container_name: templar-crusades-watchtower
     restart: unless-stopped
     
     volumes:

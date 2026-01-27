@@ -32,12 +32,8 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 # Configuration from environment variables
-OUTPUT_VECTOR_TOLERANCE = float(os.getenv("OUTPUT_VECTOR_TOLERANCE", "0.02"))
-VERIFY_LOSS = os.getenv("VERIFY_LOSS", "0") == "1"
-LOSS_TOLERANCE = float(os.getenv("LOSS_TOLERANCE", "1e-3"))
 DETERMINISTIC_MODE = os.getenv("DETERMINISTIC_MODE", "1") == "1"
 EVAL_SEQUENCE_LENGTH = int(os.getenv("EVAL_SEQUENCE_LENGTH", "1024"))
-EVAL_BATCH_SIZE = int(os.getenv("EVAL_BATCH_SIZE", "8"))
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/templar_eval"))
 
 

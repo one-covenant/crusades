@@ -195,10 +195,10 @@ MOCK_RECENT = [
         "created_at": "2026-01-07T08:40:00Z",
     },
     {
-        "submission_id": "sub_copy",
+        "submission_id": "sub_timeout",
         "miner_uid": 77,
-        "miner_hotkey": "5CopyHk...",
-        "status": "failed_copy",
+        "miner_hotkey": "5TimeoutHk...",
+        "status": "failed_evaluation",
         "final_score": None,
         "created_at": "2026-01-07T08:35:00Z",
     },
@@ -266,16 +266,16 @@ MOCK_SUBMISSIONS = {
         "final_score": None,
         "error_message": "LogitsMismatchError: Output vectors differ by 15% (threshold: 2%)",
     },
-    "sub_copy": {
-        "submission_id": "sub_copy",
-        "miner_hotkey": "5CopyHotkey123456789012345678901234567890abcde",
+    "sub_timeout": {
+        "submission_id": "sub_timeout",
+        "miner_hotkey": "5TimeoutHotkey123456789012345678901234567890abcd",
         "miner_uid": 77,
-        "code_hash": "copy12345678901234567890123456789012345678",
-        "status": "failed_copy",
+        "code_hash": "timeout12345678901234567890123456789012345",
+        "status": "failed_evaluation",
         "created_at": "2026-01-07T08:35:00Z",
         "updated_at": "2026-01-07T08:35:01Z",
         "final_score": None,
-        "error_message": "Duplicate: same code as sub_001...",
+        "error_message": "Evaluation timed out after 600s",
     },
 }
 
@@ -354,7 +354,7 @@ MOCK_EVALUATIONS = {
 }
 
 MOCK_CODE = '''"""
-Optimized training code for Templar Tournament.
+Optimized training code for Templar Crusades.
 Achieves 4302 TPS through efficient memory management and kernel fusion.
 """
 

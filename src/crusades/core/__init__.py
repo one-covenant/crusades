@@ -1,10 +1,10 @@
 """Core protocols and exceptions."""
 
 from .exceptions import (
+    CrusadesError,
     EvaluationError,
     SandboxError,
     StorageError,
-    TournamentError,
 )
 from .protocols import (
     EvaluationResult,
@@ -18,7 +18,7 @@ __all__ = [
     "SandboxRuntime",
     "Submission",
     "SubmissionStatus",
-    "TournamentError",
+    "CrusadesError",
     "SandboxError",
     "EvaluationError",
     "StorageError",
