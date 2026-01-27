@@ -100,9 +100,3 @@ services:
       # For private GitHub Container Registry
       - REPO_USER=${GITHUB_USER:-}
       - REPO_PASSWORD=${GITHUB_TOKEN:-}
-
-# Named volumes for persistence
-volumes:
-  data:
-  logs:
-

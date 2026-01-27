@@ -28,10 +28,10 @@ class WeightSetter:
         self.db = database
         self.config = get_config()
         self.hparams = get_hparams()
-        
+
         # Burn configuration from hparams
         self.burn_rate = self.hparams.burn_rate  # e.g., 0.95 = 95% to validator
-        self.burn_uid = self.hparams.burn_uid    # UID that receives burn portion
+        self.burn_uid = self.hparams.burn_uid  # UID that receives burn portion
 
     async def set_weights(self) -> tuple[bool, str]:
         """Set weights based on current leaderboard with burn_rate distribution.
@@ -39,7 +39,7 @@ class WeightSetter:
         Distribution:
         - burn_rate (e.g., 95%) goes to burn_uid (validator)
         - (1 - burn_rate) (e.g., 5%) goes to top TPS winner
-        
+
         If no valid winner, 100% goes to burn_uid.
 
         Returns:
@@ -47,11 +47,13 @@ class WeightSetter:
         """
         # Sync metagraph to get latest state
         await self.chain.sync_metagraph()
-        
+
         # Skip weight setting if metagraph sync failed
         if self.chain.metagraph is None:
             logger.warning("Metagraph not available - cannot set weights")
-            logger.warning("Possible causes: subtensor not running, network issues, or netuid doesn't exist")
+            logger.warning(
+                "Possible causes: subtensor not running, network issues, or netuid doesn't exist"
+            )
             return False, "Metagraph sync failed - cannot set weights"
 
         # Get top submission
@@ -76,8 +78,8 @@ class WeightSetter:
 
         # Calculate weight distribution
         winner_weight = 1.0 - self.burn_rate  # e.g., 5%
-        burn_weight = self.burn_rate           # e.g., 95%
-        
+        burn_weight = self.burn_rate  # e.g., 95%
+
         logger.info(
             f"Setting weights with burn_rate={self.burn_rate:.0%}:\n"
             f"  - UID {self.burn_uid} (validator): {burn_weight:.2f}\n"
@@ -87,7 +89,7 @@ class WeightSetter:
         # Set weights for both burn_uid and winner
         uids = [self.burn_uid, winner_uid]
         weights = [burn_weight, winner_weight]
-        
+
         # Handle case where winner IS the burn_uid (unlikely but possible)
         if winner_uid == self.burn_uid:
             uids = [self.burn_uid]

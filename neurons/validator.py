@@ -1,4 +1,4 @@
-"""Tournament validator - evaluates miner submissions and sets weights.
+"""Crusades validator - evaluates miner submissions and sets weights.
 
 URL-Based Architecture:
 1. Reads code URL commitments from blockchain (timelock decrypted)
@@ -10,23 +10,22 @@ URL-Based Architecture:
 import argparse
 import asyncio
 import gc
-import json
 import logging
 import os
 import statistics
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from typing import Literal
 
 import bittensor as bt
 import torch
 
+from tournament.affinetes import AffinetesRunner
 from tournament.chain.commitments import CommitmentReader, MinerCommitment
 from tournament.chain.weights import WeightSetter
 from tournament.config import get_config, get_hparams
 from tournament.core.protocols import SubmissionStatus
-from tournament.affinetes import AffinetesRunner, EvaluationResult
 from tournament.storage.database import Database, get_database
 from tournament.storage.models import EvaluationModel, SubmissionModel
 
@@ -62,7 +61,7 @@ class Validator(BaseNode):
         self.weight_setter: WeightSetter | None = None
         self.commitment_reader: CommitmentReader | None = None
         self.affinetes_runner: AffinetesRunner | None = None
-        
+
         # State
         self.last_processed_block: int = 0
         self.evaluated_code_urls: set[str] = set()  # Code URLs already evaluated
@@ -77,17 +76,17 @@ class Validator(BaseNode):
         hparams = get_hparams()
 
         logger.info("Initializing validator (URL-Based Architecture)")
-        
+
         # Database
         self.db = await get_database()
-        
+
         # Weight setter and commitment reader
         if self.chain is not None:
             self.weight_setter = WeightSetter(
                 chain=self.chain,
                 database=self.db,
             )
-            
+
             self.commitment_reader = CommitmentReader(
                 subtensor=self.chain.subtensor,
                 netuid=hparams.netuid,
@@ -103,89 +102,47 @@ class Validator(BaseNode):
                 netuid=hparams.netuid,
                 network=config.subtensor_network,
             )
-        
-        # Get model/data from hparams
-        model_url = getattr(hparams, 'benchmark_model_name', None) or os.getenv('BENCHMARK_MODEL_URL', '')
-        data_url = getattr(hparams, 'benchmark_dataset_name', None) or os.getenv('BENCHMARK_DATA_URL', '')
-        
-        if not model_url:
-            logger.warning("benchmark_model_name not set in hparams.json")
-        
-        if not data_url:
-            logger.warning("benchmark_dataset_name not set in hparams.json")
-        
-        # Affinetes runner
-        basilica_endpoint = os.getenv('BASILICA_ENDPOINT')
-        basilica_api_key = os.getenv('BASILICA_API_KEY')
-        
-        # Verification tolerance
-        verification = getattr(hparams, 'verification', None)
-        output_tolerance = 0.02
-        if verification:
-            output_tolerance = getattr(verification, 'output_vector_tolerance', 0.02)
-        
-        # Docker configuration from hparams
-        docker_config = getattr(hparams, 'docker', None)
-        docker_gpu_devices = "all"
-        docker_memory_limit = "32g"
-        docker_shm_size = "8g"
-        if docker_config:
-            docker_gpu_devices = getattr(docker_config, 'gpu_devices', 'all')
-            docker_memory_limit = getattr(docker_config, 'memory_limit', '32g')
-            docker_shm_size = getattr(docker_config, 'shm_size', '8g')
-        
-        # Basilica configuration from hparams
-        basilica_config = getattr(hparams, 'basilica', None)
-        basilica_image = "ghcr.io/one-covenant/templar-eval:latest"
-        basilica_ttl_seconds = 3600
-        basilica_gpu_count = 1
-        basilica_gpu_models = ["A100"]
-        basilica_min_gpu_memory_gb = 40
-        basilica_cpu = "4"
-        basilica_memory = "32Gi"
-        if basilica_config:
-            basilica_image = getattr(basilica_config, 'image', basilica_image)
-            basilica_ttl_seconds = getattr(basilica_config, 'ttl_seconds', basilica_ttl_seconds)
-            basilica_gpu_count = getattr(basilica_config, 'gpu_count', basilica_gpu_count)
-            basilica_gpu_models = getattr(basilica_config, 'gpu_models', basilica_gpu_models)
-            basilica_min_gpu_memory_gb = getattr(basilica_config, 'min_gpu_memory_gb', basilica_min_gpu_memory_gb)
-            basilica_cpu = getattr(basilica_config, 'cpu', basilica_cpu)
-            basilica_memory = getattr(basilica_config, 'memory', basilica_memory)
-        
+
+        # Affinetes runner - all config comes from validated Pydantic models
         self.affinetes_runner = AffinetesRunner(
             mode=self.affinetes_mode,
-            basilica_endpoint=basilica_endpoint,
-            basilica_api_key=basilica_api_key,
-            docker_gpu_devices=docker_gpu_devices,
-            docker_memory_limit=docker_memory_limit,
-            docker_shm_size=docker_shm_size,
-            model_url=model_url,
-            data_url=data_url,
-            timeout=getattr(hparams, 'eval_timeout', 600),
-            output_tolerance=output_tolerance,
-            basilica_image=basilica_image,
-            basilica_ttl_seconds=basilica_ttl_seconds,
-            basilica_gpu_count=basilica_gpu_count,
-            basilica_gpu_models=basilica_gpu_models,
-            basilica_min_gpu_memory_gb=basilica_min_gpu_memory_gb,
-            basilica_cpu=basilica_cpu,
-            basilica_memory=basilica_memory,
+            basilica_endpoint=os.getenv("BASILICA_ENDPOINT"),
+            basilica_api_key=os.getenv("BASILICA_API_KEY"),
+            # Docker config
+            docker_gpu_devices=hparams.docker.gpu_devices,
+            docker_memory_limit=hparams.docker.memory_limit,
+            docker_shm_size=hparams.docker.shm_size,
+            # Benchmark config
+            model_url=hparams.benchmark_model_name,
+            data_url=hparams.benchmark_dataset_name,
+            timeout=hparams.eval_timeout,
+            output_tolerance=hparams.verification.output_vector_tolerance,
+            # Basilica config
+            basilica_image=hparams.basilica.image,
+            basilica_ttl_seconds=hparams.basilica.ttl_seconds,
+            basilica_gpu_count=hparams.basilica.gpu_count,
+            basilica_gpu_models=hparams.basilica.gpu_models,
+            basilica_min_gpu_memory_gb=hparams.basilica.min_gpu_memory_gb,
+            basilica_cpu=hparams.basilica.cpu,
+            basilica_memory=hparams.basilica.memory,
         )
-        
+
         self.last_processed_block = 0
-        
+
         logger.info(f"   Affinetes mode: {self.affinetes_mode}")
-        logger.info(f"   Model URL: {model_url or 'NOT SET'}")
-        logger.info(f"   Data URL: {data_url or 'NOT SET'}")
+        logger.info(f"   Model: {hparams.benchmark_model_name}")
+        logger.info(f"   Dataset: {hparams.benchmark_dataset_name}")
         if self.affinetes_mode == "docker":
-            logger.info(f"   Docker GPU devices: {docker_gpu_devices}")
-            logger.info(f"   Docker memory limit: {docker_memory_limit}")
-            logger.info(f"   Docker shm size: {docker_shm_size}")
+            logger.info(f"   Docker GPU devices: {hparams.docker.gpu_devices}")
+            logger.info(f"   Docker memory limit: {hparams.docker.memory_limit}")
+            logger.info(f"   Docker shm size: {hparams.docker.shm_size}")
         elif self.affinetes_mode == "basilica":
-            logger.info(f"   Basilica image: {basilica_image}")
-            logger.info(f"   Basilica TTL: {basilica_ttl_seconds}s")
-            logger.info(f"   Basilica GPU: {basilica_gpu_count}x {basilica_gpu_models}")
-            logger.info(f"   Basilica min GPU memory: {basilica_min_gpu_memory_gb}GB")
+            logger.info(f"   Basilica image: {hparams.basilica.image}")
+            logger.info(f"   Basilica TTL: {hparams.basilica.ttl_seconds}s")
+            logger.info(
+                f"   Basilica GPU: {hparams.basilica.gpu_count}x {hparams.basilica.gpu_models}"
+            )
+            logger.info(f"   Basilica min GPU memory: {hparams.basilica.min_gpu_memory_gb}GB")
 
     async def start(self) -> None:
         """Start the validator."""
@@ -195,7 +152,7 @@ class Validator(BaseNode):
     async def run_step(self) -> None:
         """Run one iteration of the validator loop."""
         logger.info("Starting validation loop iteration...")
-        
+
         # 1. Read blockchain commitments
         logger.info("Step 1: Reading blockchain commitments...")
         await self.process_blockchain_commitments()
@@ -203,7 +160,7 @@ class Validator(BaseNode):
         # 2. Evaluate via affinetes
         logger.info("Step 2: Evaluating via affinetes...")
         await self.evaluate_submissions()
-        
+
         # 3. Set weights
         logger.info("Step 3: Checking weight setting...")
         await self.maybe_set_weights()
@@ -211,47 +168,51 @@ class Validator(BaseNode):
         # 4. Sync metagraph
         logger.info("Step 4: Checking metagraph sync...")
         await self.maybe_sync()
-        
+
         # Memory cleanup
         self._cleanup_memory()
 
         logger.info("Loop iteration complete. Sleeping 10s...")
         await asyncio.sleep(10)
-    
+
     async def process_blockchain_commitments(self) -> None:
         """Read and process new gist commitments from blockchain."""
         try:
             new_commitments = self.commitment_reader.get_new_commitments_since(
                 self.last_processed_block
             )
-            
+
             current_block = self.commitment_reader.get_current_block()
-            
+
             if new_commitments:
                 logger.info(f"Found {len(new_commitments)} new commitments")
-                
+
                 for commitment in new_commitments:
-                    logger.info(f"Processing commitment from UID {commitment.uid}, hotkey: {commitment.hotkey[:16]}...")
+                    logger.info(
+                        f"Processing commitment from UID {commitment.uid}, hotkey: {commitment.hotkey[:16]}..."
+                    )
                     logger.info(f"   Has valid URL: {commitment.has_valid_code_url()}")
-                    
+
                     # Skip if no valid code URL
                     if not commitment.has_valid_code_url():
-                        logger.warning(f"Skipping commitment without valid code URL: UID {commitment.uid}")
+                        logger.warning(
+                            f"Skipping commitment without valid code URL: UID {commitment.uid}"
+                        )
                         continue
-                    
+
                     # Use code URL as unique identifier
                     code_url = commitment.code_url_info.url
                     if code_url in self.evaluated_code_urls:
                         logger.info(f"Skipping already evaluated URL: {code_url[:50]}...")
                         continue
-                    
+
                     await self._create_submission_from_commitment(commitment)
-            
+
             self.last_processed_block = current_block
-            
+
         except Exception as e:
             logger.error(f"Error processing commitments: {e}")
-    
+
     async def _create_submission_from_commitment(
         self,
         commitment: MinerCommitment,
@@ -259,7 +220,7 @@ class Validator(BaseNode):
         """Create a submission record from a blockchain commitment."""
         hparams = get_hparams()
         submission_id = f"commit_{commitment.reveal_block}_{commitment.uid}"
-        
+
         try:
             existing = await self.db.get_submission(submission_id)
             if existing:
@@ -267,16 +228,16 @@ class Validator(BaseNode):
                 return
         except Exception as e:
             logger.error(f"Database error checking existing submission: {e}")
-        
+
         # Rate limiting
-        min_blocks = getattr(hparams, 'min_blocks_between_commits', 100)
+        min_blocks = hparams.min_blocks_between_commits
         last_submission = await self.db.get_latest_submission_by_hotkey(commitment.hotkey)
-        
+
         if last_submission:
             try:
-                last_block = int(last_submission.submission_id.split('_')[1])
+                last_block = int(last_submission.submission_id.split("_")[1])
                 blocks_since = commitment.reveal_block - last_block
-                
+
                 if blocks_since < min_blocks:
                     logger.warning(
                         f"Rate limit: {commitment.hotkey[:16]}... submitted too soon "
@@ -285,7 +246,7 @@ class Validator(BaseNode):
                     return
             except (IndexError, ValueError):
                 pass
-        
+
         submission = SubmissionModel(
             submission_id=submission_id,
             miner_hotkey=commitment.hotkey,
@@ -295,7 +256,7 @@ class Validator(BaseNode):
             status=SubmissionStatus.EVALUATING,
             payment_verified=True,
         )
-        
+
         try:
             await self.db.save_submission(submission)
             logger.info(f"✓ Created submission: {submission_id}")
@@ -305,16 +266,17 @@ class Validator(BaseNode):
         except Exception as e:
             logger.error(f"Failed to save submission: {e}")
             import traceback
+
             logger.error(traceback.format_exc())
-    
+
     def _download_from_url(self, code_url: str) -> tuple[bool, str]:
         """Download train.py code from a URL.
-        
+
         Validates that the response is a single Python file, not HTML/folder.
-        
+
         Args:
             code_url: The URL containing train.py code
-            
+
         Returns:
             Tuple of (success, code_or_error)
         """
@@ -322,50 +284,50 @@ class Validator(BaseNode):
             req = urllib.request.Request(code_url, headers={"User-Agent": "templar-validator"})
             with urllib.request.urlopen(req, timeout=30) as response:
                 code = response.read().decode("utf-8")
-                
+
                 # Reject HTML (folder page, not raw file)
                 if "<html" in code.lower()[:500] or "<!doctype html" in code.lower()[:500]:
                     return False, "URL returns HTML page, not a code file"
-                
+
                 # Reject JSON file listings
                 if code.strip().startswith("{") and '"files"' in code[:500]:
                     return False, "URL returns JSON (file listing), not code"
-                
+
                 # Size limit (500KB)
                 if len(code) > 500_000:
                     return False, f"File too large ({len(code)} bytes). Max 500KB"
-                
+
                 # Must contain inner_steps
                 if "def inner_steps" not in code:
                     return False, "Code does not contain 'def inner_steps' function"
-                
+
                 return True, code
-                
+
         except urllib.error.HTTPError as e:
             return False, f"HTTP error {e.code}: {e.reason}"
         except urllib.error.URLError as e:
             return False, f"URL error: {e.reason}"
         except Exception as e:
             return False, f"Error downloading code: {e}"
-    
+
     async def evaluate_submissions(self) -> None:
         """Evaluate submissions by downloading from code URL.
-        
+
         The code URL is stored in bucket_path field.
         """
         hparams = get_hparams()
         evaluating = await self.db.get_evaluating_submissions()
-        num_runs = getattr(hparams, 'evaluation_runs', 5)
-        
+        num_runs = hparams.evaluation_runs
+
         logger.info(f"Found {len(evaluating)} submissions in EVALUATING status")
 
         for submission in evaluating:
             code_url = submission.bucket_path
-            
+
             if not code_url or not code_url.startswith("http"):
                 logger.error(f"Invalid code URL for {submission.submission_id}: {code_url}")
                 continue
-            
+
             existing_evals = await self.db.get_evaluations(submission.submission_id)
             my_evals = [e for e in existing_evals if e.evaluator_hotkey == self.hotkey]
 
@@ -375,11 +337,11 @@ class Validator(BaseNode):
             runs_remaining = num_runs - len(my_evals)
             logger.info(f"Evaluating {submission.submission_id}")
             logger.info(f"   URL: {code_url[:60]}...")
-            logger.info(f"   Runs: {len(my_evals)+1}/{num_runs}")
+            logger.info(f"   Runs: {len(my_evals) + 1}/{num_runs}")
 
             # Download code from URL
             success, code_or_error = self._download_from_url(code_url)
-            
+
             if not success:
                 logger.error(f"Failed to download code: {code_or_error}")
                 await self.db.update_submission_status(
@@ -388,7 +350,7 @@ class Validator(BaseNode):
                     error_message=f"Failed to download code: {code_or_error}",
                 )
                 continue
-            
+
             miner_code = code_or_error
             logger.info(f"   Downloaded {len(miner_code)} bytes")
 
@@ -396,16 +358,16 @@ class Validator(BaseNode):
             for run_idx in range(runs_remaining):
                 current_run = len(my_evals) + run_idx + 1
                 seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}"
-                
+
                 logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
-                
+
                 result = await self.affinetes_runner.evaluate(
                     code=miner_code,  # Pass code directly
                     seed=seed,
-                    steps=getattr(hparams, 'eval_steps', 5),
-                    batch_size=getattr(hparams, 'benchmark_batch_size', 8),
-                    sequence_length=getattr(hparams, 'benchmark_sequence_length', 1024),
-                    data_samples=getattr(hparams, 'benchmark_data_samples', 10000),
+                    steps=hparams.eval_steps,
+                    batch_size=hparams.benchmark_batch_size,
+                    sequence_length=hparams.benchmark_sequence_length,
+                    data_samples=hparams.benchmark_data_samples,
                     task_id=current_run,
                 )
 
@@ -428,21 +390,21 @@ class Validator(BaseNode):
 
             # Mark code URL as evaluated
             self.evaluated_code_urls.add(code_url)
-            
+
             # Store miner's code in database
             await self.db.update_submission_code(submission.submission_id, miner_code)
             logger.info(f"Stored code for {submission.submission_id} in database")
-            
+
             # Finalize submission
             await self._finalize_submission(submission.submission_id, num_runs)
-    
+
     async def _finalize_submission(self, submission_id: str, num_runs: int) -> None:
         """Calculate final score and update submission status."""
         num_evals = await self.db.count_evaluations(submission_id)
         required_evals = num_runs
-        
+
         logger.info(f"Finalizing {submission_id}: {num_evals}/{required_evals} evaluations")
-        
+
         if num_evals >= required_evals:
             all_evals = await self.db.get_evaluations(submission_id)
             successful_evals = [e for e in all_evals if e.success]
@@ -450,14 +412,14 @@ class Validator(BaseNode):
             if successful_evals:
                 tps_scores = [e.tokens_per_second for e in successful_evals]
                 median_tps = statistics.median(tps_scores)
-                
+
                 logger.info(
                     f"Final score for {submission_id}:\n"
                     f"   Successful runs: {len(tps_scores)}\n"
                     f"   Scores: {[f'{s:.1f}' for s in sorted(tps_scores)]}\n"
                     f"   Median TPS: {median_tps:,.2f}"
                 )
-                
+
                 await self.db.update_submission_score(submission_id, median_tps)
             else:
                 await self.db.update_submission_status(
@@ -466,17 +428,17 @@ class Validator(BaseNode):
                     error_message="All evaluations failed",
                 )
                 logger.warning(f"Submission {submission_id} failed: no successful evaluations")
-    
+
     def _cleanup_memory(self):
         """Clean up GPU memory."""
-        if not hasattr(self, '_loop_count'):
+        if not hasattr(self, "_loop_count"):
             self._loop_count = 0
-        
+
         self._loop_count += 1
-        
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            
+
         if self._loop_count % 10 == 0:
             logger.info(f"Memory cleanup (iteration {self._loop_count})")
             if torch.cuda.is_available():
@@ -498,7 +460,7 @@ class Validator(BaseNode):
         if self.weight_setter is None:
             logger.debug("Skipping weight setting (test mode)")
             return
-            
+
         hparams = get_hparams()
         now = time.time()
 
@@ -522,8 +484,8 @@ class Validator(BaseNode):
 
 
 def main():
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-    
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
     parser = argparse.ArgumentParser(description="Tournament Validator (URL-Based)")
     parser.add_argument(
         "--wallet.name",
@@ -562,9 +524,9 @@ def main():
         affinetes_mode=args.affinetes_mode,
     )
 
-    logger.info(f"Starting validator")
+    logger.info("Starting validator")
     logger.info(f"   Affinetes mode: {args.affinetes_mode}")
-    
+
     asyncio.run(validator.start())
 
 

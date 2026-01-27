@@ -17,14 +17,13 @@ import bittensor as bt
 import torch
 
 from ..config import get_config, get_hparams
-from ..core.exceptions import ChainError
 
 logger = logging.getLogger(__name__)
 
 
 class ChainManager:
     """Manages interactions with the Bittensor blockchain.
-    
+
     Handles:
     - Metagraph syncing (who is registered)
     - Weight setting (incentive distribution)
@@ -69,7 +68,7 @@ class ChainManager:
 
     async def sync_metagraph(self) -> bt.metagraph | None:
         """Sync and return the metagraph.
-        
+
         Returns:
             The synced metagraph, or None if sync fails.
         """
@@ -94,7 +93,7 @@ class ChainManager:
 
     def get_uid_for_hotkey(self, hotkey: str) -> int | None:
         """Get the UID for a hotkey, or None if not registered.
-        
+
         Falls back to direct chain query if metagraph is unavailable.
         """
         # Try metagraph first (faster, cached)
@@ -104,7 +103,7 @@ class ChainManager:
                 return int(self.metagraph.uids[idx])
             except ValueError:
                 return None
-        
+
         # Fallback: query chain directly (works when metagraph API unavailable)
         try:
             uid = self.subtensor.get_uid_for_hotkey_on_subnet(
@@ -120,13 +119,13 @@ class ChainManager:
 
     def is_registered(self, hotkey: str) -> bool:
         """Check if a hotkey is registered on the subnet.
-        
+
         Falls back to direct chain query if metagraph is unavailable.
         """
         # Try metagraph first
         if self.metagraph is not None:
             return hotkey in self.metagraph.hotkeys
-        
+
         # Fallback: check via get_uid (if we get a UID, it's registered)
         uid = self.get_uid_for_hotkey(hotkey)
         return uid is not None
@@ -159,9 +158,9 @@ class ChainManager:
             # Convert to tensors
             uids_tensor = torch.tensor(uids, dtype=torch.int64)
             weights_tensor = torch.tensor(weights, dtype=torch.float32)
-            
+
             logger.info(f"Setting weights: UIDs={uids}, weights={weights}")
-            
+
             # Call set_weights and capture result
             success, message = await loop.run_in_executor(
                 None,
@@ -174,12 +173,12 @@ class ChainManager:
                     wait_for_finalization=False,
                 ),
             )
-            
+
             if success:
                 logger.info(f"Weights set successfully: {message}")
             else:
                 logger.error(f"Weight setting failed: {message}")
-            
+
             return (success, message)
         except Exception as e:
             logger.error(f"Exception during weight setting: {e}")

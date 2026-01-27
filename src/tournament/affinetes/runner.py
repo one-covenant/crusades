@@ -32,6 +32,7 @@ import httpx
 # Optional: Basilica SDK for cloud GPU evaluation
 try:
     from basilica import BasilicaClient
+
     BASILICA_AVAILABLE = True
 except ImportError:
     BasilicaClient = None
@@ -47,7 +48,7 @@ _basilica_deployment_time = 0
 @dataclass
 class EvaluationResult:
     """Result from evaluating a miner's submission."""
-    
+
     success: bool
     tps: float = 0.0
     total_tokens: int = 0
@@ -57,7 +58,7 @@ class EvaluationResult:
     task_id: int = 0
     diagnostics: dict = field(default_factory=dict)
     code: str | None = None  # Miner's code for storage
-    
+
     @classmethod
     def from_dict(cls, data: dict) -> "EvaluationResult":
         """Create from dictionary response."""
@@ -72,7 +73,7 @@ class EvaluationResult:
             diagnostics=data.get("diagnostics", {}),
             code=data.get("code"),
         )
-    
+
     @classmethod
     def failure(cls, error: str, task_id: int = 0) -> "EvaluationResult":
         """Create a failure result."""
@@ -81,12 +82,12 @@ class EvaluationResult:
 
 class AffinetesRunner:
     """Runs evaluations via Docker or Basilica.
-    
+
     URL-Based Architecture:
     - Miner hosts train.py at any URL
     - Validator downloads code from committed URL
     - Code is passed directly to the evaluation container
-    
+
     Example:
         runner = AffinetesRunner(mode="docker")
         result = await runner.evaluate(
@@ -96,13 +97,15 @@ class AffinetesRunner:
         if result.success:
             print(f"TPS: {result.tps}")
     """
-    
+
     # Default Docker image for local evaluation
     DEFAULT_DOCKER_IMAGE = os.getenv("VALIDATOR_EVAL_IMAGE", "templar-eval:latest")
-    
+
     # Default Basilica image (must be pushed to registry like ghcr.io)
-    DEFAULT_BASILICA_IMAGE = os.getenv("BASILICA_EVAL_IMAGE", "ghcr.io/one-covenant/templar-eval:latest")
-    
+    DEFAULT_BASILICA_IMAGE = os.getenv(
+        "BASILICA_EVAL_IMAGE", "ghcr.io/one-covenant/templar-eval:latest"
+    )
+
     def __init__(
         self,
         mode: Literal["docker", "basilica"] = "docker",
@@ -126,7 +129,7 @@ class AffinetesRunner:
         basilica_memory: str = "32Gi",
     ):
         """Initialize the runner.
-        
+
         Args:
             mode: Execution mode ("docker" for local, "basilica" for remote)
             basilica_endpoint: Basilica API endpoint (not needed with SDK)
@@ -165,17 +168,17 @@ class AffinetesRunner:
         self.basilica_min_gpu_memory_gb = basilica_min_gpu_memory_gb
         self.basilica_cpu = basilica_cpu
         self.basilica_memory = basilica_memory
-        
+
         if mode == "basilica":
             if not self.basilica_api_key:
                 logger.warning("Basilica mode: BASILICA_API_TOKEN not set")
-            logger.info(f"Basilica mode initialized")
+            logger.info("Basilica mode initialized")
             logger.info(f"   Image: {self.basilica_image}")
             logger.info(f"   TTL: {self.basilica_ttl_seconds}s")
             logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
             logger.info(f"   Min GPU Memory: {self.basilica_min_gpu_memory_gb}GB")
             logger.info(f"   CPU/Memory: {self.basilica_cpu} / {self.basilica_memory}")
-    
+
     async def evaluate(
         self,
         code: str,
@@ -189,7 +192,7 @@ class AffinetesRunner:
         task_id: int = 0,
     ) -> EvaluationResult:
         """Evaluate a miner's train.py code.
-        
+
         Args:
             code: Miner's train.py code (already downloaded from URL)
             seed: Random seed for evaluation
@@ -200,25 +203,25 @@ class AffinetesRunner:
             sequence_length: Sequence length
             data_samples: Number of data samples
             task_id: Evaluation task identifier
-            
+
         Returns:
             EvaluationResult with TPS score
         """
         model_url = model_url or self.default_model_url
         data_url = data_url or self.default_data_url
-        
+
         if not model_url or not data_url:
             return EvaluationResult.failure(
                 "model_url and data_url are required",
                 task_id=task_id,
             )
-        
+
         if not code or "def inner_steps" not in code:
             return EvaluationResult.failure(
                 "Invalid code: must contain 'def inner_steps' function",
                 task_id=task_id,
             )
-        
+
         if self.mode == "docker":
             return await self._evaluate_docker(
                 code=code,
@@ -248,7 +251,7 @@ class AffinetesRunner:
                 f"Unknown mode: {self.mode}",
                 task_id=task_id,
             )
-    
+
     async def _evaluate_docker(
         self,
         code: str,
@@ -262,36 +265,36 @@ class AffinetesRunner:
         task_id: int,
     ) -> EvaluationResult:
         """Run evaluation locally using Docker.
-        
+
         Code is mounted directly into the container - no downloads needed.
         """
-        logger.info(f"Running Docker evaluation")
+        logger.info("Running Docker evaluation")
         logger.info(f"   Code size: {len(code)} bytes")
-        
+
         # Check if validator image exists
         check_cmd = ["docker", "image", "inspect", self.validator_image]
         check_result = subprocess.run(check_cmd, capture_output=True)
-        
+
         if check_result.returncode != 0:
             return EvaluationResult.failure(
                 f"Validator image not found: {self.validator_image}. "
                 f"Build it first: cd environments/templar && docker build -t {self.validator_image} .",
                 task_id=task_id,
             )
-        
+
         # Write miner's code to temp file
         with tempfile.NamedTemporaryFile(
-            mode='w',
-            suffix='.py',
+            mode="w",
+            suffix=".py",
             delete=False,
-            prefix='train_',
+            prefix="train_",
         ) as f:
             f.write(code)
             train_path = f.name
-        
+
         # Make readable by container's non-root user
         os.chmod(train_path, 0o644)
-        
+
         # Create evaluation script that reads code from mounted file
         eval_script = f'''
 import asyncio
@@ -305,7 +308,7 @@ async def main():
     # Read miner's code
     with open('/tmp/miner_train.py') as f:
         code = f.read()
-    
+
     actor = Actor()
     result = await actor.evaluate(
         task_id={task_id},
@@ -323,28 +326,31 @@ async def main():
 
 asyncio.run(main())
 '''
-        
+
         # Write eval script to temp file
         with tempfile.NamedTemporaryFile(
-            mode='w',
-            suffix='.py',
+            mode="w",
+            suffix=".py",
             delete=False,
         ) as f:
             f.write(eval_script)
             script_path = f.name
-        
+
         # Make readable by container's non-root user
         os.chmod(script_path, 0o644)
-        
+
         try:
             # Build Docker run command
             docker_cmd = [
-                "docker", "run",
+                "docker",
+                "run",
                 "--rm",
-                "-v", f"{script_path}:/tmp/eval_script.py:ro",
-                "-v", f"{train_path}:/tmp/miner_train.py:ro",
+                "-v",
+                f"{script_path}:/tmp/eval_script.py:ro",
+                "-v",
+                f"{train_path}:/tmp/miner_train.py:ro",
             ]
-            
+
             # Add GPU if configured
             if self.docker_gpu_devices and self.docker_gpu_devices.lower() != "none":
                 if self.docker_gpu_devices.lower() == "all":
@@ -352,44 +358,58 @@ asyncio.run(main())
                 else:
                     # Specific devices like "0" or "0,1"
                     docker_cmd.extend(["--gpus", f'"device={self.docker_gpu_devices}"'])
-            
+
             # Memory limits (from hparams.json docker config)
-            docker_cmd.extend([
-                "--memory", self.docker_memory_limit,
-                "--shm-size", self.docker_shm_size,
-            ])
-            
+            docker_cmd.extend(
+                [
+                    "--memory",
+                    self.docker_memory_limit,
+                    "--shm-size",
+                    self.docker_shm_size,
+                ]
+            )
+
             # Environment variables
-            docker_cmd.extend([
-                "-e", f"OUTPUT_VECTOR_TOLERANCE={self.output_tolerance}",
-            ])
-            
+            docker_cmd.extend(
+                [
+                    "-e",
+                    f"OUTPUT_VECTOR_TOLERANCE={self.output_tolerance}",
+                ]
+            )
+
             # Timeout
-            docker_cmd.extend([
-                "--stop-timeout", str(self.timeout),
-            ])
-            
+            docker_cmd.extend(
+                [
+                    "--stop-timeout",
+                    str(self.timeout),
+                ]
+            )
+
             # Image and command
-            docker_cmd.extend([
-                self.validator_image,
-                "python", "/tmp/eval_script.py",
-            ])
-            
+            docker_cmd.extend(
+                [
+                    self.validator_image,
+                    "python",
+                    "/tmp/eval_script.py",
+                ]
+            )
+
             logger.info(f"Running evaluation in {self.validator_image}...")
             logger.info(f"   Docker command: {' '.join(docker_cmd[:6])}...")
-            
+
             # Run with timeout - stream logs in real-time
             start_time = time.perf_counter()
-            
+
             process = await asyncio.create_subprocess_exec(
                 *docker_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,  # Merge stderr into stdout for unified logging
             )
-            
+
             # Stream logs in real-time and collect for parsing
             stdout_lines = []
             try:
+
                 async def read_stream():
                     while True:
                         line = await asyncio.wait_for(
@@ -403,33 +423,33 @@ asyncio.run(main())
                         # Log Docker output with prefix for visibility
                         if decoded and not decoded.startswith("EVAL_RESULT:"):
                             logger.info(f"   [DOCKER] {decoded}")
-                
+
                 await read_stream()
                 await process.wait()
-                
-            except asyncio.TimeoutError:
+
+            except TimeoutError:
                 process.kill()
                 return EvaluationResult.failure(
                     f"Evaluation timed out after {self.timeout}s",
                     task_id=task_id,
                 )
-            
-            wall_time = time.perf_counter() - start_time
-            
+
+            time.perf_counter() - start_time
+
             stdout_text = "\n".join(stdout_lines)
             stderr_text = ""  # Already merged into stdout
-            
+
             if process.returncode != 0:
                 error_msg = stderr_text[:500] if stderr_text else f"Exit code: {process.returncode}"
                 return EvaluationResult.failure(
                     f"Container failed: {error_msg}",
                     task_id=task_id,
                 )
-            
+
             # Parse result
-            for line in stdout_text.split('\n'):
+            for line in stdout_text.split("\n"):
                 if line.startswith("EVAL_RESULT:"):
-                    result_json = line[len("EVAL_RESULT:"):]
+                    result_json = line[len("EVAL_RESULT:") :]
                     try:
                         result_data = json.loads(result_json)
                         result = EvaluationResult.from_dict(result_data)
@@ -440,19 +460,19 @@ asyncio.run(main())
                             f"Invalid result JSON: {e}",
                             task_id=task_id,
                         )
-            
+
             return EvaluationResult.failure(
                 f"No evaluation result in output. stdout: {stdout_text[:200]}",
                 task_id=task_id,
             )
-            
+
         finally:
             try:
                 os.unlink(script_path)
                 os.unlink(train_path)
             except Exception:
                 pass
-    
+
     async def _evaluate_basilica(
         self,
         code: str,
@@ -466,10 +486,10 @@ asyncio.run(main())
         task_id: int,
     ) -> EvaluationResult:
         """Run evaluation remotely via Basilica SDK.
-        
+
         Uses BasilicaClient to deploy a custom Docker image and call
         the /evaluate endpoint for TPS evaluation.
-        
+
         Flow:
         1. Deploy image to Basilica (or reuse existing deployment)
         2. Wait for deployment to be ready (/health endpoint)
@@ -479,52 +499,52 @@ asyncio.run(main())
         logger.info("=" * 60)
         logger.info("[BASILICA] Starting remote GPU evaluation")
         logger.info("=" * 60)
-        logger.info(f"[BASILICA] Configuration:")
+        logger.info("[BASILICA] Configuration:")
         logger.info(f"   Image: {self.basilica_image}")
         logger.info(f"   Model: {model_url}")
         logger.info(f"   Dataset: {data_url}")
         logger.info(f"   Steps: {steps}, Batch size: {batch_size}")
         logger.info(f"   Task ID: {task_id}, Seed: {seed}")
         logger.info(f"   Code size: {len(code)} bytes")
-        
+
         if not BASILICA_AVAILABLE:
             logger.error("[BASILICA] SDK not installed!")
             return EvaluationResult.failure(
                 "basilica SDK not installed. Run: uv add basilica",
                 task_id=task_id,
             )
-        
+
         try:
             # Get or create Basilica deployment
             logger.info("[BASILICA] Acquiring deployment...")
             deployment = await self._get_basilica_deployment()
-            
+
             if deployment is None:
                 logger.error("[BASILICA] Failed to create deployment!")
                 return EvaluationResult.failure(
                     "Failed to create Basilica deployment",
                     task_id=task_id,
                 )
-            
+
             logger.info("-" * 60)
-            logger.info(f"[BASILICA] Deployment ready!")
+            logger.info("[BASILICA] Deployment ready!")
             logger.info(f"   URL: {deployment.url}")
-            if hasattr(deployment, 'id'):
+            if hasattr(deployment, "id"):
                 logger.info(f"   Deployment ID: {deployment.id}")
             logger.info("-" * 60)
-            
+
             # Check health endpoint first
             logger.info("[BASILICA] Checking health endpoint...")
             async with httpx.AsyncClient(timeout=30) as client:
                 try:
                     health_response = await client.get(f"{deployment.url}/health")
                     if health_response.status_code == 200:
-                        logger.info(f"[BASILICA] Health check: ✅ OK")
+                        logger.info("[BASILICA] Health check: ✅ OK")
                     else:
                         logger.warning(f"[BASILICA] Health check: {health_response.status_code}")
                 except Exception as e:
                     logger.warning(f"[BASILICA] Health check failed: {e}")
-            
+
             # Call the /evaluate endpoint
             payload = {
                 "task_id": task_id,
@@ -538,36 +558,36 @@ asyncio.run(main())
                 "data_samples": data_samples,
                 "code": code,
             }
-            
+
             logger.info("[BASILICA] Sending evaluation request...")
             logger.info(f"   POST {deployment.url}/evaluate")
             logger.info(f"   Timeout: {self.timeout + 120}s")
-            
+
             start_time = time.time()
-            
+
             async with httpx.AsyncClient(timeout=self.timeout + 120) as client:
                 response = await client.post(
                     f"{deployment.url}/evaluate",
                     json=payload,
                 )
-                
+
                 elapsed = time.time() - start_time
                 logger.info(f"[BASILICA] Response received in {elapsed:.1f}s")
                 logger.info(f"   Status code: {response.status_code}")
-                
+
                 if response.status_code != 200:
                     error_text = response.text[:500]
-                    logger.error(f"[BASILICA] Evaluation failed!")
+                    logger.error("[BASILICA] Evaluation failed!")
                     logger.error(f"   Error: {error_text}")
                     return EvaluationResult.failure(
                         f"Basilica /evaluate error: {response.status_code} - {error_text}",
                         task_id=task_id,
                     )
-                
+
                 result_data = response.json()
                 result = EvaluationResult.from_dict(result_data)
                 result.code = code
-                
+
                 logger.info("=" * 60)
                 logger.info("[BASILICA] Evaluation complete!")
                 logger.info(f"   Success: {result.success}")
@@ -579,10 +599,10 @@ asyncio.run(main())
                 if result.error:
                     logger.error(f"   Error: {result.error}")
                 logger.info("=" * 60)
-                
+
                 return result
-                
-        except asyncio.TimeoutError:
+
+        except TimeoutError:
             logger.error(f"[BASILICA] Timeout after {self.timeout}s!")
             return EvaluationResult.failure(
                 f"Basilica timeout after {self.timeout}s",
@@ -595,39 +615,43 @@ asyncio.run(main())
                 f"Basilica error: {e}",
                 task_id=task_id,
             )
-    
+
     async def _get_basilica_deployment(self):
         """Get or create a Basilica deployment.
-        
+
         Reuses existing deployment if within TTL, otherwise creates new one.
         """
         global _basilica_deployment, _basilica_deployment_time
-        
+
         # Check if existing deployment is still valid
         now = time.time()
         ttl_buffer = 300  # 5 minute buffer before TTL expires
-        
-        if (_basilica_deployment is not None and 
-            now - _basilica_deployment_time < self.basilica_ttl_seconds - ttl_buffer):
+
+        if (
+            _basilica_deployment is not None
+            and now - _basilica_deployment_time < self.basilica_ttl_seconds - ttl_buffer
+        ):
             remaining = self.basilica_ttl_seconds - (now - _basilica_deployment_time)
-            logger.info(f"[BASILICA] Reusing existing deployment")
+            logger.info("[BASILICA] Reusing existing deployment")
             logger.info(f"   URL: {_basilica_deployment.url}")
-            logger.info(f"   TTL remaining: {remaining:.0f}s ({remaining/60:.1f} min)")
+            logger.info(f"   TTL remaining: {remaining:.0f}s ({remaining / 60:.1f} min)")
             return _basilica_deployment
-        
+
         # Create new deployment
         logger.info("[BASILICA] Creating NEW deployment (no valid cached deployment)")
         logger.info(f"   Image: {self.basilica_image}")
         logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
         logger.info(f"   Min GPU memory: {self.basilica_min_gpu_memory_gb}GB")
         logger.info(f"   CPU: {self.basilica_cpu}, Memory: {self.basilica_memory}")
-        logger.info(f"   TTL: {self.basilica_ttl_seconds}s ({self.basilica_ttl_seconds/60:.0f} min)")
+        logger.info(
+            f"   TTL: {self.basilica_ttl_seconds}s ({self.basilica_ttl_seconds / 60:.0f} min)"
+        )
         logger.info("[BASILICA] Requesting GPU from Basilica... (this may take 2-5 minutes)")
-        
+
         try:
             deploy_start = time.time()
             client = BasilicaClient()
-            
+
             deployment = client.deploy(
                 name="templar-eval",
                 image=self.basilica_image,
@@ -642,32 +666,34 @@ asyncio.run(main())
                 cpu=self.basilica_cpu,
                 memory=self.basilica_memory,
             )
-            
+
             deploy_time = time.time() - deploy_start
             logger.info(f"[BASILICA] ✅ Deployment created in {deploy_time:.1f}s!")
             logger.info(f"   Deployment URL: {deployment.url}")
-            if hasattr(deployment, 'id'):
+            if hasattr(deployment, "id"):
                 logger.info(f"   Deployment ID: {deployment.id}")
             logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
-            logger.info(f"   TTL: {self.basilica_ttl_seconds}s (expires in {self.basilica_ttl_seconds/60:.0f} min)")
-            
+            logger.info(
+                f"   TTL: {self.basilica_ttl_seconds}s (expires in {self.basilica_ttl_seconds / 60:.0f} min)"
+            )
+
             _basilica_deployment = deployment
             _basilica_deployment_time = now
-            
+
             return deployment
-            
+
         except Exception as e:
-            logger.error(f"[BASILICA] ❌ Failed to deploy!")
+            logger.error("[BASILICA] ❌ Failed to deploy!")
             logger.error(f"   Error: {e}")
             logger.error(traceback.format_exc())
             return None
-    
+
     async def build_validator_image(self, env_path: Path | None = None) -> bool:
         """Build the validator's evaluation Docker image.
-        
+
         Args:
             env_path: Path to environments/templar directory
-            
+
         Returns:
             True if build succeeded
         """
@@ -680,26 +706,28 @@ asyncio.run(main())
                 if candidate.exists() and (candidate / "Dockerfile").exists():
                     env_path = candidate
                     break
-        
+
         if env_path is None or not env_path.exists():
             logger.error("Could not find environments/templar directory")
             return False
-        
+
         logger.info(f"Building validator image: {self.validator_image}")
         logger.info(f"   From: {env_path}")
-        
+
         cmd = [
-            "docker", "build",
-            "-t", self.validator_image,
+            "docker",
+            "build",
+            "-t",
+            self.validator_image,
             str(env_path),
         ]
-        
+
         result = subprocess.run(cmd, capture_output=False)
-        
+
         if result.returncode != 0:
-            logger.error(f"Failed to build validator image")
+            logger.error("Failed to build validator image")
             return False
-        
+
         logger.info(f"Successfully built: {self.validator_image}")
         return True
 
@@ -709,16 +737,16 @@ def create_runner(
     **kwargs,
 ) -> AffinetesRunner:
     """Factory function to create an AffinetesRunner.
-    
+
     Args:
         mode: "docker" or "basilica"
         **kwargs: Additional arguments
-        
+
     Returns:
         Configured AffinetesRunner
     """
     if mode == "basilica":
         kwargs.setdefault("basilica_endpoint", os.getenv("BASILICA_ENDPOINT"))
         kwargs.setdefault("basilica_api_key", os.getenv("BASILICA_API_KEY"))
-    
+
     return AffinetesRunner(mode=mode, **kwargs)

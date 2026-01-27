@@ -1,11 +1,22 @@
 """Configuration management for templar-tournament (Chi/Affinetes Architecture)."""
 
 import json
+from functools import cache
 from pathlib import Path
 from typing import Self
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+@cache
+def get_project_root() -> Path:
+    """Find project root by looking for pyproject.toml."""
+    current = Path(__file__).resolve().parent
+    for parent in [current, *current.parents]:
+        if (parent / "pyproject.toml").exists():
+            return parent
+    raise FileNotFoundError("Could not find project root (no pyproject.toml found)")
 
 
 class StorageConfig(BaseModel):
@@ -23,7 +34,7 @@ class VerificationConfig(BaseModel):
 
 class DockerConfig(BaseModel):
     """Docker execution settings for validator evaluations.
-    
+
     GPU device options:
     - "all": Use all available GPUs (default)
     - "0": Use only GPU 0
@@ -38,14 +49,14 @@ class DockerConfig(BaseModel):
 
 class BasilicaConfig(BaseModel):
     """Basilica cloud GPU settings for remote evaluation.
-    
+
     Basilica is used for production evaluation when local GPUs
     are not available or for distributed validator setups.
-    
+
     Prerequisites:
     1. Build and push image: docker push ghcr.io/org/templar-eval:latest
     2. Set BASILICA_API_TOKEN environment variable
-    
+
     GPU Configuration:
     - gpu_count: Number of GPUs (1-8)
     - gpu_models: Acceptable GPU types (e.g., ["A100", "H100"])
@@ -63,7 +74,7 @@ class BasilicaConfig(BaseModel):
 
 class HParams(BaseModel):
     """Hyperparameters loaded from hparams.json.
-    
+
     URL-Based Architecture:
     - Miners host train.py at any URL and commit the URL to blockchain
     - Validators download from miner's URL and evaluate via Docker/Basilica
@@ -72,7 +83,7 @@ class HParams(BaseModel):
 
     # Network settings
     netuid: int
-    
+
     # Emissions distribution
     burn_rate: float
     burn_uid: int
@@ -115,21 +126,20 @@ class HParams(BaseModel):
     @classmethod
     def load(cls, path: Path | str | None = None) -> Self:
         """Load hyperparameters from JSON file.
-        
+
         Args:
             path: Path to hparams.json file
-            
+
         Returns:
             HParams instance with all values from JSON
-            
+
         Raises:
             FileNotFoundError: If hparams.json doesn't exist
             ValidationError: If required fields are missing
         """
         if path is None:
             # Default to hparams/hparams.json relative to project root
-            # config.py is at src/tournament/config.py, so 3 parents gets to project root
-            path = Path(__file__).parent.parent.parent / "hparams" / "hparams.json"
+            path = get_project_root() / "hparams" / "hparams.json"
         else:
             path = Path(path)
 

@@ -55,6 +55,7 @@ dev = [
 [project.scripts]
 tournament-validator = "neurons.validator:main"
 tournament-miner = "neurons.miner:main"
+tournament-api = "tournament.api.server:main"
 tplr = "tournament.tui.app:main"
 
 [tool.setuptools.packages.find]
@@ -70,7 +71,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
-ignore = ["E501"]
+ignore = ["E501", "N812"]  # N812: Allow `import torch.nn.functional as F` (PyTorch convention)
 
 [tool.mypy]
 python_version = "3.12"

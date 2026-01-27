@@ -76,10 +76,10 @@ class Database:
 
     async def update_submission_code(self, submission_id: str, code: str) -> None:
         """Store miner's code content after evaluation.
-        
+
         This is called by the validator after downloading and evaluating
         the miner's code, so it can be displayed on the dashboard.
-        
+
         Args:
             submission_id: Submission ID
             code: Miner's train.py code content
@@ -95,17 +95,18 @@ class Database:
 
     async def get_submission_code(self, submission_id: str) -> str | None:
         """Get miner's code content for a submission.
-        
+
         Args:
             submission_id: Submission ID
-            
+
         Returns:
             Code content or None if not stored
         """
         async with self.session_factory() as session:
             result = await session.execute(
-                select(SubmissionModel.code_content)
-                .where(SubmissionModel.submission_id == submission_id)
+                select(SubmissionModel.code_content).where(
+                    SubmissionModel.submission_id == submission_id
+                )
             )
             return result.scalar_one_or_none()
 
@@ -139,12 +140,12 @@ class Database:
 
     async def get_latest_submission_by_hotkey(self, hotkey: str) -> SubmissionModel | None:
         """Get the most recent submission from a miner.
-        
+
         Used for rate limiting - checking when miner last submitted.
-        
+
         Args:
             hotkey: Miner's hotkey
-            
+
         Returns:
             Most recent submission or None
         """
@@ -219,13 +220,13 @@ class Database:
 
     async def get_top_submissions(self, limit: int = 5) -> list[SubmissionModel]:
         """Get top N submissions by score for similarity checking.
-        
+
         This is used during submission to check if new code is similar
         to existing top-performing code (anti-copying).
-        
+
         Args:
             limit: Number of top submissions to return (default 5)
-            
+
         Returns:
             List of top submissions sorted by score (highest first)
         """
@@ -240,6 +241,7 @@ class Database:
                 .limit(limit)
             )
             return list(result.scalars().all())
+
 
 # Global instance
 _database: Database | None = None

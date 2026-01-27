@@ -1,4 +1,4 @@
-# Templar Tournament
+# Templar Crusades
 
 **TPS Competition on Bittensor** - Miners compete to optimize training code for maximum Tokens Per Second.
 
@@ -6,7 +6,7 @@
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────────── ┐
-│                              TOURNAMENT FLOW                                     │
+│                              Crusades FLOW                                       │
 │                                                                                  │
 │   MINER                        BLOCKCHAIN                      VALIDATOR         │
 │     │                                                              │             │
@@ -30,9 +30,6 @@
 │     │                                                        (median score)      │
 │     │                                                              │             │
 │     │                                                     7. Set weights         │
-│     │                                                              │             │
-│     └◀─────────────────── 8. Rewards ◀──────────────────────────── ┘              │
-│                              (5% to winner)                                      │
 │                                                                                  │
 └───────────────────────────────────────────────────────────────────────────────── ┘
 ```
@@ -43,8 +40,8 @@
 
 ```bash
 # Clone and setup
-git clone <repo>
-cd templar-tournament
+git clone https://github.com/one-covenant/crusades
+cd crusades
 uv sync
 
 # Create .env (for HuggingFace access)
@@ -59,10 +56,10 @@ echo "HF_TOKEN=hf_your_token" > .env
 
 ```bash
 # Download model & data for local testing
-uv run python local_test/setup_benchmark.py
+uv run local_test/setup_benchmark.py
 
 # Test your train.py locally
-cd local_test && uv run python train.py
+uv run local_test/train.py
 ```
 
 ### 2. Host Your Code
@@ -78,13 +75,13 @@ Host your `train.py` at any URL that returns raw code:
 ```bash
 
 # Submit to mainnet
-uv run python -m neurons.miner submit "https://gist.github.com/user/gist_id" \
+uv run -m neurons.miner submit "https://gist.github.com/user/gist_id" \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --network finney
 
 # Submit to localnet (testing)
-uv run python -m neurons.miner submit "https://gist.github.com/user/gist_id" \
+uv run -m neurons.miner submit "https://gist.github.com/user/gist_id" \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --network local
@@ -118,7 +115,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
     """Optimize this function for maximum TPS.
     
     Args:
-        model: Pre-loaded 7B model (already on device, in train mode)
+        model: Pre-loaded model (already on device, in train mode)
         data_iterator: Iterator yielding batches of shape (batch_size, seq_len)
         optimizer: Pre-configured AdamW optimizer
         num_steps: Number of training steps to run (typically 5)
@@ -205,7 +202,7 @@ templar-tournament/
 Monitor tournament activity:
 
 ```bash
-uv run python -m tournament.tui --db tournament.db
+uv run -m tournament.tui --db tournament.db
 ```
 
 Shows:

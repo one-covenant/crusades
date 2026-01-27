@@ -38,46 +38,48 @@ def create_chart(history: list[dict], width: int = 50, height: int = 8) -> Text:
 
     min_tps = min(tps_values)
     max_tps = max(tps_values)
-    
+
     # Add padding to min/max for better visualization
     if max_tps == min_tps:
         # All values same - show horizontal line in middle
         padding = max_tps * 0.1 if max_tps > 0 else 100
         min_tps = max_tps - padding
         max_tps = max_tps + padding
-    
+
     tps_range = max_tps - min_tps
 
     # Chart dimensions
     chart_width = width - 7  # Account for y-axis label
-    
+
     # Create a 2D grid for the chart
     grid = [[" " for _ in range(chart_width)] for _ in range(height)]
-    
+
     # Calculate positions for each data point
     if len(tps_values) == 1:
         # Single point - show in middle
         x_positions = [chart_width // 2]
     else:
-        x_positions = [int(i * (chart_width - 1) / (len(tps_values) - 1)) for i in range(len(tps_values))]
-    
+        x_positions = [
+            int(i * (chart_width - 1) / (len(tps_values) - 1)) for i in range(len(tps_values))
+        ]
+
     y_positions = []
     for tps in tps_values:
         normalized = (tps - min_tps) / tps_range
         y = int(normalized * (height - 1))
         y = max(0, min(height - 1, y))
         y_positions.append(y)
-    
+
     # Draw connecting lines between points
     for i in range(len(tps_values) - 1):
         x1, y1 = x_positions[i], y_positions[i]
         x2, y2 = x_positions[i + 1], y_positions[i + 1]
-        
+
         # Draw line between points using Bresenham-like approach
         dx = x2 - x1
         dy = y2 - y1
         steps = max(abs(dx), abs(dy), 1)
-        
+
         for step in range(steps + 1):
             t = step / steps if steps > 0 else 0
             x = int(x1 + t * dx)
@@ -90,12 +92,12 @@ def create_chart(history: list[dict], width: int = 50, height: int = 8) -> Text:
                     grid[height - 1 - y][x] = "╲"
                 else:
                     grid[height - 1 - y][x] = "─"
-    
+
     # Draw data points (overwrite lines at point locations)
     for i, (x, y) in enumerate(zip(x_positions, y_positions)):
         if 0 <= x < chart_width and 0 <= y < height:
             grid[height - 1 - y][x] = "●"
-    
+
     # Build output lines with y-axis labels
     lines = []
     for row in range(height):
@@ -118,7 +120,11 @@ def create_chart(history: list[dict], width: int = 50, height: int = 8) -> Text:
     if sorted_history:
         first_time = sorted_history[0].get("timestamp", "")[:10]
         last_time = sorted_history[-1].get("timestamp", "")[:10]
-        time_label = f"       {first_time}" + " " * (chart_width - len(first_time) - len(last_time)) + last_time
+        time_label = (
+            f"       {first_time}"
+            + " " * (chart_width - len(first_time) - len(last_time))
+            + last_time
+        )
         lines.append(time_label)
 
     chart_text = Text()
@@ -417,9 +423,9 @@ def create_submission_header(detail: SubmissionDetail) -> Panel:
     if len(code_hash) > 16:
         code_hash = code_hash[:16] + "..."
 
-    score = sub.get('final_score')
+    score = sub.get("final_score")
     score_display = f"{score:.2f}" if score is not None else "N/A"
-    
+
     grid.add_row(
         f"[bold]UID:[/] {sub.get('miner_uid', 'N/A')}",
         f"[bold]Status:[/] [{status_color}]{status}[/{status_color}]",
@@ -479,7 +485,9 @@ def create_evaluations_table(detail: SubmissionDetail) -> Panel:
     return Panel(table, title=title, border_style="cyan")
 
 
-def create_code_panel(detail: SubmissionDetail, scroll_offset: int = 0, visible_lines: int = 20) -> Panel:
+def create_code_panel(
+    detail: SubmissionDetail, scroll_offset: int = 0, visible_lines: int = 20
+) -> Panel:
     """Create the syntax-highlighted code panel with scroll support."""
     code = detail.code
 
@@ -487,14 +495,14 @@ def create_code_panel(detail: SubmissionDetail, scroll_offset: int = 0, visible_
         content = Text("Code not available", style="dim italic", justify="center")
         total_lines = 0
     else:
-        lines = code.split('\n')
+        lines = code.split("\n")
         total_lines = len(lines)
-        
+
         # Slice code based on scroll offset
         start_line = scroll_offset
         end_line = min(scroll_offset + visible_lines, total_lines)
-        visible_code = '\n'.join(lines[start_line:end_line])
-        
+        visible_code = "\n".join(lines[start_line:end_line])
+
         content = Syntax(
             visible_code,
             "python",
@@ -508,7 +516,7 @@ def create_code_panel(detail: SubmissionDetail, scroll_offset: int = 0, visible_
     title = "[bold]Code[/bold]"
     if code_hash:
         title += f" [dim](hash: {code_hash}...)[/dim]"
-    
+
     # Show scroll position
     if code and total_lines > visible_lines:
         title += f" [cyan](lines {scroll_offset + 1}-{min(scroll_offset + visible_lines, total_lines)}/{total_lines}, j/k to scroll)[/cyan]"
@@ -516,7 +524,9 @@ def create_code_panel(detail: SubmissionDetail, scroll_offset: int = 0, visible_
     return Panel(content, title=title, border_style="green")
 
 
-def create_submission_layout(detail: SubmissionDetail, show_code: bool = True, code_scroll: int = 0) -> Layout:
+def create_submission_layout(
+    detail: SubmissionDetail, show_code: bool = True, code_scroll: int = 0
+) -> Layout:
     """Create the submission detail layout."""
     layout = Layout()
 
@@ -573,9 +583,7 @@ def get_key_nonblocking(timeout: float = 0.1) -> str | None:
             if ch == "\x1b":
                 if sys.stdin in select.select([sys.stdin], [], [], 0.05)[0]:
                     ch += sys.stdin.read(1)
-                    if ch == "\x1b[" and sys.stdin in select.select(
-                        [sys.stdin], [], [], 0.05
-                    )[0]:
+                    if ch == "\x1b[" and sys.stdin in select.select([sys.stdin], [], [], 0.05)[0]:
                         ch += sys.stdin.read(1)
             return ch
         return None
@@ -630,16 +638,20 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False, db_path: s
                     if current_view == "dashboard":
                         layout = create_dashboard_layout(
                             data,
-                            leaderboard_idx=leaderboard_idx if active_panel == "leaderboard" else None,
+                            leaderboard_idx=leaderboard_idx
+                            if active_panel == "leaderboard"
+                            else None,
                             recent_idx=recent_idx if active_panel == "recent" else None,
                             active_panel=active_panel,
                             demo=demo,
                         )
                         console.print(layout)
                     elif current_view == "submission" and current_detail:
-                        layout = create_submission_layout(current_detail, show_code=show_code, code_scroll=code_scroll)
+                        layout = create_submission_layout(
+                            current_detail, show_code=show_code, code_scroll=code_scroll
+                        )
                         console.print(layout)
-                    
+
                     needs_redraw = False
 
                 # Handle input
@@ -647,7 +659,7 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False, db_path: s
 
                 if key:
                     needs_redraw = True  # Any keypress triggers redraw
-                    
+
                     # Quit
                     if key == "q" or key == "\x03":
                         break
@@ -743,7 +755,7 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False, db_path: s
                         # Scroll code down (j or down arrow)
                         elif key in ("j", "\x1b[B") and show_code and current_detail:
                             if current_detail.code:
-                                total_lines = len(current_detail.code.split('\n'))
+                                total_lines = len(current_detail.code.split("\n"))
                                 if code_scroll < total_lines - 10:
                                     code_scroll += 3
 

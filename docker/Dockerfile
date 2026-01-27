@@ -1,4 +1,4 @@
-# Templar Tournament Validator
+# Templar Crusades Validator
 #
 # URL-Based Architecture:
 # - Validator reads miner commitments from blockchain

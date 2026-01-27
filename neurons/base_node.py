@@ -96,8 +96,8 @@ class BaseNode(ABC):
 
         # Initial sync
         # Skip blockchain checks if in test mode
-        skip_check = getattr(self, 'skip_blockchain_check', False)
-        
+        skip_check = getattr(self, "skip_blockchain_check", False)
+
         if not skip_check:
             await self.sync()
 

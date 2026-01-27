@@ -156,8 +156,7 @@ class DatabaseClient:
 
         # Submissions in last 24h
         recent = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE created_at > ?",
-            (day_ago,)
+            "SELECT COUNT(*) as count FROM submissions WHERE created_at > ?", (day_ago,)
         )
         recent_count = recent["count"] if recent else 0
 
@@ -170,9 +169,8 @@ class DatabaseClient:
 
         # Active miners (unique hotkeys in last 24h)
         miners = self._query_one(
-            "SELECT COUNT(DISTINCT miner_hotkey) as count FROM submissions "
-            "WHERE created_at > ?",
-            (day_ago,)
+            "SELECT COUNT(DISTINCT miner_hotkey) as count FROM submissions WHERE created_at > ?",
+            (day_ago,),
         )
         active_miners = miners["count"] if miners else 0
 
@@ -191,8 +189,7 @@ class DatabaseClient:
 
         # Evaluations in last hour
         evals = self._query_one(
-            "SELECT COUNT(*) as count FROM evaluations WHERE created_at > ?",
-            (hour_ago,)
+            "SELECT COUNT(*) as count FROM evaluations WHERE created_at > ?", (hour_ago,)
         )
         eval_count = evals["count"] if evals else 0
 
@@ -204,7 +201,7 @@ class DatabaseClient:
 
         # Queue stats
         queue = self.get_queue_stats()
-        
+
         # Success rate
         finished = self._query_one(
             "SELECT COUNT(*) as count FROM submissions WHERE status = 'finished'"
@@ -235,25 +232,27 @@ class DatabaseClient:
             "SELECT submission_id, miner_hotkey, miner_uid, final_score, created_at "
             "FROM submissions WHERE status = 'finished' AND final_score IS NOT NULL "
             "ORDER BY final_score DESC LIMIT ?",
-            (limit,)
+            (limit,),
         )
-        
+
         leaderboard = []
         for i, row in enumerate(rows, 1):
             # Count evaluations for this submission
             eval_count = self._query_one(
                 "SELECT COUNT(*) as count FROM evaluations WHERE submission_id = ?",
-                (row["submission_id"],)
+                (row["submission_id"],),
             )
-            leaderboard.append({
-                "rank": i,
-                "submission_id": row["submission_id"],
-                "miner_hotkey": row["miner_hotkey"],
-                "miner_uid": row["miner_uid"],
-                "final_score": row["final_score"],  # Match app.py expectation
-                "num_evaluations": eval_count["count"] if eval_count else 0,
-                "created_at": row["created_at"],
-            })
+            leaderboard.append(
+                {
+                    "rank": i,
+                    "submission_id": row["submission_id"],
+                    "miner_hotkey": row["miner_hotkey"],
+                    "miner_uid": row["miner_uid"],
+                    "final_score": row["final_score"],  # Match app.py expectation
+                    "num_evaluations": eval_count["count"] if eval_count else 0,
+                    "created_at": row["created_at"],
+                }
+            )
         return leaderboard
 
     def get_recent_submissions(self) -> list[dict[str, Any]]:
@@ -265,44 +264,45 @@ class DatabaseClient:
             "'failed_copy', 'error') "
             "ORDER BY created_at DESC LIMIT 20"
         )
-        
+
         recent = []
         for row in rows:
-            recent.append({
-                "submission_id": row["submission_id"],
-                "miner_hotkey": row["miner_hotkey"],
-                "miner_uid": row["miner_uid"],
-                "status": row["status"],
-                "final_score": row["final_score"],  # Match app.py expectation
-                "created_at": row["created_at"],
-                "error": row["error_message"],
-            })
+            recent.append(
+                {
+                    "submission_id": row["submission_id"],
+                    "miner_hotkey": row["miner_hotkey"],
+                    "miner_uid": row["miner_uid"],
+                    "status": row["status"],
+                    "final_score": row["final_score"],  # Match app.py expectation
+                    "created_at": row["created_at"],
+                    "error": row["error_message"],
+                }
+            )
         return recent
 
     def get_queue_stats(self) -> dict[str, Any]:
         """Get queue statistics."""
         # Pending + validating = queued
         queued = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions "
-            "WHERE status IN ('pending', 'validating')"
+            "SELECT COUNT(*) as count FROM submissions WHERE status IN ('pending', 'validating')"
         )
-        
+
         # Running = evaluating
         running = self._query_one(
             "SELECT COUNT(*) as count FROM submissions WHERE status = 'evaluating'"
         )
-        
+
         # Finished
         finished = self._query_one(
             "SELECT COUNT(*) as count FROM submissions WHERE status = 'finished'"
         )
-        
+
         # All failures
         failed = self._query_one(
             "SELECT COUNT(*) as count FROM submissions "
             "WHERE status IN ('failed_validation', 'failed_evaluation', 'failed_copy', 'error')"
         )
-        
+
         # Average score
         avg = self._query_one(
             "SELECT AVG(final_score) as avg FROM submissions "
@@ -328,21 +328,23 @@ class DatabaseClient:
             "WHERE status = 'finished' AND final_score IS NOT NULL "
             "ORDER BY created_at ASC LIMIT 100"
         )
-        
+
         history = []
         running_best = 0.0
-        
+
         for row in rows:
             tps = row["tps"] or 0.0
             # Track the running best TPS
             if tps > running_best:
                 running_best = tps
-            
-            history.append({
-                "submission_id": row["submission_id"],
-                "tps": running_best,  # Show best TPS so far
-                "timestamp": row["created_at"],
-            })
+
+            history.append(
+                {
+                    "submission_id": row["submission_id"],
+                    "tps": running_best,  # Show best TPS so far
+                    "timestamp": row["created_at"],
+                }
+            )
         return history
 
     def fetch_all(self) -> TournamentData:
@@ -358,35 +360,32 @@ class DatabaseClient:
 
     def get_submission(self, submission_id: str) -> dict[str, Any]:
         """Get submission details."""
-        row = self._query_one(
-            "SELECT * FROM submissions WHERE submission_id = ?",
-            (submission_id,)
-        )
+        row = self._query_one("SELECT * FROM submissions WHERE submission_id = ?", (submission_id,))
         return row if row else {}
 
     def get_submission_evaluations(self, submission_id: str) -> list[dict[str, Any]]:
         """Get evaluations for a submission."""
         return self._query(
             "SELECT * FROM evaluations WHERE submission_id = ? ORDER BY created_at",
-            (submission_id,)
+            (submission_id,),
         )
 
     def get_submission_code(self, submission_id: str) -> str | None:
         """Get code content from database (stored after evaluation).
-        
+
         Code is stored in code_content column after validator evaluates.
         """
         row = self._query_one(
             "SELECT code_content, code_hash FROM submissions WHERE submission_id = ?",
-            (submission_id,)
+            (submission_id,),
         )
         if not row:
             return None
-        
+
         code = row.get("code_content")
         if code:
             return code
-        
+
         # Fallback: code not yet stored (still evaluating)
         return f"# Code not yet available\n# Submission may still be evaluating\n# code_hash: {row.get('code_hash', 'N/A')}"
 

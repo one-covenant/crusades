@@ -59,7 +59,7 @@ docker build -t templar-eval:latest .
 # 2. Run validator
 SUBTENSOR_NETWORK=finney \
 PYTHONUNBUFFERED=1 \
-uv run python -u -m neurons.validator \
+uv run -u -m neurons.validator \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --affinetes-mode docker \
@@ -78,7 +78,7 @@ docker push ghcr.io/YOUR_ORG/templar-eval:latest
 SUBTENSOR_NETWORK=finney \
 BASILICA_API_TOKEN="your-token" \
 PYTHONUNBUFFERED=1 \
-uv run python -u -m neurons.validator \
+uv run -u -m neurons.validator \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --affinetes-mode basilica \
@@ -139,7 +139,7 @@ Edit `hparams/hparams.json`:
 # Mainnet (Production)
 SUBTENSOR_NETWORK=finney \
 PYTHONUNBUFFERED=1 \
-uv run python -u -m neurons.validator \
+uv run -u -m neurons.validator \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --affinetes-mode docker \
@@ -148,7 +148,7 @@ uv run python -u -m neurons.validator \
 # Localnet (Testing)
 SUBTENSOR_NETWORK=local \
 PYTHONUNBUFFERED=1 \
-uv run python -u -m neurons.validator \
+uv run -u -m neurons.validator \
     --wallet.name templar_test \
     --wallet.hotkey V1 \
     --affinetes-mode docker \
@@ -177,9 +177,9 @@ INFO | Run 1 PASSED: 6,140.22 TPS
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              BASILICA FLOW                                   │
+│                              BASILICA FLOW                                  │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
+│                                                                             │
 │   FIRST EVALUATION (~2-4 minutes)                                           │
 │   ┌──────────────────────────────────────────────────────────────────┐      │
 │   │ 1. Validator requests deployment from Basilica API               │      │
@@ -189,21 +189,21 @@ INFO | Run 1 PASSED: 6,140.22 TPS
 │   │ 5. Validator calls POST /evaluate with miner's code              │      │
 │   │ 6. Basilica returns TPS results                                  │      │
 │   └──────────────────────────────────────────────────────────────────┘      │
-│                                                                              │
+│                                                                             │
 │   SUBSEQUENT EVALUATIONS (instant)                                          │
 │   ┌──────────────────────────────────────────────────────────────────┐      │
 │   │ 1. Validator reuses existing deployment                          │      │
 │   │ 2. Validator calls POST /evaluate with miner's code              │      │
 │   │ 3. Basilica returns TPS results                                  │      │
 │   └──────────────────────────────────────────────────────────────────┘      │
-│                                                                              │
+│                                                                             │
 │   AFTER TTL EXPIRES (default: 1 hour)                                       │
 │   ┌──────────────────────────────────────────────────────────────────┐      │
 │   │ 1. Deployment auto-terminates                                    │      │
 │   │ 2. GPU released                                                  │      │
 │   │ 3. Next evaluation creates new deployment                        │      │
 │   └──────────────────────────────────────────────────────────────────┘      │
-│                                                                              │
+│                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -279,7 +279,7 @@ source .venv/bin/activate
 set -a && source .env && set +a
 
 PYTHONUNBUFFERED=1 \
-uv run python -u -m neurons.validator \
+uv run -u -m neurons.validator \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --affinetes-mode basilica \
@@ -293,7 +293,7 @@ If you want zero local GPU memory usage:
 ```bash
 CUDA_VISIBLE_DEVICES="" \
 PYTHONUNBUFFERED=1 \
-uv run python -u -m neurons.validator \
+uv run -u -m neurons.validator \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --affinetes-mode basilica \
@@ -364,7 +364,7 @@ pkill -f neurons.validator
 ## Monitor (TUI)
 
 ```bash
-uv run python -m tournament.tui --db tournament.db
+uv run -m tournament.tui --db tournament.db
 ```
 
 Shows:
@@ -389,11 +389,11 @@ Miner code is stored in the database after evaluation.
 
 ```bash
 # List all submissions
-uv run python scripts/view_submission.py
+uv run scripts/view_submission.py
 
 # View specific submission
-uv run python scripts/view_submission.py commit_9303_1
+uv run scripts/view_submission.py commit_9303_1
 
 # Save code to file
-uv run python scripts/view_submission.py commit_9303_1 --save
+uv run scripts/view_submission.py commit_9303_1 --save
 ```

@@ -27,13 +27,13 @@ class Base(DeclarativeBase):
 
 class SubmissionModel(Base):
     """Database model for code submissions.
-    
+
     URL-Based Architecture:
     - submission_id: Format "commit_{block}_{uid}" for submissions
     - code_hash: Code URL (used as unique identifier)
     - bucket_path: Code URL (source location)
     - code_content: Actual miner code (stored after evaluation for conflict resolution)
-    
+
     All fields are preserved for future conflict resolution:
     - miner identity (hotkey, uid)
     - source location (code URL)
@@ -55,7 +55,7 @@ class SubmissionModel(Base):
     status: Mapped[SubmissionStatus] = mapped_column(
         Enum(SubmissionStatus, values_callable=lambda obj: [e.value for e in obj]),
         nullable=False,
-        default=SubmissionStatus.PENDING
+        default=SubmissionStatus.PENDING,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
