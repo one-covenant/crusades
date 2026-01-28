@@ -102,7 +102,7 @@ uv run -u -m neurons.validator \
 nvidia-smi
 
 # Check Docker GPU support
-docker run --rm --gpus all nvidia/cuda:12.1-base nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
 ```
 
 ### Step 2: Build Evaluation Image
@@ -139,7 +139,7 @@ Edit `hparams/hparams.json`:
 # Mainnet (Production)
 SUBTENSOR_NETWORK=finney \
 PYTHONUNBUFFERED=1 \
-uv run -u -m neurons.validator \
+uv run -m neurons.validator \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --affinetes-mode docker \
@@ -148,7 +148,7 @@ uv run -u -m neurons.validator \
 # Localnet (Testing)
 SUBTENSOR_NETWORK=local \
 PYTHONUNBUFFERED=1 \
-uv run -u -m neurons.validator \
+uv run -m neurons.validator \
     --wallet.name templar_test \
     --wallet.hotkey V1 \
     --affinetes-mode docker \
@@ -293,7 +293,7 @@ If you want zero local GPU memory usage:
 ```bash
 CUDA_VISIBLE_DEVICES="" \
 PYTHONUNBUFFERED=1 \
-uv run -u -m neurons.validator \
+uv run -m neurons.validator \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --affinetes-mode basilica \
