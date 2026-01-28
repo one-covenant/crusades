@@ -99,11 +99,12 @@ See [docs/Validator.md](docs/Validator.md) for detailed validator setup.
 
 ## train.py Requirements
 
-Your `train.py` must implement the `inner_steps` function:
+Your `train.py` must implement the `inner_steps` function. Here's the basic implementation:
 
 ```python
 from dataclasses import dataclass
 import torch
+import torch.nn.functional as F
 
 @dataclass
 class InnerStepsResult:
@@ -112,13 +113,14 @@ class InnerStepsResult:
     final_loss: float           # Loss value from last training step
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device):
-    """Optimize this function for maximum TPS.
+    """
+    Run training steps and return results.
     
     Args:
         model: Pre-loaded model (already on device, in train mode)
         data_iterator: Iterator yielding batches of shape (batch_size, seq_len)
-        optimizer: Pre-configured AdamW optimizer
-        num_steps: Number of training steps to run (typically 5)
+        optimizer: Pre-configured optimizer
+        num_steps: Number of training steps to run
         device: Target device (cuda or cpu)
     
     Returns:
@@ -129,23 +131,35 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
     final_loss = 0.0
     
     for step in range(num_steps):
-        batch = next(data_iterator).to(device)
+        # Get batch
+        batch = next(data_iterator)
+        batch = batch.to(device)
+        
+        # Prepare inputs and labels
         input_ids = batch[:, :-1]
         labels = batch[:, 1:]
         
+        # Forward pass
         outputs = model(input_ids)
-        logits = outputs.logits
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.reshape(-1)
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs
+        
+        # Compute loss
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            labels.reshape(-1),
+            ignore_index=-100,
         )
         
+        # Backward pass
         loss.backward()
+        
+        # Update weights
         optimizer.step()
         optimizer.zero_grad()
         
+        # Track metrics
         total_tokens += batch.numel()
-        final_logits = logits.detach()
+        final_logits = logits.detach().float()
         final_loss = loss.item()
     
     return InnerStepsResult(
@@ -154,6 +168,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
         final_loss=final_loss,
     )
 ```
+
+This is a basic implementation - miners should optimize it for better performance.
 
 ---
 
