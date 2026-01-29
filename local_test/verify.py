@@ -130,7 +130,9 @@ def verify_outputs(
     else:
         print(f"  Candidate logits shape: {cand_logits.shape}")
         if len(cand_logits.shape) != 3:
-            print(f"  [FAILED] Logits should be 3D (batch, seq, vocab), got {len(cand_logits.shape)}D")
+            print(
+                f"  [FAILED] Logits should be 3D (batch, seq, vocab), got {len(cand_logits.shape)}D"
+            )
             all_passed = False
         elif torch.isnan(cand_logits).any():
             nan_count = torch.isnan(cand_logits).sum().item()
@@ -169,13 +171,17 @@ def verify_outputs(
             abs_diff = (cand_logits - ref_logits).abs()
             relative_diff = (abs_diff.mean() / ref_scale).item() if ref_scale > 0 else 0
 
-            print(f"  Logits relative difference: {relative_diff:.6f} (tolerance: {output_tolerance})")
+            print(
+                f"  Logits relative difference: {relative_diff:.6f} (tolerance: {output_tolerance})"
+            )
 
             if relative_diff > output_tolerance:
                 print("  [FAILED] Logits difference exceeds tolerance!")
                 all_passed = False
             else:
-                print(f"  [PASSED] Logits match reference (diff={relative_diff:.4f} <= {output_tolerance})")
+                print(
+                    f"  [PASSED] Logits match reference (diff={relative_diff:.4f} <= {output_tolerance})"
+                )
 
     # Summary
     print()

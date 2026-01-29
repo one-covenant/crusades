@@ -129,6 +129,7 @@ Edit `hparams/hparams.json`:
 
 | Setting | Description | Examples |
 |---------|-------------|----------|
+| `netuid` | Subnet ID for Crusades | `3` |
 | `gpu_devices` | Which GPUs to use | `"0"`, `"0,1"`, `"all"` |
 | `memory_limit` | Container memory limit | `"32g"`, `"64g"` |
 | `shm_size` | Shared memory (PyTorch) | `"8g"`, `"16g"` |
