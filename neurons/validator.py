@@ -538,7 +538,8 @@ class Validator(BaseNode):
         blocks_since_last = current_block - self.last_weight_set_block
         min_blocks = hparams.set_weights_interval_blocks
 
-        if blocks_since_last < min_blocks:
+        # Chain uses strictly greater than (>), not >=, so we need min_blocks + 1
+        if blocks_since_last <= min_blocks:
             # Don't log every time - only when we actually attempted
             return
 
@@ -553,13 +554,14 @@ class Validator(BaseNode):
             logger.info(f"Weights set successfully at block {current_block}: {message}")
         else:
             # Provide detailed error info
-            next_allowed_block = self.last_weight_set_block + min_blocks
+            # Chain requires > min_blocks, so next allowed is last + min_blocks + 1
+            next_allowed_block = self.last_weight_set_block + min_blocks + 1
             blocks_to_wait = max(0, next_allowed_block - current_block)
             logger.warning(
                 f"Failed to set weights: {message}\n"
                 f"  Current block: {current_block}\n"
                 f"  Last successful: block {self.last_weight_set_block}\n"
-                f"  Min interval: {min_blocks} blocks\n"
+                f"  Min interval: {min_blocks} blocks (chain requires >)\n"
                 f"  Next allowed: block {next_allowed_block} ({blocks_to_wait} blocks to wait)"
             )
 
