@@ -17,11 +17,21 @@ import copy
 import importlib.util
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
+
+
+@dataclass
+class InnerStepsResult:
+    """Result type for verification (mirrors train.py's InnerStepsResult)."""
+
+    final_logits: torch.Tensor
+    total_tokens: int
+    final_loss: float
 
 
 def load_train_module(train_path: Path):
@@ -32,34 +42,39 @@ def load_train_module(train_path: Path):
     return module
 
 
-def run_reference(model, data_iterator, num_steps, device):
-    """Run reference forward passes (baseline for comparison)."""
-    from local_test.train import InnerStepsResult
+def run_reference(model, data_iterator, optimizer, num_steps, device):
+    """Run reference training (same as validator does)."""
+    # Set deterministic mode like validator
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     total_tokens = 0
     final_logits = None
     final_loss = 0.0
 
-    for step in range(num_steps):
+    for _ in range(num_steps):
         batch = next(data_iterator)
-        batch = batch.to(device)
+        batch = batch.to(device, dtype=torch.long)
 
-        input_ids = batch[:, :-1]
-        labels = batch[:, 1:]
-
-        with torch.no_grad():
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            input_ids = batch[:, :-1]
+            labels = batch[:, 1:]
             outputs = model(input_ids)
             logits = outputs.logits if hasattr(outputs, "logits") else outputs
-
             loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
                 labels.reshape(-1),
                 ignore_index=-100,
             )
 
+        # Training step (same as validator reference)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
         total_tokens += batch.numel()
-        final_logits = logits.float()
-        final_loss = loss.item()
+        final_logits = logits.detach().float()
+        final_loss = float(loss.item())
 
     return InnerStepsResult(
         final_logits=final_logits,
@@ -285,16 +300,16 @@ def main():
     # Expected tokens = batch_size * seq_len * num_steps
     expected_tokens = batch_size * seq_len * num_steps
 
-    # Run reference (forward-only, no training)
+    # Run reference (with training, same as validator)
     print("Running reference baseline...")
-    model.eval()
-    reference = run_reference(model, create_iterator(), num_steps, device)
+    model.train()
+    optimizer_ref = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    reference = run_reference(model, create_iterator(), optimizer_ref, num_steps, device)
     print(f"  Reference loss: {reference.final_loss:.6f}")
     print(f"  Reference tokens: {reference.total_tokens:,}")
 
-    # Reset model state
+    # Reset model state (same initial weights for candidate)
     model.load_state_dict(initial_state)
-    model.train()
 
     # Run candidate (miner's inner_steps)
     print()
