@@ -181,10 +181,10 @@ def verify_outputs(
     print()
     print("=" * 60)
     if all_passed:
-        print("VERIFICATION: ALL CHECKS PASSED ✓")
+        print("VERIFICATION: ALL CHECKS PASSED")
         print("Your submission should pass validator evaluation!")
     else:
-        print("VERIFICATION: SOME CHECKS FAILED ✗")
+        print("VERIFICATION: SOME CHECKS FAILED")
         print("Fix the issues above before submitting.")
     print("=" * 60)
 
@@ -244,8 +244,8 @@ def main():
         print("ERROR: train.py must have an 'InnerStepsResult' dataclass!")
         sys.exit(1)
 
-    print("  Found inner_steps function ✓")
-    print("  Found InnerStepsResult dataclass ✓")
+    print("  Found inner_steps function")
+    print("  Found InnerStepsResult dataclass")
     print()
 
     # Setup device

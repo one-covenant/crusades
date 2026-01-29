@@ -61,16 +61,9 @@ uv run local_test/setup_benchmark.py
 # Test your train.py locally (performance test)
 uv run local_test/train.py
 
-# Verify your submission passes validator checks
+# Verify your submission to avoid potential failures during validator checks
 uv run local_test/verify.py
 ```
-
-**Always run `verify.py` before submitting!** It runs the same checks as the validator:
-- Token count matches expected
-- Loss is valid (not NaN/Inf)
-- Logits shape is correct (3D)
-- Loss matches reference within 0.8-1.2x
-- Logits match reference within 5% tolerance
 
 ### 2. Host Your Code
 
