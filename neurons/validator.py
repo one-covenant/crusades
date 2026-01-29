@@ -73,7 +73,7 @@ class Validator(BaseNode):
         self.evaluated_code_urls: dict[str, tuple[int, str]] = {}
 
         # Timing
-        self.last_weight_set_time: float = 0
+        self.last_weight_set_block: int = 0
         self.last_sync_time: float = 0
 
     async def initialize(self) -> None:
@@ -99,6 +99,11 @@ class Validator(BaseNode):
                 network=config.subtensor_network,
             )
             self.commitment_reader.sync()
+
+            # Sync chain's metagraph first, then initialize weight block
+            # This prevents spamming weight setting attempts on restart
+            await self.chain.sync_metagraph()
+            await self._init_weight_block_from_chain()
         else:
             logger.warning("Running without blockchain connection")
             logger.warning("Weight setting will be disabled")
@@ -123,6 +128,8 @@ class Validator(BaseNode):
             data_url=hparams.benchmark_dataset_name,
             timeout=hparams.eval_timeout,
             output_tolerance=hparams.verification.output_vector_tolerance,
+            loss_ratio_min=hparams.verification.loss_ratio_min,
+            loss_ratio_max=hparams.verification.loss_ratio_max,
             # Basilica config
             basilica_image=hparams.basilica.image,
             basilica_ttl_seconds=hparams.basilica.ttl_seconds,
@@ -517,25 +524,69 @@ class Validator(BaseNode):
             self.last_sync_time = now
 
     async def maybe_set_weights(self) -> None:
-        """Set weights if enough time has passed."""
+        """Set weights if enough blocks have passed since last update."""
         if self.weight_setter is None:
             logger.debug("Skipping weight setting (test mode)")
             return
 
-        hparams = get_hparams()
-        now = time.time()
-
-        if now - self.last_weight_set_time < hparams.set_weights_interval_seconds:
+        if self.commitment_reader is None:
+            logger.warning("Commitment reader not initialized - cannot set weights")
             return
 
-        logger.info("Setting weights...")
+        hparams = get_hparams()
+        current_block = self.commitment_reader.get_current_block()
+        blocks_since_last = current_block - self.last_weight_set_block
+        min_blocks = hparams.set_weights_interval_blocks
+
+        if blocks_since_last < min_blocks:
+            # Don't log every time - only when we actually attempted
+            return
+
+        logger.info(
+            f"Setting weights (block {current_block}, "
+            f"{blocks_since_last} blocks since last update)..."
+        )
         success, message = await self.weight_setter.set_weights()
 
         if success:
-            self.last_weight_set_time = now
-            logger.info(f"Weights set: {message}")
+            self.last_weight_set_block = current_block
+            logger.info(f"Weights set successfully at block {current_block}: {message}")
         else:
-            logger.warning(f"Failed to set weights: {message}")
+            # Provide detailed error info
+            next_allowed_block = self.last_weight_set_block + min_blocks
+            blocks_to_wait = max(0, next_allowed_block - current_block)
+            logger.warning(
+                f"Failed to set weights: {message}\n"
+                f"  Current block: {current_block}\n"
+                f"  Last successful: block {self.last_weight_set_block}\n"
+                f"  Min interval: {min_blocks} blocks\n"
+                f"  Next allowed: block {next_allowed_block} ({blocks_to_wait} blocks to wait)"
+            )
+
+    async def _init_weight_block_from_chain(self) -> None:
+        """Initialize last_weight_set_block from chain's metagraph.
+
+        This prevents spamming weight setting attempts on validator restart
+        by checking when the chain says we last set weights.
+        """
+        if self.chain is None or self.chain.metagraph is None:
+            return
+
+        try:
+            # Find our UID in the metagraph
+            hotkey = self.chain.hotkey
+            if hotkey not in self.chain.metagraph.hotkeys:
+                logger.warning("Validator hotkey not found in metagraph")
+                return
+
+            uid = self.chain.metagraph.hotkeys.index(hotkey)
+            last_update = int(self.chain.metagraph.last_update[uid])
+
+            if last_update > 0:
+                self.last_weight_set_block = last_update
+                logger.info(f"Initialized last_weight_set_block from chain: {last_update}")
+        except Exception as e:
+            logger.warning(f"Could not init weight block from chain: {e}")
 
     async def _load_state(self) -> None:
         """Load persisted validator state from database."""

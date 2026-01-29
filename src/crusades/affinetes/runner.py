@@ -118,6 +118,8 @@ class AffinetesRunner:
         model_url: str | None = None,
         data_url: str | None = None,
         output_tolerance: float = 0.02,
+        loss_ratio_min: float = 0.8,
+        loss_ratio_max: float = 1.2,
         validator_image: str | None = None,
         # Basilica-specific settings
         basilica_image: str | None = None,
@@ -141,6 +143,8 @@ class AffinetesRunner:
             model_url: Default model URL (HuggingFace model ID)
             data_url: Default data URL (HuggingFace dataset)
             output_tolerance: Verification tolerance (0.02 = 2%)
+            loss_ratio_min: Minimum allowed loss ratio (default 0.8)
+            loss_ratio_max: Maximum allowed loss ratio (default 1.2)
             validator_image: Docker image for local evaluation
             basilica_image: Docker image for Basilica (must be in registry)
             basilica_ttl_seconds: TTL for Basilica deployment (default 1 hour)
@@ -160,6 +164,8 @@ class AffinetesRunner:
         self.default_model_url = model_url
         self.default_data_url = data_url
         self.output_tolerance = output_tolerance
+        self.loss_ratio_min = loss_ratio_min
+        self.loss_ratio_max = loss_ratio_max
         self.validator_image = validator_image or self.DEFAULT_DOCKER_IMAGE
         self.basilica_image = basilica_image or self.DEFAULT_BASILICA_IMAGE
         self.basilica_ttl_seconds = basilica_ttl_seconds
@@ -306,7 +312,7 @@ from env import Actor
 
 async def main():
     # Read miner's code
-    with open('/tmp/miner_train.py') as f:
+    with open('/app/scripts/miner_train.py') as f:
         code = f.read()
 
     actor = Actor()
@@ -322,6 +328,8 @@ async def main():
         timeout={self.timeout},
         code=code,
         output_tolerance={self.output_tolerance},
+        loss_ratio_min={self.loss_ratio_min},
+        loss_ratio_max={self.loss_ratio_max},
     )
     print("EVAL_RESULT:" + json.dumps(result))
 
@@ -342,14 +350,15 @@ asyncio.run(main())
 
         try:
             # Build Docker run command
+            # NOTE: Mount to /app/scripts/ (not /tmp/) because we use --tmpfs on /tmp
             docker_cmd = [
                 "docker",
                 "run",
                 "--rm",
                 "-v",
-                f"{script_path}:/tmp/eval_script.py:ro",
+                f"{script_path}:/app/scripts/eval_script.py:ro",
                 "-v",
-                f"{train_path}:/tmp/miner_train.py:ro",
+                f"{train_path}:/app/scripts/miner_train.py:ro",
             ]
 
             # Add GPU if configured
@@ -357,8 +366,7 @@ asyncio.run(main())
                 if self.docker_gpu_devices.lower() == "all":
                     docker_cmd.extend(["--gpus", "all"])
                 else:
-                    # Specific devices like "0" or "0,1"
-                    docker_cmd.extend(["--gpus", f"device={self.docker_gpu_devices}"])
+                    docker_cmd.extend(["--gpus", f'"device={self.docker_gpu_devices}"'])
 
             # Memory limits (from hparams.json docker config)
             docker_cmd.extend(
@@ -375,6 +383,10 @@ asyncio.run(main())
             # =================================================================
             docker_cmd.extend(
                 [
+                    # NETWORK ISOLATION - Prevent miner code from making any network requests
+                    # Model and data are pre-cached in the Docker image
+                    "--network",
+                    "none",
                     # Drop all Linux capabilities
                     "--cap-drop",
                     "ALL",
@@ -390,9 +402,7 @@ asyncio.run(main())
                     # Writable /tmp for temporary files (limited size)
                     "--tmpfs",
                     "/tmp:rw,noexec,nosuid,size=4g",
-                    # Writable cache for HuggingFace downloads
-                    "--tmpfs",
-                    "/home/appuser/.cache:rw,nosuid,size=20g",
+                    # NOTE: Don't mount tmpfs on ~/.cache/huggingface - model is pre-cached there!
                 ]
             )
 
@@ -417,11 +427,12 @@ asyncio.run(main())
                 [
                     self.validator_image,
                     "python",
-                    "/tmp/eval_script.py",
+                    "/app/scripts/eval_script.py",
                 ]
             )
 
             logger.info(f"Running evaluation in {self.validator_image}...")
+            logger.debug(f"   Full Docker command: {' '.join(docker_cmd)}")
             logger.info(f"   Docker command: {' '.join(docker_cmd[:6])}...")
 
             # Run with timeout - stream logs in real-time
@@ -514,8 +525,12 @@ asyncio.run(main())
             stdout_text = "\n".join(stdout_lines)
 
             if process.returncode != 0:
+                # Log the output for debugging
+                logger.error(f"Docker container failed with exit code {process.returncode}")
+                if stdout_text:
+                    logger.error(f"Docker output: {stdout_text[:500]}")
                 return EvaluationResult.failure(
-                    f"Container failed with exit code: {process.returncode}",
+                    f"Container failed with exit code: {process.returncode}. Output: {stdout_text[:200]}",
                     task_id=task_id,
                 )
 
@@ -631,6 +646,8 @@ asyncio.run(main())
                 "data_samples": data_samples,
                 "code": code,
                 "output_tolerance": self.output_tolerance,
+                "loss_ratio_min": self.loss_ratio_min,
+                "loss_ratio_max": self.loss_ratio_max,
             }
 
             logger.info("[BASILICA] Sending evaluation request...")

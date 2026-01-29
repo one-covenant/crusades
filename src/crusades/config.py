@@ -29,6 +29,8 @@ class VerificationConfig(BaseModel):
     """Verification tolerance settings."""
 
     output_vector_tolerance: float = 0.02  # 2% aggregate difference allowed
+    loss_ratio_min: float = 0.8  # Minimum allowed loss ratio (candidate/reference)
+    loss_ratio_max: float = 1.2  # Maximum allowed loss ratio (candidate/reference)
     deterministic_mode: bool = True
 
 
@@ -98,13 +100,12 @@ class HParams(BaseModel):
     benchmark_dataset_name: str
     benchmark_dataset_split: str
     benchmark_data_samples: int
-    benchmark_train_size: int
     benchmark_master_seed: int
     benchmark_sequence_length: int
     benchmark_batch_size: int
 
     # Timing settings
-    set_weights_interval_seconds: int
+    set_weights_interval_blocks: int  # Minimum blocks between weight updates
 
     # Commitment settings (timelock encrypted via drand)
     reveal_blocks: int

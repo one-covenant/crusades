@@ -97,10 +97,13 @@ def _load_hf_dataset(
     split: str = "train",
     validator_seed: str | None = None,
 ) -> torch.Tensor:
-    """Load and tokenize dataset from HuggingFace.
+    """Load and tokenize dataset from HuggingFace or local cache.
 
     SECURITY: Validators use unpredictable seeds so miners can't pre-compute
     which samples will be used for evaluation.
+
+    When running with --network none, uses pre-cached dataset from Docker image.
+    The validator seed is used to shuffle the cached data unpredictably.
 
     Args:
         dataset_name: HuggingFace dataset name
@@ -113,7 +116,9 @@ def _load_hf_dataset(
     Returns:
         Tensor of shape [num_samples, sequence_length]
     """
-    from datasets import load_dataset
+    import json
+    import random
+
     from transformers import AutoTokenizer
 
     # Determine seed: validators use unpredictable seed
@@ -131,7 +136,41 @@ def _load_hf_dataset(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load with streaming
+    # Check for cached dataset (enables --network none operation)
+    cached_path = os.getenv("CACHED_DATASET_PATH", "/home/appuser/.cache/templar/dataset.json")
+
+    if Path(cached_path).exists():
+        # Load from cache and shuffle with validator seed
+        logger.info(f"Using cached dataset: {cached_path}")
+        with open(cached_path) as f:
+            all_samples = json.load(f)
+
+        # Shuffle with validator seed for unpredictability
+        rng = random.Random(actual_seed)
+        rng.shuffle(all_samples)
+
+        tokens_list = []
+        for text in all_samples[:num_samples]:
+            encoded = tokenizer(
+                text,
+                max_length=sequence_length,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            tokens_list.append(encoded["input_ids"].squeeze(0))
+
+        if not tokens_list:
+            raise ValueError("No samples in cached dataset")
+
+        data = torch.stack(tokens_list)
+        logger.info(f"Loaded cached data: shape={data.shape}, seed={actual_seed}")
+        return data
+
+    # Fallback: Load from HuggingFace (requires network)
+    logger.info("No cache found, loading from HuggingFace...")
+    from datasets import load_dataset
+
     dataset = load_dataset(dataset_name, split=split, streaming=True)
     dataset = dataset.shuffle(seed=actual_seed, buffer_size=10000)
 
@@ -334,12 +373,14 @@ def _verify_outputs(
     candidate: InnerStepsResult,
     expected_tokens: int,
     output_tolerance: float = 0.05,
+    loss_ratio_min: float = 0.8,
+    loss_ratio_max: float = 1.2,
 ) -> tuple[bool, str | None, dict]:
     """Verify candidate outputs match reference within tolerance.
 
     Verification checks:
     1. Token count matches expected (miner processed correct amount of data)
-    2. Loss is reasonable (not NaN/Inf) and matches reference within 20%
+    2. Loss is reasonable (not NaN/Inf) and matches reference within allowed ratio
     3. Logits are valid tensors (not NaN/Inf)
     4. Logits match reference within tolerance (prevents cheating)
 
@@ -348,6 +389,8 @@ def _verify_outputs(
         candidate: Miner's implementation results
         expected_tokens: Expected token count (batch_size * seq_len * steps)
         output_tolerance: Maximum allowed relative difference for logits (default 5%)
+        loss_ratio_min: Minimum allowed loss ratio candidate/reference (default 0.8)
+        loss_ratio_max: Maximum allowed loss ratio candidate/reference (default 1.2)
 
     Returns:
         Tuple of (success, error_message, verification_details)
@@ -438,12 +481,12 @@ def _verify_outputs(
         logger.info(
             f"   Loss comparison: candidate={candidate.final_loss:.6f}, reference={reference.final_loss:.6f}"
         )
-        logger.info(f"   Loss ratio: {loss_ratio:.4f} (allowed: 0.8-1.2)")
+        logger.info(f"   Loss ratio: {loss_ratio:.4f} (allowed: {loss_ratio_min}-{loss_ratio_max})")
 
-        if loss_ratio < 0.8 or loss_ratio > 1.2:
+        if loss_ratio < loss_ratio_min or loss_ratio > loss_ratio_max:
             error = (
                 f"Loss mismatch: candidate={candidate.final_loss:.4f}, "
-                f"reference={reference.final_loss:.4f}, ratio={loss_ratio:.2f} (allowed: 0.8-1.2)"
+                f"reference={reference.final_loss:.4f}, ratio={loss_ratio:.2f} (allowed: {loss_ratio_min}-{loss_ratio_max})"
             )
             details["checks_failed"].append(
                 {"check": "loss_comparison", "error": error, "loss_ratio": loss_ratio}
@@ -541,6 +584,8 @@ class Actor:
         data_samples: int = 10000,
         code: str = "",  # Miner's code passed directly
         output_tolerance: float = 0.05,  # Tolerance for logits comparison
+        loss_ratio_min: float = 0.8,  # Minimum allowed loss ratio
+        loss_ratio_max: float = 1.2,  # Maximum allowed loss ratio
     ) -> dict:
         """
         Run TPS evaluation on miner's code.
@@ -557,6 +602,8 @@ class Actor:
             data_samples: Number of data samples
             code: Miner's train.py code (passed directly from validator)
             output_tolerance: Maximum allowed relative difference for logits verification
+            loss_ratio_min: Minimum allowed loss ratio (candidate/reference)
+            loss_ratio_max: Maximum allowed loss ratio (candidate/reference)
 
         Returns:
             Dict with: tps, total_tokens, wall_time_seconds, success, error, code
@@ -673,7 +720,87 @@ class Actor:
             # Reset model for miner's code
             model.load_state_dict(initial_state)
 
-            # Run miner's code
+            # =================================================================
+            # EARLY TERMINATION - Run 1 warmup step to catch basic errors
+            # =================================================================
+            # This catches shape mismatches, missing attributes, etc. before
+            # running the full evaluation (saves GPU time on broken code)
+            data_iter_warmup = _create_data_iterator(data, batch_size, seq_len)
+            optimizer_warmup = _create_optimizer(model)
+
+            logger.info("Running warmup step to check for basic errors...")
+            try:
+                warmup_result = miner_module.inner_steps(
+                    model=model,
+                    data_iterator=data_iter_warmup,
+                    optimizer=optimizer_warmup,
+                    num_steps=1,  # Just 1 step for validation
+                    device=device,
+                )
+
+                # Quick validation of warmup result
+                if warmup_result is None:
+                    return {
+                        "task_id": task_id,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": "inner_steps returned None (warmup check)",
+                        "seed": seed,
+                        "code": code,
+                    }
+
+                # Check required attributes exist
+                if not hasattr(warmup_result, "final_logits"):
+                    return {
+                        "task_id": task_id,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": "inner_steps result missing 'final_logits' attribute",
+                        "seed": seed,
+                        "code": code,
+                    }
+
+                # Check logits shape (should be 3D: batch, seq, vocab)
+                logits = warmup_result.final_logits
+                if logits is not None and len(logits.shape) != 3:
+                    return {
+                        "task_id": task_id,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": f"Logits shape mismatch: expected 3D (batch, seq, vocab), got {logits.shape}",
+                        "seed": seed,
+                        "code": code,
+                    }
+
+                logger.info("Warmup passed - proceeding with full evaluation")
+
+            except Exception as e:
+                # Early termination - don't waste time on broken code
+                error_msg = f"Early termination (warmup failed): {type(e).__name__}: {str(e)}"
+                logger.error(error_msg)
+                return {
+                    "task_id": task_id,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": 0.0,
+                    "success": False,
+                    "error": error_msg,
+                    "seed": seed,
+                    "code": code,
+                }
+
+            # Reset model state after warmup
+            model.load_state_dict(initial_state)
+
+            # =================================================================
+            # FULL EVALUATION - Run actual timed evaluation
+            # =================================================================
             data_iter_miner = _create_data_iterator(data, batch_size, seq_len)
             optimizer_miner = _create_optimizer(model)
 
@@ -713,7 +840,7 @@ class Actor:
 
             # Verify outputs against reference (correctness check with tolerance)
             verified, verify_error, verify_details = _verify_outputs(
-                reference, parsed, expected_tokens, output_tolerance
+                reference, parsed, expected_tokens, output_tolerance, loss_ratio_min, loss_ratio_max
             )
 
             # Diagnostics (include verification details)
@@ -790,6 +917,8 @@ class EvaluateRequest(BaseModel):
     data_samples: int = 10000
     code: str  # Miner's train.py code
     output_tolerance: float = 0.05  # Tolerance for logits comparison
+    loss_ratio_min: float = 0.8  # Minimum allowed loss ratio
+    loss_ratio_max: float = 1.2  # Maximum allowed loss ratio
 
 
 class EvaluateResponse(BaseModel):
@@ -835,6 +964,8 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         data_samples=request.data_samples,
         code=request.code,
         output_tolerance=request.output_tolerance,
+        loss_ratio_min=request.loss_ratio_min,
+        loss_ratio_max=request.loss_ratio_max,
     )
 
     return EvaluateResponse(

@@ -54,12 +54,12 @@
 ```bash
 # 1. Build evaluation image
 cd environments/templar
-docker build -t templar-eval:latest .
+docker build --no-cache -t templar-eval:latest .
 
 # 2. Run validator
 SUBTENSOR_NETWORK=finney \
 PYTHONUNBUFFERED=1 \
-uv run -u -m neurons.validator \
+uv run -m neurons.validator \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --affinetes-mode docker \
@@ -78,7 +78,7 @@ docker push ghcr.io/YOUR_ORG/templar-eval:latest
 SUBTENSOR_NETWORK=finney \
 BASILICA_API_TOKEN="your-token" \
 PYTHONUNBUFFERED=1 \
-uv run -u -m neurons.validator \
+uv run -m neurons.validator \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --affinetes-mode basilica \
@@ -279,7 +279,7 @@ source .venv/bin/activate
 set -a && source .env && set +a
 
 PYTHONUNBUFFERED=1 \
-uv run -u -m neurons.validator \
+uv run -m neurons.validator \
     --wallet.name your_wallet \
     --wallet.hotkey your_hotkey \
     --affinetes-mode basilica \
@@ -363,15 +363,23 @@ pkill -f neurons.validator
 
 ## Monitor (TUI)
 
+The TUI dashboard provides real-time monitoring of crusades activity from your local database.
+
+### Local Database (Validators Only)
+
+Read directly from your validator's SQLite database:
+
 ```bash
 uv run -m crusades.tui --db crusades.db
 ```
 
-Shows:
+### TUI Features
+
 - Leaderboard with TPS scores
-- Recent submissions
+- Recent submissions and their status
 - TPS history chart
 - Evaluation queue
+- View submission code (after evaluation)
 
 ## View Submission Code
 

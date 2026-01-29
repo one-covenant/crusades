@@ -835,15 +835,7 @@ Examples:
 
     args = parser.parse_args()
 
-    # Default to database mode if crusades.db exists and no explicit mode selected
-    db_path = args.db
-    if not args.demo and db_path is None:
-        from pathlib import Path
-
-        if Path("crusades.db").exists():
-            db_path = "crusades.db"
-
-    run_tui(args.url, args.refresh, demo=args.demo, db_path=db_path)
+    run_tui(args.url, args.refresh, demo=args.demo, db_path=args.db)
 
 
 if __name__ == "__main__":

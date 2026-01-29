@@ -6,6 +6,9 @@
 # Deploy to Basilica:
 #   docker push ghcr.io/one-covenant/templar-eval:latest
 #   python -c "from basilica import BasilicaClient; c = BasilicaClient(); d = c.deploy(name='templar-eval', image='ghcr.io/one-covenant/templar-eval:latest', port=8000, ttl_seconds=3600)"
+#
+# SECURITY: This image pre-caches model/data so it can run with --network none
+# This prevents miner code from making any network requests during evaluation
 
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
@@ -30,6 +33,23 @@ USER appuser
 # Install Python dependencies
 RUN pip install --no-cache-dir --user -r requirements.txt
 
+# =============================================================================
+# PRE-CACHE MODEL AND DATA (enables --network none during evaluation)
+# =============================================================================
+# Pre-download model and tokenizer (Qwen/Qwen2.5-3B ~6GB)
+RUN python -c "\
+from transformers import AutoModelForCausalLM, AutoTokenizer; \
+print('Downloading model...'); \
+AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-3B', torch_dtype='auto', trust_remote_code=True); \
+print('Downloading tokenizer...'); \
+AutoTokenizer.from_pretrained('Qwen/Qwen2.5-3B', trust_remote_code=True); \
+print('Model cached successfully')"
+
+# Pre-download dataset samples for offline evaluation
+# We download raw text and shuffle with validator seed at runtime
+COPY --chown=appuser:appuser cache_dataset.py /app/
+RUN python /app/cache_dataset.py
+
 # Copy validator's evaluation logic
 # This Actor.evaluate() receives miner's code directly from validator
 COPY --chown=appuser:appuser env.py /app/
@@ -46,6 +66,11 @@ ENV DETERMINISTIC_MODE=1
 ENV EVAL_SEQUENCE_LENGTH=1024
 ENV EVAL_BATCH_SIZE=8
 ENV PATH="/home/appuser/.local/bin:${PATH}"
+# Path to cached dataset (used when network is disabled)
+ENV CACHED_DATASET_PATH="/home/appuser/.cache/templar/dataset.json"
+# Force offline mode - use only pre-cached model, don't try to check HuggingFace
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
 
 # Expose HTTP port for Basilica
 EXPOSE 8000

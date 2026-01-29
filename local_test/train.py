@@ -182,7 +182,9 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
 
         elapsed = time.perf_counter() - start
-        print(f"  Eval {i+1}: {elapsed:.2f}s, tokens={result.total_tokens:,}, loss={result.final_loss:.4f}")
+        print(
+            f"  Eval {i + 1}: {elapsed:.2f}s, tokens={result.total_tokens:,}, loss={result.final_loss:.4f}"
+        )
 
     print()
     print("Done!")

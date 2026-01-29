@@ -215,14 +215,19 @@ templar-crusades/
 
 ## TUI Dashboard
 
-Monitor crusades activity:
+Monitor crusades activity in real-time with the terminal dashboard.
+
+### (Connect to Public API)
 
 ```bash
-uv run -m crusades.tui --db crusades.db
+# Connect to the official Crusades API
+uv run -m crusades.tui --url http://154.54.100.65:8080
 ```
 
-Shows:
+### Features
+
 - Leaderboard with TPS scores
-- Recent submissions
+- Recent submissions and their status
 - TPS history chart
 - Validator status
+- View submission code (after evaluation)
