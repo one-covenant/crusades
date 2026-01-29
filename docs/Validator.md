@@ -155,20 +155,6 @@ uv run -m neurons.validator \
     2>&1 | tee logs/validator.log
 ```
 
-### Docker Mode Log Output
-
-```
-INFO | Running Docker evaluation
-INFO |    Code size: 9876 bytes
-INFO |    Docker command: docker run --rm -v /tmp/train_abc.py...
-INFO |    [DOCKER] Loading model: Qwen/Qwen2.5-3B
-INFO |    [DOCKER] Loading dataset: HuggingFaceFW/fineweb
-INFO |    [DOCKER] Running miner's inner_steps...
-INFO |    [DOCKER] Step 1/5: loss=2.3456
-INFO |    [DOCKER] Step 5/5: loss=1.8765
-INFO | Run 1 PASSED: 6,140.22 TPS
-```
-
 ---
 
 ## Basilica Mode (Detailed)
@@ -298,32 +284,6 @@ uv run -m neurons.validator \
     --wallet.hotkey your_hotkey \
     --affinetes-mode basilica \
     2>&1 | tee logs/validator.log
-```
-
-### Basilica Mode Log Output
-
-```
-INFO | ============================================================
-INFO | [BASILICA] Starting remote GPU evaluation
-INFO | ============================================================
-INFO | [BASILICA] Configuration:
-INFO |    Image: ghcr.io/one-covenant/templar-eval:latest
-INFO |    Model: Qwen/Qwen2.5-3B
-INFO |    GPU: 1x ['A100']
-INFO | [BASILICA] Creating NEW deployment (no valid cached deployment)
-INFO |    TTL: 3600s (60 min)
-INFO | [BASILICA] Requesting GPU from Basilica... (this may take 2-5 minutes)
-INFO | [BASILICA] ✅ Deployment created in 62.3s!
-INFO |    Deployment URL: https://abc123.deployments.basilica.ai
-INFO | [BASILICA] Health check: ✅ OK
-INFO | [BASILICA] Sending evaluation request...
-INFO | [BASILICA] Response received in 61.2s
-INFO | [BASILICA] Evaluation complete!
-INFO |    Success: True
-INFO |    TPS: 6,140.22 tokens/second
-INFO |    Total tokens: 81,920
-INFO | ============================================================
-INFO | Run 1 PASSED: 6,140.22 TPS
 ```
 
 ---

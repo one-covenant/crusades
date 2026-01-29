@@ -538,7 +538,6 @@ class Validator(BaseNode):
         blocks_since_last = current_block - self.last_weight_set_block
         min_blocks = hparams.set_weights_interval_blocks
 
-        # Chain uses strictly greater than (>), not >=, so we need min_blocks + 1
         if blocks_since_last <= min_blocks:
             # Don't log every time - only when we actually attempted
             return
