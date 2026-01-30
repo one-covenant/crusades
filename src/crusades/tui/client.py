@@ -162,12 +162,40 @@ class DatabaseClient:
         )
         recent_count = recent["count"] if recent else 0
 
-        # Top score
+        # Top score (current best)
         top = self._query_one(
             "SELECT final_score FROM submissions WHERE status = 'finished' "
             "ORDER BY final_score DESC LIMIT 1"
         )
         top_score = top["final_score"] if top and top["final_score"] else 0.0
+
+        # Top score from 24 hours ago (best score that existed then)
+        top_24h_ago = self._query_one(
+            "SELECT MAX(final_score) as score FROM submissions "
+            "WHERE status = 'finished' AND created_at <= ?",
+            (day_ago,),
+        )
+        score_24h_ago = top_24h_ago["score"] if top_24h_ago and top_24h_ago["score"] else 0.0
+
+        # Calculate improvement percentage
+        if score_24h_ago > 0:
+            # Have baseline from 24h ago
+            improvement = ((top_score - score_24h_ago) / score_24h_ago) * 100
+        elif top_score > 0:
+            # No 24h baseline, use earliest score as reference
+            first_score = self._query_one(
+                "SELECT final_score FROM submissions WHERE status = 'finished' "
+                "AND final_score > 0 ORDER BY created_at ASC LIMIT 1"
+            )
+            baseline = (
+                first_score["final_score"] if first_score and first_score["final_score"] else 0.0
+            )
+            if baseline > 0 and baseline != top_score:
+                improvement = ((top_score - baseline) / baseline) * 100
+            else:
+                improvement = 0.0
+        else:
+            improvement = 0.0
 
         # Active miners (unique hotkeys in last 24h)
         miners = self._query_one(
@@ -179,7 +207,7 @@ class DatabaseClient:
         return {
             "submissions_24h": recent_count,
             "current_top_score": top_score,
-            "score_improvement_24h": 0.0,  # Would need historical data
+            "score_improvement_24h": round(improvement, 2),
             "total_submissions": total_count,
             "active_miners": active_miners,
         }
@@ -229,7 +257,19 @@ class DatabaseClient:
         }
 
     def get_leaderboard(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Get leaderboard entries."""
+        """Get leaderboard entries with 1% threshold for position changes.
+
+        A new submission only gets placed ABOVE an existing entry if it beats
+        that entry by more than 1%. This gives incumbents stability - they keep
+        their position unless significantly beaten.
+
+        Submissions are processed in order of creation (oldest first), and each
+        new submission finds its position by comparing against existing entries.
+
+        Ranks are strictly sequential: 1, 2, 3, 4...
+        """
+        # Get all finished submissions ordered by created_at (oldest first)
+        # This ensures earlier submissions have "incumbent advantage"
         rows = self._query(
             """SELECT s.submission_id, s.miner_hotkey, s.miner_uid, s.final_score,
                       s.created_at, COUNT(e.evaluation_id) as eval_count
@@ -237,24 +277,45 @@ class DatabaseClient:
                LEFT JOIN evaluations e ON s.submission_id = e.submission_id
                WHERE s.status = ? AND s.final_score IS NOT NULL
                GROUP BY s.submission_id
-               ORDER BY s.final_score DESC LIMIT ?""",
-            (SubmissionStatus.FINISHED, limit),
+               ORDER BY s.created_at ASC""",
+            (SubmissionStatus.FINISHED,),
         )
 
-        leaderboard = []
-        for i, row in enumerate(rows, 1):
-            leaderboard.append(
-                {
-                    "rank": i,
-                    "submission_id": row["submission_id"],
-                    "miner_hotkey": row["miner_hotkey"],
-                    "miner_uid": row["miner_uid"],
-                    "final_score": row["final_score"],  # Match app.py expectation
-                    "num_evaluations": row["eval_count"],
-                    "created_at": row["created_at"],
-                }
-            )
-        return leaderboard
+        # 1% threshold - must beat incumbent by more than this to take their spot
+        rank_threshold = 0.01
+
+        # Build leaderboard incrementally (oldest submissions first)
+        leaderboard: list[dict[str, Any]] = []
+
+        for row in rows:
+            score = row["final_score"] or 0.0
+            entry = {
+                "rank": 0,  # Will be assigned later
+                "submission_id": row["submission_id"],
+                "miner_hotkey": row["miner_hotkey"],
+                "miner_uid": row["miner_uid"],
+                "final_score": score,
+                "num_evaluations": row["eval_count"],
+                "created_at": row["created_at"],
+            }
+
+            # Find insertion position (scan from top)
+            # New entry only goes above existing if it beats them by >1%
+            insert_pos = len(leaderboard)  # Default: add at bottom
+            for i, existing in enumerate(leaderboard):
+                threshold_score = existing["final_score"] * (1 + rank_threshold)
+                if score > threshold_score:
+                    # Beats this incumbent by >1%, insert here
+                    insert_pos = i
+                    break
+
+            leaderboard.insert(insert_pos, entry)
+
+        # Assign sequential ranks
+        for i, entry in enumerate(leaderboard):
+            entry["rank"] = i + 1
+
+        return leaderboard[:limit]
 
     def get_recent_submissions(self) -> list[dict[str, Any]]:
         """Get recent submissions (all final statuses)."""

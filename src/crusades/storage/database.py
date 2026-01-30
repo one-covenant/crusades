@@ -191,7 +191,7 @@ class Database:
     # Leaderboard operations
 
     async def get_top_submission(self) -> SubmissionModel | None:
-        """Get the top-scoring finished submission."""
+        """Get the top-scoring finished submission (raw, no threshold)."""
         async with self.session_factory() as session:
             result = await session.execute(
                 select(SubmissionModel)
@@ -203,6 +203,58 @@ class Database:
                 .limit(1)
             )
             return result.scalar_one_or_none()
+
+    async def get_leaderboard_winner(self, threshold: float = 0.01) -> SubmissionModel | None:
+        """Get the rank 1 submission from leaderboard with 1% threshold.
+
+        A new submission only beats an incumbent if it's more than `threshold`
+        (default 1%) better. This gives stability to leaders.
+
+        Submissions are processed in order of creation (oldest first).
+        Each new submission only goes above existing ones if it beats them
+        by more than the threshold.
+
+        Args:
+            threshold: Minimum improvement ratio to beat incumbent (default 0.01 = 1%)
+
+        Returns:
+            The submission at rank 1, or None if no finished submissions.
+        """
+        async with self.session_factory() as session:
+            # Get all finished submissions ordered by created_at (oldest first)
+            result = await session.execute(
+                select(SubmissionModel)
+                .where(
+                    SubmissionModel.status == SubmissionStatus.FINISHED,
+                    SubmissionModel.final_score.isnot(None),
+                )
+                .order_by(SubmissionModel.created_at.asc())
+            )
+            submissions = list(result.scalars().all())
+
+            if not submissions:
+                return None
+
+            # Build leaderboard with threshold logic
+            # Each new submission only goes above existing if it beats by >threshold
+            leaderboard: list[SubmissionModel] = []
+
+            for submission in submissions:
+                score = submission.final_score or 0.0
+
+                # Find insertion position
+                insert_pos = len(leaderboard)
+                for i, existing in enumerate(leaderboard):
+                    existing_score = existing.final_score or 0.0
+                    threshold_score = existing_score * (1 + threshold)
+                    if score > threshold_score:
+                        insert_pos = i
+                        break
+
+                leaderboard.insert(insert_pos, submission)
+
+            # Return rank 1 (first in leaderboard)
+            return leaderboard[0] if leaderboard else None
 
     async def get_leaderboard(self, limit: int = 100) -> list[SubmissionModel]:
         """Get top submissions by score."""

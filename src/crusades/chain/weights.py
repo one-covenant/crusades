@@ -14,9 +14,13 @@ class WeightSetter:
 
     Implements burn_rate distribution:
     - burn_rate portion (e.g., 95%) goes to burn_uid (validator)
-    - (1 - burn_rate) portion (e.g., 5%) goes to top TPS winner
+    - (1 - burn_rate) portion (e.g., 5%) goes to top TPS winner (leaderboard rank 1)
 
     If no valid winner exists, all emissions go to burn_uid.
+
+    The leaderboard uses a 1% threshold - a new submission only takes rank 1
+    if it beats the incumbent by more than 1%. This prevents small fluctuations
+    from constantly changing the winner.
     """
 
     def __init__(
@@ -34,11 +38,14 @@ class WeightSetter:
         self.burn_uid = self.hparams.burn_uid  # UID that receives burn portion
 
     async def set_weights(self) -> tuple[bool, str]:
-        """Set weights based on current leaderboard with burn_rate distribution.
+        """Set weights based on leaderboard rank 1 with burn_rate distribution.
 
         Distribution:
         - burn_rate (e.g., 95%) goes to burn_uid (validator)
-        - (1 - burn_rate) (e.g., 5%) goes to top TPS winner
+        - (1 - burn_rate) (e.g., 5%) goes to leaderboard rank 1
+
+        The leaderboard applies a 1% threshold - incumbents keep their position
+        unless beaten by more than 1%.
 
         If no valid winner, 100% goes to burn_uid.
 
@@ -56,16 +63,16 @@ class WeightSetter:
             )
             return False, "Metagraph sync failed - cannot set weights"
 
-        # Get top submission
-        top_submission = await self.db.get_top_submission()
+        # Get leaderboard rank 1 (with 1% threshold applied)
+        winner = await self.db.get_leaderboard_winner(threshold=0.01)
 
         # If no valid winner, all emissions go to burn_uid
-        if top_submission is None:
+        if winner is None:
             logger.info("No finished submissions - 100% to burn_uid")
             return await self._set_burn_only_weights("No finished submissions")
 
         # Verify miner is still registered
-        winner_hotkey = top_submission.miner_hotkey
+        winner_hotkey = winner.miner_hotkey
         if not self.chain.is_registered(winner_hotkey):
             logger.warning(f"Winner {winner_hotkey} not registered - 100% to burn_uid")
             return await self._set_burn_only_weights(f"Winner {winner_hotkey} not registered")
@@ -76,6 +83,8 @@ class WeightSetter:
             logger.error(f"Could not get UID for {winner_hotkey} - 100% to burn_uid")
             return await self._set_burn_only_weights(f"Could not get UID for {winner_hotkey}")
 
+        winner_score = winner.final_score or 0.0
+
         # Calculate weight distribution
         winner_weight = 1.0 - self.burn_rate  # e.g., 5%
         burn_weight = self.burn_rate  # e.g., 95%
@@ -83,7 +92,7 @@ class WeightSetter:
         logger.info(
             f"Setting weights with burn_rate={self.burn_rate:.0%}:\n"
             f"  - UID {self.burn_uid} (validator): {burn_weight:.2f}\n"
-            f"  - UID {winner_uid} (winner, score={top_submission.final_score:.2f}): {winner_weight:.2f}"
+            f"  - UID {winner_uid} (winner, score={winner_score:.2f}): {winner_weight:.2f}"
         )
 
         # Set weights for both burn_uid and winner
