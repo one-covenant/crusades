@@ -186,10 +186,13 @@ async def get_history(
     """Get TPS history for charts.
 
     Returns list of TPS scores over time for chart visualization.
+    Returns the most recent `limit` data points (newest submissions).
     """
     verify_api_key(x_api_key)
     client = get_db_client()
-    return client.get_history()[:limit]
+    history = client.get_history()
+    # Return the most recent N data points (end of the list)
+    return history[-limit:] if len(history) > limit else history
 
 
 @app.get("/api/stats/queue")

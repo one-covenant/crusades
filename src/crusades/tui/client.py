@@ -150,7 +150,8 @@ class DatabaseClient:
     def get_overview(self) -> dict[str, Any]:
         """Get dashboard overview stats."""
         now = datetime.now()
-        day_ago = (now - timedelta(days=1)).isoformat()
+        # Use space separator to match SQLite datetime format
+        day_ago = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
 
         # Total submissions
         total = self._query_one("SELECT COUNT(*) as count FROM submissions")
@@ -212,10 +213,27 @@ class DatabaseClient:
             "active_miners": active_miners,
         }
 
+    def _format_duration(self, seconds: float) -> str:
+        """Format duration in seconds to human-readable string."""
+        if seconds < 0:
+            return "N/A"
+
+        days = int(seconds // 86400)
+        hours = int((seconds % 86400) // 3600)
+        minutes = int((seconds % 3600) // 60)
+
+        if days > 0:
+            return f"{days}d {hours}h {minutes}m"
+        elif hours > 0:
+            return f"{hours}h {minutes}m"
+        else:
+            return f"{minutes}m"
+
     def get_validator_status(self) -> dict[str, Any]:
         """Get validator status."""
         now = datetime.now()
-        hour_ago = (now - timedelta(hours=1)).isoformat()
+        # Use space separator to match SQLite datetime format
+        hour_ago = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
 
         # Evaluations in last hour
         evals = self._query_one(
@@ -244,11 +262,29 @@ class DatabaseClient:
         total = finished_count + failed_count
         success_rate = (finished_count / total * 100) if total > 0 else 0
 
+        # Calculate uptime from first submission
+        first_submission = self._query_one(
+            "SELECT MIN(created_at) as start_time FROM submissions"
+        )
+        if first_submission and first_submission["start_time"]:
+            try:
+                # Parse the timestamp (handles both ISO and SQLite formats)
+                start_str = first_submission["start_time"]
+                # Replace space with T for fromisoformat compatibility
+                start_str = start_str.replace(" ", "T")
+                start_time = datetime.fromisoformat(start_str)
+                uptime_seconds = (now - start_time).total_seconds()
+                uptime = self._format_duration(uptime_seconds)
+            except (ValueError, TypeError):
+                uptime = "N/A"
+        else:
+            uptime = "N/A"
+
         return {
             "status": "running" if current else "idle",
             "evaluations_completed_1h": eval_count,
             "current_evaluation": current["submission_id"] if current else None,
-            "uptime": "N/A",
+            "uptime": uptime,
             "queued_count": queue["queued_count"],
             "running_count": queue["running_count"],
             "finished_count": queue["finished_count"],
@@ -387,12 +423,12 @@ class DatabaseClient:
 
     def get_history(self) -> list[dict[str, Any]]:
         """Get TPS history for chart - shows top TPS progression over time."""
-        # Get finished submissions ordered by time, tracking best score
+        # Get ALL finished submissions ordered by time, tracking best score
         rows = self._query(
             "SELECT submission_id, final_score as tps, created_at "
             "FROM submissions "
             "WHERE status = 'finished' AND final_score IS NOT NULL "
-            "ORDER BY created_at ASC LIMIT 100"
+            "ORDER BY created_at ASC"
         )
 
         history = []

@@ -523,6 +523,40 @@ class Validator(BaseNode):
                 self.commitment_reader.sync()
             self.last_sync_time = now
 
+    async def _refresh_weight_block_from_chain(self) -> None:
+        """Refresh last_weight_set_block from chain's metagraph.
+
+        This ensures we have the latest last_update from chain before
+        checking if we can set weights.
+        """
+        if self.chain is None:
+            return
+
+        try:
+            # Sync metagraph to get latest state
+            await self.chain.sync_metagraph()
+
+            if self.chain.metagraph is None:
+                return
+
+            # Find our UID in the metagraph
+            hotkey = self.chain.hotkey
+            if hotkey not in self.chain.metagraph.hotkeys:
+                return
+
+            uid = self.chain.metagraph.hotkeys.index(hotkey)
+            chain_last_update = int(self.chain.metagraph.last_update[uid])
+
+            # Update if chain shows a more recent value
+            if chain_last_update > self.last_weight_set_block:
+                logger.debug(
+                    f"Updating last_weight_set_block from chain: "
+                    f"{self.last_weight_set_block} -> {chain_last_update}"
+                )
+                self.last_weight_set_block = chain_last_update
+        except Exception as e:
+            logger.debug(f"Could not refresh weight block from chain: {e}")
+
     async def maybe_set_weights(self) -> None:
         """Set weights if enough blocks have passed since last update."""
         if self.weight_setter is None:
@@ -532,6 +566,10 @@ class Validator(BaseNode):
         if self.commitment_reader is None:
             logger.warning("Commitment reader not initialized - cannot set weights")
             return
+
+        # Sync metagraph and refresh last_weight_set_block from chain
+        # This ensures we don't attempt weight setting if chain shows recent update
+        await self._refresh_weight_block_from_chain()
 
         hparams = get_hparams()
         current_block = self.commitment_reader.get_current_block()
