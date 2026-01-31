@@ -10,18 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class WeightSetter:
-    """Handles setting weights on the Bittensor network.
-
-    Implements burn_rate distribution:
-    - burn_rate portion (e.g., 95%) goes to burn_uid (validator)
-    - (1 - burn_rate) portion (e.g., 5%) goes to top TPS winner (leaderboard rank 1)
-
-    If no valid winner exists, all emissions go to burn_uid.
-
-    The leaderboard uses a 1% threshold - a new submission only takes rank 1
-    if it beats the incumbent by more than 1%. This prevents small fluctuations
-    from constantly changing the winner.
-    """
+    """Sets weights on Bittensor: burn_rate% to validator, rest to rank 1 winner."""
 
     def __init__(
         self,
@@ -33,25 +22,11 @@ class WeightSetter:
         self.config = get_config()
         self.hparams = get_hparams()
 
-        # Burn configuration from hparams
-        self.burn_rate = self.hparams.burn_rate  # e.g., 0.95 = 95% to validator
-        self.burn_uid = self.hparams.burn_uid  # UID that receives burn portion
+        self.burn_rate = self.hparams.burn_rate
+        self.burn_uid = self.hparams.burn_uid
 
     async def set_weights(self) -> tuple[bool, str]:
-        """Set weights based on leaderboard rank 1 with burn_rate distribution.
-
-        Distribution:
-        - burn_rate (e.g., 95%) goes to burn_uid (validator)
-        - (1 - burn_rate) (e.g., 5%) goes to leaderboard rank 1
-
-        The leaderboard applies a 1% threshold - incumbents keep their position
-        unless beaten by more than 1%.
-
-        If no valid winner, 100% goes to burn_uid.
-
-        Returns:
-            Tuple of (success, message)
-        """
+        """Set weights: burn_rate% to validator, rest to rank 1 (with 1% threshold)."""
         # Sync metagraph to get latest state
         await self.chain.sync_metagraph()
 

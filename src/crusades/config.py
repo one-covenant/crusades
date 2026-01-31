@@ -28,10 +28,12 @@ class StorageConfig(BaseModel):
 class VerificationConfig(BaseModel):
     """Verification tolerance settings."""
 
-    output_vector_tolerance: float = 0.02  # 2% aggregate difference allowed
-    loss_ratio_min: float = 0.8  # Minimum allowed loss ratio (candidate/reference)
-    loss_ratio_max: float = 1.2  # Maximum allowed loss ratio (candidate/reference)
+    output_vector_tolerance: float = 0.02
+    loss_ratio_min: float = 0.8
+    loss_ratio_max: float = 1.2
     deterministic_mode: bool = True
+    min_trainable_params_ratio: float = 0.9
+    min_params_changed_ratio: float = 0.5
 
 
 class DockerConfig(BaseModel):
@@ -94,6 +96,7 @@ class HParams(BaseModel):
     evaluation_runs: int
     eval_steps: int
     eval_timeout: int
+    min_success_rate: float = 0.5  # Minimum success rate required (default 50%)
 
     # Benchmark settings
     benchmark_model_name: str

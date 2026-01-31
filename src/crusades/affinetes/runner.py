@@ -120,6 +120,8 @@ class AffinetesRunner:
         output_tolerance: float = 0.02,
         loss_ratio_min: float = 0.8,
         loss_ratio_max: float = 1.2,
+        min_trainable_params_ratio: float = 0.9,
+        min_params_changed_ratio: float = 0.5,
         validator_image: str | None = None,
         # Basilica-specific settings
         basilica_image: str | None = None,
@@ -145,6 +147,8 @@ class AffinetesRunner:
             output_tolerance: Verification tolerance (0.02 = 2%)
             loss_ratio_min: Minimum allowed loss ratio (default 0.8)
             loss_ratio_max: Maximum allowed loss ratio (default 1.2)
+            min_trainable_params_ratio: Minimum trainable params (default 0.9 = 90%)
+            min_params_changed_ratio: Minimum params that must change (default 0.5 = 50%)
             validator_image: Docker image for local evaluation
             basilica_image: Docker image for Basilica (must be in registry)
             basilica_ttl_seconds: TTL for Basilica deployment (default 1 hour)
@@ -166,6 +170,8 @@ class AffinetesRunner:
         self.output_tolerance = output_tolerance
         self.loss_ratio_min = loss_ratio_min
         self.loss_ratio_max = loss_ratio_max
+        self.min_trainable_params_ratio = min_trainable_params_ratio
+        self.min_params_changed_ratio = min_params_changed_ratio
         self.validator_image = validator_image or self.DEFAULT_DOCKER_IMAGE
         self.basilica_image = basilica_image or self.DEFAULT_BASILICA_IMAGE
         self.basilica_ttl_seconds = basilica_ttl_seconds
@@ -330,6 +336,8 @@ async def main():
         output_tolerance={self.output_tolerance},
         loss_ratio_min={self.loss_ratio_min},
         loss_ratio_max={self.loss_ratio_max},
+        min_trainable_params_ratio={self.min_trainable_params_ratio},
+        min_params_changed_ratio={self.min_params_changed_ratio},
     )
     print("EVAL_RESULT:" + json.dumps(result))
 
@@ -651,6 +659,8 @@ asyncio.run(main())
                 "output_tolerance": self.output_tolerance,
                 "loss_ratio_min": self.loss_ratio_min,
                 "loss_ratio_max": self.loss_ratio_max,
+                "min_trainable_params_ratio": self.min_trainable_params_ratio,
+                "min_params_changed_ratio": self.min_params_changed_ratio,
             }
 
             logger.info("[BASILICA] Sending evaluation request...")

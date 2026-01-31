@@ -289,19 +289,8 @@ class DatabaseClient:
         }
 
     def get_leaderboard(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Get leaderboard entries with 1% threshold for position changes.
-
-        A new submission only gets placed ABOVE an existing entry if it beats
-        that entry by more than 1%. This gives incumbents stability - they keep
-        their position unless significantly beaten.
-
-        Submissions are processed in order of creation (oldest first), and each
-        new submission finds its position by comparing against existing entries.
-
-        Ranks are strictly sequential: 1, 2, 3, 4...
-        """
-        # Get all finished submissions ordered by created_at (oldest first)
-        # This ensures earlier submissions have "incumbent advantage"
+        """Get leaderboard with 1% incumbent protection. Ranks are sequential."""
+        # Get all finished submissions (oldest first for incumbent advantage)
         rows = self._query(
             """SELECT s.submission_id, s.miner_hotkey, s.miner_uid, s.final_score,
                       s.created_at, COUNT(e.evaluation_id) as eval_count
@@ -313,10 +302,7 @@ class DatabaseClient:
             (SubmissionStatus.FINISHED,),
         )
 
-        # 1% threshold - must beat incumbent by more than this to take their spot
-        rank_threshold = 0.01
-
-        # Build leaderboard incrementally (oldest submissions first)
+        rank_threshold = 0.01  # 1% threshold
         leaderboard: list[dict[str, Any]] = []
 
         for row in rows:
@@ -331,13 +317,11 @@ class DatabaseClient:
                 "created_at": row["created_at"],
             }
 
-            # Find insertion position (scan from top)
-            # New entry only goes above existing if it beats them by >1%
-            insert_pos = len(leaderboard)  # Default: add at bottom
+            # Find insertion position (only above if beats by >1%)
+            insert_pos = len(leaderboard)
             for i, existing in enumerate(leaderboard):
                 threshold_score = existing["final_score"] * (1 + rank_threshold)
                 if score > threshold_score:
-                    # Beats this incumbent by >1%, insert here
                     insert_pos = i
                     break
 
