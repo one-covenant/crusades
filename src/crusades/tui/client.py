@@ -163,12 +163,10 @@ class DatabaseClient:
         )
         recent_count = recent["count"] if recent else 0
 
-        # Top score (current best)
-        top = self._query_one(
-            "SELECT final_score FROM submissions WHERE status = 'finished' "
-            "ORDER BY final_score DESC LIMIT 1"
-        )
-        top_score = top["final_score"] if top and top["final_score"] else 0.0
+        # Top score (rank 1 from leaderboard with 1% threshold)
+        # This ensures consistency between "Current Top TPS" and leaderboard rank 1
+        leaderboard = self.get_leaderboard(limit=1)
+        top_score = leaderboard[0]["final_score"] if leaderboard else 0.0
 
         # Top score from 24 hours ago (best score that existed then)
         top_24h_ago = self._query_one(
@@ -263,9 +261,7 @@ class DatabaseClient:
         success_rate = (finished_count / total * 100) if total > 0 else 0
 
         # Calculate uptime from first submission
-        first_submission = self._query_one(
-            "SELECT MIN(created_at) as start_time FROM submissions"
-        )
+        first_submission = self._query_one("SELECT MIN(created_at) as start_time FROM submissions")
         if first_submission and first_submission["start_time"]:
             try:
                 # Parse the timestamp (handles both ISO and SQLite formats)
@@ -422,8 +418,12 @@ class DatabaseClient:
         }
 
     def get_history(self) -> list[dict[str, Any]]:
-        """Get TPS history for chart - shows top TPS progression over time."""
-        # Get ALL finished submissions ordered by time, tracking best score
+        """Get TPS history for chart - shows rank 1 TPS progression over time.
+
+        Uses the same 1% threshold as the leaderboard - the chart only shows
+        TPS going up when a submission beats the incumbent by >1%.
+        """
+        # Get ALL finished submissions ordered by time
         rows = self._query(
             "SELECT submission_id, final_score as tps, created_at "
             "FROM submissions "
@@ -433,17 +433,20 @@ class DatabaseClient:
 
         history = []
         running_best = 0.0
+        rank_threshold = 0.01  # 1% threshold, same as leaderboard
 
         for row in rows:
             tps = row["tps"] or 0.0
-            # Track the running best TPS
-            if tps > running_best:
+            # Only update running_best if it beats incumbent by >1%
+            # This matches the leaderboard 1% threshold logic
+            threshold_score = running_best * (1 + rank_threshold)
+            if tps > threshold_score:
                 running_best = tps
 
             history.append(
                 {
                     "submission_id": row["submission_id"],
-                    "tps": running_best,  # Show best TPS so far
+                    "tps": running_best,  # Show rank 1 TPS so far (with threshold)
                     "timestamp": row["created_at"],
                 }
             )
