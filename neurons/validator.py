@@ -130,6 +130,8 @@ class Validator(BaseNode):
             output_tolerance=hparams.verification.output_vector_tolerance,
             loss_ratio_min=hparams.verification.loss_ratio_min,
             loss_ratio_max=hparams.verification.loss_ratio_max,
+            min_trainable_params_ratio=hparams.verification.min_trainable_params_ratio,
+            min_params_changed_ratio=hparams.verification.min_params_changed_ratio,
             # Basilica config
             basilica_image=hparams.basilica.image,
             basilica_ttl_seconds=hparams.basilica.ttl_seconds,
@@ -422,6 +424,7 @@ class Validator(BaseNode):
             logger.info(f"   Downloaded {len(miner_code)} bytes")
 
             # Run evaluations
+            early_terminate = False
             for run_idx in range(runs_remaining):
                 current_run = len(my_evals) + run_idx + 1
                 seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}"
@@ -429,7 +432,7 @@ class Validator(BaseNode):
                 logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
 
                 result = await self.affinetes_runner.evaluate(
-                    code=miner_code,  # Pass code directly
+                    code=miner_code,
                     seed=seed,
                     steps=hparams.eval_steps,
                     batch_size=hparams.benchmark_batch_size,
@@ -455,6 +458,33 @@ class Validator(BaseNode):
                 await self.db.save_evaluation(evaluation)
                 self._cleanup_memory()
 
+                # Early termination for permanent failures (won't pass on retry)
+                if not result.success and result.error:
+                    error_lower = result.error.lower()
+                    if any(
+                        msg in error_lower
+                        for msg in [
+                            "trainable parameters",
+                            "parameter updates",
+                            "do not freeze",
+                            "ensure all layers",
+                        ]
+                    ):
+                        logger.warning(
+                            f"Early termination: {submission.submission_id} - "
+                            f"verification failure won't improve on retry"
+                        )
+                        await self.db.update_submission_status(
+                            submission.submission_id,
+                            SubmissionStatus.FAILED_EVALUATION,
+                            error_message=result.error,
+                        )
+                        early_terminate = True
+                        break
+
+            if early_terminate:
+                continue
+
             # Persist state (URL already recorded during commitment processing)
             await self._save_state()
 
@@ -466,15 +496,30 @@ class Validator(BaseNode):
             await self._finalize_submission(submission.submission_id, num_runs)
 
     async def _finalize_submission(self, submission_id: str, num_runs: int) -> None:
-        """Calculate final score and update submission status."""
+        """Calculate final score. Requires min_success_rate to pass."""
         num_evals = await self.db.count_evaluations(submission_id)
         required_evals = num_runs
+        min_success_rate = get_hparams().min_success_rate
 
         logger.info(f"Finalizing {submission_id}: {num_evals}/{required_evals} evaluations")
 
         if num_evals >= required_evals:
             all_evals = await self.db.get_evaluations(submission_id)
             successful_evals = [e for e in all_evals if e.success]
+            success_rate = len(successful_evals) / len(all_evals) if all_evals else 0
+
+            # Check minimum success rate requirement
+            if success_rate < min_success_rate:
+                await self.db.update_submission_status(
+                    submission_id,
+                    SubmissionStatus.FAILED_EVALUATION,
+                    error_message=f"Success rate {success_rate:.0%} below minimum {min_success_rate:.0%}",
+                )
+                logger.warning(
+                    f"Submission {submission_id} failed: success rate {success_rate:.0%} "
+                    f"({len(successful_evals)}/{len(all_evals)}) below minimum {min_success_rate:.0%}"
+                )
+                return
 
             if successful_evals:
                 tps_scores = [e.tokens_per_second for e in successful_evals]
@@ -483,7 +528,7 @@ class Validator(BaseNode):
 
                 logger.info(
                     f"Final score for {submission_id}:\n"
-                    f"   Successful runs: {len(tps_scores)}\n"
+                    f"   Successful runs: {len(tps_scores)}/{len(all_evals)} ({success_rate:.0%})\n"
                     f"   Scores: {[f'{s:.1f}' for s in sorted(tps_scores)]}\n"
                     f"   Median TPS (low): {median_tps:,.2f}"
                 )
@@ -524,11 +569,7 @@ class Validator(BaseNode):
             self.last_sync_time = now
 
     async def _refresh_weight_block_from_chain(self) -> None:
-        """Refresh last_weight_set_block from chain's metagraph.
-
-        This ensures we have the latest last_update from chain before
-        checking if we can set weights.
-        """
+        """Sync last_weight_set_block from chain before setting weights."""
         if self.chain is None:
             return
 
@@ -567,8 +608,6 @@ class Validator(BaseNode):
             logger.warning("Commitment reader not initialized - cannot set weights")
             return
 
-        # Sync metagraph and refresh last_weight_set_block from chain
-        # This ensures we don't attempt weight setting if chain shows recent update
         await self._refresh_weight_block_from_chain()
 
         hparams = get_hparams()
@@ -603,11 +642,7 @@ class Validator(BaseNode):
             )
 
     async def _init_weight_block_from_chain(self) -> None:
-        """Initialize last_weight_set_block from chain's metagraph.
-
-        This prevents spamming weight setting attempts on validator restart
-        by checking when the chain says we last set weights.
-        """
+        """Init last_weight_set_block from chain to prevent spam on restart."""
         if self.chain is None or self.chain.metagraph is None:
             return
 

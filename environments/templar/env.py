@@ -564,6 +564,103 @@ def _verify_outputs(
     return True, None, details
 
 
+def _verify_trainable_params(
+    model: torch.nn.Module,
+    min_trainable_ratio: float = 0.9,
+) -> tuple[bool, str | None, dict]:
+    """Check that min % of params are trainable (prevents layer freezing)."""
+    total_params = 0
+    trainable_params = 0
+
+    for param in model.parameters():
+        num_params = param.numel()
+        total_params += num_params
+        if param.requires_grad:
+            trainable_params += num_params
+
+    trainable_ratio = trainable_params / total_params if total_params > 0 else 0
+
+    details = {
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "trainable_ratio": trainable_ratio,
+        "min_required": min_trainable_ratio,
+    }
+
+    logger.info("=" * 60)
+    logger.info("VERIFICATION: Checking trainable parameters")
+    logger.info(f"   Total params: {total_params:,}")
+    logger.info(f"   Trainable params: {trainable_params:,}")
+    logger.info(f"   Trainable ratio: {trainable_ratio:.1%}")
+    logger.info(f"   Minimum required: {min_trainable_ratio:.0%}")
+
+    if trainable_ratio < min_trainable_ratio:
+        error = (
+            f"Insufficient trainable parameters: {trainable_ratio:.1%} "
+            f"({trainable_params:,}/{total_params:,}) - minimum {min_trainable_ratio:.0%} required. "
+            f"Do not freeze model layers."
+        )
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
+
+    logger.info(
+        f"[PASSED] Trainable params check ({trainable_ratio:.1%} >= {min_trainable_ratio:.0%})"
+    )
+    logger.info("=" * 60)
+    return True, None, details
+
+
+def _verify_params_changed(
+    model: torch.nn.Module,
+    initial_state: dict[str, torch.Tensor],
+    min_changed_ratio: float = 0.5,
+) -> tuple[bool, str | None, dict]:
+    """Check that min % of params actually changed (prevents fake training)."""
+    total_params = 0
+    changed_params = 0
+
+    for name, param in model.named_parameters():
+        num_params = param.numel()
+        total_params += num_params
+
+        if name in initial_state:
+            initial_param = initial_state[name].to(param.device)
+            # Check if parameter changed (not exactly equal)
+            if not torch.equal(param.data, initial_param):
+                changed_params += num_params
+
+    changed_ratio = changed_params / total_params if total_params > 0 else 0
+
+    details = {
+        "total_params": total_params,
+        "changed_params": changed_params,
+        "changed_ratio": changed_ratio,
+        "min_required": min_changed_ratio,
+    }
+
+    logger.info("=" * 60)
+    logger.info("VERIFICATION: Checking parameter changes")
+    logger.info(f"   Total params: {total_params:,}")
+    logger.info(f"   Changed params: {changed_params:,}")
+    logger.info(f"   Changed ratio: {changed_ratio:.1%}")
+    logger.info(f"   Minimum required: {min_changed_ratio:.0%}")
+
+    if changed_ratio < min_changed_ratio:
+        error = (
+            f"Insufficient parameter updates: {changed_ratio:.1%} "
+            f"({changed_params:,}/{total_params:,}) - minimum {min_changed_ratio:.0%} required. "
+            f"Ensure all layers are being trained."
+        )
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
+
+    logger.info(
+        f"[PASSED] Parameter changes check ({changed_ratio:.1%} >= {min_changed_ratio:.0%})"
+    )
+    logger.info("=" * 60)
+    return True, None, details
+
+
 class Actor:
     """Templar TPS Evaluation Actor for Affinetes (Validator-Owned).
 
@@ -586,6 +683,8 @@ class Actor:
         output_tolerance: float = 0.05,  # Tolerance for logits comparison
         loss_ratio_min: float = 0.8,  # Minimum allowed loss ratio
         loss_ratio_max: float = 1.2,  # Maximum allowed loss ratio
+        min_trainable_params_ratio: float = 0.9,  # Minimum trainable params (90%)
+        min_params_changed_ratio: float = 0.5,  # Minimum params that must change (50%)
     ) -> dict:
         """
         Run TPS evaluation on miner's code.
@@ -780,6 +879,26 @@ class Actor:
 
                 logger.info("Warmup passed - proceeding with full evaluation")
 
+                # =================================================================
+                # TRAINABLE PARAMS CHECK - Verify miner didn't freeze layers
+                # =================================================================
+                # Check AFTER warmup runs miner code (which may modify requires_grad)
+                trainable_ok, trainable_error, trainable_details = _verify_trainable_params(
+                    model, min_trainable_params_ratio
+                )
+                if not trainable_ok:
+                    return {
+                        "task_id": task_id,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": trainable_error,
+                        "seed": seed,
+                        "code": code,
+                        "diagnostics": {"trainable_params": trainable_details},
+                    }
+
             except Exception as e:
                 # Early termination - don't waste time on broken code
                 error_msg = f"Early termination (warmup failed): {type(e).__name__}: {str(e)}"
@@ -821,6 +940,25 @@ class Actor:
 
             wall_time = time.perf_counter() - start
 
+            # =================================================================
+            # PARAMS CHANGED CHECK - Verify miner actually trained the model
+            # =================================================================
+            params_ok, params_error, params_details = _verify_params_changed(
+                model, initial_state, min_params_changed_ratio
+            )
+            if not params_ok:
+                return {
+                    "task_id": task_id,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": params_error,
+                    "seed": seed,
+                    "code": code,
+                    "diagnostics": {"params_changed": params_details},
+                }
+
             # Validate return type
             ok, error, parsed = _validate_return_type(miner_result)
             if not ok or parsed is None:
@@ -846,6 +984,7 @@ class Actor:
             # Diagnostics (include verification details)
             diagnostics = {
                 "verification": verify_details,
+                "params_changed": params_details,
                 "reference_loss": reference.final_loss,
                 "candidate_loss": parsed.final_loss,
                 "expected_tokens": expected_tokens,
