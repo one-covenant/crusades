@@ -120,10 +120,7 @@ class AffinetesRunner:
         model_url: str | None = None,
         data_url: str | None = None,
         # Verification settings
-        loss_ratio_min: float = 0.8,
-        loss_ratio_max: float = 1.2,
-        use_random_init: bool = True,
-        min_trainable_params_ratio: float = 0.9,
+        max_loss_difference: float = 0.5,
         min_params_changed_ratio: float = 0.5,
         # Gradient verification
         gradient_cosine_min: float = 0.8,
@@ -153,10 +150,7 @@ class AffinetesRunner:
             timeout: Evaluation timeout in seconds
             model_url: Default model URL (HuggingFace model ID)
             data_url: Default data URL (HuggingFace dataset)
-            loss_ratio_min: Minimum allowed loss ratio
-            loss_ratio_max: Maximum allowed loss ratio
-            use_random_init: Use random weights (anti-cheat)
-            min_trainable_params_ratio: Min % params that must be trainable
+            max_loss_difference: Max allowed |candidate_loss - reference_loss|
             min_params_changed_ratio: Min % params that must change
             gradient_cosine_min: Min gradient cosine similarity
             gradient_norm_ratio_min: Min gradient norm ratio
@@ -181,10 +175,7 @@ class AffinetesRunner:
         self.default_model_url = model_url
         self.default_data_url = data_url
         # Verification settings
-        self.loss_ratio_min = loss_ratio_min
-        self.loss_ratio_max = loss_ratio_max
-        self.use_random_init = use_random_init
-        self.min_trainable_params_ratio = min_trainable_params_ratio
+        self.max_loss_difference = max_loss_difference
         self.min_params_changed_ratio = min_params_changed_ratio
         # Gradient verification
         self.gradient_cosine_min = gradient_cosine_min
@@ -353,11 +344,9 @@ async def main():
         data_samples={data_samples},
         timeout={self.timeout},
         code=code,
-        # Verification settings
-        loss_ratio_min={self.loss_ratio_min},
-        loss_ratio_max={self.loss_ratio_max},
-        use_random_init={self.use_random_init},
-        min_trainable_params_ratio={self.min_trainable_params_ratio},
+        max_loss_difference={self.max_loss_difference},
+        use_random_init=True,
+        min_trainable_params_ratio=1.0,
         min_params_changed_ratio={self.min_params_changed_ratio},
         # Gradient verification
         gradient_cosine_min={self.gradient_cosine_min},
@@ -683,11 +672,9 @@ asyncio.run(main())
                 "sequence_length": sequence_length,
                 "data_samples": data_samples,
                 "code": code,
-                # Verification settings
-                "loss_ratio_min": self.loss_ratio_min,
-                "loss_ratio_max": self.loss_ratio_max,
-                "use_random_init": self.use_random_init,
-                "min_trainable_params_ratio": self.min_trainable_params_ratio,
+                "max_loss_difference": self.max_loss_difference,
+                "use_random_init": True,
+                "min_trainable_params_ratio": 1.0,
                 "min_params_changed_ratio": self.min_params_changed_ratio,
                 # Gradient verification
                 "gradient_cosine_min": self.gradient_cosine_min,

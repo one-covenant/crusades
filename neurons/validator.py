@@ -127,11 +127,7 @@ class Validator(BaseNode):
             model_url=hparams.benchmark_model_name,
             data_url=hparams.benchmark_dataset_name,
             timeout=hparams.eval_timeout,
-            # Verification settings
-            loss_ratio_min=hparams.verification.loss_ratio_min,
-            loss_ratio_max=hparams.verification.loss_ratio_max,
-            use_random_init=hparams.verification.use_random_init,
-            min_trainable_params_ratio=hparams.verification.min_trainable_params_ratio,
+            max_loss_difference=hparams.verification.max_loss_difference,
             min_params_changed_ratio=hparams.verification.min_params_changed_ratio,
             # Gradient verification
             gradient_cosine_min=hparams.verification.gradient_cosine_min,
@@ -396,7 +392,9 @@ class Validator(BaseNode):
         evaluating = await self.db.get_evaluating_submissions(spec_version=hparams.spec_version)
         num_runs = hparams.evaluation_runs
 
-        logger.info(f"Found {len(evaluating)} submissions in EVALUATING status (v{hparams.spec_version})")
+        logger.info(
+            f"Found {len(evaluating)} submissions in EVALUATING status (v{hparams.spec_version})"
+        )
 
         for submission in evaluating:
             code_url = submission.bucket_path
@@ -449,7 +447,9 @@ class Validator(BaseNode):
                 )
 
                 if result.success:
-                    logger.info(f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}")
+                    logger.info(
+                        f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}"
+                    )
                 else:
                     logger.warning(f"Run {current_run} FAILED: {result.error}")
 

@@ -33,6 +33,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from crusades.config import get_hparams
 from crusades.tui.client import DatabaseClient, MockClient
 
 logger = logging.getLogger(__name__)
@@ -42,13 +43,15 @@ _db_client = None
 
 
 def get_db_client():
-    """Get or create database client."""
+    """Get or create database client (filtered by current spec_version)."""
     global _db_client
     if _db_client is None:
         db_path = os.getenv("CRUSADES_DB_PATH", "crusades.db")
+        hparams = get_hparams()
+        spec_version = hparams.spec_version
         if Path(db_path).exists():
-            logger.info(f"Using database: {db_path}")
-            _db_client = DatabaseClient(db_path)
+            logger.info(f"Using database: {db_path} (spec_version={spec_version})")
+            _db_client = DatabaseClient(db_path, spec_version=spec_version)
         else:
             logger.warning(f"Database not found at {db_path}, using mock data")
             _db_client = MockClient()

@@ -77,7 +77,7 @@ class WeightSetter:
         current_threshold = await self.db.get_adaptive_threshold(
             current_block=current_block,
             base_threshold=threshold_config.base_threshold,
-            decay_rate=threshold_config.decay_rate,
+            decay_percent=threshold_config.decay_percent,
             decay_interval_blocks=threshold_config.decay_interval_blocks,
         )
 
@@ -117,10 +117,16 @@ class WeightSetter:
                     old_score=self._previous_winner_score,
                     current_block=current_block,
                     base_threshold=threshold_config.base_threshold,
-                    max_threshold=threshold_config.max_threshold,
-                    improvement_multiplier=threshold_config.improvement_multiplier,
                 )
-                improvement = ((winner_score - self._previous_winner_score) / self._previous_winner_score * 100) if self._previous_winner_score > 0 else 100
+                improvement = (
+                    (
+                        (winner_score - self._previous_winner_score)
+                        / self._previous_winner_score
+                        * 100
+                    )
+                    if self._previous_winner_score > 0
+                    else 100
+                )
                 logger.info(
                     f"NEW LEADER! Threshold updated:\n"
                     f"  - Previous: {self._previous_winner_score:.2f}% MFU\n"

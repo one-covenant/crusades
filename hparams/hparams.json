@@ -18,13 +18,12 @@
     "benchmark_batch_size": 4,
 
     "set_weights_interval_blocks": 100,
-
     "reveal_blocks": 100,
     "min_blocks_between_commits": 300,
     "block_time": 12,
 
     "docker": {
-        "gpu_devices": "0,1",
+        "gpu_devices": "4",
         "memory_limit": "64g",
         "shm_size": "16g"
     },
@@ -34,17 +33,13 @@
         "ttl_seconds": 3600,
         "gpu_count": 1,
         "gpu_models": ["A100"],
-        "min_gpu_memory_gb": 40,
+        "min_gpu_memory_gb": 80,
         "cpu": "4",
         "memory": "32Gi"
     },
 
     "verification": {
-        "deterministic_mode": true,
-        "use_random_init": true,
-        "loss_ratio_min": 0.8,
-        "loss_ratio_max": 1.2,
-        "min_trainable_params_ratio": 1.0,
+        "max_loss_difference": 0.5,
         "min_params_changed_ratio": 0.8,
         "gradient_cosine_min": 0.8,
         "gradient_norm_ratio_min": 0.5,
@@ -58,9 +53,7 @@
 
     "adaptive_threshold": {
         "base_threshold": 0.01,
-        "max_threshold": 0.50,
-        "decay_rate": 0.95,
-        "decay_interval_blocks": 100,
-        "improvement_multiplier": 2.0
+        "decay_percent": 0.05,
+        "decay_interval_blocks": 100
     }
 }

@@ -124,27 +124,35 @@ class Database:
             )
             return list(result.scalars().all())
 
-    async def get_pending_submissions(self, spec_version: int | None = None) -> list[SubmissionModel]:
+    async def get_pending_submissions(
+        self, spec_version: int | None = None
+    ) -> list[SubmissionModel]:
         """Get submissions pending validation.
 
         Args:
             spec_version: If provided, only return submissions matching this version
         """
         async with self.session_factory() as session:
-            query = select(SubmissionModel).where(SubmissionModel.status == SubmissionStatus.PENDING)
+            query = select(SubmissionModel).where(
+                SubmissionModel.status == SubmissionStatus.PENDING
+            )
             if spec_version is not None:
                 query = query.where(SubmissionModel.spec_version == spec_version)
             result = await session.execute(query.order_by(SubmissionModel.created_at))
             return list(result.scalars().all())
 
-    async def get_evaluating_submissions(self, spec_version: int | None = None) -> list[SubmissionModel]:
+    async def get_evaluating_submissions(
+        self, spec_version: int | None = None
+    ) -> list[SubmissionModel]:
         """Get submissions currently being evaluated.
 
         Args:
             spec_version: If provided, only return submissions matching this version
         """
         async with self.session_factory() as session:
-            query = select(SubmissionModel).where(SubmissionModel.status == SubmissionStatus.EVALUATING)
+            query = select(SubmissionModel).where(
+                SubmissionModel.status == SubmissionStatus.EVALUATING
+            )
             if spec_version is not None:
                 query = query.where(SubmissionModel.spec_version == spec_version)
             result = await session.execute(query.order_by(SubmissionModel.created_at))
@@ -342,34 +350,38 @@ class Database:
         self,
         current_block: int,
         base_threshold: float = 0.01,
-        decay_rate: float = 0.95,
+        decay_percent: float = 0.05,
         decay_interval_blocks: int = 100,
     ) -> float:
         """Get the current adaptive threshold with decay applied.
 
         The threshold decays towards base_threshold over time.
-        threshold = base + (peak - base) * decay^(blocks_since_update / interval)
+        Each interval, it loses decay_percent (5%) of the excess above base.
+        Formula: threshold = base + (current - base) * (1 - decay_percent)^steps
 
         Args:
             current_block: Current block number
             base_threshold: Minimum threshold (default 1%)
-            decay_rate: Decay multiplier per interval (default 0.95)
+            decay_percent: Percent of excess to lose per interval (default 5%)
             decay_interval_blocks: Blocks between decay steps
 
         Returns:
             Current threshold value
         """
         async with self.session_factory() as session:
-            result = await session.execute(select(AdaptiveThresholdModel).where(AdaptiveThresholdModel.id == 1))
+            result = await session.execute(
+                select(AdaptiveThresholdModel).where(AdaptiveThresholdModel.id == 1)
+            )
             state = result.scalar_one_or_none()
 
             if state is None:
                 return base_threshold
 
             # Calculate decay based on blocks elapsed
+            # Each step loses decay_percent of the excess above base
             blocks_elapsed = max(0, current_block - state.last_update_block)
             decay_steps = blocks_elapsed / decay_interval_blocks
-            decay_factor = decay_rate ** decay_steps
+            decay_factor = (1.0 - decay_percent) ** decay_steps
 
             # Decay from current threshold towards base
             decayed = base_threshold + (state.current_threshold - base_threshold) * decay_factor
@@ -381,38 +393,35 @@ class Database:
         old_score: float,
         current_block: int,
         base_threshold: float = 0.01,
-        max_threshold: float = 0.50,
-        improvement_multiplier: float = 2.0,
     ) -> float:
         """Update threshold when a new leader is established.
 
-        Threshold increases based on the improvement magnitude:
-        - Small improvement (1-5%): threshold stays low
-        - Big improvement (50%+): threshold becomes high
+        Threshold = improvement percentage (no multiplier).
+        e.g., if new leader is 20% better, threshold becomes 20%.
 
         Args:
             new_score: New leader's score
             old_score: Previous leader's score
             current_block: Current block number
             base_threshold: Minimum threshold
-            max_threshold: Maximum threshold cap
-            improvement_multiplier: Threshold = improvement * multiplier
 
         Returns:
             New threshold value
         """
         async with self.session_factory() as session:
-            result = await session.execute(select(AdaptiveThresholdModel).where(AdaptiveThresholdModel.id == 1))
+            result = await session.execute(
+                select(AdaptiveThresholdModel).where(AdaptiveThresholdModel.id == 1)
+            )
             state = result.scalar_one_or_none()
 
-            # Calculate improvement ratio
+            # Calculate improvement ratio (this becomes the new threshold directly)
             if old_score > 0:
                 improvement = (new_score - old_score) / old_score
             else:
-                improvement = 1.0  # First submission, use max
+                improvement = base_threshold  # First submission, use base
 
-            # New threshold based on improvement
-            new_threshold = min(max_threshold, max(base_threshold, improvement * improvement_multiplier))
+            # New threshold = improvement (no multiplier, no max cap)
+            new_threshold = max(base_threshold, improvement)
 
             if state is None:
                 # Create new state

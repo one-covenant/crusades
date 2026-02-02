@@ -12,6 +12,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
+from crusades.config import get_hparams
 from crusades.tui.client import (
     CrusadesClient,
     CrusadesData,
@@ -171,13 +172,15 @@ def create_stats_panel(data: CrusadesData) -> Panel:
     stats.add_column(justify="center")
     stats.add_column(justify="center")
 
-    # Format threshold percentage
-    threshold_pct = threshold.get("decayed_threshold", 0.01) * 100
+    # Calculate MFU to Beat: top_mfu * (1 + threshold)
+    top_mfu = overview.get("current_top_score", 0)
+    threshold_val = threshold.get("decayed_threshold", 0.01)
+    mfu_to_beat = top_mfu * (1 + threshold_val) if top_mfu > 0 else 0
 
     stats.add_row(
         Text(f"24h Submissions\n{overview.get('submissions_24h', 0)}", justify="center"),
-        Text(f"Top MFU\n{overview.get('current_top_score', 0):.1f}%", justify="center"),
-        Text(f"Threshold\n{threshold_pct:.1f}%", justify="center"),
+        Text(f"Top MFU\n{top_mfu:.1f}%", justify="center"),
+        Text(f"MFU to Beat\n{mfu_to_beat:.1f}%", justify="center"),
         Text(f"Active Miners\n{overview.get('active_miners', 0)}", justify="center"),
         Text(f"Total\n{overview.get('total_submissions', 0)}", justify="center"),
     )
@@ -606,23 +609,26 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False, db_path: s
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
 
-    # Select client based on mode
+    # Select client based on mode (filter by spec_version)
+    hparams = get_hparams()
+    spec_version = hparams.spec_version
+
     if demo:
         client_class = MockClient
-        client_args = ()
+        client_kwargs = {}
     elif db_path:
         client_class = DatabaseClient
-        client_args = (db_path,)
+        client_kwargs = {"db_path": db_path, "spec_version": spec_version}
     else:
         client_class = CrusadesClient
-        client_args = (base_url,)
+        client_kwargs = {"base_url": base_url}
 
     # Hide cursor and set up alternate screen buffer
     print("\033[?25l", end="", flush=True)  # Hide cursor
     print("\033[?1049h", end="", flush=True)  # Use alternate screen buffer
 
     try:
-        with client_class(*client_args) as client:
+        with client_class(**client_kwargs) as client:
             # State
             data = client.fetch_all()
             current_view = "dashboard"

@@ -28,16 +28,11 @@ class StorageConfig(BaseModel):
 class VerificationConfig(BaseModel):
     """Verification settings using gradient-based checks."""
 
-    deterministic_mode: bool = True
-    use_random_init: bool = True  # Use random weights to prevent pretrained cheating
-    loss_ratio_min: float = 0.8  # Minimum allowed loss ratio (candidate/reference)
-    loss_ratio_max: float = 1.2  # Maximum allowed loss ratio (candidate/reference)
-    min_trainable_params_ratio: float = 1.0  # 100% of params must be trainable
-    min_params_changed_ratio: float = 0.8  # 80% of params must change (higher with random init)
-    # Gradient-based verification (replaces logits comparison)
-    gradient_cosine_min: float = 0.8  # Minimum cosine similarity between gradients
-    gradient_norm_ratio_min: float = 0.5  # Min ratio of candidate/reference gradient norm
-    gradient_norm_ratio_max: float = 2.0  # Max ratio of candidate/reference gradient norm
+    max_loss_difference: float = 0.5
+    min_params_changed_ratio: float = 0.8
+    gradient_cosine_min: float = 0.8
+    gradient_norm_ratio_min: float = 0.5
+    gradient_norm_ratio_max: float = 2.0
 
 
 class MFUConfig(BaseModel):
@@ -51,15 +46,13 @@ class AdaptiveThresholdConfig(BaseModel):
     """Adaptive decay threshold for leaderboard replacement.
 
     Instead of a fixed 1% threshold, we use an adaptive threshold that:
-    - Increases when big improvements happen (rewards big jumps)
-    - Decays over time towards base_threshold
+    - Sets threshold = improvement when new leader wins
+    - Decays over time towards base_threshold (loses decay_percent each interval)
     """
 
     base_threshold: float = 0.01  # Minimum threshold (1%)
-    max_threshold: float = 0.50  # Maximum threshold (50%)
-    decay_rate: float = 0.95  # Decay multiplier per interval
-    decay_interval_blocks: int = 100  # Blocks between decay steps
-    improvement_multiplier: float = 2.0  # Threshold = improvement * multiplier
+    decay_percent: float = 0.05  # Percent to lose per interval (5% = loses 5% of excess)
+    decay_interval_blocks: int = 100  # Blocks between decay steps (~20 min)
 
 
 class DockerConfig(BaseModel):

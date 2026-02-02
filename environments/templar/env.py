@@ -369,7 +369,7 @@ def _capture_gradients(model: torch.nn.Module) -> GradientInfo:
         else:
             layers_without_grad += 1
 
-    grad_norm = total_norm_sq ** 0.5
+    grad_norm = total_norm_sq**0.5
 
     # Log layer gradient coverage
     total_layers = layers_with_grad + layers_without_grad
@@ -424,7 +424,9 @@ def _verify_trainable_params(
         logger.error(f"[FAILED] {error}")
         return False, error, details
 
-    logger.info(f"[PASSED] Trainable params check ({trainable_ratio:.1%} >= {min_trainable_ratio:.0%})")
+    logger.info(
+        f"[PASSED] Trainable params check ({trainable_ratio:.1%} >= {min_trainable_ratio:.0%})"
+    )
     return True, None, details
 
 
@@ -463,7 +465,9 @@ def _verify_params_changed(
         logger.error(f"[FAILED] {error}")
         return False, error, details
 
-    logger.info(f"[PASSED] Parameter changes check ({changed_ratio:.1%} >= {min_changed_ratio:.0%})")
+    logger.info(
+        f"[PASSED] Parameter changes check ({changed_ratio:.1%} >= {min_changed_ratio:.0%})"
+    )
     return True, None, details
 
 
@@ -633,7 +637,9 @@ def _verify_gradients(
         grad_coverage = candidate_grad.layers_with_grad / candidate_grad.total_layers
         details["gradient_coverage"] = grad_coverage
         logger.info(f"[CHECK 0/3] Gradient coverage: {grad_coverage:.1%}")
-        logger.info(f"   Layers with gradients: {candidate_grad.layers_with_grad}/{candidate_grad.total_layers}")
+        logger.info(
+            f"   Layers with gradients: {candidate_grad.layers_with_grad}/{candidate_grad.total_layers}"
+        )
 
         if grad_coverage < 1.0:
             error = (
@@ -685,9 +691,7 @@ def _verify_gradients(
             return False, error, details
 
         # Calculate cosine similarity
-        cosine_sim = F.cosine_similarity(
-            ref_vec.unsqueeze(0), cand_vec.unsqueeze(0)
-        ).item()
+        cosine_sim = F.cosine_similarity(ref_vec.unsqueeze(0), cand_vec.unsqueeze(0)).item()
         details["cosine_similarity"] = cosine_sim
 
         logger.info(f"[CHECK 2/3] Gradient cosine similarity: {cosine_sim:.4f}")
@@ -717,8 +721,7 @@ def _verify_outputs(
     expected_tokens: int,
     reference_grad: GradientInfo | None = None,
     candidate_grad: GradientInfo | None = None,
-    loss_ratio_min: float = 0.8,
-    loss_ratio_max: float = 1.2,
+    max_loss_difference: float = 0.5,
     gradient_cosine_min: float = 0.8,
     gradient_norm_ratio_min: float = 0.5,
     gradient_norm_ratio_max: float = 2.0,
@@ -727,7 +730,7 @@ def _verify_outputs(
 
     Verification checks:
     1. Token count matches expected
-    2. Loss is valid and matches reference within ratio
+    2. Loss is valid and similar to reference (small difference)
     3. Gradient-based verification (replaces logits comparison)
 
     Args:
@@ -736,8 +739,7 @@ def _verify_outputs(
         expected_tokens: Expected token count
         reference_grad: Reference gradients for comparison
         candidate_grad: Candidate gradients for comparison
-        loss_ratio_min: Minimum allowed loss ratio
-        loss_ratio_max: Maximum allowed loss ratio
+        max_loss_difference: Maximum allowed |candidate_loss - reference_loss|
         gradient_cosine_min: Minimum gradient cosine similarity
         gradient_norm_ratio_min: Min gradient norm ratio
         gradient_norm_ratio_max: Max gradient norm ratio
@@ -759,7 +761,9 @@ def _verify_outputs(
     logger.info("=" * 60)
 
     # 1. Verify token count matches expected
-    logger.info(f"[CHECK 1/3] Token count: expected={expected_tokens}, got={candidate.total_tokens}")
+    logger.info(
+        f"[CHECK 1/3] Token count: expected={expected_tokens}, got={candidate.total_tokens}"
+    )
     if candidate.total_tokens != expected_tokens:
         error = f"Token count mismatch: expected {expected_tokens}, got {candidate.total_tokens}"
         details["checks_failed"].append({"check": "token_count", "error": error})
@@ -768,7 +772,7 @@ def _verify_outputs(
     details["checks_passed"].append("token_count")
     logger.info("[PASSED] Token count matches")
 
-    # 2. Verify loss is reasonable
+    # 2. Verify loss is reasonable and similar to reference
     logger.info(f"[CHECK 2/3] Loss validity: candidate_loss={candidate.final_loss:.6f}")
     if candidate.final_loss != candidate.final_loss:  # NaN check
         error = "Loss is NaN"
@@ -781,22 +785,28 @@ def _verify_outputs(
         logger.error(f"[FAILED] {error}")
         return False, error, details
 
-    # Compare losses
+    # Compare losses - check absolute difference
     if reference is not None and reference.final_loss > 0:
-        loss_ratio = candidate.final_loss / reference.final_loss
-        details["loss_ratio"] = loss_ratio
-        logger.info(f"   Loss ratio: {loss_ratio:.4f} (allowed: {loss_ratio_min}-{loss_ratio_max})")
+        loss_difference = abs(candidate.final_loss - reference.final_loss)
+        details["loss_difference"] = loss_difference
+        logger.info(
+            f"   Reference loss: {reference.final_loss:.4f}, "
+            f"Candidate loss: {candidate.final_loss:.4f}"
+        )
+        logger.info(
+            f"   Loss difference: {loss_difference:.4f} (max allowed: {max_loss_difference})"
+        )
 
-        if loss_ratio < loss_ratio_min or loss_ratio > loss_ratio_max:
+        if loss_difference > max_loss_difference:
             error = (
-                f"Loss mismatch: candidate={candidate.final_loss:.4f}, "
-                f"reference={reference.final_loss:.4f}, ratio={loss_ratio:.2f}"
+                f"Loss difference too large: candidate={candidate.final_loss:.4f}, "
+                f"reference={reference.final_loss:.4f}, diff={loss_difference:.4f} > {max_loss_difference}"
             )
             details["checks_failed"].append({"check": "loss_comparison", "error": error})
             logger.error(f"[FAILED] {error}")
             return False, error, details
     details["checks_passed"].append("loss_validity")
-    logger.info("[PASSED] Loss is valid and matches reference")
+    logger.info("[PASSED] Loss is valid and similar to reference")
 
     # 3. Gradient-based verification (replaces logits comparison)
     logger.info("[CHECK 3/3] Gradient verification")
@@ -843,10 +853,9 @@ class Actor:
         data_samples: int = 10000,
         code: str = "",  # Miner's code passed directly
         # Verification settings
-        loss_ratio_min: float = 0.8,
-        loss_ratio_max: float = 1.2,
+        max_loss_difference: float = 0.5,
         use_random_init: bool = True,
-        min_trainable_params_ratio: float = 0.9,
+        min_trainable_params_ratio: float = 1.0,
         min_params_changed_ratio: float = 0.5,
         # Gradient verification (replaces logits)
         gradient_cosine_min: float = 0.8,
@@ -870,8 +879,7 @@ class Actor:
             sequence_length: Sequence length
             data_samples: Number of data samples
             code: Miner's train.py code (passed directly from validator)
-            loss_ratio_min: Minimum allowed loss ratio
-            loss_ratio_max: Maximum allowed loss ratio
+            max_loss_difference: Max allowed |candidate_loss - reference_loss|
             use_random_init: Use random weights (anti-cheat)
             min_trainable_params_ratio: Min % params that must be trainable
             min_params_changed_ratio: Min % params that must change
@@ -1188,8 +1196,7 @@ class Actor:
                 expected_tokens,
                 reference_grad=reference_grad,
                 candidate_grad=candidate_grad,
-                loss_ratio_min=loss_ratio_min,
-                loss_ratio_max=loss_ratio_max,
+                max_loss_difference=max_loss_difference,
                 gradient_cosine_min=gradient_cosine_min,
                 gradient_norm_ratio_min=gradient_norm_ratio_min,
                 gradient_norm_ratio_max=gradient_norm_ratio_max,
@@ -1277,10 +1284,9 @@ class EvaluateRequest(BaseModel):
     data_samples: int = 10000
     code: str  # Miner's train.py code
     # Verification settings
-    loss_ratio_min: float = 0.8
-    loss_ratio_max: float = 1.2
+    max_loss_difference: float = 0.5
     use_random_init: bool = True
-    min_trainable_params_ratio: float = 0.9
+    min_trainable_params_ratio: float = 1.0
     min_params_changed_ratio: float = 0.5
     # Gradient verification
     gradient_cosine_min: float = 0.8
@@ -1333,8 +1339,7 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         sequence_length=request.sequence_length,
         data_samples=request.data_samples,
         code=request.code,
-        loss_ratio_min=request.loss_ratio_min,
-        loss_ratio_max=request.loss_ratio_max,
+        max_loss_difference=request.max_loss_difference,
         use_random_init=request.use_random_init,
         min_trainable_params_ratio=request.min_trainable_params_ratio,
         min_params_changed_ratio=request.min_params_changed_ratio,

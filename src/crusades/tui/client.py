@@ -93,10 +93,10 @@ class MockClient:
     def get_adaptive_threshold(self) -> dict[str, Any]:
         """Mock adaptive threshold."""
         return {
-            "current_threshold": 0.01,
-            "last_improvement": 15.5,
+            "current_threshold": 0.20,
+            "last_improvement": 0.20,
             "last_update_block": 1000,
-            "decayed_threshold": 0.01,
+            "decayed_threshold": 0.15,  # Decayed from 20% to 15%
         }
 
     def fetch_all(self) -> CrusadesData:
@@ -130,12 +130,19 @@ class MockClient:
 class DatabaseClient:
     """Client that reads directly from validator's SQLite database."""
 
-    def __init__(self, db_path: str = "crusades.db"):
+    def __init__(self, db_path: str = "crusades.db", spec_version: int | None = None):
         self.db_path = Path(db_path)
+        self.spec_version = spec_version
         if not self.db_path.exists():
             raise FileNotFoundError(f"Database not found: {db_path}")
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+
+    def _version_filter(self, alias: str = "s") -> str:
+        """Get SQL WHERE clause for spec_version filtering."""
+        if self.spec_version is None:
+            return ""
+        return f" AND {alias}.spec_version = {self.spec_version}"
 
     def close(self):
         self._conn.close()
@@ -161,7 +168,7 @@ class DatabaseClient:
     def get_adaptive_threshold(
         self,
         base_threshold: float = 0.01,
-        decay_rate: float = 0.95,
+        decay_percent: float = 0.05,
         decay_interval_blocks: int = 100,
     ) -> dict[str, Any]:
         """Get current adaptive threshold info.
@@ -196,43 +203,41 @@ class DatabaseClient:
         }
 
     def get_overview(self) -> dict[str, Any]:
-        """Get dashboard overview stats."""
+        """Get dashboard overview stats (filtered by spec_version)."""
         now = datetime.now()
-        # Use space separator to match SQLite datetime format
         day_ago = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        vf = self._version_filter("s")
 
         # Total submissions
-        total = self._query_one("SELECT COUNT(*) as count FROM submissions")
+        total = self._query_one(f"SELECT COUNT(*) as count FROM submissions s WHERE 1=1{vf}")
         total_count = total["count"] if total else 0
 
         # Submissions in last 24h
         recent = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE created_at > ?", (day_ago,)
+            f"SELECT COUNT(*) as count FROM submissions s WHERE created_at > ?{vf}",
+            (day_ago,),
         )
         recent_count = recent["count"] if recent else 0
 
         # Top MFU (rank 1 from leaderboard with adaptive threshold)
-        # This ensures consistency between "Top MFU" stat and leaderboard rank 1
         leaderboard = self.get_leaderboard(limit=1)
         top_score = leaderboard[0]["final_score"] if leaderboard else 0.0
 
-        # Top score from 24 hours ago (best score that existed then)
+        # Top score from 24 hours ago
         top_24h_ago = self._query_one(
-            "SELECT MAX(final_score) as score FROM submissions "
-            "WHERE status = 'finished' AND created_at <= ?",
+            f"SELECT MAX(final_score) as score FROM submissions s "
+            f"WHERE status = 'finished' AND created_at <= ?{vf}",
             (day_ago,),
         )
         score_24h_ago = top_24h_ago["score"] if top_24h_ago and top_24h_ago["score"] else 0.0
 
-        # Calculate improvement percentage (never negative)
+        # Calculate improvement percentage
         if score_24h_ago > 0:
-            # Have baseline from 24h ago
             improvement = max(0, ((top_score - score_24h_ago) / score_24h_ago) * 100)
         elif top_score > 0:
-            # No 24h baseline, use earliest score as reference
             first_score = self._query_one(
-                "SELECT final_score FROM submissions WHERE status = 'finished' "
-                "AND final_score > 0 ORDER BY created_at ASC LIMIT 1"
+                f"SELECT final_score FROM submissions s WHERE status = 'finished' "
+                f"AND final_score > 0{vf} ORDER BY created_at ASC LIMIT 1"
             )
             baseline = (
                 first_score["final_score"] if first_score and first_score["final_score"] else 0.0
@@ -246,7 +251,8 @@ class DatabaseClient:
 
         # Active miners (unique hotkeys in last 24h)
         miners = self._query_one(
-            "SELECT COUNT(DISTINCT miner_hotkey) as count FROM submissions WHERE created_at > ?",
+            f"SELECT COUNT(DISTINCT miner_hotkey) as count FROM submissions s "
+            f"WHERE created_at > ?{vf}",
             (day_ago,),
         )
         active_miners = miners["count"] if miners else 0
@@ -276,21 +282,24 @@ class DatabaseClient:
             return f"{minutes}m"
 
     def get_validator_status(self) -> dict[str, Any]:
-        """Get validator status."""
+        """Get validator status (filtered by spec_version)."""
         now = datetime.now()
-        # Use space separator to match SQLite datetime format
         hour_ago = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        vf = self._version_filter("s")
 
-        # Evaluations in last hour
+        # Evaluations in last hour (join with submissions for version filter)
         evals = self._query_one(
-            "SELECT COUNT(*) as count FROM evaluations WHERE created_at > ?", (hour_ago,)
+            f"SELECT COUNT(*) as count FROM evaluations e "
+            f"JOIN submissions s ON e.submission_id = s.submission_id "
+            f"WHERE e.created_at > ?{vf}",
+            (hour_ago,),
         )
         eval_count = evals["count"] if evals else 0
 
         # Current evaluation (most recent evaluating submission)
         current = self._query_one(
-            "SELECT submission_id FROM submissions WHERE status = 'evaluating' "
-            "ORDER BY created_at DESC LIMIT 1"
+            f"SELECT submission_id FROM submissions s WHERE status = 'evaluating'{vf} "
+            f"ORDER BY created_at DESC LIMIT 1"
         )
 
         # Queue stats
@@ -298,10 +307,10 @@ class DatabaseClient:
 
         # Success rate
         finished = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE status = 'finished'"
+            f"SELECT COUNT(*) as count FROM submissions s WHERE status = 'finished'{vf}"
         )
         failed = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE status LIKE 'failed%'"
+            f"SELECT COUNT(*) as count FROM submissions s WHERE status LIKE 'failed%'{vf}"
         )
         finished_count = finished["count"] if finished else 0
         failed_count = failed["count"] if failed else 0
@@ -309,12 +318,12 @@ class DatabaseClient:
         success_rate = (finished_count / total * 100) if total > 0 else 0
 
         # Calculate uptime from first submission
-        first_submission = self._query_one("SELECT MIN(created_at) as start_time FROM submissions")
+        first_submission = self._query_one(
+            f"SELECT MIN(created_at) as start_time FROM submissions s WHERE 1=1{vf}"
+        )
         if first_submission and first_submission["start_time"]:
             try:
-                # Parse the timestamp (handles both ISO and SQLite formats)
                 start_str = first_submission["start_time"]
-                # Replace space with T for fromisoformat compatibility
                 start_str = start_str.replace(" ", "T")
                 start_time = datetime.fromisoformat(start_str)
                 uptime_seconds = (now - start_time).total_seconds()
@@ -337,25 +346,14 @@ class DatabaseClient:
         }
 
     def get_leaderboard(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Get leaderboard entries with adaptive threshold for position changes.
-
-        A new submission only gets placed ABOVE an existing entry if it beats
-        that entry by more than the current threshold. This gives incumbents
-        stability - they keep their position unless significantly beaten.
-
-        Submissions are processed in order of creation (oldest first), and each
-        new submission finds its position by comparing against existing entries.
-
-        Ranks are strictly sequential: 1, 2, 3, 4...
-        """
-        # Get all finished submissions ordered by created_at (oldest first)
-        # This ensures earlier submissions have "incumbent advantage"
+        """Get leaderboard entries with adaptive threshold (filtered by spec_version)."""
+        vf = self._version_filter("s")
         rows = self._query(
-            """SELECT s.submission_id, s.miner_hotkey, s.miner_uid, s.final_score,
+            f"""SELECT s.submission_id, s.miner_hotkey, s.miner_uid, s.final_score,
                       s.created_at, COUNT(e.evaluation_id) as eval_count
                FROM submissions s
                LEFT JOIN evaluations e ON s.submission_id = e.submission_id
-               WHERE s.status = ? AND s.final_score IS NOT NULL
+               WHERE s.status = ? AND s.final_score IS NOT NULL{vf}
                GROUP BY s.submission_id
                ORDER BY s.created_at ASC""",
             (SubmissionStatus.FINISHED,),
@@ -399,13 +397,14 @@ class DatabaseClient:
         return leaderboard[:limit]
 
     def get_recent_submissions(self) -> list[dict[str, Any]]:
-        """Get recent submissions (all final statuses)."""
+        """Get recent submissions (filtered by spec_version)."""
+        vf = self._version_filter("s")
         rows = self._query(
-            "SELECT submission_id, miner_hotkey, miner_uid, status, final_score, "
-            "created_at, error_message FROM submissions "
-            "WHERE status IN ('finished', 'failed_validation', 'failed_evaluation', "
-            "'failed_copy', 'error') "
-            "ORDER BY created_at DESC LIMIT 20"
+            f"SELECT submission_id, miner_hotkey, miner_uid, status, final_score, "
+            f"created_at, error_message FROM submissions s "
+            f"WHERE status IN ('finished', 'failed_validation', 'failed_evaluation', "
+            f"'failed_copy', 'error'){vf} "
+            f"ORDER BY created_at DESC LIMIT 20"
         )
 
         recent = []
@@ -424,25 +423,24 @@ class DatabaseClient:
         return recent
 
     def get_queue_stats(self) -> dict[str, Any]:
-        """Get queue statistics."""
-        # Pending + validating = queued
+        """Get queue statistics (filtered by spec_version)."""
+        vf = self._version_filter("s")
+
         queued = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE status IN ('pending', 'validating')"
+            f"SELECT COUNT(*) as count FROM submissions s "
+            f"WHERE status IN ('pending', 'validating'){vf}"
         )
 
-        # Running = evaluating
         running = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE status = 'evaluating'"
+            f"SELECT COUNT(*) as count FROM submissions s WHERE status = 'evaluating'{vf}"
         )
 
-        # Finished
         finished = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE status = 'finished'"
+            f"SELECT COUNT(*) as count FROM submissions s WHERE status = 'finished'{vf}"
         )
 
-        # All failures
         failed = self._query_one(
-            "SELECT COUNT(*) as count FROM submissions WHERE status IN (?, ?, ?)",
+            f"SELECT COUNT(*) as count FROM submissions s WHERE status IN (?, ?, ?){vf}",
             (
                 SubmissionStatus.FAILED_VALIDATION,
                 SubmissionStatus.FAILED_EVALUATION,
@@ -450,10 +448,9 @@ class DatabaseClient:
             ),
         )
 
-        # Average score
         avg = self._query_one(
-            "SELECT AVG(final_score) as avg FROM submissions "
-            "WHERE status = 'finished' AND final_score IS NOT NULL"
+            f"SELECT AVG(final_score) as avg FROM submissions s "
+            f"WHERE status = 'finished' AND final_score IS NOT NULL{vf}"
         )
 
         return {
@@ -467,17 +464,13 @@ class DatabaseClient:
         }
 
     def get_history(self) -> list[dict[str, Any]]:
-        """Get MFU history for chart - shows rank 1 MFU progression over time.
-
-        Uses the same adaptive threshold as the leaderboard - the chart only shows
-        MFU going up when a submission beats the incumbent by more than threshold.
-        """
-        # Get ALL finished submissions ordered by time
+        """Get MFU history for chart (filtered by spec_version)."""
+        vf = self._version_filter("s")
         rows = self._query(
-            "SELECT submission_id, final_score as mfu, created_at "
-            "FROM submissions "
-            "WHERE status = 'finished' AND final_score IS NOT NULL "
-            "ORDER BY created_at ASC"
+            f"SELECT submission_id, final_score as mfu, created_at "
+            f"FROM submissions s "
+            f"WHERE status = 'finished' AND final_score IS NOT NULL{vf} "
+            f"ORDER BY created_at ASC"
         )
 
         history = []
