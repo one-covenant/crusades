@@ -21,6 +21,7 @@ class CrusadesData:
     recent: list[dict[str, Any]]
     queue: dict[str, Any]
     history: list[dict[str, Any]]
+    threshold: dict[str, Any] | None = None  # Adaptive threshold info
 
 
 @dataclass
@@ -89,6 +90,15 @@ class MockClient:
     def get_history(self) -> list[dict[str, Any]]:
         return self._history
 
+    def get_adaptive_threshold(self) -> dict[str, Any]:
+        """Mock adaptive threshold."""
+        return {
+            "current_threshold": 0.01,
+            "last_improvement": 15.5,
+            "last_update_block": 1000,
+            "decayed_threshold": 0.01,
+        }
+
     def fetch_all(self) -> CrusadesData:
         return CrusadesData(
             overview=self.get_overview(),
@@ -97,6 +107,7 @@ class MockClient:
             recent=self.get_recent_submissions(),
             queue=self.get_queue_stats(),
             history=self.get_history(),
+            threshold=self.get_adaptive_threshold(),
         )
 
     def get_submission(self, submission_id: str) -> dict[str, Any]:
@@ -146,6 +157,43 @@ class DatabaseClient:
         cursor = self._conn.execute(sql, params)
         row = cursor.fetchone()
         return dict(row) if row else None
+
+    def get_adaptive_threshold(
+        self,
+        base_threshold: float = 0.01,
+        decay_rate: float = 0.95,
+        decay_interval_blocks: int = 100,
+    ) -> dict[str, Any]:
+        """Get current adaptive threshold info.
+
+        Calculates the decayed threshold based on stored state.
+        """
+        try:
+            row = self._query_one(
+                "SELECT current_threshold, last_improvement, last_update_block, updated_at "
+                "FROM adaptive_threshold WHERE id = 1"
+            )
+        except sqlite3.OperationalError:
+            # Table doesn't exist yet
+            row = None
+
+        if not row:
+            return {
+                "current_threshold": base_threshold,
+                "last_improvement": 0.0,
+                "last_update_block": 0,
+                "decayed_threshold": base_threshold,
+            }
+
+        # Calculate decay (simplified - we don't have current block in TUI)
+        # Just show stored values
+        return {
+            "current_threshold": row["current_threshold"],
+            "last_improvement": row["last_improvement"],
+            "last_update_block": row["last_update_block"],
+            "decayed_threshold": row["current_threshold"],  # Approximate
+            "updated_at": row["updated_at"],
+        }
 
     def get_overview(self) -> dict[str, Any]:
         """Get dashboard overview stats."""
@@ -289,11 +337,11 @@ class DatabaseClient:
         }
 
     def get_leaderboard(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Get leaderboard entries with 1% threshold for position changes.
+        """Get leaderboard entries with adaptive threshold for position changes.
 
         A new submission only gets placed ABOVE an existing entry if it beats
-        that entry by more than 1%. This gives incumbents stability - they keep
-        their position unless significantly beaten.
+        that entry by more than the current threshold. This gives incumbents
+        stability - they keep their position unless significantly beaten.
 
         Submissions are processed in order of creation (oldest first), and each
         new submission finds its position by comparing against existing entries.
@@ -313,8 +361,9 @@ class DatabaseClient:
             (SubmissionStatus.FINISHED,),
         )
 
-        # 1% threshold - must beat incumbent by more than this to take their spot
-        rank_threshold = 0.01
+        # Get adaptive threshold (defaults to 1% if not set)
+        threshold_info = self.get_adaptive_threshold()
+        rank_threshold = threshold_info["decayed_threshold"]
 
         # Build leaderboard incrementally (oldest submissions first)
         leaderboard: list[dict[str, Any]] = []
@@ -418,14 +467,14 @@ class DatabaseClient:
         }
 
     def get_history(self) -> list[dict[str, Any]]:
-        """Get TPS history for chart - shows rank 1 TPS progression over time.
+        """Get MFU history for chart - shows rank 1 MFU progression over time.
 
-        Uses the same 1% threshold as the leaderboard - the chart only shows
-        TPS going up when a submission beats the incumbent by >1%.
+        Uses the same adaptive threshold as the leaderboard - the chart only shows
+        MFU going up when a submission beats the incumbent by more than threshold.
         """
         # Get ALL finished submissions ordered by time
         rows = self._query(
-            "SELECT submission_id, final_score as tps, created_at "
+            "SELECT submission_id, final_score as mfu, created_at "
             "FROM submissions "
             "WHERE status = 'finished' AND final_score IS NOT NULL "
             "ORDER BY created_at ASC"
@@ -433,20 +482,22 @@ class DatabaseClient:
 
         history = []
         running_best = 0.0
-        rank_threshold = 0.01  # 1% threshold, same as leaderboard
+        # Get adaptive threshold (defaults to 1% if not set)
+        threshold_info = self.get_adaptive_threshold()
+        rank_threshold = threshold_info["decayed_threshold"]
 
         for row in rows:
-            tps = row["tps"] or 0.0
-            # Only update running_best if it beats incumbent by >1%
-            # This matches the leaderboard 1% threshold logic
+            mfu = row["mfu"] or 0.0
+            # Only update running_best if it beats incumbent by >threshold
+            # This matches the leaderboard adaptive threshold logic
             threshold_score = running_best * (1 + rank_threshold)
-            if tps > threshold_score:
-                running_best = tps
+            if mfu > threshold_score:
+                running_best = mfu
 
             history.append(
                 {
                     "submission_id": row["submission_id"],
-                    "tps": running_best,  # Show rank 1 TPS so far (with threshold)
+                    "mfu": running_best,  # Show rank 1 MFU so far (with threshold)
                     "timestamp": row["created_at"],
                 }
             )
@@ -461,6 +512,7 @@ class DatabaseClient:
             recent=self.get_recent_submissions(),
             queue=self.get_queue_stats(),
             history=self.get_history(),
+            threshold=self.get_adaptive_threshold(),
         )
 
     def get_submission(self, submission_id: str) -> dict[str, Any]:
@@ -583,10 +635,22 @@ class CrusadesClient:
         return data
 
     def get_history(self) -> list[dict[str, Any]]:
-        """Get TPS history."""
+        """Get MFU history."""
         data = self._get("/api/stats/history")
         if not data or not isinstance(data, list):
             return []
+        return data
+
+    def get_adaptive_threshold(self) -> dict[str, Any]:
+        """Get current adaptive threshold."""
+        data = self._get("/api/stats/threshold")
+        if not data:
+            return {
+                "current_threshold": 0.01,
+                "last_improvement": 0.0,
+                "last_update_block": 0,
+                "decayed_threshold": 0.01,
+            }
         return data
 
     def fetch_all(self) -> CrusadesData:
@@ -598,6 +662,7 @@ class CrusadesClient:
             recent=self.get_recent_submissions(),
             queue=self.get_queue_stats(),
             history=self.get_history(),
+            threshold=self.get_adaptive_threshold(),
         )
 
     def get_submission(self, submission_id: str) -> dict[str, Any]:
