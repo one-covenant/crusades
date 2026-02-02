@@ -231,7 +231,7 @@ MOCK_SUBMISSIONS = {
         "status": "finished",
         "created_at": "2026-01-07T10:30:00Z",
         "updated_at": "2026-01-07T10:35:00Z",
-        "final_score": 4302,
+        "final_score": 43.0,  # MFU %
         "error_message": None,
     },
     "sub_002": {
@@ -242,7 +242,7 @@ MOCK_SUBMISSIONS = {
         "status": "finished",
         "created_at": "2026-01-07T09:15:00Z",
         "updated_at": "2026-01-07T09:20:00Z",
-        "final_score": 4156,
+        "final_score": 41.6,  # MFU %
         "error_message": None,
     },
     "sub_fail_001": {
@@ -322,6 +322,7 @@ MOCK_EVALUATIONS = {
             "evaluation_id": "eval_004",
             "submission_id": "sub_002",
             "evaluator_hotkey": "5Validator...",
+            "mfu": 41.6,  # MFU %
             "tokens_per_second": 4160,
             "total_tokens": 40960,
             "wall_time_seconds": 9.85,
@@ -333,6 +334,7 @@ MOCK_EVALUATIONS = {
             "evaluation_id": "eval_005",
             "submission_id": "sub_002",
             "evaluator_hotkey": "5Validator...",
+            "mfu": 41.5,  # MFU %
             "tokens_per_second": 4152,
             "total_tokens": 40960,
             "wall_time_seconds": 9.87,
@@ -344,6 +346,7 @@ MOCK_EVALUATIONS = {
             "evaluation_id": "eval_006",
             "submission_id": "sub_002",
             "evaluator_hotkey": "5Validator...",
+            "mfu": 41.6,  # MFU %
             "tokens_per_second": 4156,
             "total_tokens": 40960,
             "wall_time_seconds": 9.86,
