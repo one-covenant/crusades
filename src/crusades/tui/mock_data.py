@@ -287,6 +287,7 @@ MOCK_EVALUATIONS = {
             "evaluation_id": "eval_001",
             "submission_id": "sub_001",
             "evaluator_hotkey": "5Validator...",
+            "mfu": 43.2,  # MFU %
             "tokens_per_second": 4315,
             "total_tokens": 40960,
             "wall_time_seconds": 9.49,
@@ -298,6 +299,7 @@ MOCK_EVALUATIONS = {
             "evaluation_id": "eval_002",
             "submission_id": "sub_001",
             "evaluator_hotkey": "5Validator...",
+            "mfu": 42.9,  # MFU %
             "tokens_per_second": 4289,
             "total_tokens": 40960,
             "wall_time_seconds": 9.55,
@@ -309,6 +311,7 @@ MOCK_EVALUATIONS = {
             "evaluation_id": "eval_003",
             "submission_id": "sub_001",
             "evaluator_hotkey": "5Validator...",
+            "mfu": 43.0,  # MFU %
             "tokens_per_second": 4302,
             "total_tokens": 40960,
             "wall_time_seconds": 9.52,

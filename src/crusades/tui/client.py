@@ -211,8 +211,8 @@ class DatabaseClient:
         )
         recent_count = recent["count"] if recent else 0
 
-        # Top score (rank 1 from leaderboard with 1% threshold)
-        # This ensures consistency between "Current Top TPS" and leaderboard rank 1
+        # Top MFU (rank 1 from leaderboard with adaptive threshold)
+        # This ensures consistency between "Top MFU" stat and leaderboard rank 1
         leaderboard = self.get_leaderboard(limit=1)
         top_score = leaderboard[0]["final_score"] if leaderboard else 0.0
 
@@ -381,7 +381,7 @@ class DatabaseClient:
             }
 
             # Find insertion position (scan from top)
-            # New entry only goes above existing if it beats them by >1%
+            # New entry only goes above existing if it beats them by >threshold
             insert_pos = len(leaderboard)  # Default: add at bottom
             for i, existing in enumerate(leaderboard):
                 threshold_score = existing["final_score"] * (1 + rank_threshold)
