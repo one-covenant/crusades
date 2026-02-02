@@ -1,4 +1,4 @@
-"""Weight setting logic with configurable burn rate."""
+"""Weight setting logic with configurable burn rate and adaptive threshold."""
 
 import logging
 
@@ -14,13 +14,13 @@ class WeightSetter:
 
     Implements burn_rate distribution:
     - burn_rate portion (e.g., 95%) goes to burn_uid (validator)
-    - (1 - burn_rate) portion (e.g., 5%) goes to top TPS winner (leaderboard rank 1)
+    - (1 - burn_rate) portion (e.g., 5%) goes to top MFU winner (leaderboard rank 1)
 
     If no valid winner exists, all emissions go to burn_uid.
 
-    The leaderboard uses a 1% threshold - a new submission only takes rank 1
-    if it beats the incumbent by more than 1%. This prevents small fluctuations
-    from constantly changing the winner.
+    The leaderboard uses an adaptive threshold that:
+    - Increases when big improvements happen (rewards big jumps)
+    - Decays over time towards base_threshold (1%)
     """
 
     def __init__(
@@ -37,6 +37,10 @@ class WeightSetter:
         self.burn_rate = self.hparams.burn_rate  # e.g., 0.95 = 95% to validator
         self.burn_uid = self.hparams.burn_uid  # UID that receives burn portion
 
+        # Track previous winner to detect changes
+        self._previous_winner_id: str | None = None
+        self._previous_winner_score: float = 0.0
+
     async def set_weights(self) -> tuple[bool, str]:
         """Set weights based on leaderboard rank 1 with burn_rate distribution.
 
@@ -44,8 +48,8 @@ class WeightSetter:
         - burn_rate (e.g., 95%) goes to burn_uid (validator)
         - (1 - burn_rate) (e.g., 5%) goes to leaderboard rank 1
 
-        The leaderboard applies a 1% threshold - incumbents keep their position
-        unless beaten by more than 1%.
+        The leaderboard applies an adaptive threshold that decays over time.
+        Big improvements create high thresholds, rewarding significant jumps.
 
         If no valid winner, 100% goes to burn_uid.
 
@@ -63,9 +67,25 @@ class WeightSetter:
             )
             return False, "Metagraph sync failed - cannot set weights"
 
-        # Get leaderboard rank 1 (with threshold, filtered by current spec_version)
+        # Get current block for adaptive threshold
+        current_block = await self.chain.get_current_block()
+
+        # Get adaptive threshold config
+        threshold_config = self.hparams.adaptive_threshold
+
+        # Get current adaptive threshold (decays over time)
+        current_threshold = await self.db.get_adaptive_threshold(
+            current_block=current_block,
+            base_threshold=threshold_config.base_threshold,
+            decay_rate=threshold_config.decay_rate,
+            decay_interval_blocks=threshold_config.decay_interval_blocks,
+        )
+
+        logger.info(f"Adaptive threshold: {current_threshold:.2%} at block {current_block}")
+
+        # Get leaderboard rank 1 (with adaptive threshold, filtered by spec_version)
         winner = await self.db.get_leaderboard_winner(
-            threshold=0.01,
+            threshold=current_threshold,
             spec_version=self.hparams.spec_version,
         )
 
@@ -88,6 +108,32 @@ class WeightSetter:
 
         winner_score = winner.final_score or 0.0
 
+        # Check if winner changed - if so, update adaptive threshold
+        if winner.submission_id != self._previous_winner_id:
+            if self._previous_winner_id is not None:
+                # New winner! Update adaptive threshold based on improvement
+                new_threshold = await self.db.update_adaptive_threshold(
+                    new_score=winner_score,
+                    old_score=self._previous_winner_score,
+                    current_block=current_block,
+                    base_threshold=threshold_config.base_threshold,
+                    max_threshold=threshold_config.max_threshold,
+                    improvement_multiplier=threshold_config.improvement_multiplier,
+                )
+                improvement = ((winner_score - self._previous_winner_score) / self._previous_winner_score * 100) if self._previous_winner_score > 0 else 100
+                logger.info(
+                    f"NEW LEADER! Threshold updated:\n"
+                    f"  - Previous: {self._previous_winner_score:.2f}% MFU\n"
+                    f"  - New: {winner_score:.2f}% MFU (+{improvement:.1f}%)\n"
+                    f"  - New threshold: {new_threshold:.2%}"
+                )
+            else:
+                logger.info(f"First winner established: {winner_score:.2f}% MFU")
+
+            # Update tracking
+            self._previous_winner_id = winner.submission_id
+            self._previous_winner_score = winner_score
+
         # Calculate weight distribution
         winner_weight = 1.0 - self.burn_rate  # e.g., 5%
         burn_weight = self.burn_rate  # e.g., 95%
@@ -95,7 +141,7 @@ class WeightSetter:
         logger.info(
             f"Setting weights with burn_rate={self.burn_rate:.0%}:\n"
             f"  - UID {self.burn_uid} (validator): {burn_weight:.2f}\n"
-            f"  - UID {winner_uid} (winner, score={winner_score:.2f}): {winner_weight:.2f}"
+            f"  - UID {winner_uid} (winner, MFU={winner_score:.2f}%): {winner_weight:.2f}"
         )
 
         # Set weights for both burn_uid and winner
