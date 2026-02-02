@@ -127,9 +127,18 @@ class Validator(BaseNode):
             model_url=hparams.benchmark_model_name,
             data_url=hparams.benchmark_dataset_name,
             timeout=hparams.eval_timeout,
-            output_tolerance=hparams.verification.output_vector_tolerance,
+            # Verification settings
             loss_ratio_min=hparams.verification.loss_ratio_min,
             loss_ratio_max=hparams.verification.loss_ratio_max,
+            use_random_init=hparams.verification.use_random_init,
+            min_trainable_params_ratio=hparams.verification.min_trainable_params_ratio,
+            min_params_changed_ratio=hparams.verification.min_params_changed_ratio,
+            # Gradient verification
+            gradient_cosine_min=hparams.verification.gradient_cosine_min,
+            gradient_norm_ratio_min=hparams.verification.gradient_norm_ratio_min,
+            gradient_norm_ratio_max=hparams.verification.gradient_norm_ratio_max,
+            # MFU calculation
+            gpu_peak_tflops=hparams.mfu.gpu_peak_tflops,
             # Basilica config
             basilica_image=hparams.basilica.image,
             basilica_ttl_seconds=hparams.basilica.ttl_seconds,
@@ -380,13 +389,14 @@ class Validator(BaseNode):
     async def evaluate_submissions(self) -> None:
         """Evaluate submissions by downloading from code URL.
 
-        The code URL is stored in bucket_path field.
+        Only evaluates submissions matching current spec_version.
         """
         hparams = get_hparams()
-        evaluating = await self.db.get_evaluating_submissions()
+        # Only evaluate submissions from current version
+        evaluating = await self.db.get_evaluating_submissions(spec_version=hparams.spec_version)
         num_runs = hparams.evaluation_runs
 
-        logger.info(f"Found {len(evaluating)} submissions in EVALUATING status")
+        logger.info(f"Found {len(evaluating)} submissions in EVALUATING status (v{hparams.spec_version})")
 
         for submission in evaluating:
             code_url = submission.bucket_path
@@ -439,13 +449,14 @@ class Validator(BaseNode):
                 )
 
                 if result.success:
-                    logger.info(f"Run {current_run} PASSED: {result.tps:,.2f} TPS")
+                    logger.info(f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}")
                 else:
                     logger.warning(f"Run {current_run} FAILED: {result.error}")
 
                 evaluation = EvaluationModel(
                     submission_id=submission.submission_id,
                     evaluator_hotkey=self.hotkey,
+                    mfu=result.mfu,  # MFU is primary metric
                     tokens_per_second=result.tps,
                     total_tokens=result.total_tokens,
                     wall_time_seconds=result.wall_time_seconds,
@@ -466,7 +477,8 @@ class Validator(BaseNode):
             await self._finalize_submission(submission.submission_id, num_runs)
 
     async def _finalize_submission(self, submission_id: str, num_runs: int) -> None:
-        """Calculate final score and update submission status."""
+        """Calculate final score (MFU) and update submission status."""
+        hparams = get_hparams()
         num_evals = await self.db.count_evaluations(submission_id)
         required_evals = num_runs
 
@@ -476,19 +488,35 @@ class Validator(BaseNode):
             all_evals = await self.db.get_evaluations(submission_id)
             successful_evals = [e for e in all_evals if e.success]
 
+            # Check minimum success rate
+            success_rate = len(successful_evals) / len(all_evals) if all_evals else 0
+            min_success_rate = getattr(hparams, "min_success_rate", 0.5)
+
+            if success_rate < min_success_rate:
+                await self.db.update_submission_status(
+                    submission_id,
+                    SubmissionStatus.FAILED_EVALUATION,
+                    error_message=f"Success rate {success_rate:.1%} below minimum {min_success_rate:.0%}",
+                )
+                logger.warning(
+                    f"Submission {submission_id} failed: success rate {success_rate:.1%} < {min_success_rate:.0%}"
+                )
+                return
+
             if successful_evals:
-                tps_scores = [e.tokens_per_second for e in successful_evals]
+                # MFU is the primary metric now
+                mfu_scores = [e.mfu for e in successful_evals]
                 # Use median_low to always return an actual run value (not average of two)
-                median_tps = statistics.median_low(tps_scores)
+                median_mfu = statistics.median_low(mfu_scores)
 
                 logger.info(
                     f"Final score for {submission_id}:\n"
-                    f"   Successful runs: {len(tps_scores)}\n"
-                    f"   Scores: {[f'{s:.1f}' for s in sorted(tps_scores)]}\n"
-                    f"   Median TPS (low): {median_tps:,.2f}"
+                    f"   Successful runs: {len(mfu_scores)}\n"
+                    f"   MFU scores: {[f'{s:.2f}%' for s in sorted(mfu_scores)]}\n"
+                    f"   Median MFU (low): {median_mfu:.2f}%"
                 )
 
-                await self.db.update_submission_score(submission_id, median_tps)
+                await self.db.update_submission_score(submission_id, median_mfu)
             else:
                 await self.db.update_submission_status(
                     submission_id,

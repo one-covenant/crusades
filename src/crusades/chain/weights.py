@@ -63,8 +63,11 @@ class WeightSetter:
             )
             return False, "Metagraph sync failed - cannot set weights"
 
-        # Get leaderboard rank 1 (with 1% threshold applied)
-        winner = await self.db.get_leaderboard_winner(threshold=0.01)
+        # Get leaderboard rank 1 (with threshold, filtered by current spec_version)
+        winner = await self.db.get_leaderboard_winner(
+            threshold=0.01,
+            spec_version=self.hparams.spec_version,
+        )
 
         # If no valid winner, all emissions go to burn_uid
         if winner is None:

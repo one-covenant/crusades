@@ -50,7 +50,8 @@ class EvaluationResult:
     """Result from evaluating a miner's submission."""
 
     success: bool
-    tps: float = 0.0
+    mfu: float = 0.0  # Model FLOPs Utilization (primary metric)
+    tps: float = 0.0  # Tokens per second (secondary metric)
     total_tokens: int = 0
     wall_time_seconds: float = 0.0
     error: str | None = None
@@ -64,6 +65,7 @@ class EvaluationResult:
         """Create from dictionary response."""
         return cls(
             success=data.get("success", False),
+            mfu=float(data.get("mfu", 0.0)),
             tps=float(data.get("tps", 0.0)),
             total_tokens=int(data.get("total_tokens", 0)),
             wall_time_seconds=float(data.get("wall_time_seconds", 0.0)),
@@ -108,7 +110,7 @@ class AffinetesRunner:
 
     def __init__(
         self,
-        mode: Literal["docker", "basilica"] = "docker",
+        mode: Literal["docker", "basilica", "affinetes"] = "docker",
         basilica_endpoint: str | None = None,
         basilica_api_key: str | None = None,
         docker_gpu_devices: str = "all",
@@ -117,9 +119,18 @@ class AffinetesRunner:
         timeout: int = 600,
         model_url: str | None = None,
         data_url: str | None = None,
-        output_tolerance: float = 0.02,
+        # Verification settings
         loss_ratio_min: float = 0.8,
         loss_ratio_max: float = 1.2,
+        use_random_init: bool = True,
+        min_trainable_params_ratio: float = 0.9,
+        min_params_changed_ratio: float = 0.5,
+        # Gradient verification
+        gradient_cosine_min: float = 0.8,
+        gradient_norm_ratio_min: float = 0.5,
+        gradient_norm_ratio_max: float = 2.0,
+        # MFU calculation
+        gpu_peak_tflops: float = 312.0,
         validator_image: str | None = None,
         # Basilica-specific settings
         basilica_image: str | None = None,
@@ -133,7 +144,7 @@ class AffinetesRunner:
         """Initialize the runner.
 
         Args:
-            mode: Execution mode ("docker" for local, "basilica" for remote)
+            mode: Execution mode ("docker", "basilica", or "affinetes")
             basilica_endpoint: Basilica API endpoint (not needed with SDK)
             basilica_api_key: Basilica API key (or BASILICA_API_TOKEN env var)
             docker_gpu_devices: GPU devices for Docker ("all", "0", "0,1", "none")
@@ -142,9 +153,15 @@ class AffinetesRunner:
             timeout: Evaluation timeout in seconds
             model_url: Default model URL (HuggingFace model ID)
             data_url: Default data URL (HuggingFace dataset)
-            output_tolerance: Verification tolerance (0.02 = 2%)
-            loss_ratio_min: Minimum allowed loss ratio (default 0.8)
-            loss_ratio_max: Maximum allowed loss ratio (default 1.2)
+            loss_ratio_min: Minimum allowed loss ratio
+            loss_ratio_max: Maximum allowed loss ratio
+            use_random_init: Use random weights (anti-cheat)
+            min_trainable_params_ratio: Min % params that must be trainable
+            min_params_changed_ratio: Min % params that must change
+            gradient_cosine_min: Min gradient cosine similarity
+            gradient_norm_ratio_min: Min gradient norm ratio
+            gradient_norm_ratio_max: Max gradient norm ratio
+            gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             validator_image: Docker image for local evaluation
             basilica_image: Docker image for Basilica (must be in registry)
             basilica_ttl_seconds: TTL for Basilica deployment (default 1 hour)
@@ -163,9 +180,18 @@ class AffinetesRunner:
         self.timeout = timeout
         self.default_model_url = model_url
         self.default_data_url = data_url
-        self.output_tolerance = output_tolerance
+        # Verification settings
         self.loss_ratio_min = loss_ratio_min
         self.loss_ratio_max = loss_ratio_max
+        self.use_random_init = use_random_init
+        self.min_trainable_params_ratio = min_trainable_params_ratio
+        self.min_params_changed_ratio = min_params_changed_ratio
+        # Gradient verification
+        self.gradient_cosine_min = gradient_cosine_min
+        self.gradient_norm_ratio_min = gradient_norm_ratio_min
+        self.gradient_norm_ratio_max = gradient_norm_ratio_max
+        # MFU calculation
+        self.gpu_peak_tflops = gpu_peak_tflops
         self.validator_image = validator_image or self.DEFAULT_DOCKER_IMAGE
         self.basilica_image = basilica_image or self.DEFAULT_BASILICA_IMAGE
         self.basilica_ttl_seconds = basilica_ttl_seconds
@@ -327,9 +353,18 @@ async def main():
         data_samples={data_samples},
         timeout={self.timeout},
         code=code,
-        output_tolerance={self.output_tolerance},
+        # Verification settings
         loss_ratio_min={self.loss_ratio_min},
         loss_ratio_max={self.loss_ratio_max},
+        use_random_init={self.use_random_init},
+        min_trainable_params_ratio={self.min_trainable_params_ratio},
+        min_params_changed_ratio={self.min_params_changed_ratio},
+        # Gradient verification
+        gradient_cosine_min={self.gradient_cosine_min},
+        gradient_norm_ratio_min={self.gradient_norm_ratio_min},
+        gradient_norm_ratio_max={self.gradient_norm_ratio_max},
+        # MFU calculation
+        gpu_peak_tflops={self.gpu_peak_tflops},
     )
     print("EVAL_RESULT:" + json.dumps(result))
 
@@ -648,9 +683,18 @@ asyncio.run(main())
                 "sequence_length": sequence_length,
                 "data_samples": data_samples,
                 "code": code,
-                "output_tolerance": self.output_tolerance,
+                # Verification settings
                 "loss_ratio_min": self.loss_ratio_min,
                 "loss_ratio_max": self.loss_ratio_max,
+                "use_random_init": self.use_random_init,
+                "min_trainable_params_ratio": self.min_trainable_params_ratio,
+                "min_params_changed_ratio": self.min_params_changed_ratio,
+                # Gradient verification
+                "gradient_cosine_min": self.gradient_cosine_min,
+                "gradient_norm_ratio_min": self.gradient_norm_ratio_min,
+                "gradient_norm_ratio_max": self.gradient_norm_ratio_max,
+                # MFU calculation
+                "gpu_peak_tflops": self.gpu_peak_tflops,
             }
 
             logger.info("[BASILICA] Sending evaluation request...")
@@ -685,6 +729,7 @@ asyncio.run(main())
                 logger.info("=" * 60)
                 logger.info("[BASILICA] Evaluation complete!")
                 logger.info(f"   Success: {result.success}")
+                logger.info(f"   MFU: {result.mfu:.2f}%")
                 logger.info(f"   TPS: {result.tps:,.2f} tokens/second")
                 logger.info(f"   Total tokens: {result.total_tokens:,}")
                 logger.info(f"   Wall time: {result.wall_time_seconds:.2f}s")

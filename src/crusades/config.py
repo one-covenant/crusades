@@ -26,12 +26,40 @@ class StorageConfig(BaseModel):
 
 
 class VerificationConfig(BaseModel):
-    """Verification tolerance settings."""
+    """Verification settings using gradient-based checks."""
 
-    output_vector_tolerance: float = 0.02  # 2% aggregate difference allowed
+    deterministic_mode: bool = True
+    use_random_init: bool = True  # Use random weights to prevent pretrained cheating
     loss_ratio_min: float = 0.8  # Minimum allowed loss ratio (candidate/reference)
     loss_ratio_max: float = 1.2  # Maximum allowed loss ratio (candidate/reference)
-    deterministic_mode: bool = True
+    min_trainable_params_ratio: float = 1.0  # 100% of params must be trainable
+    min_params_changed_ratio: float = 0.8  # 80% of params must change (higher with random init)
+    # Gradient-based verification (replaces logits comparison)
+    gradient_cosine_min: float = 0.8  # Minimum cosine similarity between gradients
+    gradient_norm_ratio_min: float = 0.5  # Min ratio of candidate/reference gradient norm
+    gradient_norm_ratio_max: float = 2.0  # Max ratio of candidate/reference gradient norm
+
+
+class MFUConfig(BaseModel):
+    """MFU (Model FLOPs Utilization) calculation settings."""
+
+    gpu_peak_tflops: float = 312.0  # A100 80GB peak TFLOPS (bfloat16)
+    model_params_billions: float = 3.0  # Model size in billions of parameters
+
+
+class AdaptiveThresholdConfig(BaseModel):
+    """Adaptive decay threshold for leaderboard replacement.
+
+    Instead of a fixed 1% threshold, we use an adaptive threshold that:
+    - Increases when big improvements happen (rewards big jumps)
+    - Decays over time towards base_threshold
+    """
+
+    base_threshold: float = 0.01  # Minimum threshold (1%)
+    max_threshold: float = 0.50  # Maximum threshold (50%)
+    decay_rate: float = 0.95  # Decay multiplier per interval
+    decay_interval_blocks: int = 100  # Blocks between decay steps
+    improvement_multiplier: float = 2.0  # Threshold = improvement * multiplier
 
 
 class DockerConfig(BaseModel):
@@ -83,6 +111,9 @@ class HParams(BaseModel):
     - All settings are defined in hparams.json (no hardcoded defaults)
     """
 
+    # Versioning - increment when making breaking changes
+    spec_version: int = 1
+
     # Network settings
     netuid: int
 
@@ -94,6 +125,7 @@ class HParams(BaseModel):
     evaluation_runs: int
     eval_steps: int
     eval_timeout: int
+    min_success_rate: float = 0.5  # Minimum success rate for submissions
 
     # Benchmark settings
     benchmark_model_name: str
@@ -120,6 +152,12 @@ class HParams(BaseModel):
 
     # Verification (nested config with defaults from JSON)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
+
+    # MFU calculation settings
+    mfu: MFUConfig = Field(default_factory=MFUConfig)
+
+    # Adaptive threshold for leaderboard
+    adaptive_threshold: AdaptiveThresholdConfig = Field(default_factory=AdaptiveThresholdConfig)
 
     # Storage (for evaluation records - not in hparams.json)
     storage: StorageConfig = Field(default_factory=StorageConfig)

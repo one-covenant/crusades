@@ -5,7 +5,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from ..config import get_hparams
 from ..core.protocols import SubmissionStatus
-from .models import Base, EvaluationModel, SubmissionModel, ValidatorStateModel
+from .models import (
+    AdaptiveThresholdModel,
+    Base,
+    EvaluationModel,
+    SubmissionModel,
+    ValidatorStateModel,
+)
 
 
 class Database:
@@ -118,24 +124,30 @@ class Database:
             )
             return list(result.scalars().all())
 
-    async def get_pending_submissions(self) -> list[SubmissionModel]:
-        """Get submissions pending validation."""
+    async def get_pending_submissions(self, spec_version: int | None = None) -> list[SubmissionModel]:
+        """Get submissions pending validation.
+
+        Args:
+            spec_version: If provided, only return submissions matching this version
+        """
         async with self.session_factory() as session:
-            result = await session.execute(
-                select(SubmissionModel)
-                .where(SubmissionModel.status == SubmissionStatus.PENDING)
-                .order_by(SubmissionModel.created_at)
-            )
+            query = select(SubmissionModel).where(SubmissionModel.status == SubmissionStatus.PENDING)
+            if spec_version is not None:
+                query = query.where(SubmissionModel.spec_version == spec_version)
+            result = await session.execute(query.order_by(SubmissionModel.created_at))
             return list(result.scalars().all())
 
-    async def get_evaluating_submissions(self) -> list[SubmissionModel]:
-        """Get submissions currently being evaluated."""
+    async def get_evaluating_submissions(self, spec_version: int | None = None) -> list[SubmissionModel]:
+        """Get submissions currently being evaluated.
+
+        Args:
+            spec_version: If provided, only return submissions matching this version
+        """
         async with self.session_factory() as session:
-            result = await session.execute(
-                select(SubmissionModel)
-                .where(SubmissionModel.status == SubmissionStatus.EVALUATING)
-                .order_by(SubmissionModel.created_at)
-            )
+            query = select(SubmissionModel).where(SubmissionModel.status == SubmissionStatus.EVALUATING)
+            if spec_version is not None:
+                query = query.where(SubmissionModel.spec_version == spec_version)
+            result = await session.execute(query.order_by(SubmissionModel.created_at))
             return list(result.scalars().all())
 
     async def get_latest_submission_by_hotkey(self, hotkey: str) -> SubmissionModel | None:
@@ -190,53 +202,54 @@ class Database:
 
     # Leaderboard operations
 
-    async def get_top_submission(self) -> SubmissionModel | None:
-        """Get the top-scoring finished submission (raw, no threshold)."""
+    async def get_top_submission(self, spec_version: int | None = None) -> SubmissionModel | None:
+        """Get the top-scoring finished submission (raw, no threshold).
+
+        Args:
+            spec_version: If provided, only consider submissions from this version
+        """
         async with self.session_factory() as session:
+            query = select(SubmissionModel).where(
+                SubmissionModel.status == SubmissionStatus.FINISHED,
+                SubmissionModel.final_score.isnot(None),
+            )
+            if spec_version is not None:
+                query = query.where(SubmissionModel.spec_version == spec_version)
             result = await session.execute(
-                select(SubmissionModel)
-                .where(
-                    SubmissionModel.status == SubmissionStatus.FINISHED,
-                    SubmissionModel.final_score.isnot(None),
-                )
-                .order_by(desc(SubmissionModel.final_score))
-                .limit(1)
+                query.order_by(desc(SubmissionModel.final_score)).limit(1)
             )
             return result.scalar_one_or_none()
 
-    async def get_leaderboard_winner(self, threshold: float = 0.01) -> SubmissionModel | None:
-        """Get the rank 1 submission from leaderboard with 1% threshold.
+    async def get_leaderboard_winner(
+        self, threshold: float = 0.01, spec_version: int | None = None
+    ) -> SubmissionModel | None:
+        """Get the rank 1 submission from leaderboard with threshold.
 
         A new submission only beats an incumbent if it's more than `threshold`
-        (default 1%) better. This gives stability to leaders.
-
-        Submissions are processed in order of creation (oldest first).
-        Each new submission only goes above existing ones if it beats them
-        by more than the threshold.
+        better. This gives stability to leaders.
 
         Args:
-            threshold: Minimum improvement ratio to beat incumbent (default 0.01 = 1%)
+            threshold: Minimum improvement ratio to beat incumbent
+            spec_version: If provided, only consider submissions from this version
 
         Returns:
             The submission at rank 1, or None if no finished submissions.
         """
         async with self.session_factory() as session:
             # Get all finished submissions ordered by created_at (oldest first)
-            result = await session.execute(
-                select(SubmissionModel)
-                .where(
-                    SubmissionModel.status == SubmissionStatus.FINISHED,
-                    SubmissionModel.final_score.isnot(None),
-                )
-                .order_by(SubmissionModel.created_at.asc())
+            query = select(SubmissionModel).where(
+                SubmissionModel.status == SubmissionStatus.FINISHED,
+                SubmissionModel.final_score.isnot(None),
             )
+            if spec_version is not None:
+                query = query.where(SubmissionModel.spec_version == spec_version)
+            result = await session.execute(query.order_by(SubmissionModel.created_at.asc()))
             submissions = list(result.scalars().all())
 
             if not submissions:
                 return None
 
             # Build leaderboard with threshold logic
-            # Each new submission only goes above existing if it beats by >threshold
             leaderboard: list[SubmissionModel] = []
 
             for submission in submissions:
@@ -253,44 +266,50 @@ class Database:
 
                 leaderboard.insert(insert_pos, submission)
 
-            # Return rank 1 (first in leaderboard)
             return leaderboard[0] if leaderboard else None
 
-    async def get_leaderboard(self, limit: int = 100) -> list[SubmissionModel]:
-        """Get top submissions by score."""
+    async def get_leaderboard(
+        self, limit: int = 100, spec_version: int | None = None
+    ) -> list[SubmissionModel]:
+        """Get top submissions by score.
+
+        Args:
+            limit: Maximum number of submissions to return
+            spec_version: If provided, only show submissions from this version
+        """
         async with self.session_factory() as session:
+            query = select(SubmissionModel).where(
+                SubmissionModel.status == SubmissionStatus.FINISHED,
+                SubmissionModel.final_score.isnot(None),
+            )
+            if spec_version is not None:
+                query = query.where(SubmissionModel.spec_version == spec_version)
             result = await session.execute(
-                select(SubmissionModel)
-                .where(
-                    SubmissionModel.status == SubmissionStatus.FINISHED,
-                    SubmissionModel.final_score.isnot(None),
-                )
-                .order_by(desc(SubmissionModel.final_score))
-                .limit(limit)
+                query.order_by(desc(SubmissionModel.final_score)).limit(limit)
             )
             return list(result.scalars().all())
 
-    async def get_top_submissions(self, limit: int = 5) -> list[SubmissionModel]:
+    async def get_top_submissions(
+        self, limit: int = 5, spec_version: int | None = None
+    ) -> list[SubmissionModel]:
         """Get top N submissions by score for similarity checking.
-
-        This is used during submission to check if new code is similar
-        to existing top-performing code (anti-copying).
 
         Args:
             limit: Number of top submissions to return (default 5)
+            spec_version: If provided, only consider submissions from this version
 
         Returns:
             List of top submissions sorted by score (highest first)
         """
         async with self.session_factory() as session:
+            query = select(SubmissionModel).where(
+                SubmissionModel.status == SubmissionStatus.FINISHED,
+                SubmissionModel.final_score.isnot(None),
+            )
+            if spec_version is not None:
+                query = query.where(SubmissionModel.spec_version == spec_version)
             result = await session.execute(
-                select(SubmissionModel)
-                .where(
-                    SubmissionModel.status == SubmissionStatus.FINISHED,
-                    SubmissionModel.final_score.isnot(None),
-                )
-                .order_by(desc(SubmissionModel.final_score))
-                .limit(limit)
+                query.order_by(desc(SubmissionModel.final_score)).limit(limit)
             )
             return list(result.scalars().all())
 
@@ -316,6 +335,102 @@ class Database:
             else:
                 session.add(ValidatorStateModel(key=key, value=value))
             await session.commit()
+
+    # Adaptive threshold operations
+
+    async def get_adaptive_threshold(
+        self,
+        current_block: int,
+        base_threshold: float = 0.01,
+        decay_rate: float = 0.95,
+        decay_interval_blocks: int = 100,
+    ) -> float:
+        """Get the current adaptive threshold with decay applied.
+
+        The threshold decays towards base_threshold over time.
+        threshold = base + (peak - base) * decay^(blocks_since_update / interval)
+
+        Args:
+            current_block: Current block number
+            base_threshold: Minimum threshold (default 1%)
+            decay_rate: Decay multiplier per interval (default 0.95)
+            decay_interval_blocks: Blocks between decay steps
+
+        Returns:
+            Current threshold value
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(select(AdaptiveThresholdModel).where(AdaptiveThresholdModel.id == 1))
+            state = result.scalar_one_or_none()
+
+            if state is None:
+                return base_threshold
+
+            # Calculate decay based on blocks elapsed
+            blocks_elapsed = max(0, current_block - state.last_update_block)
+            decay_steps = blocks_elapsed / decay_interval_blocks
+            decay_factor = decay_rate ** decay_steps
+
+            # Decay from current threshold towards base
+            decayed = base_threshold + (state.current_threshold - base_threshold) * decay_factor
+            return max(base_threshold, decayed)
+
+    async def update_adaptive_threshold(
+        self,
+        new_score: float,
+        old_score: float,
+        current_block: int,
+        base_threshold: float = 0.01,
+        max_threshold: float = 0.50,
+        improvement_multiplier: float = 2.0,
+    ) -> float:
+        """Update threshold when a new leader is established.
+
+        Threshold increases based on the improvement magnitude:
+        - Small improvement (1-5%): threshold stays low
+        - Big improvement (50%+): threshold becomes high
+
+        Args:
+            new_score: New leader's score
+            old_score: Previous leader's score
+            current_block: Current block number
+            base_threshold: Minimum threshold
+            max_threshold: Maximum threshold cap
+            improvement_multiplier: Threshold = improvement * multiplier
+
+        Returns:
+            New threshold value
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(select(AdaptiveThresholdModel).where(AdaptiveThresholdModel.id == 1))
+            state = result.scalar_one_or_none()
+
+            # Calculate improvement ratio
+            if old_score > 0:
+                improvement = (new_score - old_score) / old_score
+            else:
+                improvement = 1.0  # First submission, use max
+
+            # New threshold based on improvement
+            new_threshold = min(max_threshold, max(base_threshold, improvement * improvement_multiplier))
+
+            if state is None:
+                # Create new state
+                state = AdaptiveThresholdModel(
+                    id=1,
+                    current_threshold=new_threshold,
+                    last_improvement=improvement,
+                    last_update_block=current_block,
+                )
+                session.add(state)
+            else:
+                # Update existing state
+                state.current_threshold = new_threshold
+                state.last_improvement = improvement
+                state.last_update_block = current_block
+
+            await session.commit()
+            return new_threshold
 
 
 # Global instance

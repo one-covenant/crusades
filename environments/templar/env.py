@@ -61,6 +61,16 @@ class InnerStepsResult:
     final_loss: float
 
 
+@dataclass
+class GradientInfo:
+    """Captured gradient information for verification."""
+
+    grad_norm: float  # L2 norm of all gradients
+    grad_vector: torch.Tensor | None = None  # Flattened gradient vector for cosine sim
+    layers_with_grad: int = 0  # Layers with non-zero gradients
+    total_layers: int = 0  # Total trainable layers
+
+
 # Global cache for model (data is NOT cached for validators)
 _CACHE = {
     "model": None,
@@ -254,36 +264,225 @@ def _validate_return_type(result) -> tuple[bool, str | None, InnerStepsResult | 
     return False, f"Invalid return type from inner_steps: {type(result)}", None
 
 
-def _load_model(model_path: str):
-    """Load model from HuggingFace."""
-    from transformers import AutoModelForCausalLM
+def _load_model(model_path: str, use_random_init: bool = False):
+    """Load model from HuggingFace.
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-        attn_implementation="sdpa",
-    )
+    Args:
+        model_path: HuggingFace model name/path
+        use_random_init: If True, initialize with random weights (anti-cheat)
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    if use_random_init:
+        # Random init - miners can't cheat by freezing pretrained layers
+        logger.info(f"Loading model config from {model_path} with RANDOM initialization")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_config(
+            config,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            attn_implementation="sdpa",
+        )
+        model = model.to("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        logger.info(f"Loading pretrained model from {model_path}")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+            attn_implementation="sdpa",
+        )
+
     model.train()
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     return model
 
 
-def _get_cached_model(model_path: str):
+def _count_model_params(model: torch.nn.Module) -> int:
+    """Count total parameters in model."""
+    return sum(p.numel() for p in model.parameters())
+
+
+def _calculate_mfu(
+    total_tokens: int,
+    wall_time: float,
+    model_params: int,
+    gpu_peak_tflops: float = 312.0,
+) -> float:
+    """Calculate Model FLOPs Utilization (MFU).
+
+    MFU = actual_flops / theoretical_peak_flops
+
+    For transformer training (forward + backward):
+    - Forward: 2 * params * tokens (multiply-accumulate)
+    - Backward: 4 * params * tokens (gradients are 2x forward)
+    - Total: 6 * params * tokens
+
+    Args:
+        total_tokens: Total tokens processed
+        wall_time: Wall clock time in seconds
+        model_params: Number of model parameters
+        gpu_peak_tflops: GPU theoretical peak TFLOPS (A100 80GB = 312 TFLOPS bfloat16)
+
+    Returns:
+        MFU as a percentage (0-100)
+    """
+    if wall_time <= 0:
+        return 0.0
+
+    # FLOPs for forward + backward pass
+    flops_per_token = 6 * model_params
+    total_flops = flops_per_token * total_tokens
+
+    # Actual TFLOPS achieved
+    actual_tflops = total_flops / wall_time / 1e12
+
+    # MFU as percentage
+    mfu = (actual_tflops / gpu_peak_tflops) * 100
+
+    return min(mfu, 100.0)  # Cap at 100%
+
+
+def _capture_gradients(model: torch.nn.Module) -> GradientInfo:
+    """Capture gradient information from model after backward pass.
+
+    Returns:
+        GradientInfo with norm and flattened gradient vector
+    """
+    grad_list = []
+    total_norm_sq = 0.0
+    layers_with_grad = 0
+    layers_without_grad = 0
+
+    for param in model.parameters():
+        if param.grad is not None:
+            grad_flat = param.grad.detach().float().view(-1)
+            grad_list.append(grad_flat)
+            total_norm_sq += grad_flat.pow(2).sum().item()
+            # Check if gradient is actually non-zero (not just allocated)
+            if grad_flat.abs().sum().item() > 1e-10:
+                layers_with_grad += 1
+            else:
+                layers_without_grad += 1
+        else:
+            layers_without_grad += 1
+
+    grad_norm = total_norm_sq ** 0.5
+
+    # Log layer gradient coverage
+    total_layers = layers_with_grad + layers_without_grad
+    if total_layers > 0:
+        coverage = layers_with_grad / total_layers
+        logger.info(f"Gradient coverage: {layers_with_grad}/{total_layers} layers ({coverage:.1%})")
+        if layers_without_grad > 0:
+            logger.warning(f"WARNING: {layers_without_grad} layers have zero/no gradients!")
+
+    # Concatenate all gradients into single vector for cosine similarity
+    if grad_list:
+        grad_vector = torch.cat(grad_list)
+    else:
+        grad_vector = None
+
+    return GradientInfo(
+        grad_norm=grad_norm,
+        grad_vector=grad_vector,
+        layers_with_grad=layers_with_grad,
+        total_layers=total_layers,
+    )
+
+
+def _verify_trainable_params(
+    model: torch.nn.Module,
+    min_trainable_ratio: float = 0.9,
+) -> tuple[bool, str | None, dict]:
+    """Check that minimum % of params are trainable (prevents layer freezing)."""
+    total_params = 0
+    trainable_params = 0
+
+    for param in model.parameters():
+        num_params = param.numel()
+        total_params += num_params
+        if param.requires_grad:
+            trainable_params += num_params
+
+    trainable_ratio = trainable_params / total_params if total_params > 0 else 0.0
+
+    details = {
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "trainable_ratio": trainable_ratio,
+        "min_required": min_trainable_ratio,
+    }
+
+    if trainable_ratio < min_trainable_ratio:
+        error = (
+            f"Insufficient trainable params: {trainable_ratio:.1%} "
+            f"({trainable_params:,}/{total_params:,}) - minimum {min_trainable_ratio:.0%} required"
+        )
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
+
+    logger.info(f"[PASSED] Trainable params check ({trainable_ratio:.1%} >= {min_trainable_ratio:.0%})")
+    return True, None, details
+
+
+def _verify_params_changed(
+    model: torch.nn.Module,
+    initial_state: dict,
+    min_changed_ratio: float = 0.5,
+) -> tuple[bool, str | None, dict]:
+    """Verify that minimum % of params actually changed during training."""
+    total_params = 0
+    changed_params = 0
+
+    for name, param in model.named_parameters():
+        if name in initial_state:
+            initial = initial_state[name].to(param.device)
+            diff = (param.data - initial).abs().sum().item()
+            num_params = param.numel()
+            total_params += num_params
+            if diff > 1e-6:  # Threshold for "changed"
+                changed_params += num_params
+
+    changed_ratio = changed_params / total_params if total_params > 0 else 0.0
+
+    details = {
+        "total_params": total_params,
+        "changed_params": changed_params,
+        "changed_ratio": changed_ratio,
+        "min_required": min_changed_ratio,
+    }
+
+    if changed_ratio < min_changed_ratio:
+        error = (
+            f"Insufficient parameter updates: {changed_ratio:.1%} "
+            f"({changed_params:,}/{total_params:,}) - minimum {min_changed_ratio:.0%} required"
+        )
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
+
+    logger.info(f"[PASSED] Parameter changes check ({changed_ratio:.1%} >= {min_changed_ratio:.0%})")
+    return True, None, details
+
+
+def _get_cached_model(model_path: str, use_random_init: bool = False):
     """Get model from cache or load it."""
     cached = _CACHE.get("model")
     cached_path = _CACHE.get("model_path")
+    cached_random_init = _CACHE.get("use_random_init")
 
-    if cached is not None and cached_path == model_path:
+    # Cache hit only if path AND init mode match
+    if cached is not None and cached_path == model_path and cached_random_init == use_random_init:
         if _CACHE.get("initial_state"):
             cached.load_state_dict(_CACHE["initial_state"])
         return cached
 
-    model = _load_model(model_path)
+    model = _load_model(model_path, use_random_init=use_random_init)
     _CACHE["model"] = model
     _CACHE["model_path"] = model_path
+    _CACHE["use_random_init"] = use_random_init
     _CACHE["initial_state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     return model
 
@@ -327,8 +526,14 @@ def _run_reference(
     optimizer: torch.optim.Optimizer,
     num_steps: int,
     device: torch.device,
-) -> InnerStepsResult:
-    """Run reference implementation for comparison."""
+    capture_final_gradients: bool = True,
+) -> tuple[InnerStepsResult, GradientInfo | None]:
+    """Run reference implementation for comparison.
+
+    Returns:
+        Tuple of (InnerStepsResult, GradientInfo) where GradientInfo
+        contains the gradients from the final step (before optimizer.step)
+    """
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -337,8 +542,9 @@ def _run_reference(
     total_tokens = 0
     final_logits = None
     final_loss = 0.0
+    final_gradients = None
 
-    for _ in range(num_steps):
+    for step in range(num_steps):
         batch = next(data_iterator)
         batch = batch.to(device, dtype=torch.long)
 
@@ -354,6 +560,11 @@ def _run_reference(
             )
 
         loss.backward()
+
+        # Capture gradients on final step (before optimizer.step clears them)
+        if capture_final_gradients and step == num_steps - 1:
+            final_gradients = _capture_gradients(model)
+
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -361,47 +572,184 @@ def _run_reference(
         final_logits = logits.detach().float()
         final_loss = float(loss.item())
 
-    return InnerStepsResult(
+    result = InnerStepsResult(
         final_logits=final_logits,
         total_tokens=total_tokens,
         final_loss=final_loss,
     )
+    return result, final_gradients
+
+
+def _verify_gradients(
+    reference_grad: GradientInfo | None,
+    candidate_grad: GradientInfo | None,
+    cosine_min: float = 0.8,
+    norm_ratio_min: float = 0.5,
+    norm_ratio_max: float = 2.0,
+) -> tuple[bool, str | None, dict]:
+    """Verify candidate gradients match reference using cosine similarity and norm ratio.
+
+    This is more robust than logits comparison because:
+    1. Gradients directly reflect what the model learned
+    2. Cheaters who freeze layers will have different gradient patterns
+    3. Cosine similarity catches direction changes
+    4. Norm ratio catches magnitude cheating
+
+    Args:
+        reference_grad: Reference implementation gradients
+        candidate_grad: Miner's implementation gradients
+        cosine_min: Minimum cosine similarity required
+        norm_ratio_min: Minimum ratio of candidate/reference gradient norm
+        norm_ratio_max: Maximum ratio of candidate/reference gradient norm
+
+    Returns:
+        Tuple of (success, error_message, details)
+    """
+    details = {
+        "cosine_min": cosine_min,
+        "norm_ratio_min": norm_ratio_min,
+        "norm_ratio_max": norm_ratio_max,
+        "checks_passed": [],
+        "checks_failed": [],
+    }
+
+    logger.info("=" * 60)
+    logger.info("VERIFICATION: Gradient-based verification")
+    logger.info("=" * 60)
+
+    if reference_grad is None or candidate_grad is None:
+        error = "Missing gradient information for verification"
+        details["checks_failed"].append({"check": "gradient_availability", "error": error})
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
+
+    details["reference_grad_norm"] = reference_grad.grad_norm
+    details["candidate_grad_norm"] = candidate_grad.grad_norm
+    details["candidate_layers_with_grad"] = candidate_grad.layers_with_grad
+    details["candidate_total_layers"] = candidate_grad.total_layers
+
+    # Check 0: All layers must have gradients (catches "restore weights" attack)
+    if candidate_grad.total_layers > 0:
+        grad_coverage = candidate_grad.layers_with_grad / candidate_grad.total_layers
+        details["gradient_coverage"] = grad_coverage
+        logger.info(f"[CHECK 0/3] Gradient coverage: {grad_coverage:.1%}")
+        logger.info(f"   Layers with gradients: {candidate_grad.layers_with_grad}/{candidate_grad.total_layers}")
+
+        if grad_coverage < 1.0:
+            error = (
+                f"Not all layers have gradients: {candidate_grad.layers_with_grad}/{candidate_grad.total_layers} "
+                f"({grad_coverage:.1%}) - possible layer freezing detected"
+            )
+            details["checks_failed"].append({"check": "gradient_coverage", "error": error})
+            logger.error(f"[FAILED] {error}")
+            return False, error, details
+        details["checks_passed"].append("gradient_coverage")
+        logger.info("[PASSED] All layers have gradients")
+
+    # Check 1: Gradient norm ratio
+    if reference_grad.grad_norm > 0:
+        norm_ratio = candidate_grad.grad_norm / reference_grad.grad_norm
+        details["norm_ratio"] = norm_ratio
+        logger.info(f"[CHECK 1/3] Gradient norm ratio: {norm_ratio:.4f}")
+        logger.info(f"   Reference norm: {reference_grad.grad_norm:.6f}")
+        logger.info(f"   Candidate norm: {candidate_grad.grad_norm:.6f}")
+        logger.info(f"   Allowed range: [{norm_ratio_min}, {norm_ratio_max}]")
+
+        if norm_ratio < norm_ratio_min or norm_ratio > norm_ratio_max:
+            error = (
+                f"Gradient norm ratio {norm_ratio:.4f} outside allowed range "
+                f"[{norm_ratio_min}, {norm_ratio_max}]"
+            )
+            details["checks_failed"].append({"check": "gradient_norm_ratio", "error": error})
+            logger.error(f"[FAILED] {error}")
+            return False, error, details
+        details["checks_passed"].append("gradient_norm_ratio")
+        logger.info("[PASSED] Gradient norm ratio in acceptable range")
+    else:
+        logger.warning("Reference gradient norm is zero, skipping norm ratio check")
+
+    # Check 2: Cosine similarity
+    ref_vec = reference_grad.grad_vector
+    cand_vec = candidate_grad.grad_vector
+
+    if ref_vec is not None and cand_vec is not None:
+        # Ensure same device
+        if ref_vec.device != cand_vec.device:
+            cand_vec = cand_vec.to(ref_vec.device)
+
+        # Ensure same size (might differ if model structure changed)
+        if ref_vec.shape != cand_vec.shape:
+            error = f"Gradient vector shape mismatch: ref={ref_vec.shape}, cand={cand_vec.shape}"
+            details["checks_failed"].append({"check": "gradient_shape", "error": error})
+            logger.error(f"[FAILED] {error}")
+            return False, error, details
+
+        # Calculate cosine similarity
+        cosine_sim = F.cosine_similarity(
+            ref_vec.unsqueeze(0), cand_vec.unsqueeze(0)
+        ).item()
+        details["cosine_similarity"] = cosine_sim
+
+        logger.info(f"[CHECK 2/3] Gradient cosine similarity: {cosine_sim:.4f}")
+        logger.info(f"   Minimum required: {cosine_min}")
+
+        if cosine_sim < cosine_min:
+            error = f"Gradient cosine similarity {cosine_sim:.4f} below minimum {cosine_min}"
+            details["checks_failed"].append({"check": "gradient_cosine", "error": error})
+            logger.error(f"[FAILED] {error}")
+            return False, error, details
+        details["checks_passed"].append("gradient_cosine_similarity")
+        logger.info("[PASSED] Gradient cosine similarity acceptable")
+    else:
+        logger.warning("Gradient vectors unavailable, skipping cosine similarity check")
+
+    logger.info("=" * 60)
+    logger.info("VERIFICATION: GRADIENT CHECKS PASSED")
+    logger.info(f"   Checks passed: {details['checks_passed']}")
+    logger.info("=" * 60)
+
+    return True, None, details
 
 
 def _verify_outputs(
     reference: InnerStepsResult,
     candidate: InnerStepsResult,
     expected_tokens: int,
-    output_tolerance: float = 0.05,
+    reference_grad: GradientInfo | None = None,
+    candidate_grad: GradientInfo | None = None,
     loss_ratio_min: float = 0.8,
     loss_ratio_max: float = 1.2,
+    gradient_cosine_min: float = 0.8,
+    gradient_norm_ratio_min: float = 0.5,
+    gradient_norm_ratio_max: float = 2.0,
 ) -> tuple[bool, str | None, dict]:
-    """Verify candidate outputs match reference within tolerance.
+    """Verify candidate outputs match reference.
 
     Verification checks:
-    1. Token count matches expected (miner processed correct amount of data)
-    2. Loss is reasonable (not NaN/Inf) and matches reference within allowed ratio
-    3. Logits are valid tensors (not NaN/Inf)
-    4. Logits match reference within tolerance (prevents cheating)
+    1. Token count matches expected
+    2. Loss is valid and matches reference within ratio
+    3. Gradient-based verification (replaces logits comparison)
 
     Args:
         reference: Reference implementation results
         candidate: Miner's implementation results
-        expected_tokens: Expected token count (batch_size * seq_len * steps)
-        output_tolerance: Maximum allowed relative difference for logits (default 5%)
-        loss_ratio_min: Minimum allowed loss ratio candidate/reference (default 0.8)
-        loss_ratio_max: Maximum allowed loss ratio candidate/reference (default 1.2)
+        expected_tokens: Expected token count
+        reference_grad: Reference gradients for comparison
+        candidate_grad: Candidate gradients for comparison
+        loss_ratio_min: Minimum allowed loss ratio
+        loss_ratio_max: Maximum allowed loss ratio
+        gradient_cosine_min: Minimum gradient cosine similarity
+        gradient_norm_ratio_min: Min gradient norm ratio
+        gradient_norm_ratio_max: Max gradient norm ratio
 
     Returns:
         Tuple of (success, error_message, verification_details)
     """
-    # Collect detailed verification info for logging
     details = {
         "expected_tokens": expected_tokens,
         "candidate_tokens": candidate.total_tokens,
         "candidate_loss": candidate.final_loss,
         "reference_loss": reference.final_loss if reference else None,
-        "output_tolerance": output_tolerance,
         "checks_passed": [],
         "checks_failed": [],
     }
@@ -411,9 +759,7 @@ def _verify_outputs(
     logger.info("=" * 60)
 
     # 1. Verify token count matches expected
-    logger.info(
-        f"[CHECK 1/4] Token count: expected={expected_tokens}, got={candidate.total_tokens}"
-    )
+    logger.info(f"[CHECK 1/3] Token count: expected={expected_tokens}, got={candidate.total_tokens}")
     if candidate.total_tokens != expected_tokens:
         error = f"Token count mismatch: expected {expected_tokens}, got {candidate.total_tokens}"
         details["checks_failed"].append({"check": "token_count", "error": error})
@@ -422,8 +768,8 @@ def _verify_outputs(
     details["checks_passed"].append("token_count")
     logger.info("[PASSED] Token count matches")
 
-    # 2. Verify loss is reasonable (typical loss range is 1.5-3 for trained LLMs)
-    logger.info(f"[CHECK 2/4] Loss validity: candidate_loss={candidate.final_loss:.6f}")
+    # 2. Verify loss is reasonable
+    logger.info(f"[CHECK 2/3] Loss validity: candidate_loss={candidate.final_loss:.6f}")
     if candidate.final_loss != candidate.final_loss:  # NaN check
         error = "Loss is NaN"
         details["checks_failed"].append({"check": "loss_validity", "error": error})
@@ -434,127 +780,39 @@ def _verify_outputs(
         details["checks_failed"].append({"check": "loss_validity", "error": error})
         logger.error(f"[FAILED] {error}")
         return False, error, details
-    details["checks_passed"].append("loss_validity")
-    logger.info("[PASSED] Loss is valid (not NaN/Inf, in reasonable range)")
 
-    # 3. Verify logits are valid
-    logger.info("[CHECK 3/4] Logits validity")
-    cand_logits = candidate.final_logits
-    if cand_logits is None:
-        error = "No logits returned"
-        details["checks_failed"].append({"check": "logits_validity", "error": error})
-        logger.error(f"[FAILED] {error}")
-        return False, error, details
-
-    if isinstance(cand_logits, str):
-        cand_logits = torch.load(cand_logits, weights_only=True)
-
-    details["candidate_logits_shape"] = list(cand_logits.shape)
-    logger.info(f"   Candidate logits shape: {cand_logits.shape}")
-
-    if torch.isnan(cand_logits).any():
-        nan_count = torch.isnan(cand_logits).sum().item()
-        error = f"Logits contain {nan_count} NaN values"
-        details["checks_failed"].append(
-            {"check": "logits_validity", "error": error, "nan_count": nan_count}
-        )
-        logger.error(f"[FAILED] {error}")
-        return False, error, details
-    if torch.isinf(cand_logits).any():
-        inf_count = torch.isinf(cand_logits).sum().item()
-        error = f"Logits contain {inf_count} Inf values"
-        details["checks_failed"].append(
-            {"check": "logits_validity", "error": error, "inf_count": inf_count}
-        )
-        logger.error(f"[FAILED] {error}")
-        return False, error, details
-    details["checks_passed"].append("logits_validity")
-    logger.info("[PASSED] Logits are valid (no NaN/Inf)")
-
-    # 4. Compare with reference
-    logger.info("[CHECK 4/4] Reference comparison")
-
-    # 4a. Compare losses - they should be within 20% of each other
+    # Compare losses
     if reference is not None and reference.final_loss > 0:
         loss_ratio = candidate.final_loss / reference.final_loss
         details["loss_ratio"] = loss_ratio
-        logger.info(
-            f"   Loss comparison: candidate={candidate.final_loss:.6f}, reference={reference.final_loss:.6f}"
-        )
         logger.info(f"   Loss ratio: {loss_ratio:.4f} (allowed: {loss_ratio_min}-{loss_ratio_max})")
 
         if loss_ratio < loss_ratio_min or loss_ratio > loss_ratio_max:
             error = (
                 f"Loss mismatch: candidate={candidate.final_loss:.4f}, "
-                f"reference={reference.final_loss:.4f}, ratio={loss_ratio:.2f} (allowed: {loss_ratio_min}-{loss_ratio_max})"
+                f"reference={reference.final_loss:.4f}, ratio={loss_ratio:.2f}"
             )
-            details["checks_failed"].append(
-                {"check": "loss_comparison", "error": error, "loss_ratio": loss_ratio}
-            )
+            details["checks_failed"].append({"check": "loss_comparison", "error": error})
             logger.error(f"[FAILED] {error}")
             return False, error, details
-        details["checks_passed"].append("loss_comparison")
-        logger.info("[PASSED] Loss matches reference within 20%")
+    details["checks_passed"].append("loss_validity")
+    logger.info("[PASSED] Loss is valid and matches reference")
 
-    # 4b. Compare logits against reference
-    if reference is not None and reference.final_logits is not None:
-        ref_logits = reference.final_logits
-        if isinstance(ref_logits, str):
-            ref_logits = torch.load(ref_logits, weights_only=True)
+    # 3. Gradient-based verification (replaces logits comparison)
+    logger.info("[CHECK 3/3] Gradient verification")
+    grad_ok, grad_error, grad_details = _verify_gradients(
+        reference_grad,
+        candidate_grad,
+        cosine_min=gradient_cosine_min,
+        norm_ratio_min=gradient_norm_ratio_min,
+        norm_ratio_max=gradient_norm_ratio_max,
+    )
+    details["gradient_verification"] = grad_details
 
-        details["reference_logits_shape"] = list(ref_logits.shape)
-        logger.info(f"   Reference logits shape: {ref_logits.shape}")
-
-        # Ensure same device for comparison
-        if cand_logits.device != ref_logits.device:
-            cand_logits = cand_logits.to(ref_logits.device)
-
-        # Check shape match
-        if cand_logits.shape != ref_logits.shape:
-            error = f"Logits shape mismatch: candidate={cand_logits.shape}, reference={ref_logits.shape}"
-            details["checks_failed"].append({"check": "logits_shape", "error": error})
-            logger.error(f"[FAILED] {error}")
-            return False, error, details
-        details["checks_passed"].append("logits_shape")
-
-        # Calculate relative difference using mean absolute error
-        # Normalize by the scale of the reference logits
-        abs_diff = torch.abs(cand_logits - ref_logits)
-        ref_scale = torch.abs(ref_logits).mean() + 1e-8  # Avoid division by zero
-        relative_diff = (abs_diff.mean() / ref_scale).item()
-        max_diff = abs_diff.max().item()
-
-        details["logits_relative_diff"] = relative_diff
-        details["logits_max_diff"] = max_diff
-        details["logits_ref_scale"] = ref_scale.item()
-
-        logger.info("   Logits comparison:")
-        logger.info(f"      Reference scale (mean abs): {ref_scale.item():.6f}")
-        logger.info(f"      Mean absolute difference: {abs_diff.mean().item():.6f}")
-        logger.info(f"      Max absolute difference: {max_diff:.6f}")
-        logger.info(f"      Relative difference: {relative_diff:.6f}")
-        logger.info(f"      Tolerance: {output_tolerance}")
-
-        if relative_diff > output_tolerance:
-            error = (
-                f"Logits mismatch: relative_diff={relative_diff:.6f} "
-                f"exceeds tolerance={output_tolerance} (max_diff={max_diff:.6f})"
-            )
-            details["checks_failed"].append(
-                {
-                    "check": "logits_comparison",
-                    "error": error,
-                    "relative_diff": relative_diff,
-                    "max_diff": max_diff,
-                }
-            )
-            logger.error(f"[FAILED] {error}")
-            return False, error, details
-
-        details["checks_passed"].append("logits_comparison")
-        logger.info(
-            f"[PASSED] Logits match reference (relative_diff={relative_diff:.6f} <= {output_tolerance})"
-        )
+    if not grad_ok:
+        details["checks_failed"].append({"check": "gradient_verification", "error": grad_error})
+        return False, grad_error, details
+    details["checks_passed"].append("gradient_verification")
 
     logger.info("=" * 60)
     logger.info("VERIFICATION: ALL CHECKS PASSED")
@@ -565,10 +823,11 @@ def _verify_outputs(
 
 
 class Actor:
-    """Templar TPS Evaluation Actor for Affinetes (Validator-Owned).
+    """Templar MFU Evaluation Actor for Affinetes (Validator-Owned).
 
     This Actor is owned by the validator, not the miner.
     Code is passed directly from the validator (downloaded from URL).
+    Uses MFU (Model FLOPs Utilization) instead of TPS as the metric.
     """
 
     async def evaluate(
@@ -583,12 +842,22 @@ class Actor:
         sequence_length: int | None = None,
         data_samples: int = 10000,
         code: str = "",  # Miner's code passed directly
-        output_tolerance: float = 0.05,  # Tolerance for logits comparison
-        loss_ratio_min: float = 0.8,  # Minimum allowed loss ratio
-        loss_ratio_max: float = 1.2,  # Maximum allowed loss ratio
+        # Verification settings
+        loss_ratio_min: float = 0.8,
+        loss_ratio_max: float = 1.2,
+        use_random_init: bool = True,
+        min_trainable_params_ratio: float = 0.9,
+        min_params_changed_ratio: float = 0.5,
+        # Gradient verification (replaces logits)
+        gradient_cosine_min: float = 0.8,
+        gradient_norm_ratio_min: float = 0.5,
+        gradient_norm_ratio_max: float = 2.0,
+        # MFU calculation
+        gpu_peak_tflops: float = 312.0,
+        model_params_override: int | None = None,
     ) -> dict:
         """
-        Run TPS evaluation on miner's code.
+        Run MFU evaluation on miner's code.
 
         Args:
             task_id: Evaluation run identifier
@@ -601,12 +870,19 @@ class Actor:
             sequence_length: Sequence length
             data_samples: Number of data samples
             code: Miner's train.py code (passed directly from validator)
-            output_tolerance: Maximum allowed relative difference for logits verification
-            loss_ratio_min: Minimum allowed loss ratio (candidate/reference)
-            loss_ratio_max: Maximum allowed loss ratio (candidate/reference)
+            loss_ratio_min: Minimum allowed loss ratio
+            loss_ratio_max: Maximum allowed loss ratio
+            use_random_init: Use random weights (anti-cheat)
+            min_trainable_params_ratio: Min % params that must be trainable
+            min_params_changed_ratio: Min % params that must change
+            gradient_cosine_min: Min gradient cosine similarity
+            gradient_norm_ratio_min: Min gradient norm ratio
+            gradient_norm_ratio_max: Max gradient norm ratio
+            gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
+            model_params_override: Override model param count (None = auto-detect)
 
         Returns:
-            Dict with: tps, total_tokens, wall_time_seconds, success, error, code
+            Dict with: mfu, tps, total_tokens, wall_time_seconds, success, error, code
         """
         # Validate code
         if not code:
@@ -693,8 +969,11 @@ class Actor:
                     "code": code,
                 }
 
-            # Load model and data
-            model = _get_cached_model(model_url)
+            # Load model and data (with random init if enabled for anti-cheat)
+            model = _get_cached_model(model_url, use_random_init=use_random_init)
+            model_params = model_params_override or _count_model_params(model)
+            logger.info(f"Model loaded: {model_params:,} parameters, random_init={use_random_init}")
+
             data = _load_hf_dataset(
                 dataset_name=data_url,
                 model_name=model_url,
@@ -706,7 +985,7 @@ class Actor:
 
             seq_len = sequence_length or EVAL_SEQUENCE_LENGTH
 
-            # Run reference implementation
+            # Run reference implementation (captures gradients for verification)
             data_iter_ref = _create_data_iterator(data, batch_size, seq_len)
             optimizer_ref = _create_optimizer(model)
 
@@ -715,7 +994,9 @@ class Actor:
                 initial_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 _CACHE["initial_state"] = initial_state
 
-            reference = _run_reference(model, data_iter_ref, optimizer_ref, steps, device)
+            reference, reference_grad = _run_reference(
+                model, data_iter_ref, optimizer_ref, steps, device, capture_final_gradients=True
+            )
 
             # Reset model for miner's code
             model.load_state_dict(initial_state)
@@ -778,7 +1059,25 @@ class Actor:
                         "code": code,
                     }
 
-                logger.info("Warmup passed - proceeding with full evaluation")
+                logger.info("Warmup passed - proceeding with verification checks")
+
+                # Check trainable params AFTER warmup (miner code may modify requires_grad)
+                trainable_ok, trainable_error, trainable_details = _verify_trainable_params(
+                    model, min_trainable_params_ratio
+                )
+                if not trainable_ok:
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": trainable_error,
+                        "seed": seed,
+                        "code": code,
+                        "diagnostics": {"trainable_params": trainable_details},
+                    }
 
             except Exception as e:
                 # Early termination - don't waste time on broken code
@@ -786,6 +1085,7 @@ class Actor:
                 logger.error(error_msg)
                 return {
                     "task_id": task_id,
+                    "mfu": 0.0,
                     "tps": 0.0,
                     "total_tokens": 0,
                     "wall_time_seconds": 0.0,
@@ -799,7 +1099,7 @@ class Actor:
             model.load_state_dict(initial_state)
 
             # =================================================================
-            # FULL EVALUATION - Run actual timed evaluation
+            # FULL EVALUATION - Run actual timed evaluation with gradient capture
             # =================================================================
             data_iter_miner = _create_data_iterator(data, batch_size, seq_len)
             optimizer_miner = _create_optimizer(model)
@@ -807,58 +1107,117 @@ class Actor:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
+            # We need to capture gradients on the final step
+            # Run all but last step normally
             start = time.perf_counter()
-            miner_result = miner_module.inner_steps(
-                model=model,
-                data_iterator=data_iter_miner,
-                optimizer=optimizer_miner,
-                num_steps=steps,
-                device=device,
-            )
+
+            if steps > 1:
+                # Run steps-1 steps without gradient capture
+                miner_module.inner_steps(
+                    model=model,
+                    data_iterator=data_iter_miner,
+                    optimizer=optimizer_miner,
+                    num_steps=steps - 1,
+                    device=device,
+                )
+
+            # Run final step and capture gradients
+            # We run the last step manually to capture gradients before optimizer.step()
+            batch = next(data_iter_miner)
+            batch = batch.to(device, dtype=torch.long)
+
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                input_ids = batch[:, :-1]
+                labels = batch[:, 1:]
+                outputs = model(input_ids)
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1),
+                    ignore_index=-100,
+                )
+
+            loss.backward()
+
+            # Capture candidate gradients BEFORE optimizer step
+            candidate_grad = _capture_gradients(model)
+
+            optimizer_miner.step()
+            optimizer_miner.zero_grad(set_to_none=True)
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
             wall_time = time.perf_counter() - start
 
-            # Validate return type
-            ok, error, parsed = _validate_return_type(miner_result)
-            if not ok or parsed is None:
+            # Create result from final step
+            total_tokens = batch_size * seq_len * steps
+            parsed = InnerStepsResult(
+                final_logits=logits.detach().float(),
+                total_tokens=total_tokens,
+                final_loss=float(loss.item()),
+            )
+
+            # =================================================================
+            # PARAMS CHANGED CHECK - Verify miner actually trained the model
+            # =================================================================
+            params_ok, params_error, params_details = _verify_params_changed(
+                model, initial_state, min_params_changed_ratio
+            )
+            if not params_ok:
                 return {
                     "task_id": task_id,
+                    "mfu": 0.0,
                     "tps": 0.0,
                     "total_tokens": 0,
                     "wall_time_seconds": wall_time,
                     "success": False,
-                    "error": error,
+                    "error": params_error,
                     "seed": seed,
                     "code": code,
+                    "diagnostics": {"params_changed": params_details},
                 }
 
             # Calculate expected tokens
             expected_tokens = batch_size * seq_len * steps
 
-            # Verify outputs against reference (correctness check with tolerance)
+            # Verify outputs using gradient-based verification
             verified, verify_error, verify_details = _verify_outputs(
-                reference, parsed, expected_tokens, output_tolerance, loss_ratio_min, loss_ratio_max
+                reference,
+                parsed,
+                expected_tokens,
+                reference_grad=reference_grad,
+                candidate_grad=candidate_grad,
+                loss_ratio_min=loss_ratio_min,
+                loss_ratio_max=loss_ratio_max,
+                gradient_cosine_min=gradient_cosine_min,
+                gradient_norm_ratio_min=gradient_norm_ratio_min,
+                gradient_norm_ratio_max=gradient_norm_ratio_max,
             )
 
-            # Diagnostics (include verification details)
+            # Calculate MFU and TPS
+            total_tokens_int = int(parsed.total_tokens)
+            tps = float(total_tokens_int) / max(wall_time, 1e-6)
+            mfu = _calculate_mfu(total_tokens_int, wall_time, model_params, gpu_peak_tflops)
+
+            # Diagnostics
             diagnostics = {
                 "verification": verify_details,
                 "reference_loss": reference.final_loss,
                 "candidate_loss": parsed.final_loss,
                 "expected_tokens": expected_tokens,
                 "actual_tokens": parsed.total_tokens,
+                "model_params": model_params,
+                "gpu_peak_tflops": gpu_peak_tflops,
+                "trainable_params": trainable_details,
+                "params_changed": params_details,
             }
-
-            total_tokens = int(parsed.total_tokens)
-            tps = float(total_tokens) / max(wall_time, 1e-6)
 
             return {
                 "task_id": task_id,
+                "mfu": mfu if verified else 0.0,
                 "tps": tps if verified else 0.0,
-                "total_tokens": total_tokens if verified else 0,
+                "total_tokens": total_tokens_int if verified else 0,
                 "wall_time_seconds": wall_time,
                 "success": verified,
                 "error": verify_error,
@@ -870,6 +1229,7 @@ class Actor:
         except Exception as e:
             return {
                 "task_id": task_id,
+                "mfu": 0.0,
                 "tps": 0.0,
                 "total_tokens": 0,
                 "wall_time_seconds": 0.0,
@@ -889,7 +1249,7 @@ class Actor:
 # FastAPI HTTP Server (for Basilica custom Docker deployment)
 # =============================================================================
 
-app = FastAPI(title="Templar TPS Evaluation", version="1.0.0")
+app = FastAPI(title="Templar MFU Evaluation", version="2.0.0")
 
 # Global actor instance (reused for efficiency)
 _actor: Actor | None = None
@@ -916,16 +1276,26 @@ class EvaluateRequest(BaseModel):
     sequence_length: int | None = None
     data_samples: int = 10000
     code: str  # Miner's train.py code
-    output_tolerance: float = 0.05  # Tolerance for logits comparison
-    loss_ratio_min: float = 0.8  # Minimum allowed loss ratio
-    loss_ratio_max: float = 1.2  # Maximum allowed loss ratio
+    # Verification settings
+    loss_ratio_min: float = 0.8
+    loss_ratio_max: float = 1.2
+    use_random_init: bool = True
+    min_trainable_params_ratio: float = 0.9
+    min_params_changed_ratio: float = 0.5
+    # Gradient verification
+    gradient_cosine_min: float = 0.8
+    gradient_norm_ratio_min: float = 0.5
+    gradient_norm_ratio_max: float = 2.0
+    # MFU calculation
+    gpu_peak_tflops: float = 312.0
 
 
 class EvaluateResponse(BaseModel):
     """Response body from /evaluate endpoint."""
 
     task_id: int
-    tps: float
+    mfu: float  # Model FLOPs Utilization (primary metric)
+    tps: float  # Tokens per second (secondary metric)
     total_tokens: int
     wall_time_seconds: float
     success: bool
@@ -946,7 +1316,7 @@ async def health():
 
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
-    """Evaluate miner's train.py code and return TPS score.
+    """Evaluate miner's train.py code and return MFU score.
 
     This endpoint is called by the validator via Basilica.
     """
@@ -963,13 +1333,20 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         sequence_length=request.sequence_length,
         data_samples=request.data_samples,
         code=request.code,
-        output_tolerance=request.output_tolerance,
         loss_ratio_min=request.loss_ratio_min,
         loss_ratio_max=request.loss_ratio_max,
+        use_random_init=request.use_random_init,
+        min_trainable_params_ratio=request.min_trainable_params_ratio,
+        min_params_changed_ratio=request.min_params_changed_ratio,
+        gradient_cosine_min=request.gradient_cosine_min,
+        gradient_norm_ratio_min=request.gradient_norm_ratio_min,
+        gradient_norm_ratio_max=request.gradient_norm_ratio_max,
+        gpu_peak_tflops=request.gpu_peak_tflops,
     )
 
     return EvaluateResponse(
         task_id=result.get("task_id", request.task_id),
+        mfu=result.get("mfu", 0.0),
         tps=result.get("tps", 0.0),
         total_tokens=result.get("total_tokens", 0),
         wall_time_seconds=result.get("wall_time_seconds", 0.0),
