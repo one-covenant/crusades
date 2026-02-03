@@ -111,21 +111,19 @@ class WeightSetter:
 
         winner_score = winner.final_score or 0.0
 
-        # Rehydrate previous winner from DB on first call (survives restarts)
+        # Initialize tracking on first call using current thresholded winner
+        # This prevents spurious "winner change" on restart by matching the same
+        # winner selection logic used below (with adaptive threshold applied)
         if not self._initialized:
             self._initialized = True
-            # Get current top submission to initialize tracking
-            top_submission = await self.db.get_leaderboard_winner(
-                threshold=0.0,  # No threshold - get absolute top
-                spec_version=get_competition_version(),
+            # Use current winner (with threshold) to initialize, avoiding mismatch
+            self._previous_winner_id = winner.submission_id
+            self._previous_winner_score = winner_score
+            logger.info(
+                f"Initialized winner tracking: "
+                f"{self._previous_winner_id} ({self._previous_winner_score:.2f}% MFU)"
             )
-            if top_submission:
-                self._previous_winner_id = top_submission.submission_id
-                self._previous_winner_score = top_submission.final_score or 0.0
-                logger.info(
-                    f"Rehydrated previous winner from DB: "
-                    f"{self._previous_winner_id} ({self._previous_winner_score:.2f}% MFU)"
-                )
+            # First call - no winner change to process, just set weights
 
         # Check if winner changed - if so, update adaptive threshold
         if winner.submission_id != self._previous_winner_id:

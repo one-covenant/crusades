@@ -140,10 +140,16 @@ class DatabaseClient:
         self._conn.row_factory = sqlite3.Row
 
     def _version_filter(self, alias: str = "s") -> str:
-        """Get SQL WHERE clause for spec_version filtering."""
+        """Get SQL WHERE clause for spec_version filtering.
+
+        Note: spec_version is validated as int in __init__ and derived from
+        hardcoded package version, not user input. Using int() as defense-in-depth.
+        """
         if self.spec_version is None:
             return ""
-        return f" AND {alias}.spec_version = {self.spec_version}"
+        # Validate spec_version is an integer to prevent SQL injection
+        version = int(self.spec_version)
+        return f" AND {alias}.spec_version = {version}"
 
     def close(self):
         self._conn.close()
