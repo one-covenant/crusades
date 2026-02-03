@@ -169,11 +169,12 @@ class DatabaseClient:
         self,
         base_threshold: float = 0.01,
         decay_percent: float = 0.05,
-        decay_interval_blocks: int = 100,
+        decay_interval_blocks: int = 300,
+        block_time: int = 12,
     ) -> dict[str, Any]:
         """Get current adaptive threshold info.
 
-        Calculates the decayed threshold based on stored state.
+        Calculates the decayed threshold based on time elapsed since last update.
         """
         try:
             row = self._query_one(
@@ -192,13 +193,29 @@ class DatabaseClient:
                 "decayed_threshold": base_threshold,
             }
 
-        # Calculate decay (simplified - we don't have current block in TUI)
-        # Just show stored values
+        # Calculate decay based on time elapsed (estimate blocks from time)
+        current_threshold = row["current_threshold"]
+        updated_at_str = row["updated_at"]
+
+        # Parse updated_at and calculate elapsed time
+        try:
+            updated_at_str = (
+                updated_at_str.replace(" ", "T") if " " in updated_at_str else updated_at_str
+            )
+            updated_at = datetime.fromisoformat(updated_at_str)
+            elapsed_seconds = (datetime.now() - updated_at).total_seconds()
+            elapsed_blocks = elapsed_seconds / block_time
+            decay_steps = elapsed_blocks / decay_interval_blocks
+            decay_factor = (1.0 - decay_percent) ** decay_steps
+            decayed = base_threshold + (current_threshold - base_threshold) * decay_factor
+        except (ValueError, TypeError):
+            decayed = current_threshold
+
         return {
-            "current_threshold": row["current_threshold"],
+            "current_threshold": current_threshold,
             "last_improvement": row["last_improvement"],
             "last_update_block": row["last_update_block"],
-            "decayed_threshold": row["current_threshold"],  # Approximate
+            "decayed_threshold": max(base_threshold, decayed),
             "updated_at": row["updated_at"],
         }
 
