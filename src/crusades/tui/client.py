@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from crusades.config import get_hparams
 from crusades.core.protocols import SubmissionStatus
 
 
@@ -167,15 +168,23 @@ class DatabaseClient:
 
     def get_adaptive_threshold(
         self,
-        base_threshold: float = 0.01,
-        decay_percent: float = 0.05,
-        decay_interval_blocks: int = 300,
-        block_time: int = 12,
+        base_threshold: float | None = None,
+        decay_percent: float | None = None,
+        decay_interval_blocks: int | None = None,
+        block_time: int | None = None,
     ) -> dict[str, Any]:
         """Get current adaptive threshold info.
 
         Calculates the decayed threshold based on time elapsed since last update.
+        Uses values from hparams.json if not explicitly provided.
         """
+        # Get defaults from hparams
+        hparams = get_hparams()
+        threshold_config = hparams.adaptive_threshold
+        base_threshold = base_threshold if base_threshold is not None else threshold_config.base_threshold
+        decay_percent = decay_percent if decay_percent is not None else threshold_config.decay_percent
+        decay_interval_blocks = decay_interval_blocks if decay_interval_blocks is not None else threshold_config.decay_interval_blocks
+        block_time = block_time if block_time is not None else hparams.block_time
         try:
             row = self._query_one(
                 "SELECT current_threshold, last_improvement, last_update_block, updated_at "
@@ -274,9 +283,16 @@ class DatabaseClient:
         )
         active_miners = miners["count"] if miners else 0
 
+        # Get adaptive threshold for "MFU to Beat" calculation
+        threshold_data = self.get_adaptive_threshold()
+        adaptive_threshold = threshold_data.get("decayed_threshold", 0.01)
+        mfu_to_beat = top_score * (1 + adaptive_threshold) if top_score > 0 else 0.0
+
         return {
             "submissions_24h": recent_count,
             "current_top_score": top_score,
+            "mfu_to_beat": round(mfu_to_beat, 4),
+            "adaptive_threshold": adaptive_threshold,
             "score_improvement_24h": round(improvement, 2),
             "total_submissions": total_count,
             "active_miners": active_miners,

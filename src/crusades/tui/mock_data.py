@@ -19,6 +19,8 @@ MOCK_HISTORY = [
 MOCK_OVERVIEW = {
     "submissions_24h": 47,
     "current_top_score": 43.0,  # MFU percentage
+    "mfu_to_beat": 43.43,  # top_score * (1 + adaptive_threshold)
+    "adaptive_threshold": 0.01,  # 1% threshold
     "score_improvement_24h": 12.5,
     "total_submissions": 1283,
     "active_miners": 23,
