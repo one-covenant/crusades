@@ -102,10 +102,11 @@ class HParams(BaseModel):
     - Miners host train.py at any URL and commit the URL to blockchain
     - Validators download from miner's URL and evaluate via Docker/Basilica
     - All settings are defined in hparams.json (no hardcoded defaults)
-    """
 
-    # Versioning - increment when making breaking changes
-    spec_version: int = 1
+    Versioning:
+    - Competition version is derived from __version__ major number
+    - Use crusades.get_competition_version() to get the current competition version
+    """
 
     # Network settings
     netuid: int

@@ -2,6 +2,8 @@
 
 import logging
 
+from crusades import get_competition_version
+
 from ..config import get_config, get_hparams
 from ..storage.database import Database
 from .manager import ChainManager
@@ -83,10 +85,10 @@ class WeightSetter:
 
         logger.info(f"Adaptive threshold: {current_threshold:.2%} at block {current_block}")
 
-        # Get leaderboard rank 1 (with adaptive threshold, filtered by spec_version)
+        # Get leaderboard rank 1 (with adaptive threshold, filtered by competition version)
         winner = await self.db.get_leaderboard_winner(
             threshold=current_threshold,
-            spec_version=self.hparams.spec_version,
+            spec_version=get_competition_version(),
         )
 
         # If no valid winner, all emissions go to burn_uid

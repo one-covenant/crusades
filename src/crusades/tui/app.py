@@ -12,7 +12,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from crusades.config import get_hparams
+from crusades import get_competition_version
 from crusades.tui.client import (
     CrusadesClient,
     CrusadesData,
@@ -609,16 +609,15 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False, db_path: s
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
 
-    # Select client based on mode (filter by spec_version)
-    hparams = get_hparams()
-    spec_version = hparams.spec_version
+    # Select client based on mode (filter by competition version)
+    competition_version = get_competition_version()
 
     if demo:
         client_class = MockClient
         client_kwargs = {}
     elif db_path:
         client_class = DatabaseClient
-        client_kwargs = {"db_path": db_path, "spec_version": spec_version}
+        client_kwargs = {"db_path": db_path, "spec_version": competition_version}
     else:
         client_class = CrusadesClient
         client_kwargs = {"base_url": base_url}

@@ -12,6 +12,7 @@ import logging
 import logging.handlers
 import os
 import socket
+import time
 import uuid
 from queue import Queue
 from typing import Final
@@ -62,12 +63,14 @@ def setup_loki_logger(
     if logger.handlers:
         return logger
 
-    # Console handler (always enabled)
+    # Console handler (always enabled) - use UTC for consistency with Grafana
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    formatter = logging.Formatter(
+        "%(asctime)s UTC | %(levelname)s | %(name)s | %(message)s"
     )
+    formatter.converter = time.gmtime  # Force UTC
+    console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
     
     # Prevent propagation to root logger (avoids duplicates)

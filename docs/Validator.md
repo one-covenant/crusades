@@ -52,9 +52,8 @@
 ### Docker Mode (Local GPU)
 
 ```bash
-# 1. Build evaluation image
-cd environments/templar
-docker build --no-cache -t templar-eval:latest .
+# 1. Build evaluation image (from repo root)
+docker build --network=host -f environments/templar/Dockerfile --no-cache -t templar-eval:latest .
 
 # 2. Run validator
 SUBTENSOR_NETWORK=finney \
@@ -69,9 +68,8 @@ uv run -m neurons.validator \
 ### Basilica Mode (Remote GPU)
 
 ```bash
-# 1. Build and push image to registry
-cd environments/templar
-docker build -t ghcr.io/YOUR_ORG/templar-eval:latest .
+# 1. Build and push image to registry (from repo root)
+docker build --network=host -f environments/templar/Dockerfile -t ghcr.io/YOUR_ORG/templar-eval:latest .
 docker push ghcr.io/YOUR_ORG/templar-eval:latest
 
 # 2. Run validator (no local GPU needed!)
@@ -108,8 +106,8 @@ docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
 ### Step 2: Build Evaluation Image
 
 ```bash
-cd environments/templar
-docker build -t templar-eval:latest .
+# Run from repo root - reads model/dataset from hparams.json
+docker build --network=host -f environments/templar/Dockerfile --no-cache -t templar-eval:latest .
 ```
 
 ### Step 3: Configure hparams.json
@@ -207,9 +205,8 @@ Contact the Basilica team to get your `BASILICA_API_TOKEN`.
 ### Step 2: Build and Push Docker Image
 
 ```bash
-# Build the evaluation image
-cd environments/templar
-docker build -t ghcr.io/YOUR_ORG/templar-eval:latest .
+# Build the evaluation image (from repo root)
+docker build --network=host -f environments/templar/Dockerfile -t ghcr.io/YOUR_ORG/templar-eval:latest .
 
 # Login to GitHub Container Registry
 echo $GITHUB_TOKEN | docker login ghcr.io -u YOUR_USERNAME --password-stdin

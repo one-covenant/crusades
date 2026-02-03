@@ -40,8 +40,10 @@ from .base_node import BaseNode
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s UTC | %(levelname)s | %(name)s | %(message)s",
 )
+# Force UTC for all log timestamps
+logging.Formatter.converter = time.gmtime
 logger = logging.getLogger(__name__)
 
 
@@ -269,7 +271,8 @@ class Validator(BaseNode):
     ) -> None:
         """Create a submission record from a blockchain commitment."""
         hparams = get_hparams()
-        submission_id = f"commit_{commitment.reveal_block}_{commitment.uid}"
+        version = crusades.get_competition_version()
+        submission_id = f"v{version}_commit_{commitment.reveal_block}_{commitment.uid}"
 
         try:
             existing = await self.db.get_submission(submission_id)
@@ -285,7 +288,14 @@ class Validator(BaseNode):
 
         if last_submission:
             try:
-                last_block = int(last_submission.submission_id.split("_")[1])
+                # Handle both old (commit_block_uid) and new (vN_commit_block_uid) formats
+                parts = last_submission.submission_id.split("_")
+                if parts[0].startswith("v"):
+                    # New format: v3_commit_79639_1
+                    last_block = int(parts[2])
+                else:
+                    # Old format: commit_79639_1
+                    last_block = int(parts[1])
                 blocks_since = commitment.reveal_block - last_block
 
                 if blocks_since < min_blocks:
@@ -305,6 +315,7 @@ class Validator(BaseNode):
             bucket_path=commitment.code_url_info.url,  # Store code URL
             status=SubmissionStatus.EVALUATING,
             payment_verified=True,
+            spec_version=crusades.get_competition_version(),
         )
 
         try:
@@ -398,15 +409,16 @@ class Validator(BaseNode):
     async def evaluate_submissions(self) -> None:
         """Evaluate submissions by downloading from code URL.
 
-        Only evaluates submissions matching current spec_version.
+        Only evaluates submissions matching current competition version.
         """
         hparams = get_hparams()
+        competition_version = crusades.get_competition_version()
         # Only evaluate submissions from current version
-        evaluating = await self.db.get_evaluating_submissions(spec_version=hparams.spec_version)
+        evaluating = await self.db.get_evaluating_submissions(spec_version=competition_version)
         num_runs = hparams.evaluation_runs
 
         logger.info(
-            f"Found {len(evaluating)} submissions in EVALUATING status (v{hparams.spec_version})"
+            f"Found {len(evaluating)} submissions in EVALUATING status (v{competition_version})"
         )
 
         for submission in evaluating:
@@ -532,10 +544,9 @@ class Validator(BaseNode):
                 await self.db.update_submission_score(submission_id, median_mfu)
                 await self.db.update_submission_status(
                     submission_id,
-                    SubmissionStatus.FAILED_EVALUATION,
-                    error_message="All evaluations failed",
+                    SubmissionStatus.FINISHED,
                 )
-                logger.warning(f"Submission {submission_id} failed: no successful evaluations")
+                logger.info(f"Submission {submission_id} FINISHED with MFU={median_mfu:.2f}%")
 
     def _cleanup_memory(self):
         """Clean up GPU memory."""
@@ -669,7 +680,34 @@ class Validator(BaseNode):
 
     async def _load_state(self) -> None:
         """Load persisted validator state from database."""
+        from crusades import get_competition_version
+        
+        current_version = get_competition_version()
+        
         try:
+            # Check if version changed - if so, reset state for fresh competition
+            stored_version_str = await self.db.get_validator_state("competition_version")
+            stored_version = int(stored_version_str) if stored_version_str else 0
+            
+            if stored_version != current_version:
+                # Get current block to start fresh from NOW (ignore old commitments)
+                try:
+                    current_block = self.chain.subtensor.get_current_block()
+                except Exception:
+                    current_block = 0  # Fallback, will process all if can't get block
+                
+                logger.info(
+                    f"Competition version changed ({stored_version} -> {current_version}), "
+                    f"starting fresh from block {current_block}"
+                )
+                # Keep last_processed_block at current block (ignore old commitments)
+                self.last_processed_block = current_block
+                # Clear evaluated URLs (allow same URLs in new version)
+                self.evaluated_code_urls = {}
+                # Save new version
+                await self.db.set_validator_state("competition_version", str(current_version))
+                return
+            
             # Load last processed block
             block_str = await self.db.get_validator_state("last_processed_block")
             if block_str:
@@ -697,7 +735,12 @@ class Validator(BaseNode):
 
     async def _save_state(self) -> None:
         """Persist validator state to database."""
+        from crusades import get_competition_version
+        
         try:
+            await self.db.set_validator_state(
+                "competition_version", str(get_competition_version())
+            )
             await self.db.set_validator_state(
                 "last_processed_block", str(self.last_processed_block)
             )

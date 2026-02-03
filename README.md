@@ -234,3 +234,15 @@ uv run -m crusades.tui --url 69.19.137.219:8080
 - TPS history chart
 - Validator status
 - View submission code (after evaluation)
+
+---
+
+## Docker Build
+
+Build the evaluation image from repo root (reads model/dataset from `hparams.json`):
+
+```bash
+docker build --network=host -f environments/templar/Dockerfile --no-cache -t templar-eval:latest .
+```
+
+> Note: `--network=host` is required to avoid DNS resolution issues during build.
