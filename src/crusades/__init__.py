@@ -2,7 +2,7 @@
 
 __version__ = "2.0.0"  # Major bump to test competition reset
 
-from crusades.logging import setup_loki_logger, LOKI_URL
+from crusades.logging import LOKI_URL, setup_loki_logger
 
 
 def get_competition_version() -> int:

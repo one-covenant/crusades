@@ -5,12 +5,8 @@ and easy testing/mocking.
 """
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
-
-try:
-    from enum import StrEnum
-except ImportError:
-    from strenum import StrEnum  # Python 3.10 backport
 
 
 class SubmissionStatus(StrEnum):

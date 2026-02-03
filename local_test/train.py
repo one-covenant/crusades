@@ -23,7 +23,7 @@ class InnerStepsResult:
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device):
     """Training inner loop - must train ALL parameters."""
-    
+
     # Enable performance optimizations
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -40,10 +40,10 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             input_ids = batch[:, :-1]
             labels = batch[:, 1:]
-            
+
             outputs = model(input_ids)
             logits = outputs.logits if hasattr(outputs, "logits") else outputs
-            
+
             loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
                 labels.reshape(-1),

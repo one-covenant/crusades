@@ -17,6 +17,7 @@ Endpoints:
     GET /api/stats/recent    - Recent submissions
     GET /api/stats/history   - TPS history for charts
     GET /api/stats/queue     - Queue statistics
+    GET /api/stats/threshold - Adaptive threshold stats
     GET /leaderboard         - Leaderboard entries
     GET /api/submissions/{id}            - Submission details
     GET /api/submissions/{id}/evaluations - Submission evaluations
@@ -212,6 +213,21 @@ async def get_queue_stats(x_api_key: str | None = Header(None)) -> dict[str, Any
     verify_api_key(x_api_key)
     client = get_db_client()
     return client.get_queue_stats()
+
+
+@app.get("/api/stats/threshold")
+async def get_threshold(x_api_key: str | None = Header(None)) -> dict[str, Any]:
+    """Get adaptive threshold statistics.
+
+    Returns:
+        - current_threshold: Current threshold value
+        - last_improvement: Last improvement ratio
+        - last_update_block: Block when threshold was last updated
+        - decayed_threshold: Current threshold after time-based decay
+    """
+    verify_api_key(x_api_key)
+    client = get_db_client()
+    return client.get_adaptive_threshold()
 
 
 # ============================================================

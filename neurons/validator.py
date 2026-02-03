@@ -681,21 +681,21 @@ class Validator(BaseNode):
     async def _load_state(self) -> None:
         """Load persisted validator state from database."""
         from crusades import get_competition_version
-        
+
         current_version = get_competition_version()
-        
+
         try:
             # Check if version changed - if so, reset state for fresh competition
             stored_version_str = await self.db.get_validator_state("competition_version")
             stored_version = int(stored_version_str) if stored_version_str else 0
-            
+
             if stored_version != current_version:
                 # Get current block to start fresh from NOW (ignore old commitments)
                 try:
                     current_block = self.chain.subtensor.get_current_block()
                 except Exception:
                     current_block = 0  # Fallback, will process all if can't get block
-                
+
                 logger.info(
                     f"Competition version changed ({stored_version} -> {current_version}), "
                     f"starting fresh from block {current_block}"
@@ -707,7 +707,7 @@ class Validator(BaseNode):
                 # Save new version
                 await self.db.set_validator_state("competition_version", str(current_version))
                 return
-            
+
             # Load last processed block
             block_str = await self.db.get_validator_state("last_processed_block")
             if block_str:
@@ -736,7 +736,7 @@ class Validator(BaseNode):
     async def _save_state(self) -> None:
         """Persist validator state to database."""
         from crusades import get_competition_version
-        
+
         try:
             await self.db.set_validator_state(
                 "competition_version", str(get_competition_version())

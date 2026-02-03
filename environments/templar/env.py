@@ -64,10 +64,15 @@ class InnerStepsResult:
 
 @dataclass
 class GradientInfo:
-    """Captured gradient information for verification."""
+    """Captured gradient information for verification.
+
+    MEMORY OPTIMIZATION: grad_vector is a list of per-layer tensors stored on CPU,
+    rather than a single concatenated tensor. This avoids allocating ~6-12GB for
+    large models. Cosine similarity is computed incrementally layer-by-layer.
+    """
 
     grad_norm: float  # L2 norm of all gradients
-    grad_vector: torch.Tensor | None = None  # Flattened gradient vector for cosine sim
+    grad_vector: list | None = None  # List of per-layer gradient tensors (on CPU)
     layers_with_grad: int = 0  # Layers with non-zero gradients
     total_layers: int = 0  # Total trainable layers
 
@@ -81,7 +86,7 @@ _CACHE = {
 
 
 def _load_miner_module(train_path: Path):
-    """Dynamically load miner's train.py as a module with import sandboxing.
+    """Dynamically load miner's train.py as a module.
 
     Args:
         train_path: Path to train.py
@@ -90,8 +95,8 @@ def _load_miner_module(train_path: Path):
         Loaded module with inner_steps function
 
     Security:
-        - Enables import sandbox before loading (blocks os, sys, subprocess, etc.)
-        - Sandbox remains active during module execution
+        - Docker provides isolation (--network=none, restricted filesystem)
+        - No import sandboxing (incompatible with ML libraries)
     """
     spec = importlib.util.spec_from_file_location("miner_train", train_path)
     if spec is None or spec.loader is None:
@@ -307,13 +312,47 @@ def _load_model(model_path: str, use_random_init: bool = False):
         # Random init - miners can't cheat by freezing pretrained layers
         logger.info(f"Loading model config from {model_path} with RANDOM initialization")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_config(
-            config,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            attn_implementation="sdpa",
-        )
-        model = model.to("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Use accelerate for memory-efficient loading (matches pretrained branch)
+        # This prevents OOM on large models by distributing across devices
+        try:
+            from accelerate import dispatch_model, infer_auto_device_map, init_empty_weights
+
+            # Create model with empty weights first (no memory allocation)
+            with init_empty_weights():
+                empty_model = AutoModelForCausalLM.from_config(
+                    config,
+                    torch_dtype=torch.bfloat16,
+                    trust_remote_code=True,
+                    attn_implementation="sdpa",
+                )
+
+            # Infer device map for auto distribution
+            device_map = infer_auto_device_map(
+                empty_model,
+                max_memory={0: "70GiB", "cpu": "30GiB"} if torch.cuda.is_available() else None,
+            )
+
+            # Now create actual model and dispatch
+            model = AutoModelForCausalLM.from_config(
+                config,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                attn_implementation="sdpa",
+            )
+            model = dispatch_model(model, device_map=device_map)
+            logger.info(f"Model loaded with device_map: {device_map}")
+
+        except ImportError:
+            # Fallback if accelerate not available
+            logger.warning("accelerate not available, using simple device placement")
+            model = AutoModelForCausalLM.from_config(
+                config,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                attn_implementation="sdpa",
+            )
+            model = model.to("cuda" if torch.cuda.is_available() else "cpu")
     else:
         logger.info(f"Loading pretrained model from {model_path}")
         model = AutoModelForCausalLM.from_pretrained(
@@ -359,7 +398,8 @@ def _calculate_mfu(
     Returns:
         MFU as a percentage (0-100)
     """
-    if wall_time <= 0:
+    # Guard against division by zero / invalid inputs
+    if wall_time <= 0 or gpu_peak_tflops <= 0:
         return 0.0
 
     # FLOPs for forward + backward pass
@@ -378,10 +418,15 @@ def _calculate_mfu(
 def _capture_gradients(model: torch.nn.Module) -> GradientInfo:
     """Capture gradient information from model after backward pass.
 
+    MEMORY OPTIMIZATION: Instead of concatenating all gradients into a single
+    large tensor (which can be ~6-12GB for 3B models), we store per-layer
+    gradient vectors on CPU. Cosine similarity is computed incrementally
+    in _verify_gradients() to avoid memory pressure.
+
     Returns:
-        GradientInfo with norm and flattened gradient vector
+        GradientInfo with norm and per-layer gradient vectors (on CPU)
     """
-    grad_list = []
+    grad_vectors_cpu = []  # Store per-layer on CPU to save GPU memory
     total_norm_sq = 0.0
     layers_with_grad = 0
     layers_without_grad = 0
@@ -389,15 +434,18 @@ def _capture_gradients(model: torch.nn.Module) -> GradientInfo:
     for param in model.parameters():
         if param.grad is not None:
             grad_flat = param.grad.detach().float().view(-1)
-            grad_list.append(grad_flat)
             total_norm_sq += grad_flat.pow(2).sum().item()
             # Check if gradient is actually non-zero (not just allocated)
             if grad_flat.abs().sum().item() > 1e-10:
                 layers_with_grad += 1
+                # Move to CPU immediately to free GPU memory
+                grad_vectors_cpu.append(grad_flat.cpu())
             else:
                 layers_without_grad += 1
+                grad_vectors_cpu.append(grad_flat.cpu())  # Still store for shape matching
         else:
             layers_without_grad += 1
+            grad_vectors_cpu.append(None)
 
     grad_norm = total_norm_sq**0.5
 
@@ -409,15 +457,9 @@ def _capture_gradients(model: torch.nn.Module) -> GradientInfo:
         if layers_without_grad > 0:
             logger.warning(f"WARNING: {layers_without_grad} layers have zero/no gradients!")
 
-    # Concatenate all gradients into single vector for cosine similarity
-    if grad_list:
-        grad_vector = torch.cat(grad_list)
-    else:
-        grad_vector = None
-
     return GradientInfo(
         grad_norm=grad_norm,
-        grad_vector=grad_vector,
+        grad_vector=grad_vectors_cpu,  # Now a list of per-layer tensors on CPU
         layers_with_grad=layers_with_grad,
         total_layers=total_layers,
     )
@@ -425,7 +467,7 @@ def _capture_gradients(model: torch.nn.Module) -> GradientInfo:
 
 def _verify_trainable_params(
     model: torch.nn.Module,
-    min_trainable_ratio: float = 0.9,
+    min_trainable_ratio: float = 1.0,
 ) -> tuple[bool, str | None, dict]:
     """Check that minimum % of params are trainable (prevents layer freezing)."""
     total_params = 0
@@ -464,33 +506,47 @@ def _verify_params_changed(
     model: torch.nn.Module,
     initial_state: dict,
     min_changed_ratio: float = 0.5,
+    element_threshold: float = 1e-6,
 ) -> tuple[bool, str | None, dict]:
-    """Verify that minimum % of params actually changed during training."""
-    total_params = 0
-    changed_params = 0
+    """Verify that minimum % of individual parameter elements changed during training.
+
+    SECURITY: Counts individual elements, not tensors. This prevents a bypass where
+    miners make tiny modifications to many tensors (each barely above threshold) to
+    pass the check without meaningful training.
+
+    Args:
+        model: Model after training
+        initial_state: Model state before training
+        min_changed_ratio: Minimum fraction of elements that must change
+        element_threshold: Minimum absolute change for an element to count as "changed"
+    """
+    total_elements = 0
+    changed_elements = 0
 
     for name, param in model.named_parameters():
         if name in initial_state:
             initial = initial_state[name].to(param.device)
-            diff = (param.data - initial).abs().sum().item()
-            num_params = param.numel()
-            total_params += num_params
-            if diff > 1e-6:  # Threshold for "changed"
-                changed_params += num_params
+            # Count individual elements that changed (not whole tensors)
+            element_diffs = (param.data - initial).abs()
+            changed_mask = element_diffs > element_threshold
 
-    changed_ratio = changed_params / total_params if total_params > 0 else 0.0
+            total_elements += param.numel()
+            changed_elements += changed_mask.sum().item()
+
+    changed_ratio = changed_elements / total_elements if total_elements > 0 else 0.0
 
     details = {
-        "total_params": total_params,
-        "changed_params": changed_params,
+        "total_elements": total_elements,
+        "changed_elements": int(changed_elements),
         "changed_ratio": changed_ratio,
         "min_required": min_changed_ratio,
+        "element_threshold": element_threshold,
     }
 
     if changed_ratio < min_changed_ratio:
         error = (
             f"Insufficient parameter updates: {changed_ratio:.1%} "
-            f"({changed_params:,}/{total_params:,}) - minimum {min_changed_ratio:.0%} required"
+            f"({int(changed_elements):,}/{total_elements:,} elements) - minimum {min_changed_ratio:.0%} required"
         )
         logger.error(f"[FAILED] {error}")
         return False, error, details
@@ -552,6 +608,67 @@ def _create_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
         weight_decay=0.1,
         betas=(0.9, 0.95),
     )
+
+
+class GradientCapturingOptimizer:
+    """Optimizer wrapper that captures gradients before each step.
+
+    SECURITY: This wrapper intercepts optimizer.step() to capture gradients
+    from within the miner's inner_steps execution. This ensures we verify
+    gradients produced by miner code, not validator code.
+
+    The previous approach (running final step manually outside inner_steps)
+    was flawed because when steps==1, the miner's inner_steps was never
+    called during full evaluation, only during warmup.
+    """
+
+    def __init__(self, optimizer: torch.optim.Optimizer, model: torch.nn.Module):
+        self.optimizer = optimizer
+        self.model = model
+        self.captured_gradients: GradientInfo | None = None
+        self.step_count = 0
+
+    def step(self, *args, **kwargs):
+        """Capture gradients BEFORE optimizer.step() clears them."""
+        # Always capture (we'll use the last one)
+        self.captured_gradients = _capture_gradients(self.model)
+        self.step_count += 1
+        return self.optimizer.step(*args, **kwargs)
+
+    def zero_grad(self, set_to_none: bool = False):
+        """Forward to underlying optimizer."""
+        return self.optimizer.zero_grad(set_to_none=set_to_none)
+
+    @property
+    def param_groups(self):
+        """Forward param_groups access to underlying optimizer."""
+        return self.optimizer.param_groups
+
+    @param_groups.setter
+    def param_groups(self, value):
+        """Forward param_groups setter to underlying optimizer."""
+        self.optimizer.param_groups = value
+
+    def state_dict(self):
+        """Forward to underlying optimizer."""
+        return self.optimizer.state_dict()
+
+    def load_state_dict(self, state_dict):
+        """Forward to underlying optimizer."""
+        return self.optimizer.load_state_dict(state_dict)
+
+    def add_param_group(self, param_group):
+        """Forward to underlying optimizer."""
+        return self.optimizer.add_param_group(param_group)
+
+    @property
+    def state(self):
+        """Forward state access to underlying optimizer."""
+        return self.optimizer.state
+
+    def __getattr__(self, name):
+        """Forward any other attribute access to underlying optimizer."""
+        return getattr(self.optimizer, name)
 
 
 def _run_reference(
@@ -706,28 +823,54 @@ def _verify_gradients(
     else:
         logger.warning("Reference gradient norm is zero, skipping norm ratio check")
 
-    # Check 2: Cosine similarity
-    ref_vec = reference_grad.grad_vector
-    cand_vec = candidate_grad.grad_vector
+    # Check 2: Cosine similarity (computed incrementally to save memory)
+    ref_vecs = reference_grad.grad_vector  # List of per-layer tensors
+    cand_vecs = candidate_grad.grad_vector  # List of per-layer tensors
 
-    if ref_vec is not None and cand_vec is not None:
-        # Ensure same device
-        if ref_vec.device != cand_vec.device:
-            cand_vec = cand_vec.to(ref_vec.device)
-
-        # Ensure same size (might differ if model structure changed)
-        if ref_vec.shape != cand_vec.shape:
-            error = f"Gradient vector shape mismatch: ref={ref_vec.shape}, cand={cand_vec.shape}"
+    if ref_vecs is not None and cand_vecs is not None and len(ref_vecs) > 0:
+        # Verify same number of layers
+        if len(ref_vecs) != len(cand_vecs):
+            error = f"Gradient layer count mismatch: ref={len(ref_vecs)}, cand={len(cand_vecs)}"
             details["checks_failed"].append({"check": "gradient_shape", "error": error})
             logger.error(f"[FAILED] {error}")
             return False, error, details
 
-        # Calculate cosine similarity
-        cosine_sim = F.cosine_similarity(ref_vec.unsqueeze(0), cand_vec.unsqueeze(0)).item()
+        # Compute cosine similarity incrementally (layer-by-layer)
+        # cosine_sim = dot_product / (norm_ref * norm_cand)
+        # We already have norms from GradientInfo, just need dot product
+        dot_product = 0.0
+        total_elements = 0
+
+        for ref_layer, cand_layer in zip(ref_vecs, cand_vecs):
+            if ref_layer is None or cand_layer is None:
+                continue
+
+            # Verify shape match for this layer
+            if ref_layer.shape != cand_layer.shape:
+                error = f"Gradient shape mismatch at layer: ref={ref_layer.shape}, cand={cand_layer.shape}"
+                details["checks_failed"].append({"check": "gradient_shape", "error": error})
+                logger.error(f"[FAILED] {error}")
+                return False, error, details
+
+            # Accumulate dot product (both tensors are on CPU)
+            dot_product += (ref_layer * cand_layer).sum().item()
+            total_elements += ref_layer.numel()
+
+        # Calculate cosine similarity using pre-computed norms
+        ref_norm = reference_grad.grad_norm
+        cand_norm = candidate_grad.grad_norm
+
+        if ref_norm > 0 and cand_norm > 0:
+            cosine_sim = dot_product / (ref_norm * cand_norm)
+        else:
+            cosine_sim = 0.0
+
         details["cosine_similarity"] = cosine_sim
+        details["gradient_elements"] = total_elements
 
         logger.info(f"[CHECK 2/3] Gradient cosine similarity: {cosine_sim:.4f}")
         logger.info(f"   Minimum required: {cosine_min}")
+        logger.info(f"   Total gradient elements: {total_elements:,}")
 
         if cosine_sim < cosine_min:
             error = f"Gradient cosine similarity {cosine_sim:.4f} below minimum {cosine_min}"
@@ -1146,62 +1289,67 @@ class Actor:
             # =================================================================
             # FULL EVALUATION - Run actual timed evaluation with gradient capture
             # =================================================================
+            # SECURITY: Use GradientCapturingOptimizer to capture gradients from
+            # WITHIN the miner's inner_steps execution. This ensures we verify
+            # gradients produced by miner code, not validator code.
+            #
+            # Previous approach (running final step manually) was flawed because
+            # when steps==1, miner's inner_steps was never called during evaluation.
             data_iter_miner = _create_data_iterator(data, batch_size, seq_len)
-            optimizer_miner = _create_optimizer(model)
+            base_optimizer = _create_optimizer(model)
+            optimizer_miner = GradientCapturingOptimizer(base_optimizer, model)
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
-            # We need to capture gradients on the final step
-            # Run all but last step normally
             start = time.perf_counter()
 
-            if steps > 1:
-                # Run steps-1 steps without gradient capture
-                miner_module.inner_steps(
-                    model=model,
-                    data_iterator=data_iter_miner,
-                    optimizer=optimizer_miner,
-                    num_steps=steps - 1,
-                    device=device,
-                )
-
-            # Run final step and capture gradients
-            # We run the last step manually to capture gradients before optimizer.step()
-            batch = next(data_iter_miner)
-            batch = batch.to(device, dtype=torch.long)
-
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                input_ids = batch[:, :-1]
-                labels = batch[:, 1:]
-                outputs = model(input_ids)
-                logits = outputs.logits if hasattr(outputs, "logits") else outputs
-                loss = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    labels.reshape(-1),
-                    ignore_index=-100,
-                )
-
-            loss.backward()
-
-            # Capture candidate gradients BEFORE optimizer step
-            candidate_grad = _capture_gradients(model)
-
-            optimizer_miner.step()
-            optimizer_miner.zero_grad(set_to_none=True)
+            # Run ALL steps through miner's inner_steps
+            # Gradients are captured automatically by the wrapper on each step
+            miner_result = miner_module.inner_steps(
+                model=model,
+                data_iterator=data_iter_miner,
+                optimizer=optimizer_miner,
+                num_steps=steps,
+                device=device,
+            )
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
             wall_time = time.perf_counter() - start
 
-            # Create result from final step
-            total_tokens = batch_size * seq_len * steps
-            parsed = InnerStepsResult(
-                final_logits=logits.detach().float(),
-                total_tokens=total_tokens,
-                final_loss=float(loss.item()),
-            )
+            # Get gradients captured from the final step (inside miner's code)
+            candidate_grad = optimizer_miner.captured_gradients
+
+            if candidate_grad is None:
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": "No gradients captured - miner may not be calling optimizer.step()",
+                    "error_code": "no_gradients_captured",
+                    "seed": seed,
+                    "code": code,
+                }
+
+            # Validate miner's returned result
+            ok, error, parsed = _validate_return_type(miner_result)
+            if not ok or parsed is None:
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": error,
+                    "seed": seed,
+                    "code": code,
+                }
 
             # =================================================================
             # PARAMS CHANGED CHECK - Verify miner actually trained the model

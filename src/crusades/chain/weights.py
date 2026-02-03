@@ -39,9 +39,10 @@ class WeightSetter:
         self.burn_rate = self.hparams.burn_rate  # e.g., 0.95 = 95% to validator
         self.burn_uid = self.hparams.burn_uid  # UID that receives burn portion
 
-        # Track previous winner to detect changes
+        # Track previous winner to detect changes (rehydrated from DB on first call)
         self._previous_winner_id: str | None = None
         self._previous_winner_score: float = 0.0
+        self._initialized: bool = False
 
     async def set_weights(self) -> tuple[bool, str]:
         """Set weights based on leaderboard rank 1 with burn_rate distribution.
@@ -110,10 +111,26 @@ class WeightSetter:
 
         winner_score = winner.final_score or 0.0
 
+        # Rehydrate previous winner from DB on first call (survives restarts)
+        if not self._initialized:
+            self._initialized = True
+            # Get current top submission to initialize tracking
+            top_submission = await self.db.get_leaderboard_winner(
+                threshold=0.0,  # No threshold - get absolute top
+                spec_version=get_competition_version(),
+            )
+            if top_submission:
+                self._previous_winner_id = top_submission.submission_id
+                self._previous_winner_score = top_submission.final_score or 0.0
+                logger.info(
+                    f"Rehydrated previous winner from DB: "
+                    f"{self._previous_winner_id} ({self._previous_winner_score:.2f}% MFU)"
+                )
+
         # Check if winner changed - if so, update adaptive threshold
         if winner.submission_id != self._previous_winner_id:
-            if self._previous_winner_id is not None:
-                # New winner! Update adaptive threshold based on improvement
+            # Update adaptive threshold (even for first winner if previous was rehydrated)
+            if self._previous_winner_score > 0:
                 new_threshold = await self.db.update_adaptive_threshold(
                     new_score=winner_score,
                     old_score=self._previous_winner_score,
@@ -121,13 +138,7 @@ class WeightSetter:
                     base_threshold=threshold_config.base_threshold,
                 )
                 improvement = (
-                    (
-                        (winner_score - self._previous_winner_score)
-                        / self._previous_winner_score
-                        * 100
-                    )
-                    if self._previous_winner_score > 0
-                    else 100
+                    (winner_score - self._previous_winner_score) / self._previous_winner_score * 100
                 )
                 logger.info(
                     f"NEW LEADER! Threshold updated:\n"
@@ -136,6 +147,13 @@ class WeightSetter:
                     f"  - New threshold: {new_threshold * 100:.1f}%"
                 )
             else:
+                # First winner ever - initialize with base threshold
+                await self.db.update_adaptive_threshold(
+                    new_score=winner_score,
+                    old_score=0.0,
+                    current_block=current_block,
+                    base_threshold=threshold_config.base_threshold,
+                )
                 logger.info(f"First winner established: {winner_score:.2f}% MFU")
 
             # Update tracking

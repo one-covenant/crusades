@@ -22,7 +22,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoConfig
+from transformers import AutoConfig, AutoModelForCausalLM
 
 
 @dataclass
@@ -37,7 +37,7 @@ class InnerStepsResult:
 @dataclass
 class GradientInfo:
     """Gradient information for verification."""
-    
+
     norm: float
     vector: torch.Tensor | None
     layers_with_grad: int
@@ -57,7 +57,7 @@ def capture_gradients(model: torch.nn.Module) -> GradientInfo:
     grads = []
     layers_with_grad = 0
     total_layers = 0
-    
+
     for name, param in model.named_parameters():
         if param.requires_grad:
             total_layers += 1
@@ -66,14 +66,14 @@ def capture_gradients(model: torch.nn.Module) -> GradientInfo:
                 if grad.abs().sum() > 0:
                     layers_with_grad += 1
                 grads.append(grad)
-    
+
     if grads:
         grad_vector = torch.cat(grads)
         grad_norm = grad_vector.norm().item()
     else:
         grad_vector = None
         grad_norm = 0.0
-    
+
     return GradientInfo(
         norm=grad_norm,
         vector=grad_vector,
@@ -108,11 +108,11 @@ def run_reference_with_gradients(model, data_iterator, optimizer, num_steps, dev
             )
 
         loss.backward()
-        
+
         # Capture gradients on final step BEFORE optimizer.step()
         if step == num_steps - 1:
             grad_info = capture_gradients(model)
-        
+
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -132,12 +132,12 @@ def verify_trainable_params(model, min_ratio: float = 1.0) -> tuple[bool, str | 
     """Check that required percentage of parameters are trainable."""
     total_params = 0
     trainable_params = 0
-    
+
     for name, param in model.named_parameters():
         total_params += param.numel()
         if param.requires_grad:
             trainable_params += param.numel()
-    
+
     ratio = trainable_params / total_params if total_params > 0 else 0.0
     details = {
         "total_params": total_params,
@@ -145,11 +145,11 @@ def verify_trainable_params(model, min_ratio: float = 1.0) -> tuple[bool, str | 
         "trainable_ratio": ratio,
         "required_ratio": min_ratio,
     }
-    
+
     if ratio < min_ratio:
         error = f"Only {ratio:.1%} params trainable, need {min_ratio:.0%}"
         return False, error, details
-    
+
     return True, None, details
 
 
@@ -159,13 +159,13 @@ def verify_params_changed(
     """Check that required percentage of parameters changed during training."""
     total_params = 0
     changed_params = 0
-    
+
     for name, param in model.named_parameters():
         if name in initial_state:
             total_params += param.numel()
             diff = (param.data - initial_state[name].to(param.device)).abs()
             changed_params += (diff > 1e-8).sum().item()
-    
+
     ratio = changed_params / total_params if total_params > 0 else 0.0
     details = {
         "total_params": total_params,
@@ -173,11 +173,11 @@ def verify_params_changed(
         "changed_ratio": ratio,
         "required_ratio": min_ratio,
     }
-    
+
     if ratio < min_ratio:
         error = f"Only {ratio:.1%} params changed, need {min_ratio:.0%}"
         return False, error, details
-    
+
     return True, None, details
 
 
@@ -195,14 +195,14 @@ def verify_gradients(
         "checks_passed": [],
         "checks_failed": [],
     }
-    
+
     # Check gradient coverage (100% of layers must have gradients)
     if candidate_grad.total_layers > 0:
         coverage = candidate_grad.layers_with_grad / candidate_grad.total_layers
         details["gradient_coverage"] = coverage
         details["layers_with_grad"] = candidate_grad.layers_with_grad
         details["total_layers"] = candidate_grad.total_layers
-        
+
         if coverage < 1.0:
             error = (
                 f"Not all layers have gradients: "
@@ -211,21 +211,20 @@ def verify_gradients(
             details["checks_failed"].append({"check": "gradient_coverage", "error": error})
             return False, error, details
         details["checks_passed"].append("gradient_coverage")
-    
+
     # Check gradient norm ratio
     if reference_grad.norm > 0:
         norm_ratio = candidate_grad.norm / reference_grad.norm
         details["norm_ratio"] = norm_ratio
-        
+
         if norm_ratio < norm_ratio_min or norm_ratio > norm_ratio_max:
             error = (
-                f"Gradient norm ratio {norm_ratio:.2f} "
-                f"outside [{norm_ratio_min}, {norm_ratio_max}]"
+                f"Gradient norm ratio {norm_ratio:.2f} outside [{norm_ratio_min}, {norm_ratio_max}]"
             )
             details["checks_failed"].append({"check": "norm_ratio", "error": error})
             return False, error, details
         details["checks_passed"].append("norm_ratio")
-    
+
     # Check cosine similarity
     if reference_grad.vector is not None and candidate_grad.vector is not None:
         if reference_grad.vector.shape == candidate_grad.vector.shape:
@@ -234,13 +233,13 @@ def verify_gradients(
                 candidate_grad.vector.unsqueeze(0),
             ).item()
             details["cosine_similarity"] = cosine
-            
+
             if cosine < cosine_min:
                 error = f"Gradient cosine similarity {cosine:.4f} < {cosine_min}"
                 details["checks_failed"].append({"check": "cosine_similarity", "error": error})
                 return False, error, details
             details["checks_passed"].append("cosine_similarity")
-    
+
     return True, None, details
 
 
@@ -280,7 +279,7 @@ def verify_all(
     print("\n[CHECK 2/5] Loss validity and comparison")
     print(f"  Reference loss: {reference.final_loss:.6f}")
     print(f"  Candidate loss: {candidate.final_loss:.6f}")
-    
+
     if candidate.final_loss != candidate.final_loss:  # NaN check
         print("  [FAILED] Loss is NaN!")
         all_passed = False
@@ -301,8 +300,8 @@ def verify_all(
     trainable_ok, trainable_err, trainable_details = verify_trainable_params(
         model, min_trainable_ratio
     )
-    trainable_count = trainable_details['trainable_params']
-    total_count = trainable_details['total_params']
+    trainable_count = trainable_details["trainable_params"]
+    total_count = trainable_details["total_params"]
     print(f"  Trainable: {trainable_count:,} / {total_count:,}")
     print(f"  Ratio: {trainable_details['trainable_ratio']:.1%}")
     if not trainable_ok:
@@ -316,8 +315,8 @@ def verify_all(
     changed_ok, changed_err, changed_details = verify_params_changed(
         model, initial_state, min_changed_ratio
     )
-    changed_count = changed_details['changed_params']
-    total_params = changed_details['total_params']
+    changed_count = changed_details["changed_params"]
+    total_params = changed_details["total_params"]
     print(f"  Changed: {changed_count:,} / {total_params:,}")
     print(f"  Ratio: {changed_details['changed_ratio']:.1%}")
     if not changed_ok:
@@ -329,7 +328,8 @@ def verify_all(
     # CHECK 5: Gradient verification
     print("\n[CHECK 5/5] Gradient verification")
     grad_ok, grad_err, grad_details = verify_gradients(
-        reference_grad, candidate_grad,
+        reference_grad,
+        candidate_grad,
         cosine_min=gradient_cosine_min,
         norm_ratio_min=gradient_norm_ratio_min,
         norm_ratio_max=gradient_norm_ratio_max,
@@ -337,18 +337,18 @@ def verify_all(
     print(f"  Reference gradient norm: {grad_details['reference_norm']:.4f}")
     print(f"  Candidate gradient norm: {grad_details['candidate_norm']:.4f}")
     if "gradient_coverage" in grad_details:
-        cov = grad_details['gradient_coverage']
-        layers = grad_details['layers_with_grad']
-        total = grad_details['total_layers']
+        cov = grad_details["gradient_coverage"]
+        layers = grad_details["layers_with_grad"]
+        total = grad_details["total_layers"]
         print(f"  Gradient coverage: {cov:.1%} ({layers}/{total} layers)")
     if "norm_ratio" in grad_details:
-        ratio = grad_details['norm_ratio']
+        ratio = grad_details["norm_ratio"]
         allowed = f"{gradient_norm_ratio_min}-{gradient_norm_ratio_max}"
         print(f"  Norm ratio: {ratio:.4f} (allowed: {allowed})")
     if "cosine_similarity" in grad_details:
-        cos = grad_details['cosine_similarity']
+        cos = grad_details["cosine_similarity"]
         print(f"  Cosine similarity: {cos:.4f} (min: {gradient_cosine_min})")
-    
+
     if not grad_ok:
         print(f"  [FAILED] {grad_err}")
         all_passed = False
@@ -386,7 +386,7 @@ def main():
     batch_size = hparams.get("benchmark_batch_size", 4)
     seq_len = hparams.get("benchmark_sequence_length", 1024)
     num_steps = hparams.get("eval_steps", 5)
-    
+
     # Verification settings (same as validator)
     verification = hparams.get("verification", {})
     max_loss_difference = verification.get("max_loss_difference", 0.5)
@@ -503,16 +503,16 @@ def main():
     print("Running your inner_steps...")
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    
+
     # Run all but last step normally
     data_iter = create_iterator()
     if num_steps > 1:
         train_module.inner_steps(model, data_iter, optimizer, num_steps - 1, device)
-    
+
     # Run final step manually to capture gradients
     batch = next(data_iter)
     batch = batch.to(device, dtype=torch.long)
-    
+
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
         input_ids = batch[:, :-1]
         labels = batch[:, 1:]
@@ -523,18 +523,21 @@ def main():
             labels.reshape(-1),
             ignore_index=-100,
         )
-    
+
     loss.backward()
     candidate_grad = capture_gradients(model)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
-    
+
+    # total_tokens computed from controlled test inputs (batch_size * seq_len * num_steps)
+    # This mirrors production where validator controls the data iterator
+    actual_tokens = batch_size * seq_len * num_steps
     candidate = InnerStepsResult(
         final_logits=logits.detach().float(),
-        total_tokens=batch_size * seq_len * num_steps,
+        total_tokens=actual_tokens,
         final_loss=float(loss.item()),
     )
-    
+
     print(f"  Candidate loss: {candidate.final_loss:.6f}")
     print(f"  Candidate tokens: {candidate.total_tokens:,}")
     print(f"  Candidate gradient norm: {candidate_grad.norm:.4f}")

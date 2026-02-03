@@ -173,8 +173,9 @@ def create_stats_panel(data: CrusadesData) -> Panel:
     stats.add_column(justify="center")
 
     # Calculate MFU to Beat: top_mfu * (1 + threshold)
-    top_mfu = overview.get("current_top_score", 0)
-    threshold_val = threshold.get("decayed_threshold", 0.01)
+    # Handle None values to avoid math errors
+    top_mfu = overview.get("current_top_score") or 0
+    threshold_val = threshold.get("decayed_threshold") or 0.01
     mfu_to_beat = top_mfu * (1 + threshold_val) if top_mfu > 0 else 0
 
     stats.add_row(

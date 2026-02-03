@@ -72,7 +72,7 @@ def setup_loki_logger(
     formatter.converter = time.gmtime  # Force UTC
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-    
+
     # Prevent propagation to root logger (avoids duplicates)
     logger.propagate = False
 

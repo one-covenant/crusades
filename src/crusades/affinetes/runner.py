@@ -277,7 +277,8 @@ class AffinetesRunner:
                 task_id=task_id,
             )
 
-        if self.mode == "docker":
+        if self.mode in ("docker", "affinetes"):
+            # Both docker and affinetes use local Docker evaluation
             return await self._evaluate_docker(
                 code=code,
                 seed=str(seed),

@@ -13,7 +13,14 @@ from datasets import load_dataset
 
 # Configuration from environment (set by Dockerfile build args)
 DATASET_NAME = os.environ.get("DATASET_NAME", "HuggingFaceFW/fineweb")
-NUM_SAMPLES = int(os.environ.get("NUM_SAMPLES", "50000"))
+_num_samples_str = os.environ.get("NUM_SAMPLES", "50000")
+try:
+    NUM_SAMPLES = int(_num_samples_str)
+    if NUM_SAMPLES <= 0:
+        raise ValueError("NUM_SAMPLES must be positive")
+except ValueError as e:
+    raise ValueError(f"Invalid NUM_SAMPLES='{_num_samples_str}': {e}") from e
+
 CACHE_PATH = Path("/home/appuser/.cache/templar")
 OUTPUT_FILE = CACHE_PATH / "dataset.json"
 
