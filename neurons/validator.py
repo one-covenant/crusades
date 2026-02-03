@@ -693,8 +693,14 @@ class Validator(BaseNode):
                 # Get current block to start fresh from NOW (ignore old commitments)
                 try:
                     current_block = self.chain.subtensor.get_current_block()
-                except Exception:
-                    current_block = 0  # Fallback, will process all if can't get block
+                except Exception as e:
+                    # Cannot determine current block - defer version reset to avoid
+                    # reprocessing all historical commitments from block 0
+                    logger.warning(
+                        f"Competition version changed ({stored_version} -> {current_version}), "
+                        f"but cannot get current block: {e}. Deferring reset until chain is available."
+                    )
+                    return
 
                 logger.info(
                     f"Competition version changed ({stored_version} -> {current_version}), "
