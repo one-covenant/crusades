@@ -133,7 +133,7 @@ class WeightSetter:
                     f"NEW LEADER! Threshold updated:\n"
                     f"  - Previous: {self._previous_winner_score:.2f}% MFU\n"
                     f"  - New: {winner_score:.2f}% MFU (+{improvement:.1f}%)\n"
-                    f"  - New threshold: {new_threshold:.2%}"
+                    f"  - New threshold: {new_threshold * 100:.1f}%"
                 )
             else:
                 logger.info(f"First winner established: {winner_score:.2f}% MFU")

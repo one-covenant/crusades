@@ -346,7 +346,11 @@ class DatabaseClient:
         }
 
     def get_leaderboard(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Get leaderboard entries with adaptive threshold (filtered by spec_version)."""
+        """Get leaderboard entries sorted by score (filtered by spec_version).
+
+        Note: Adaptive threshold is only used for weight setting, not display.
+        The leaderboard shows all finished submissions ranked by final_score.
+        """
         vf = self._version_filter("s")
         rows = self._query(
             f"""SELECT s.submission_id, s.miner_hotkey, s.miner_uid, s.final_score,
@@ -355,44 +359,23 @@ class DatabaseClient:
                LEFT JOIN evaluations e ON s.submission_id = e.submission_id
                WHERE s.status = ? AND s.final_score IS NOT NULL{vf}
                GROUP BY s.submission_id
-               ORDER BY s.created_at ASC""",
+               ORDER BY s.final_score DESC""",
             (SubmissionStatus.FINISHED,),
         )
 
-        # Get adaptive threshold (defaults to 1% if not set)
-        threshold_info = self.get_adaptive_threshold()
-        rank_threshold = threshold_info["decayed_threshold"]
-
-        # Build leaderboard incrementally (oldest submissions first)
-        leaderboard: list[dict[str, Any]] = []
-
-        for row in rows:
-            score = row["final_score"] or 0.0
-            entry = {
-                "rank": 0,  # Will be assigned later
-                "submission_id": row["submission_id"],
-                "miner_hotkey": row["miner_hotkey"],
-                "miner_uid": row["miner_uid"],
-                "final_score": score,
-                "num_evaluations": row["eval_count"],
-                "created_at": row["created_at"],
-            }
-
-            # Find insertion position (scan from top)
-            # New entry only goes above existing if it beats them by >threshold
-            insert_pos = len(leaderboard)  # Default: add at bottom
-            for i, existing in enumerate(leaderboard):
-                threshold_score = existing["final_score"] * (1 + rank_threshold)
-                if score > threshold_score:
-                    # Beats this incumbent by >1%, insert here
-                    insert_pos = i
-                    break
-
-            leaderboard.insert(insert_pos, entry)
-
-        # Assign sequential ranks
-        for i, entry in enumerate(leaderboard):
-            entry["rank"] = i + 1
+        leaderboard = []
+        for i, row in enumerate(rows):
+            leaderboard.append(
+                {
+                    "rank": i + 1,
+                    "submission_id": row["submission_id"],
+                    "miner_hotkey": row["miner_hotkey"],
+                    "miner_uid": row["miner_uid"],
+                    "final_score": row["final_score"] or 0.0,
+                    "num_evaluations": row["eval_count"],
+                    "created_at": row["created_at"],
+                }
+            )
 
         return leaderboard[:limit]
 
@@ -464,7 +447,10 @@ class DatabaseClient:
         }
 
     def get_history(self) -> list[dict[str, Any]]:
-        """Get MFU history for chart (filtered by spec_version)."""
+        """Get MFU history for chart (filtered by spec_version).
+
+        Shows running maximum MFU over time (simple max, no threshold).
+        """
         vf = self._version_filter("s")
         rows = self._query(
             f"SELECT submission_id, final_score as mfu, created_at "
@@ -475,22 +461,16 @@ class DatabaseClient:
 
         history = []
         running_best = 0.0
-        # Get adaptive threshold (defaults to 1% if not set)
-        threshold_info = self.get_adaptive_threshold()
-        rank_threshold = threshold_info["decayed_threshold"]
 
         for row in rows:
             mfu = row["mfu"] or 0.0
-            # Only update running_best if it beats incumbent by >threshold
-            # This matches the leaderboard adaptive threshold logic
-            threshold_score = running_best * (1 + rank_threshold)
-            if mfu > threshold_score:
+            if mfu > running_best:
                 running_best = mfu
 
             history.append(
                 {
                     "submission_id": row["submission_id"],
-                    "mfu": running_best,  # Show rank 1 MFU so far (with threshold)
+                    "mfu": running_best,
                     "timestamp": row["created_at"],
                 }
             )

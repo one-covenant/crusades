@@ -414,13 +414,13 @@ class Database:
             )
             state = result.scalar_one_or_none()
 
-            # Calculate improvement ratio (this becomes the new threshold directly)
+            # Calculate improvement ratio
             if old_score > 0:
                 improvement = (new_score - old_score) / old_score
             else:
                 improvement = base_threshold  # First submission, use base
 
-            # New threshold = improvement (no multiplier, no max cap)
+            # New threshold = improvement (no cap)
             new_threshold = max(base_threshold, improvement)
 
             if state is None:
