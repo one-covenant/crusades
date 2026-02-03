@@ -20,6 +20,7 @@ import hashlib
 import importlib.util
 import logging
 import os
+import random
 import sys
 import time
 import traceback
@@ -51,6 +52,85 @@ DETERMINISTIC_MODE = os.getenv("DETERMINISTIC_MODE", "1") == "1"
 EVAL_SEQUENCE_LENGTH = int(os.getenv("EVAL_SEQUENCE_LENGTH", "1024"))
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/templar_eval"))
 
+# =============================================================================
+# SECURITY: Import Sandboxing
+# =============================================================================
+# Modules that miners are NOT allowed to import (security risk)
+BLOCKED_MODULES = frozenset([
+    # System access
+    "os", "sys", "subprocess", "shutil", "pathlib",
+    # Network access
+    "socket", "requests", "urllib", "http", "ftplib", "smtplib",
+    "asyncio",  # Could be used for network
+    # File system
+    "io", "tempfile", "glob",
+    # Code execution
+    "exec", "eval", "compile", "code", "codeop",
+    # Process control
+    "multiprocessing", "threading", "concurrent",
+    # Dangerous builtins access
+    "builtins", "__builtins__",
+    # Pickle (code execution risk)
+    "pickle", "cPickle", "dill", "cloudpickle",
+])
+
+# Modules that miners ARE allowed to import
+ALLOWED_MODULES = frozenset([
+    # PyTorch and ML
+    "torch", "torch.nn", "torch.nn.functional", "torch.optim",
+    "torch.cuda", "torch.amp", "torch.autograd",
+    "torch.distributed", "torch.utils",
+    # Math/Science
+    "math", "random", "numpy",
+    # Data structures
+    "collections", "dataclasses", "typing", "functools", "itertools",
+    # Transformers (for model access)
+    "transformers",
+    # Time (for benchmarking, read-only)
+    "time",
+])
+
+_original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
+
+
+def _sandboxed_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """Sandboxed import that blocks dangerous modules."""
+    # Get the top-level module name
+    top_module = name.split('.')[0]
+    
+    # Check if explicitly blocked
+    if top_module in BLOCKED_MODULES or name in BLOCKED_MODULES:
+        raise ImportError(
+            f"Import of '{name}' is blocked for security reasons. "
+            f"Allowed modules: torch, numpy, math, random, collections, dataclasses, typing, functools, itertools, transformers, time"
+        )
+    
+    # Allow if in whitelist or is a submodule of allowed
+    is_allowed = (
+        top_module in ALLOWED_MODULES or
+        any(name.startswith(allowed + '.') for allowed in ALLOWED_MODULES)
+    )
+    
+    if not is_allowed:
+        # Log warning but allow (some modules may be needed)
+        logger.warning(f"Miner importing non-whitelisted module: {name}")
+    
+    return _original_import(name, globals, locals, fromlist, level)
+
+
+def _enable_import_sandbox():
+    """Enable the import sandbox for miner code execution."""
+    import builtins
+    builtins.__import__ = _sandboxed_import
+    logger.info("Import sandbox ENABLED - blocked modules: os, sys, subprocess, socket, etc.")
+
+
+def _disable_import_sandbox():
+    """Disable the import sandbox and restore original import."""
+    import builtins
+    builtins.__import__ = _original_import
+    logger.info("Import sandbox DISABLED")
+
 
 @dataclass
 class InnerStepsResult:
@@ -80,13 +160,17 @@ _CACHE = {
 
 
 def _load_miner_module(train_path: Path):
-    """Dynamically load miner's train.py as a module.
+    """Dynamically load miner's train.py as a module with import sandboxing.
 
     Args:
         train_path: Path to train.py
 
     Returns:
         Loaded module with inner_steps function
+    
+    Security:
+        - Enables import sandbox before loading (blocks os, sys, subprocess, etc.)
+        - Sandbox remains active during module execution
     """
     spec = importlib.util.spec_from_file_location("miner_train", train_path)
     if spec is None or spec.loader is None:
@@ -94,9 +178,42 @@ def _load_miner_module(train_path: Path):
 
     module = importlib.util.module_from_spec(spec)
     sys.modules["miner_train"] = module
-    spec.loader.exec_module(module)
+    
+    # Enable import sandbox before executing miner code
+    _enable_import_sandbox()
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        # Keep sandbox enabled - will be disabled after evaluation
+        pass
 
     return module
+
+
+def _reset_torch_state():
+    """Reset torch global state after miner code execution.
+    
+    This prevents miners from leaving malicious state that affects
+    subsequent evaluations or verification.
+    """
+    # Reset CUDA state
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    
+    # Reset deterministic settings
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Ensure gradients are enabled
+    torch.set_grad_enabled(True)
+    
+    # Reset default dtype (miners might change this)
+    torch.set_default_dtype(torch.float32)
+    
+    logger.debug("Torch state reset complete")
 
 
 def _load_hf_dataset(
@@ -1010,20 +1127,23 @@ class Actor:
             model.load_state_dict(initial_state)
 
             # =================================================================
-            # EARLY TERMINATION - Run 1 warmup step to catch basic errors
+            # EARLY TERMINATION - Run randomized warmup steps to catch errors
             # =================================================================
             # This catches shape mismatches, missing attributes, etc. before
             # running the full evaluation (saves GPU time on broken code)
+            # SECURITY: Randomize warmup steps to prevent miners from detecting
+            # and behaving differently during warmup vs evaluation
+            warmup_steps = random.randint(1, 3)
             data_iter_warmup = _create_data_iterator(data, batch_size, seq_len)
             optimizer_warmup = _create_optimizer(model)
 
-            logger.info("Running warmup step to check for basic errors...")
+            logger.info(f"Running {warmup_steps} warmup step(s) to check for basic errors...")
             try:
                 warmup_result = miner_module.inner_steps(
                     model=model,
                     data_iterator=data_iter_warmup,
                     optimizer=optimizer_warmup,
-                    num_steps=1,  # Just 1 step for validation
+                    num_steps=warmup_steps,  # Randomized to prevent detection
                     device=device,
                 )
 
@@ -1247,6 +1367,13 @@ class Actor:
             }
 
         finally:
+            # SECURITY: Disable import sandbox
+            _disable_import_sandbox()
+            
+            # SECURITY: Reset torch state to prevent cross-evaluation contamination
+            _reset_torch_state()
+            
+            # Memory cleanup
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
