@@ -22,6 +22,7 @@ from typing import Literal
 import bittensor as bt
 import torch
 
+import crusades
 from crusades.affinetes import AffinetesRunner
 from crusades.chain.commitments import (
     CodeUrlInfo,
@@ -31,6 +32,7 @@ from crusades.chain.commitments import (
 from crusades.chain.weights import WeightSetter
 from crusades.config import get_config, get_hparams
 from crusades.core.protocols import SubmissionStatus
+from crusades.logging import setup_loki_logger
 from crusades.storage.database import Database, get_database
 from crusades.storage.models import EvaluationModel, SubmissionModel
 
@@ -78,8 +80,19 @@ class Validator(BaseNode):
 
     async def initialize(self) -> None:
         """Initialize validator components."""
+        global logger
+
         config = get_config()
         hparams = get_hparams()
+
+        # Setup Loki logging for Grafana dashboard
+        uid_str = str(self.uid) if self.uid is not None else "unknown"
+        logger = setup_loki_logger(
+            service="crusades-validator",
+            uid=uid_str,
+            version=crusades.__version__,
+            environment=config.subtensor_network or "finney",
+        )
 
         logger.info("Initializing validator (URL-Based Architecture)")
 
@@ -517,7 +530,6 @@ class Validator(BaseNode):
                 )
 
                 await self.db.update_submission_score(submission_id, median_mfu)
-            else:
                 await self.db.update_submission_status(
                     submission_id,
                     SubmissionStatus.FAILED_EVALUATION,

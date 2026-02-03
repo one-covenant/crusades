@@ -183,6 +183,8 @@ class AffinetesRunner:
         self.gradient_norm_ratio_max = gradient_norm_ratio_max
         # MFU calculation
         self.gpu_peak_tflops = gpu_peak_tflops
+        # Output tolerance (for output vector comparison)
+        self.output_tolerance = 0.02
         self.validator_image = validator_image or self.DEFAULT_DOCKER_IMAGE
         self.basilica_image = basilica_image or self.DEFAULT_BASILICA_IMAGE
         self.basilica_ttl_seconds = basilica_ttl_seconds
