@@ -56,71 +56,108 @@ CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/templar_eval"))
 # SECURITY: Import Sandboxing
 # =============================================================================
 # Modules that miners are NOT allowed to import (security risk)
-BLOCKED_MODULES = frozenset([
-    # System access
-    "os", "sys", "subprocess", "shutil", "pathlib",
-    # Network access
-    "socket", "requests", "urllib", "http", "ftplib", "smtplib",
-    "asyncio",  # Could be used for network
-    # File system
-    "io", "tempfile", "glob",
-    # Code execution
-    "exec", "eval", "compile", "code", "codeop",
-    # Process control
-    "multiprocessing", "threading", "concurrent",
-    # Dangerous builtins access
-    "builtins", "__builtins__",
-    # Pickle (code execution risk)
-    "pickle", "cPickle", "dill", "cloudpickle",
-])
+BLOCKED_MODULES = frozenset(
+    [
+        # System access
+        "os",
+        "sys",
+        "subprocess",
+        "shutil",
+        "pathlib",
+        # Network access
+        "socket",
+        "requests",
+        "urllib",
+        "http",
+        "ftplib",
+        "smtplib",
+        "asyncio",  # Could be used for network
+        # File system
+        "io",
+        "tempfile",
+        "glob",
+        # Code execution
+        "exec",
+        "eval",
+        "compile",
+        "code",
+        "codeop",
+        # Process control
+        "multiprocessing",
+        "threading",
+        "concurrent",
+        # Dangerous builtins access
+        "builtins",
+        "__builtins__",
+        # Pickle (code execution risk)
+        "pickle",
+        "cPickle",
+        "dill",
+        "cloudpickle",
+    ]
+)
 
 # Modules that miners ARE allowed to import
-ALLOWED_MODULES = frozenset([
-    # PyTorch and ML
-    "torch", "torch.nn", "torch.nn.functional", "torch.optim",
-    "torch.cuda", "torch.amp", "torch.autograd",
-    "torch.distributed", "torch.utils",
-    # Math/Science
-    "math", "random", "numpy",
-    # Data structures
-    "collections", "dataclasses", "typing", "functools", "itertools",
-    # Transformers (for model access)
-    "transformers",
-    # Time (for benchmarking, read-only)
-    "time",
-])
+ALLOWED_MODULES = frozenset(
+    [
+        # PyTorch and ML
+        "torch",
+        "torch.nn",
+        "torch.nn.functional",
+        "torch.optim",
+        "torch.cuda",
+        "torch.amp",
+        "torch.autograd",
+        "torch.distributed",
+        "torch.utils",
+        # Math/Science
+        "math",
+        "random",
+        "numpy",
+        # Data structures
+        "collections",
+        "dataclasses",
+        "typing",
+        "functools",
+        "itertools",
+        # Transformers (for model access)
+        "transformers",
+        # Time (for benchmarking, read-only)
+        "time",
+    ]
+)
 
-_original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
+_original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
 
 
 def _sandboxed_import(name, globals=None, locals=None, fromlist=(), level=0):
     """Sandboxed import that blocks dangerous modules."""
     # Get the top-level module name
-    top_module = name.split('.')[0]
-    
+    top_module = name.split(".")[0]
+
     # Check if explicitly blocked
     if top_module in BLOCKED_MODULES or name in BLOCKED_MODULES:
         raise ImportError(
             f"Import of '{name}' is blocked for security reasons. "
             f"Allowed modules: torch, numpy, math, random, collections, dataclasses, typing, functools, itertools, transformers, time"
         )
-    
+
     # Allow if in whitelist or is a submodule of allowed
-    is_allowed = (
-        top_module in ALLOWED_MODULES or
-        any(name.startswith(allowed + '.') for allowed in ALLOWED_MODULES)
+    is_allowed = top_module in ALLOWED_MODULES or any(
+        name.startswith(allowed + ".") for allowed in ALLOWED_MODULES
     )
-    
+
     if not is_allowed:
         # Log warning but allow (some modules may be needed)
         logger.warning(f"Miner importing non-whitelisted module: {name}")
-    
+
     return _original_import(name, globals, locals, fromlist, level)
 
 
 def _enable_import_sandbox():
     """Enable the import sandbox for miner code execution."""
     import builtins
+
     builtins.__import__ = _sandboxed_import
     logger.info("Import sandbox ENABLED - blocked modules: os, sys, subprocess, socket, etc.")
 
@@ -128,6 +165,7 @@ def _enable_import_sandbox():
 def _disable_import_sandbox():
     """Disable the import sandbox and restore original import."""
     import builtins
+
     builtins.__import__ = _original_import
     logger.info("Import sandbox DISABLED")
 
@@ -167,7 +205,7 @@ def _load_miner_module(train_path: Path):
 
     Returns:
         Loaded module with inner_steps function
-    
+
     Security:
         - Enables import sandbox before loading (blocks os, sys, subprocess, etc.)
         - Sandbox remains active during module execution
@@ -178,7 +216,7 @@ def _load_miner_module(train_path: Path):
 
     module = importlib.util.module_from_spec(spec)
     sys.modules["miner_train"] = module
-    
+
     # Enable import sandbox before executing miner code
     _enable_import_sandbox()
     try:
@@ -192,7 +230,7 @@ def _load_miner_module(train_path: Path):
 
 def _reset_torch_state():
     """Reset torch global state after miner code execution.
-    
+
     This prevents miners from leaving malicious state that affects
     subsequent evaluations or verification.
     """
@@ -200,19 +238,19 @@ def _reset_torch_state():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-    
+
     # Reset deterministic settings
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    
+
     # Ensure gradients are enabled
     torch.set_grad_enabled(True)
-    
+
     # Reset default dtype (miners might change this)
     torch.set_default_dtype(torch.float32)
-    
+
     logger.debug("Torch state reset complete")
 
 
@@ -1369,10 +1407,10 @@ class Actor:
         finally:
             # SECURITY: Disable import sandbox
             _disable_import_sandbox()
-            
+
             # SECURITY: Reset torch state to prevent cross-evaluation contamination
             _reset_torch_state()
-            
+
             # Memory cleanup
             gc.collect()
             if torch.cuda.is_available():
