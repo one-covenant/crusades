@@ -1,5 +1,4 @@
 {
-    "spec_version": 1,
     "netuid": 3,
     "burn_rate": 0.95,
     "burn_uid": 1,
@@ -39,11 +38,11 @@
     },
 
     "verification": {
-        "max_loss_difference": 0.5,
+        "max_loss_difference": 0.3,
         "min_params_changed_ratio": 0.8,
-        "gradient_cosine_min": 0.8,
-        "gradient_norm_ratio_min": 0.5,
-        "gradient_norm_ratio_max": 2.0
+        "gradient_cosine_min": 0.95,
+        "gradient_norm_ratio_min": 0.7,
+        "gradient_norm_ratio_max": 1.5
     },
 
     "mfu": {
@@ -54,6 +53,6 @@
     "adaptive_threshold": {
         "base_threshold": 0.01,
         "decay_percent": 0.05,
-        "decay_interval_blocks": 100
+        "decay_interval_blocks": 300
     }
 }

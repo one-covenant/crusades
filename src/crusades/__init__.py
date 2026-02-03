@@ -1,6 +1,6 @@
 """Templar Crusades - Training code efficiency crusades subnet."""
 
-__version__ = "3.0.0"  # Major bump to test competition reset
+__version__ = "2.0.0"  # Major bump to test competition reset
 
 from crusades.logging import setup_loki_logger, LOKI_URL
 

@@ -52,123 +52,6 @@ DETERMINISTIC_MODE = os.getenv("DETERMINISTIC_MODE", "1") == "1"
 EVAL_SEQUENCE_LENGTH = int(os.getenv("EVAL_SEQUENCE_LENGTH", "1024"))
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/templar_eval"))
 
-# =============================================================================
-# SECURITY: Import Sandboxing
-# =============================================================================
-# Modules that miners are NOT allowed to import (security risk)
-BLOCKED_MODULES = frozenset(
-    [
-        # System access
-        "os",
-        "sys",
-        "subprocess",
-        "shutil",
-        "pathlib",
-        # Network access
-        "socket",
-        "requests",
-        "urllib",
-        "http",
-        "ftplib",
-        "smtplib",
-        "asyncio",  # Could be used for network
-        # File system
-        "io",
-        "tempfile",
-        "glob",
-        # Code execution
-        "exec",
-        "eval",
-        "compile",
-        "code",
-        "codeop",
-        # Process control
-        "multiprocessing",
-        "threading",
-        "concurrent",
-        # Dangerous builtins access
-        "builtins",
-        "__builtins__",
-        # Pickle (code execution risk)
-        "pickle",
-        "cPickle",
-        "dill",
-        "cloudpickle",
-    ]
-)
-
-# Modules that miners ARE allowed to import
-ALLOWED_MODULES = frozenset(
-    [
-        # PyTorch and ML
-        "torch",
-        "torch.nn",
-        "torch.nn.functional",
-        "torch.optim",
-        "torch.cuda",
-        "torch.amp",
-        "torch.autograd",
-        "torch.distributed",
-        "torch.utils",
-        # Math/Science
-        "math",
-        "random",
-        "numpy",
-        # Data structures
-        "collections",
-        "dataclasses",
-        "typing",
-        "functools",
-        "itertools",
-        # Transformers (for model access)
-        "transformers",
-        # Time (for benchmarking, read-only)
-        "time",
-    ]
-)
-
-_original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
-
-
-def _sandboxed_import(name, globals=None, locals=None, fromlist=(), level=0):
-    """Sandboxed import that blocks dangerous modules."""
-    # Get the top-level module name
-    top_module = name.split(".")[0]
-
-    # Check if explicitly blocked
-    if top_module in BLOCKED_MODULES or name in BLOCKED_MODULES:
-        raise ImportError(
-            f"Import of '{name}' is blocked for security reasons. "
-            f"Allowed modules: torch, numpy, math, random, collections, dataclasses, typing, functools, itertools, transformers, time"
-        )
-
-    # Allow if in whitelist or is a submodule of allowed
-    is_allowed = top_module in ALLOWED_MODULES or any(
-        name.startswith(allowed + ".") for allowed in ALLOWED_MODULES
-    )
-
-    if not is_allowed:
-        # Log warning but allow (some modules may be needed)
-        logger.warning(f"Miner importing non-whitelisted module: {name}")
-
-    return _original_import(name, globals, locals, fromlist, level)
-
-
-def _enable_import_sandbox():
-    """Enable the import sandbox for miner code execution."""
-    import builtins
-
-    builtins.__import__ = _sandboxed_import
-    logger.info("Import sandbox ENABLED - blocked modules: os, sys, subprocess, socket, etc.")
-
-
-def _disable_import_sandbox():
-    """Disable the import sandbox and restore original import."""
-    import builtins
-
-    builtins.__import__ = _original_import
-    logger.info("Import sandbox DISABLED")
-
 
 @dataclass
 class InnerStepsResult:
@@ -190,9 +73,6 @@ class GradientInfo:
 
 
 # Global cache for model (data is NOT cached for validators)
-# NOTE: initial_state stores full model weights on CPU for verification.
-# For large models (e.g., 70B), ensure sufficient CPU RAM (~140GB for bf16).
-# This is necessary for params_changed verification and model reset between evals.
 _CACHE = {
     "model": None,
     "model_path": None,
@@ -219,15 +99,7 @@ def _load_miner_module(train_path: Path):
 
     module = importlib.util.module_from_spec(spec)
     sys.modules["miner_train"] = module
-
-    # Enable import sandbox before executing miner code
-    _enable_import_sandbox()
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        # Keep sandbox enabled - will be disabled after evaluation
-        pass
-
+    spec.loader.exec_module(module)
     return module
 
 
@@ -1431,9 +1303,6 @@ class Actor:
             }
 
         finally:
-            # SECURITY: Disable import sandbox
-            _disable_import_sandbox()
-
             # SECURITY: Reset torch state to prevent cross-evaluation contamination
             _reset_torch_state()
 
