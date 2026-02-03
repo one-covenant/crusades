@@ -238,7 +238,7 @@ Edit `hparams/hparams.json`:
         "ttl_seconds": 3600,
         "gpu_count": 1,
         "gpu_models": ["A100"],
-        "min_gpu_memory_gb": 40,
+        "min_gpu_memory_gb": 80,
         "cpu": "6",
         "memory": "32Gi"
     }
@@ -353,3 +353,4 @@ uv run scripts/view_submission.py commit_9303_1
 # Save code to file
 uv run scripts/view_submission.py commit_9303_1 --save
 ```
+

@@ -55,6 +55,7 @@ class EvaluationResult:
     total_tokens: int = 0
     wall_time_seconds: float = 0.0
     error: str | None = None
+    error_code: str | None = None  # Structured error code for reliable error handling
     seed: str = ""
     task_id: int = 0
     diagnostics: dict = field(default_factory=dict)
@@ -70,6 +71,7 @@ class EvaluationResult:
             total_tokens=int(data.get("total_tokens", 0)),
             wall_time_seconds=float(data.get("wall_time_seconds", 0.0)),
             error=data.get("error"),
+            error_code=data.get("error_code"),
             seed=str(data.get("seed", "")),
             task_id=int(data.get("task_id", 0)),
             diagnostics=data.get("diagnostics", {}),
@@ -77,9 +79,37 @@ class EvaluationResult:
         )
 
     @classmethod
-    def failure(cls, error: str, task_id: int = 0) -> "EvaluationResult":
+    def failure(
+        cls, error: str, task_id: int = 0, error_code: str | None = None
+    ) -> "EvaluationResult":
         """Create a failure result."""
-        return cls(success=False, error=error, task_id=task_id)
+        return cls(success=False, error=error, error_code=error_code, task_id=task_id)
+
+    def is_verification_failure(self) -> bool:
+        """Check if this result failed due to verification/anti-cheat checks."""
+        from crusades.core.exceptions import EvaluationErrorCode
+
+        if not self.error_code:
+            return False
+        try:
+            code = EvaluationErrorCode(self.error_code)
+            return EvaluationErrorCode.is_verification_failure(code)
+        except ValueError:
+            return False
+
+    def is_miner_fault(self) -> bool:
+        """Check if the error is likely the miner's fault."""
+        from crusades.core.exceptions import EvaluationErrorCode
+
+        if self.success:
+            return False
+        if not self.error_code:
+            return True  # Assume miner fault if no code
+        try:
+            code = EvaluationErrorCode(self.error_code)
+            return EvaluationErrorCode.is_miner_fault(code)
+        except ValueError:
+            return True
 
 
 class AffinetesRunner:

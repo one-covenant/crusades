@@ -190,6 +190,9 @@ class GradientInfo:
 
 
 # Global cache for model (data is NOT cached for validators)
+# NOTE: initial_state stores full model weights on CPU for verification.
+# For large models (e.g., 70B), ensure sufficient CPU RAM (~140GB for bf16).
+# This is necessary for params_changed verification and model reset between evals.
 _CACHE = {
     "model": None,
     "model_path": None,
@@ -802,6 +805,7 @@ def _verify_gradients(
                 f"({grad_coverage:.1%}) - possible layer freezing detected"
             )
             details["checks_failed"].append({"check": "gradient_coverage", "error": error})
+            details["error_code"] = "gradient_coverage_failed"
             logger.error(f"[FAILED] {error}")
             return False, error, details
         details["checks_passed"].append("gradient_coverage")
@@ -822,6 +826,7 @@ def _verify_gradients(
                 f"[{norm_ratio_min}, {norm_ratio_max}]"
             )
             details["checks_failed"].append({"check": "gradient_norm_ratio", "error": error})
+            details["error_code"] = "gradient_norm_ratio_failed"
             logger.error(f"[FAILED] {error}")
             return False, error, details
         details["checks_passed"].append("gradient_norm_ratio")
@@ -855,6 +860,7 @@ def _verify_gradients(
         if cosine_sim < cosine_min:
             error = f"Gradient cosine similarity {cosine_sim:.4f} below minimum {cosine_min}"
             details["checks_failed"].append({"check": "gradient_cosine", "error": error})
+            details["error_code"] = "gradient_cosine_failed"
             logger.error(f"[FAILED] {error}")
             return False, error, details
         details["checks_passed"].append("gradient_cosine_similarity")
@@ -1240,6 +1246,7 @@ class Actor:
                         "wall_time_seconds": 0.0,
                         "success": False,
                         "error": trainable_error,
+                        "error_code": "insufficient_trainable_params",
                         "seed": seed,
                         "code": code,
                         "diagnostics": {"trainable_params": trainable_details},
@@ -1327,6 +1334,9 @@ class Actor:
             # =================================================================
             # PARAMS CHANGED CHECK - Verify miner actually trained the model
             # =================================================================
+            # SECURITY: This catches the "freeze layers then restore requires_grad" attack.
+            # Even if a miner restores requires_grad=True after their inner_steps,
+            # the frozen layers wouldn't have changed during training, so this check fails.
             params_ok, params_error, params_details = _verify_params_changed(
                 model, initial_state, min_params_changed_ratio
             )
@@ -1339,6 +1349,7 @@ class Actor:
                     "wall_time_seconds": wall_time,
                     "success": False,
                     "error": params_error,
+                    "error_code": "insufficient_params_changed",
                     "seed": seed,
                     "code": code,
                     "diagnostics": {"params_changed": params_details},
@@ -1378,6 +1389,20 @@ class Actor:
                 "params_changed": params_details,
             }
 
+            # Extract error_code from verification details if present
+            error_code = None
+            if not verified and verify_details:
+                # Check gradient_verification sub-details
+                grad_details = verify_details.get("gradient_verification", {})
+                error_code = grad_details.get("error_code")
+                # Check other verification failures
+                if not error_code:
+                    for check in verify_details.get("checks_failed", []):
+                        if check.get("check") == "token_count":
+                            error_code = "token_count_mismatch"
+                        elif check.get("check") == "loss_comparison":
+                            error_code = "loss_mismatch"
+
             return {
                 "task_id": task_id,
                 "mfu": mfu if verified else 0.0,
@@ -1386,6 +1411,7 @@ class Actor:
                 "wall_time_seconds": wall_time,
                 "success": verified,
                 "error": verify_error,
+                "error_code": error_code,
                 "seed": seed,
                 "diagnostics": diagnostics,
                 "code": code,
