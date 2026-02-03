@@ -2,7 +2,7 @@
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -211,8 +211,20 @@ class DatabaseClient:
             updated_at_str = (
                 updated_at_str.replace(" ", "T") if " " in updated_at_str else updated_at_str
             )
+            # Handle timezone-aware datetimes (e.g., "2026-01-07T10:35:00Z")
+            if updated_at_str.endswith("Z"):
+                updated_at_str = updated_at_str[:-1] + "+00:00"
             updated_at = datetime.fromisoformat(updated_at_str)
-            elapsed_seconds = (datetime.now() - updated_at).total_seconds()
+
+            # Use timezone-aware now() if updated_at is tz-aware, else naive
+            if updated_at.tzinfo is not None:
+                now = datetime.now(UTC)
+            else:
+                now = datetime.now()
+
+            elapsed_seconds = (now - updated_at).total_seconds()
+            # Clamp to non-negative to prevent decay_factor > 1.0 from clock skew
+            elapsed_seconds = max(0, elapsed_seconds)
             elapsed_blocks = elapsed_seconds / block_time
             decay_steps = elapsed_blocks / decay_interval_blocks
             decay_factor = (1.0 - decay_percent) ** decay_steps
