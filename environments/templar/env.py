@@ -305,13 +305,25 @@ def _load_model(model_path: str, use_random_init: bool = False):
     Args:
         model_path: HuggingFace model name/path
         use_random_init: If True, initialize with random weights (anti-cheat)
+
+    Note:
+        Docker evaluation runs with --network=none for security.
+        Models must be pre-cached in the Docker image. If cache is missing,
+        rebuild the image: docker build --network=host -f environments/templar/Dockerfile -t templar-eval:latest .
     """
     from transformers import AutoConfig, AutoModelForCausalLM
 
     if use_random_init:
         # Random init - miners can't cheat by freezing pretrained layers
         logger.info(f"Loading model config from {model_path} with RANDOM initialization")
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+        # Use local cache only - Docker runs with --network=none for security
+        # If this fails, the Docker image needs to be rebuilt with the model cached
+        config = AutoConfig.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
 
         # Use accelerate for memory-efficient loading (matches pretrained branch)
         # This prevents OOM on large models by distributing across devices
@@ -355,12 +367,14 @@ def _load_model(model_path: str, use_random_init: bool = False):
             model = model.to("cuda" if torch.cuda.is_available() else "cpu")
     else:
         logger.info(f"Loading pretrained model from {model_path}")
+        # Use local cache only - Docker runs with --network=none for security
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
             attn_implementation="sdpa",
+            local_files_only=True,
         )
 
     model.train()
