@@ -105,7 +105,7 @@ class HParams(BaseModel):
 
     Versioning:
     - Competition version is derived from __version__ major number
-    - Use crusades.get_competition_version() to get the current competition version
+    - Use crusades.COMPETITION_VERSION to get the current competition version
     """
 
     # Network settings

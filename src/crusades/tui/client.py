@@ -246,6 +246,42 @@ class DatabaseClient:
             "updated_at": row["updated_at"],
         }
 
+    def get_threshold_winner(self, threshold: float = 0.01) -> dict[str, Any] | None:
+        """Get the threshold-adjusted winner (for weight distribution).
+
+        A new submission only beats an incumbent if it's more than `threshold` better.
+        This gives stability to leaders and matches the weight setting logic.
+        """
+        vf = self._version_filter("s")
+        # Get all finished submissions ordered by created_at (oldest first)
+        rows = self._query(
+            f"""SELECT submission_id, final_score, created_at
+               FROM submissions s
+               WHERE status = ? AND final_score IS NOT NULL{vf}
+               ORDER BY created_at ASC""",
+            (SubmissionStatus.FINISHED,),
+        )
+
+        if not rows:
+            return None
+
+        # Build leaderboard with threshold logic (same as database.py get_leaderboard_winner)
+        leaderboard: list[dict] = []
+        for row in rows:
+            score = row["final_score"] or 0.0
+            insert_pos = len(leaderboard)
+
+            for i, existing in enumerate(leaderboard):
+                existing_score = existing["final_score"] or 0.0
+                threshold_score = existing_score * (1 + threshold)
+                if score > threshold_score:
+                    insert_pos = i
+                    break
+
+            leaderboard.insert(insert_pos, dict(row))
+
+        return leaderboard[0] if leaderboard else None
+
     def get_overview(self) -> dict[str, Any]:
         """Get dashboard overview stats (filtered by spec_version)."""
         now = datetime.now()
@@ -263,9 +299,13 @@ class DatabaseClient:
         )
         recent_count = recent["count"] if recent else 0
 
-        # Top MFU (rank 1 from leaderboard with adaptive threshold)
-        leaderboard = self.get_leaderboard(limit=1)
-        top_score = leaderboard[0]["final_score"] if leaderboard else 0.0
+        # Get adaptive threshold for calculations
+        threshold_data = self.get_adaptive_threshold()
+        adaptive_threshold = threshold_data.get("decayed_threshold", 0.01)
+
+        # Top MFU (threshold-adjusted winner - the one who gets weights)
+        threshold_winner = self.get_threshold_winner(threshold=adaptive_threshold)
+        top_score = threshold_winner["final_score"] if threshold_winner else 0.0
 
         # Top score from 24 hours ago
         top_24h_ago = self._query_one(
@@ -301,9 +341,7 @@ class DatabaseClient:
         )
         active_miners = miners["count"] if miners else 0
 
-        # Get adaptive threshold for "MFU to Beat" calculation
-        threshold_data = self.get_adaptive_threshold()
-        adaptive_threshold = threshold_data.get("decayed_threshold", 0.01)
+        # MFU to Beat = threshold winner's score * (1 + threshold)
         mfu_to_beat = top_score * (1 + adaptive_threshold) if top_score > 0 else 0.0
 
         return {
@@ -397,11 +435,20 @@ class DatabaseClient:
         }
 
     def get_leaderboard(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Get leaderboard entries sorted by score (filtered by spec_version).
+        """Get leaderboard with threshold winner at #1, rest sorted by raw MFU.
 
-        Note: Adaptive threshold is only used for weight setting, not display.
-        The leaderboard shows all finished submissions ranked by final_score.
+        Position #1: Threshold-adjusted winner (gets emissions)
+        Positions #2+: All others sorted by raw MFU descending
         """
+        # Get adaptive threshold
+        threshold_data = self.get_adaptive_threshold()
+        threshold = threshold_data.get("decayed_threshold", 0.01)
+
+        # Get threshold winner (position #1)
+        winner = self.get_threshold_winner(threshold=threshold)
+        winner_id = winner["submission_id"] if winner else None
+
+        # Get all submissions sorted by raw score
         vf = self._version_filter("s")
         rows = self._query(
             f"""SELECT s.submission_id, s.miner_hotkey, s.miner_uid, s.final_score,
@@ -414,19 +461,40 @@ class DatabaseClient:
             (SubmissionStatus.FINISHED,),
         )
 
+        # Build leaderboard: winner first, then others by raw score
         leaderboard = []
-        for i, row in enumerate(rows):
-            leaderboard.append(
-                {
-                    "rank": i + 1,
+
+        # Add winner as #1 (if exists)
+        if winner:
+            # Find winner's full data from rows
+            winner_row = next((r for r in rows if r["submission_id"] == winner_id), None)
+            if winner_row:
+                leaderboard.append({
+                    "rank": 1,
+                    "submission_id": winner_row["submission_id"],
+                    "miner_hotkey": winner_row["miner_hotkey"],
+                    "miner_uid": winner_row["miner_uid"],
+                    "final_score": winner_row["final_score"] or 0.0,
+                    "num_evaluations": winner_row["eval_count"],
+                    "created_at": winner_row["created_at"],
+                })
+
+        # Add remaining submissions (excluding winner) sorted by raw score
+        rank = 2 if winner else 1
+        for row in rows:
+            if row["submission_id"] != winner_id:
+                leaderboard.append({
+                    "rank": rank,
                     "submission_id": row["submission_id"],
                     "miner_hotkey": row["miner_hotkey"],
                     "miner_uid": row["miner_uid"],
                     "final_score": row["final_score"] or 0.0,
                     "num_evaluations": row["eval_count"],
                     "created_at": row["created_at"],
-                }
-            )
+                })
+                rank += 1
+                if len(leaderboard) >= limit:
+                    break
 
         return leaderboard[:limit]
 

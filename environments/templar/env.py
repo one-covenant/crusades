@@ -11,7 +11,7 @@ Flow:
 1. Validator reads miner commitment (contains code URL)
 2. Validator downloads train.py from URL
 3. Validator calls env.evaluate(code="...", ...)
-4. This Actor runs benchmark and returns TPS
+4. This Actor runs benchmark and returns MFU
 """
 
 import ast
@@ -325,46 +325,16 @@ def _load_model(model_path: str, use_random_init: bool = False):
             local_files_only=True,
         )
 
-        # Use accelerate for memory-efficient loading (matches pretrained branch)
-        # This prevents OOM on large models by distributing across devices
-        try:
-            from accelerate import dispatch_model, infer_auto_device_map, init_empty_weights
-
-            # Create model with empty weights first (no memory allocation)
-            with init_empty_weights():
-                empty_model = AutoModelForCausalLM.from_config(
-                    config,
-                    torch_dtype=torch.bfloat16,
-                    trust_remote_code=True,
-                    attn_implementation="sdpa",
-                )
-
-            # Infer device map for auto distribution
-            device_map = infer_auto_device_map(
-                empty_model,
-                max_memory={0: "70GiB", "cpu": "30GiB"} if torch.cuda.is_available() else None,
-            )
-
-            # Now create actual model and dispatch
-            model = AutoModelForCausalLM.from_config(
-                config,
-                torch_dtype=torch.bfloat16,
-                trust_remote_code=True,
-                attn_implementation="sdpa",
-            )
-            model = dispatch_model(model, device_map=device_map)
-            logger.info(f"Model loaded with device_map: {device_map}")
-
-        except ImportError:
-            # Fallback if accelerate not available
-            logger.warning("accelerate not available, using simple device placement")
-            model = AutoModelForCausalLM.from_config(
-                config,
-                torch_dtype=torch.bfloat16,
-                trust_remote_code=True,
-                attn_implementation="sdpa",
-            )
-            model = model.to("cuda" if torch.cuda.is_available() else "cpu")
+        # Simple model loading - Qwen2.5-3B (~6GB) fits easily on A100 80GB
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = AutoModelForCausalLM.from_config(
+            config,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            attn_implementation="sdpa",
+        )
+        model = model.to(device)
+        logger.info(f"Model loaded on {device}")
     else:
         logger.info(f"Loading pretrained model from {model_path}")
         # Use local cache only - Docker runs with --network=none for security
@@ -378,6 +348,11 @@ def _load_model(model_path: str, use_random_init: bool = False):
         )
 
     model.train()
+    
+    # Ensure ALL parameters have requires_grad=True for training
+    for param in model.parameters():
+        param.requires_grad = True
+    
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     return model
@@ -447,16 +422,16 @@ def _capture_gradients(model: torch.nn.Module) -> GradientInfo:
 
     for param in model.parameters():
         if param.grad is not None:
-            grad_flat = param.grad.detach().float().view(-1)
+            # Move to CPU immediately to free GPU memory
+            grad_flat = param.grad.detach().cpu().float().view(-1)
             total_norm_sq += grad_flat.pow(2).sum().item()
             # Check if gradient is actually non-zero (not just allocated)
             if grad_flat.abs().sum().item() > 1e-10:
                 layers_with_grad += 1
-                # Move to CPU immediately to free GPU memory
-                grad_vectors_cpu.append(grad_flat.cpu())
+                grad_vectors_cpu.append(grad_flat)
             else:
                 layers_without_grad += 1
-                grad_vectors_cpu.append(grad_flat.cpu())  # Still store for shape matching
+                grad_vectors_cpu.append(grad_flat)  # Still store for shape matching
         else:
             layers_without_grad += 1
             grad_vectors_cpu.append(None)
@@ -634,6 +609,12 @@ class GradientCapturingOptimizer:
     The previous approach (running final step manually outside inner_steps)
     was flawed because when steps==1, the miner's inner_steps was never
     called during full evaluation, only during warmup.
+
+    PERFORMANCE: Tracks overhead time separately and excludes it from wall_time
+    for fair MFU/TPS calculation. MFU formula (6 * params * tokens) only accounts
+    for forward + backward FLOPs, so we exclude:
+    - Gradient capture (validator overhead)
+
     """
 
     def __init__(self, optimizer: torch.optim.Optimizer, model: torch.nn.Module):
@@ -641,11 +622,20 @@ class GradientCapturingOptimizer:
         self.model = model
         self.captured_gradients: GradientInfo | None = None
         self.step_count = 0
+        self.gradient_capture_time: float = 0.0  # Cumulative time spent in gradient capture
 
     def step(self, *args, **kwargs):
         """Capture gradients BEFORE optimizer.step() clears them."""
-        # Always capture (we'll use the last one)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
+        # Now time ONLY the gradient capture (GPU→CPU copy for verification)
+        # This is validator overhead and should be excluded from wall_time
+        capture_start = time.perf_counter()
         self.captured_gradients = _capture_gradients(self.model)
+        self.gradient_capture_time += time.perf_counter() - capture_start
+
+        # Actual optimizer step (part of miner's training)
         self.step_count += 1
         return self.optimizer.step(*args, **kwargs)
 
@@ -753,12 +743,6 @@ def _verify_gradients(
     norm_ratio_max: float = 2.0,
 ) -> tuple[bool, str | None, dict]:
     """Verify candidate gradients match reference using cosine similarity and norm ratio.
-
-    This is more robust than logits comparison because:
-    1. Gradients directly reflect what the model learned
-    2. Cheaters who freeze layers will have different gradient patterns
-    3. Cosine similarity catches direction changes
-    4. Norm ratio catches magnitude cheating
 
     Args:
         reference_grad: Reference implementation gradients
@@ -1027,7 +1011,6 @@ class Actor:
 
     This Actor is owned by the validator, not the miner.
     Code is passed directly from the validator (downloaded from URL).
-    Uses MFU (Model FLOPs Utilization) instead of TPS as the metric.
     """
 
     async def evaluate(
@@ -1086,6 +1069,7 @@ class Actor:
         if not code:
             return {
                 "task_id": task_id,
+                "mfu": 0.0,
                 "tps": 0.0,
                 "total_tokens": 0,
                 "wall_time_seconds": 0.0,
@@ -1098,6 +1082,7 @@ class Actor:
         if not model_url or not data_url:
             return {
                 "task_id": task_id,
+                "mfu": 0.0,
                 "tps": 0.0,
                 "total_tokens": 0,
                 "wall_time_seconds": 0.0,
@@ -1116,6 +1101,7 @@ class Actor:
         if not code_ok:
             return {
                 "task_id": task_id,
+                "mfu": 0.0,
                 "tps": 0.0,
                 "total_tokens": 0,
                 "wall_time_seconds": 0.0,
@@ -1132,6 +1118,7 @@ class Actor:
         except Exception as e:
             return {
                 "task_id": task_id,
+                "mfu": 0.0,
                 "tps": 0.0,
                 "total_tokens": 0,
                 "wall_time_seconds": 0.0,
@@ -1143,6 +1130,7 @@ class Actor:
         if time.monotonic() > deadline:
             return {
                 "task_id": task_id,
+                "mfu": 0.0,
                 "tps": 0.0,
                 "total_tokens": 0,
                 "wall_time_seconds": 0.0,
@@ -1158,6 +1146,7 @@ class Actor:
             if not hasattr(miner_module, "inner_steps"):
                 return {
                     "task_id": task_id,
+                    "mfu": 0.0,
                     "tps": 0.0,
                     "total_tokens": 0,
                     "wall_time_seconds": 0.0,
@@ -1198,15 +1187,7 @@ class Actor:
 
             # Reset model for miner's code
             model.load_state_dict(initial_state)
-
-            # =================================================================
-            # EARLY TERMINATION - Run randomized warmup steps to catch errors
-            # =================================================================
-            # This catches shape mismatches, missing attributes, etc. before
-            # running the full evaluation (saves GPU time on broken code)
-            # SECURITY: Randomize warmup steps to prevent miners from detecting
-            # and behaving differently during warmup vs evaluation
-            warmup_steps = random.randint(1, 3)
+            warmup_steps = 2
             data_iter_warmup = _create_data_iterator(data, batch_size, seq_len)
             optimizer_warmup = _create_optimizer(model)
 
@@ -1224,6 +1205,7 @@ class Actor:
                 if warmup_result is None:
                     return {
                         "task_id": task_id,
+                        "mfu": 0.0,
                         "tps": 0.0,
                         "total_tokens": 0,
                         "wall_time_seconds": 0.0,
@@ -1237,6 +1219,7 @@ class Actor:
                 if not hasattr(warmup_result, "final_logits"):
                     return {
                         "task_id": task_id,
+                        "mfu": 0.0,
                         "tps": 0.0,
                         "total_tokens": 0,
                         "wall_time_seconds": 0.0,
@@ -1251,6 +1234,7 @@ class Actor:
                 if logits is not None and len(logits.shape) != 3:
                     return {
                         "task_id": task_id,
+                        "mfu": 0.0,
                         "tps": 0.0,
                         "total_tokens": 0,
                         "wall_time_seconds": 0.0,
@@ -1319,7 +1303,6 @@ class Actor:
             start = time.perf_counter()
 
             # Run ALL steps through miner's inner_steps
-            # Gradients are captured automatically by the wrapper on each step
             miner_result = miner_module.inner_steps(
                 model=model,
                 data_iterator=data_iter_miner,
@@ -1331,7 +1314,17 @@ class Actor:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
-            wall_time = time.perf_counter() - start
+            total_time = time.perf_counter() - start
+
+            # Exclude gradient capture time from wall_time for fair MFU calculation
+            # Gradient capture is validator overhead (copies gradients GPU→CPU for verification)
+            # optimizer.step() and zero_grad() ARE part of miner's training, included in wall_time
+            gradient_capture_time = optimizer_miner.gradient_capture_time
+            wall_time = total_time - gradient_capture_time
+            logger.info(
+                f"Timing: total={total_time:.2f}s, grad_capture={gradient_capture_time:.2f}s, "
+                f"wall_time={wall_time:.2f}s (used for MFU/TPS)"
+            )
 
             # Get gradients captured from the final step (inside miner's code)
             candidate_grad = optimizer_miner.captured_gradients

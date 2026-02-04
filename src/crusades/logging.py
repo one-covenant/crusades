@@ -17,12 +17,7 @@ import uuid
 from queue import Queue
 from typing import Final
 
-try:
-    import logging_loki
-
-    LOKI_AVAILABLE = True
-except ImportError:
-    LOKI_AVAILABLE = False
+import logging_loki
 
 # Default Loki URL - same as Templar
 LOKI_URL: Final[str] = os.environ.get(
@@ -79,12 +74,6 @@ def setup_loki_logger(
     # Check if Loki is enabled
     if not ENABLE_LOKI:
         logger.info("Loki logging disabled (set ENABLE_LOKI=true to enable)")
-        return logger
-
-    if not LOKI_AVAILABLE:
-        logger.warning(
-            "Loki requested but not available. Install with: uv add python-logging-loki"
-        )
         return logger
 
     url = url or LOKI_URL

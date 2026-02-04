@@ -271,7 +271,7 @@ class Validator(BaseNode):
     ) -> None:
         """Create a submission record from a blockchain commitment."""
         hparams = get_hparams()
-        version = crusades.get_competition_version()
+        version = crusades.COMPETITION_VERSION
         submission_id = f"v{version}_commit_{commitment.reveal_block}_{commitment.uid}"
 
         try:
@@ -315,7 +315,7 @@ class Validator(BaseNode):
             bucket_path=commitment.code_url_info.url,  # Store code URL
             status=SubmissionStatus.EVALUATING,
             payment_verified=True,
-            spec_version=crusades.get_competition_version(),
+            spec_version=crusades.COMPETITION_VERSION,
         )
 
         try:
@@ -412,7 +412,7 @@ class Validator(BaseNode):
         Only evaluates submissions matching current competition version.
         """
         hparams = get_hparams()
-        competition_version = crusades.get_competition_version()
+        competition_version = crusades.COMPETITION_VERSION
         # Only evaluate submissions from current version
         evaluating = await self.db.get_evaluating_submissions(spec_version=competition_version)
         num_runs = hparams.evaluation_runs
@@ -547,6 +547,14 @@ class Validator(BaseNode):
                     SubmissionStatus.FINISHED,
                 )
                 logger.info(f"Submission {submission_id} FINISHED with MFU={median_mfu:.2f}%")
+            else:
+                # All evaluations failed - mark submission as failed with score 0
+                await self.db.update_submission_score(submission_id, 0.0)
+                await self.db.update_submission_status(
+                    submission_id,
+                    SubmissionStatus.FAILED,
+                )
+                logger.warning(f"Submission {submission_id} FAILED: all evaluations failed")
 
     def _cleanup_memory(self):
         """Clean up GPU memory."""
@@ -680,9 +688,9 @@ class Validator(BaseNode):
 
     async def _load_state(self) -> None:
         """Load persisted validator state from database."""
-        from crusades import get_competition_version
+        from crusades import COMPETITION_VERSION
 
-        current_version = get_competition_version()
+        current_version = COMPETITION_VERSION
 
         try:
             # Check if version changed - if so, reset state for fresh competition
@@ -741,11 +749,11 @@ class Validator(BaseNode):
 
     async def _save_state(self) -> None:
         """Persist validator state to database."""
-        from crusades import get_competition_version
+        from crusades import COMPETITION_VERSION
 
         try:
             await self.db.set_validator_state(
-                "competition_version", str(get_competition_version())
+                "competition_version", str(COMPETITION_VERSION)
             )
             await self.db.set_validator_state(
                 "last_processed_block", str(self.last_processed_block)

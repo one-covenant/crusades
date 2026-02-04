@@ -1,9 +1,9 @@
 """Custom exceptions for templar-crusades."""
 
-from enum import Enum
+from enum import StrEnum
 
 
-class EvaluationErrorCode(str, Enum):
+class EvaluationErrorCode(StrEnum):
     """Structured error codes for evaluation failures.
 
     Use these codes instead of string matching for robust error handling.

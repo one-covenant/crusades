@@ -277,15 +277,28 @@ class Database:
             return leaderboard[0] if leaderboard else None
 
     async def get_leaderboard(
-        self, limit: int = 100, spec_version: int | None = None
+        self,
+        limit: int = 100,
+        spec_version: int | None = None,
+        threshold: float = 0.01,
     ) -> list[SubmissionModel]:
-        """Get top submissions by score.
+        """Get leaderboard with threshold winner at #1, rest sorted by raw MFU.
+
+        Position #1: Threshold-adjusted winner (gets emissions)
+        Positions #2+: All others sorted by raw MFU descending
 
         Args:
             limit: Maximum number of submissions to return
             spec_version: If provided, only show submissions from this version
+            threshold: Adaptive threshold for determining #1
         """
+        # Get threshold winner (position #1)
+        winner = await self.get_leaderboard_winner(
+            threshold=threshold, spec_version=spec_version
+        )
+
         async with self.session_factory() as session:
+            # Get all finished submissions sorted by raw score
             query = select(SubmissionModel).where(
                 SubmissionModel.status == SubmissionStatus.FINISHED,
                 SubmissionModel.final_score.isnot(None),
@@ -293,9 +306,26 @@ class Database:
             if spec_version is not None:
                 query = query.where(SubmissionModel.spec_version == spec_version)
             result = await session.execute(
-                query.order_by(desc(SubmissionModel.final_score)).limit(limit)
+                query.order_by(desc(SubmissionModel.final_score)).limit(limit + 1)
             )
-            return list(result.scalars().all())
+            all_submissions = list(result.scalars().all())
+
+        # Build leaderboard: winner first, then others by raw score
+        leaderboard: list[SubmissionModel] = []
+
+        if winner:
+            leaderboard.append(winner)
+            # Add remaining submissions (excluding winner) sorted by raw score
+            for sub in all_submissions:
+                if sub.submission_id != winner.submission_id:
+                    leaderboard.append(sub)
+                    if len(leaderboard) >= limit:
+                        break
+        else:
+            # No winner, just return raw sorted
+            leaderboard = all_submissions[:limit]
+
+        return leaderboard
 
     async def get_top_submissions(
         self, limit: int = 5, spec_version: int | None = None

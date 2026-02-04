@@ -12,7 +12,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from crusades import get_competition_version
+from crusades import COMPETITION_VERSION
 from crusades.tui.client import (
     CrusadesClient,
     CrusadesData,
@@ -611,7 +611,7 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False, db_path: s
     old_settings = termios.tcgetattr(fd)
 
     # Select client based on mode (filter by competition version)
-    competition_version = get_competition_version()
+    competition_version = COMPETITION_VERSION
 
     if demo:
         client_class = MockClient

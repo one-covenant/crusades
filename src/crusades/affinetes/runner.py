@@ -29,6 +29,8 @@ from typing import Literal
 
 import httpx
 
+from crusades.core.exceptions import EvaluationErrorCode
+
 # Optional: Basilica SDK for cloud GPU evaluation
 try:
     from basilica import BasilicaClient
@@ -87,8 +89,6 @@ class EvaluationResult:
 
     def is_verification_failure(self) -> bool:
         """Check if this result failed due to verification/anti-cheat checks."""
-        from crusades.core.exceptions import EvaluationErrorCode
-
         if not self.error_code:
             return False
         try:
@@ -99,8 +99,6 @@ class EvaluationResult:
 
     def is_miner_fault(self) -> bool:
         """Check if the error is likely the miner's fault."""
-        from crusades.core.exceptions import EvaluationErrorCode
-
         if self.success:
             return False
         if not self.error_code:
@@ -140,7 +138,7 @@ class AffinetesRunner:
 
     def __init__(
         self,
-        mode: Literal["docker", "basilica", "affinetes"] = "docker",
+        mode: Literal["docker", "basilica"] = "docker",
         basilica_endpoint: str | None = None,
         basilica_api_key: str | None = None,
         docker_gpu_devices: str = "all",
@@ -171,7 +169,7 @@ class AffinetesRunner:
         """Initialize the runner.
 
         Args:
-            mode: Execution mode ("docker", "basilica", or "affinetes")
+            mode: Execution mode ("docker" for local, "basilica" for remote)
             basilica_endpoint: Basilica API endpoint (not needed with SDK)
             basilica_api_key: Basilica API key (or BASILICA_API_TOKEN env var)
             docker_gpu_devices: GPU devices for Docker ("all", "0", "0,1", "none")
@@ -213,8 +211,6 @@ class AffinetesRunner:
         self.gradient_norm_ratio_max = gradient_norm_ratio_max
         # MFU calculation
         self.gpu_peak_tflops = gpu_peak_tflops
-        # Output tolerance (for output vector comparison)
-        self.output_tolerance = 0.02
         self.validator_image = validator_image or self.DEFAULT_DOCKER_IMAGE
         self.basilica_image = basilica_image or self.DEFAULT_BASILICA_IMAGE
         self.basilica_ttl_seconds = basilica_ttl_seconds
@@ -277,8 +273,7 @@ class AffinetesRunner:
                 task_id=task_id,
             )
 
-        if self.mode in ("docker", "affinetes"):
-            # Both docker and affinetes use local Docker evaluation
+        if self.mode == "docker":
             return await self._evaluate_docker(
                 code=code,
                 seed=str(seed),
@@ -463,14 +458,6 @@ asyncio.run(main())
                     "--tmpfs",
                     "/home/appuser/.triton:rw,exec,size=2g",
                     # NOTE: Don't mount tmpfs on ~/.cache/huggingface - model is pre-cached there!
-                ]
-            )
-
-            # Environment variables
-            docker_cmd.extend(
-                [
-                    "-e",
-                    f"OUTPUT_VECTOR_TOLERANCE={self.output_tolerance}",
                 ]
             )
 

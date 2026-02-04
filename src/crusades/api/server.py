@@ -34,7 +34,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from crusades import get_competition_version
+from crusades import COMPETITION_VERSION
 from crusades.tui.client import DatabaseClient, MockClient
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ def get_db_client():
     global _db_client
     if _db_client is None:
         db_path = os.getenv("CRUSADES_DB_PATH", "crusades.db")
-        competition_version = get_competition_version()
+        competition_version = COMPETITION_VERSION
         if Path(db_path).exists():
             logger.info(f"Using database: {db_path} (version={competition_version})")
             _db_client = DatabaseClient(db_path, spec_version=competition_version)
