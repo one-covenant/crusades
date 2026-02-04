@@ -410,6 +410,11 @@ class Database:
             # Calculate decay based on blocks elapsed
             # Each step loses decay_percent of the excess above base
             blocks_elapsed = max(0, current_block - state.last_update_block)
+            
+            # Guard against misconfigured decay_interval_blocks (avoid division by zero)
+            if decay_interval_blocks <= 0:
+                return state.current_threshold
+            
             decay_steps = blocks_elapsed / decay_interval_blocks
             decay_factor = (1.0 - decay_percent) ** decay_steps
 

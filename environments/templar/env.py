@@ -1197,7 +1197,7 @@ class Actor:
                     model=model,
                     data_iterator=data_iter_warmup,
                     optimizer=optimizer_warmup,
-                    num_steps=warmup_steps,  # Randomized to prevent detection
+                    num_steps=warmup_steps,
                     device=device,
                 )
 

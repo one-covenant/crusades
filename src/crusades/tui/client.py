@@ -231,10 +231,15 @@ class DatabaseClient:
             elapsed_seconds = (now - updated_at).total_seconds()
             # Clamp to non-negative to prevent decay_factor > 1.0 from clock skew
             elapsed_seconds = max(0, elapsed_seconds)
-            elapsed_blocks = elapsed_seconds / block_time
-            decay_steps = elapsed_blocks / decay_interval_blocks
-            decay_factor = (1.0 - decay_percent) ** decay_steps
-            decayed = base_threshold + (current_threshold - base_threshold) * decay_factor
+            
+            # Guard against misconfigured intervals (avoid division by zero)
+            if block_time <= 0 or decay_interval_blocks <= 0:
+                decayed = current_threshold
+            else:
+                elapsed_blocks = elapsed_seconds / block_time
+                decay_steps = elapsed_blocks / decay_interval_blocks
+                decay_factor = (1.0 - decay_percent) ** decay_steps
+                decayed = base_threshold + (current_threshold - base_threshold) * decay_factor
         except (ValueError, TypeError):
             decayed = current_threshold
 

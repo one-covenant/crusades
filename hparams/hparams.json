@@ -22,9 +22,9 @@
     "block_time": 12,
 
     "docker": {
-        "gpu_devices": "4",
-        "memory_limit": "64g",
-        "shm_size": "16g"
+        "gpu_devices": "0",
+        "memory_limit": "80g",
+        "shm_size": "32g"
     },
 
     "basilica": {
@@ -32,7 +32,7 @@
         "ttl_seconds": 3600,
         "gpu_count": 1,
         "gpu_models": ["A100"],
-        "min_gpu_memory_gb": 80,
+        "min_gpu_memory_gb": 64,
         "cpu": "4",
         "memory": "32Gi"
     },
@@ -41,18 +41,17 @@
         "max_loss_difference": 0.3,
         "min_params_changed_ratio": 0.8,
         "gradient_cosine_min": 0.95,
-        "gradient_norm_ratio_min": 0.7,
-        "gradient_norm_ratio_max": 1.5
+        "gradient_norm_ratio_min": 0.9,
+        "gradient_norm_ratio_max": 1.1
     },
 
     "mfu": {
-        "gpu_peak_tflops": 312.0,
-        "model_params_billions": 3.0
+        "gpu_peak_tflops": 312.0
     },
 
     "adaptive_threshold": {
         "base_threshold": 0.01,
         "decay_percent": 0.05,
-        "decay_interval_blocks": 300
+        "decay_interval_blocks": 100
     }
 }

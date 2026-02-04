@@ -238,7 +238,7 @@ Edit `hparams/hparams.json`:
         "ttl_seconds": 3600,
         "gpu_count": 1,
         "gpu_models": ["A100"],
-        "min_gpu_memory_gb": 80,
+        "min_gpu_memory_gb": 64,
         "cpu": "6",
         "memory": "32Gi"
     }
