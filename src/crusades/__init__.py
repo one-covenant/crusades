@@ -1,11 +1,11 @@
 """Templar Crusades - Training code efficiency crusades subnet."""
 
-__version__ = "2.0.0"  # Major bump to test competition reset
+__version__ = "0.2.0"
 
 # Competition version from major.minor version number
 # Major OR Minor bump = new competition (fresh start)
 # Patch bump only = same competition continues
-# Examples: "2.0.0" → 200, "2.1.0" → 201, "3.0.0" → 300
+# Examples: "0.2.0" → 2, "0.3.0" → 3, "1.0.0" → 100
 _version_parts = __version__.split(".")
 COMPETITION_VERSION: int = int(_version_parts[0]) * 100 + int(_version_parts[1])
 
