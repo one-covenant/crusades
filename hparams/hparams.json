@@ -32,9 +32,9 @@
         "ttl_seconds": 3600,
         "gpu_count": 1,
         "gpu_models": ["A100"],
-        "min_gpu_memory_gb": 64,
-        "cpu": "4",
-        "memory": "32Gi"
+        "min_gpu_memory_gb": 80,
+        "cpu": "8",
+        "memory": "80Gi"
     },
 
     "verification": {
