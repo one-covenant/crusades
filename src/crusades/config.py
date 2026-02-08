@@ -114,6 +114,11 @@ class HParams(BaseModel):
     burn_rate: float
     burn_uid: int
 
+    # Competition start block — submissions committed before this block are ignored.
+    # Set this when deploying new security rules to invalidate old submissions.
+    # 0 means no filter (accept all blocks).
+    competition_start_block: int = 0
+
     # Evaluation settings
     evaluation_runs: int
     eval_steps: int

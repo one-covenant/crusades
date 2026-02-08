@@ -98,6 +98,15 @@ class Validator(BaseNode):
 
         logger.info("Initializing validator (URL-Based Architecture)")
 
+        # Log competition start block for transparency
+        if hparams.competition_start_block > 0:
+            logger.info(
+                f"competition_start_block = {hparams.competition_start_block} "
+                f"— submissions before this block will be ignored"
+            )
+        else:
+            logger.info("competition_start_block = 0 (disabled — all blocks accepted)")
+
         # Database
         self.db = await get_database()
 
@@ -212,6 +221,7 @@ class Validator(BaseNode):
     async def process_blockchain_commitments(self) -> None:
         """Read and process new gist commitments from blockchain."""
         try:
+            hparams = get_hparams()
             new_commitments = self.commitment_reader.get_new_commitments_since(
                 self.last_processed_block
             )
@@ -231,6 +241,15 @@ class Validator(BaseNode):
                     if not commitment.has_valid_code_url():
                         logger.warning(
                             f"Skipping commitment without valid code URL: UID {commitment.uid}"
+                        )
+                        continue
+
+                    # Skip commitments from before the competition start block
+                    start_block = hparams.competition_start_block
+                    if start_block > 0 and commitment.reveal_block < start_block:
+                        logger.info(
+                            f"Skipping pre-competition commitment from UID {commitment.uid} "
+                            f"(reveal_block={commitment.reveal_block} < competition_start_block={start_block})"
                         )
                         continue
 
@@ -435,6 +454,26 @@ class Validator(BaseNode):
         logger.info(
             f"Found {len(evaluating)} submissions in EVALUATING status (v{competition_version})"
         )
+
+        # Filter out pre-competition submissions
+        start_block = hparams.competition_start_block
+        if start_block > 0:
+            filtered = []
+            for s in evaluating:
+                commit_block = self._extract_commit_block(s.submission_id)
+                if commit_block is not None and commit_block < start_block:
+                    logger.info(
+                        f"Skipping pre-competition submission {s.submission_id} "
+                        f"(block {commit_block} < start_block {start_block}), marking FAILED"
+                    )
+                    await self.db.update_submission_status(
+                        s.submission_id,
+                        SubmissionStatus.FAILED_EVALUATION,
+                        error_message=f"Submitted before competition_start_block ({commit_block} < {start_block})",
+                    )
+                else:
+                    filtered.append(s)
+            evaluating = filtered
 
         for submission in evaluating:
             code_url = submission.bucket_path
@@ -646,9 +685,11 @@ class Validator(BaseNode):
         )
 
         # Get the current leaderboard winner (after this submission was marked FINISHED)
+        # Filter out submissions from before competition_start_block
         winner = await self.db.get_leaderboard_winner(
             threshold=current_threshold,
             spec_version=crusades.COMPETITION_VERSION,
+            min_commit_block=hparams.competition_start_block,
         )
 
         if winner is None:
@@ -707,6 +748,27 @@ class Validator(BaseNode):
                 base_threshold=threshold_config.base_threshold,
             )
             logger.info(f"First leader established (immediate): {score:.2f}% MFU")
+
+    @staticmethod
+    def _extract_commit_block(submission_id: str) -> int | None:
+        """Extract the commit block number from a submission ID.
+
+        Handles both formats:
+          - New: v3_commit_79639_1  -> 79639
+          - Old: commit_79639_1    -> 79639
+
+        Returns None if the format is unrecognised.
+        """
+        try:
+            parts = submission_id.split("_")
+            if parts[0].startswith("v"):
+                # v3_commit_79639_1
+                return int(parts[2])
+            else:
+                # commit_79639_1
+                return int(parts[1])
+        except (IndexError, ValueError):
+            return None
 
     def _cleanup_memory(self):
         """Clean up GPU memory."""

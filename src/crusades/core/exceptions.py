@@ -27,6 +27,8 @@ class EvaluationErrorCode(StrEnum):
     MISSING_LOGITS = "missing_logits"
     INVALID_LOGITS_SHAPE = "invalid_logits_shape"
     SEQUENCE_TRUNCATION = "sequence_truncation"
+    STEP_COUNT_MISMATCH = "step_count_mismatch"
+    FORBIDDEN_CODE_PATTERN = "forbidden_code_pattern"
 
     # Runtime errors
     TIMEOUT = "timeout"
@@ -57,6 +59,8 @@ class EvaluationErrorCode(StrEnum):
             cls.MISSING_LOGITS,
             cls.INVALID_LOGITS_SHAPE,
             cls.SEQUENCE_TRUNCATION,
+            cls.STEP_COUNT_MISMATCH,
+            cls.FORBIDDEN_CODE_PATTERN,
         }
 
     @classmethod
@@ -73,12 +77,14 @@ class EvaluationErrorCode(StrEnum):
             cls.SYNTAX_ERROR,
             cls.MISSING_INNER_STEPS,
             cls.INVALID_RETURN_TYPE,
+            cls.FORBIDDEN_CODE_PATTERN,  # Forbidden AST patterns in miner code
             # Code-level security checks - deterministic regardless of data
             cls.INSUFFICIENT_TRAINABLE_PARAMS,  # Code freezes layers or not
             cls.NO_GRADIENTS_CAPTURED,  # Code calls optimizer.step() or not
             cls.MISSING_LOGITS,  # Code returns None or not
             cls.INVALID_LOGITS_SHAPE,  # Code returns wrong shape or not
             cls.SEQUENCE_TRUNCATION,  # Code truncates or not
+            cls.STEP_COUNT_MISMATCH,  # Code skips optimizer.step() calls
             # NOT fatal (data-dependent, can vary between seeds):
             # - INSUFFICIENT_PARAMS_CHANGED (borderline with few steps)
             # - GRADIENT_NORM_RATIO_FAILED (varies with data)

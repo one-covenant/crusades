@@ -281,12 +281,14 @@ class AffinetesRunner:
             return EvaluationResult.failure(
                 "model_url and data_url are required",
                 task_id=task_id,
+                error_code=EvaluationErrorCode.DATA_LOAD_FAILED,
             )
 
         if not code or "def inner_steps" not in code:
             return EvaluationResult.failure(
                 "Invalid code: must contain 'def inner_steps' function",
                 task_id=task_id,
+                error_code=EvaluationErrorCode.NO_CODE,
             )
 
         if self.mode == "docker":
@@ -317,6 +319,7 @@ class AffinetesRunner:
             return EvaluationResult.failure(
                 f"Unknown mode: {self.mode}",
                 task_id=task_id,
+                error_code=EvaluationErrorCode.EXECUTION_FAILED,
             )
 
     async def _evaluate_docker(
@@ -347,6 +350,7 @@ class AffinetesRunner:
                 f"Validator image not found: {self.validator_image}. "
                 f"Build it first: cd environments/templar && docker build -t {self.validator_image} .",
                 task_id=task_id,
+                error_code=EvaluationErrorCode.DOCKER_FAILED,
             )
 
         # Write miner's code to temp file
@@ -583,6 +587,7 @@ asyncio.run(main())
                 return EvaluationResult.failure(
                     f"Evaluation timed out after {self.timeout}s",
                     task_id=task_id,
+                    error_code=EvaluationErrorCode.TIMEOUT,
                 )
 
             stdout_text = "\n".join(stdout_lines)
@@ -592,9 +597,14 @@ asyncio.run(main())
                 logger.error(f"Docker container failed with exit code {process.returncode}")
                 if stdout_text:
                     logger.error(f"Docker output: {stdout_text[:500]}")
+                # Check for OOM (exit code 137 = killed by OOM killer)
+                err_code = EvaluationErrorCode.DOCKER_FAILED
+                if process.returncode == 137:
+                    err_code = EvaluationErrorCode.OUT_OF_MEMORY
                 return EvaluationResult.failure(
                     f"Container failed with exit code: {process.returncode}. Output: {stdout_text[:200]}",
                     task_id=task_id,
+                    error_code=err_code,
                 )
 
             # Parse result
@@ -610,11 +620,13 @@ asyncio.run(main())
                         return EvaluationResult.failure(
                             f"Invalid result JSON: {e}",
                             task_id=task_id,
+                            error_code=EvaluationErrorCode.EXECUTION_FAILED,
                         )
 
             return EvaluationResult.failure(
                 f"No evaluation result in output. stdout: {stdout_text[:200]}",
                 task_id=task_id,
+                error_code=EvaluationErrorCode.EXECUTION_FAILED,
             )
 
         finally:
@@ -663,6 +675,7 @@ asyncio.run(main())
             return EvaluationResult.failure(
                 "basilica SDK not installed. Run: uv add basilica",
                 task_id=task_id,
+                error_code=EvaluationErrorCode.DOCKER_FAILED,
             )
 
         try:
@@ -675,6 +688,7 @@ asyncio.run(main())
                 return EvaluationResult.failure(
                     "Failed to create Basilica deployment",
                     task_id=task_id,
+                    error_code=EvaluationErrorCode.DOCKER_FAILED,
                 )
 
             logger.info("-" * 60)
@@ -743,6 +757,7 @@ asyncio.run(main())
                     return EvaluationResult.failure(
                         f"Basilica /evaluate error: {response.status_code} - {error_text}",
                         task_id=task_id,
+                        error_code=EvaluationErrorCode.EXECUTION_FAILED,
                     )
 
                 result_data = response.json()
@@ -769,6 +784,7 @@ asyncio.run(main())
             return EvaluationResult.failure(
                 f"Basilica timeout after {self.timeout}s",
                 task_id=task_id,
+                error_code=EvaluationErrorCode.TIMEOUT,
             )
         except Exception as e:
             logger.error(f"[BASILICA] Error: {e}")
@@ -776,6 +792,7 @@ asyncio.run(main())
             return EvaluationResult.failure(
                 f"Basilica error: {e}",
                 task_id=task_id,
+                error_code=EvaluationErrorCode.EXECUTION_FAILED,
             )
 
     async def _get_basilica_deployment(self):

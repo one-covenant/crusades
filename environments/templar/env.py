@@ -131,7 +131,100 @@ def _reset_torch_state():
     # Reset default dtype (miners might change this)
     torch.set_default_dtype(torch.float32)
 
+    # Clear torch.compile / dynamo caches (major memory leak source)
+    # Miners using torch.compile leave compiled graphs + triton kernels in GPU memory
+    try:
+        import torch._dynamo
+
+        torch._dynamo.reset()
+        logger.debug("torch._dynamo cache cleared")
+    except (ImportError, AttributeError):
+        pass
+
+    # Clear torch.compile inductor caches
+    try:
+        import torch._inductor.codecache
+
+        if hasattr(torch._inductor.codecache, "PyCodeCache"):
+            torch._inductor.codecache.PyCodeCache.cache_clear()
+    except (ImportError, AttributeError):
+        pass
+
+    # Remove miner module from sys.modules to release all its global state
+    # (closures, leaked tensor references, global variables, etc.)
+    miner_module = sys.modules.pop("miner_train", None)
+    if miner_module is not None:
+        # Delete all attributes to break reference cycles
+        for attr in list(vars(miner_module).keys()):
+            try:
+                delattr(miner_module, attr)
+            except Exception:
+                pass
+        del miner_module
+
     logger.debug("Torch state reset complete")
+
+
+def _check_gpu_memory_pressure() -> bool:
+    """Check if GPU memory is under pressure and evict cache if needed.
+
+    Returns True if cache was evicted (caller should reload model).
+    """
+    if not torch.cuda.is_available():
+        return False
+
+    try:
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        used_fraction = 1.0 - (free_mem / total_mem)
+        free_gb = free_mem / (1024**3)
+        total_gb = total_mem / (1024**3)
+
+        logger.info(
+            f"GPU memory: {free_gb:.1f}GB free / {total_gb:.1f}GB total "
+            f"({used_fraction:.0%} used)"
+        )
+
+        # If more than 80% of GPU memory is used, evict the model cache
+        # to prevent OOM on the next evaluation
+        if used_fraction > 0.80:
+            logger.warning(
+                f"GPU memory pressure detected ({used_fraction:.0%} used, "
+                f"{free_gb:.1f}GB free). Evicting model cache."
+            )
+            _evict_model_cache()
+            return True
+
+    except Exception as e:
+        logger.debug(f"Could not check GPU memory: {e}")
+
+    return False
+
+
+def _evict_model_cache():
+    """Evict cached model and state to free GPU+CPU memory."""
+    if _CACHE.get("model") is not None:
+        # Move model to CPU first, then delete
+        try:
+            _CACHE["model"].cpu()
+        except Exception:
+            pass
+        _CACHE["model"] = None
+        _CACHE["model_path"] = None
+        _CACHE["use_random_init"] = None
+
+    if _CACHE.get("initial_state") is not None:
+        _CACHE["initial_state"] = None
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    try:
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        free_gb = free_mem / (1024**3)
+        logger.info(f"After cache eviction: {free_gb:.1f}GB free")
+    except Exception:
+        pass
 
 
 def _load_hf_dataset(
@@ -257,12 +350,23 @@ def _set_deterministic(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def _validate_code_structure(code: str) -> tuple[bool, str | None]:
-    """Validate that train.py has correct structure."""
+def _validate_code_structure(code: str) -> tuple[bool, str | None, str | None]:
+    """Validate that train.py has correct structure and no forbidden patterns.
+
+    Checks:
+    1. Code parses without syntax errors
+    2. inner_steps function exists with correct signature
+    3. No forbidden patterns that violate miner rules (optimizer bypass, memory
+       manipulation, gradient checkpointing disable, module manipulation)
+
+    Returns:
+        (ok, error_message, error_code) - error_code is a structured code for
+        reliable error handling (maps to EvaluationErrorCode).
+    """
     try:
         tree = ast.parse(code)
     except SyntaxError as exc:
-        return False, f"Syntax error at line {exc.lineno}: {exc.msg}"
+        return False, f"Syntax error at line {exc.lineno}: {exc.msg}", "syntax_error"
 
     inner_steps_found = False
     for node in ast.walk(tree):
@@ -270,13 +374,200 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
             inner_steps_found = True
             args = node.args
             if len(args.args) < 5:
-                return False, f"inner_steps has {len(args.args)} args, expected at least 5"
+                return (
+                    False,
+                    f"inner_steps has {len(args.args)} args, expected at least 5",
+                    "missing_inner_steps",
+                )
             break
 
     if not inner_steps_found:
-        return False, "Missing required function: inner_steps"
+        return False, "Missing required function: inner_steps", "missing_inner_steps"
 
-    return True, None
+    # Scan for forbidden patterns
+    forbidden_error = _scan_forbidden_patterns(tree)
+    if forbidden_error is not None:
+        return False, forbidden_error, "forbidden_code_pattern"
+
+    return True, None, None
+
+
+def _scan_forbidden_patterns(tree: ast.AST) -> str | None:
+    """Scan AST for forbidden code patterns that violate miner rules.
+
+    This scanner works in two layers:
+    1. BLANKET BANS: Dangerous builtins/modules that have no legitimate use in
+       a training loop (eval, exec, gc, sys._getframe, ctypes, etc.)
+    2. TARGETED CHECKS: Specific patterns on optimizer/model objects
+
+    Returns an error message if a forbidden pattern is found, None otherwise.
+    """
+    # =========================================================================
+    # LAYER 1: Blanket-banned names and attribute accesses
+    # These builtins/modules have no legitimate use in inner_steps.
+    # =========================================================================
+
+    # Function/builtin names that are always forbidden
+    BANNED_CALL_NAMES = frozenset({
+        "eval",           # Dynamic code execution (complete AST bypass)
+        "exec",           # Dynamic code execution (complete AST bypass)
+        "compile",        # Code compilation (used with eval/exec)
+        "__import__",     # Dynamic import (bypasses all module-level checks)
+        "globals",        # Access to global namespace (smuggles __builtins__)
+        "breakpoint",     # Debugger access
+    })
+
+    # Attribute names on 'sys' that are always forbidden
+    BANNED_SYS_ATTRS = frozenset({
+        "modules",        # Module manipulation
+        "_getframe",      # Stack walking (reads validator locals including reference gradients)
+        "_current_frames",  # Stack walking
+        "_current_exceptions",  # Stack walking
+    })
+
+    # Attribute names on 'gc' that are always forbidden
+    BANNED_GC_ATTRS = frozenset({
+        "get_objects",    # Walk all process objects
+        "get_referents",  # Walk object references (finds real optimizer)
+        "get_referrers",  # Walk object referrers
+    })
+
+    # Module names that are always forbidden to import or reference
+    BANNED_MODULES = frozenset({
+        "ctypes",         # Memory manipulation
+        "inspect",        # Introspection (getattr_static, stack frames, etc.)
+        "importlib",      # Dynamic module loading
+        "code",           # Interactive interpreter
+        "codeop",         # Compile code with possibility of incomplete input
+        "dis",            # Bytecode disassembler (introspection)
+        "types",          # Type manipulation (FunctionType, CodeType)
+    })
+
+    # Names (variables/builtins) that are forbidden to READ at all
+    BANNED_NAMES = frozenset({
+        "__builtins__",   # Access to eval/exec/compile via __builtins__['eval']
+    })
+
+    # Attribute names that are always forbidden on any object
+    BANNED_ATTRS_ANY_OBJECT = frozenset({
+        "gradient_checkpointing_disable",   # Disabling gradient checkpointing
+    })
+
+    for node in ast.walk(tree):
+
+        # =================================================================
+        # Check for banned name references (variables/builtins)
+        # =================================================================
+        if isinstance(node, ast.Name) and node.id in BANNED_NAMES:
+            return (
+                f"Forbidden: {node.id} (line {node.lineno}). "
+                f"Accessing '{node.id}' is not allowed."
+            )
+
+        # =================================================================
+        # Check function/method calls
+        # =================================================================
+        if isinstance(node, ast.Call):
+            func = node.func
+
+            # --- Banned builtins: eval(), exec(), compile(), __import__(), globals() ---
+            if isinstance(func, ast.Name) and func.id in BANNED_CALL_NAMES:
+                return (
+                    f"Forbidden: {func.id}() (line {node.lineno}). "
+                    f"Dynamic code execution is not allowed."
+                )
+
+            # --- gc.get_objects / gc.get_referents / gc.get_referrers ---
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr in BANNED_GC_ATTRS
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "gc"
+            ):
+                return (
+                    f"Forbidden: gc.{func.attr}() (line {node.lineno}). "
+                    f"Process memory introspection is not allowed."
+                )
+
+            # --- __import__('gc').get_objects() pattern ---
+            # Catches: __import__('gc').get_objects() etc.
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr in BANNED_GC_ATTRS
+                and isinstance(func.value, ast.Call)
+                and isinstance(func.value.func, ast.Name)
+                and func.value.func.id == "__import__"
+            ):
+                return (
+                    f"Forbidden: __import__ + {func.attr}() (line {node.lineno}). "
+                    f"Dynamic import for process introspection is not allowed."
+                )
+
+            # --- object.__getattribute__(optimizer, ...) ---
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr in ("__getattribute__", "__setattr__", "__delattr__")
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "object"
+            ):
+                return (
+                    f"Forbidden: object.{func.attr}() (line {node.lineno}). "
+                    f"Direct object protocol manipulation is not allowed."
+                )
+
+        # =================================================================
+        # Check attribute accesses
+        # =================================================================
+        if isinstance(node, ast.Attribute):
+
+            # --- sys.modules / sys._getframe / sys._current_frames ---
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == "sys"
+                and node.attr in BANNED_SYS_ATTRS
+            ):
+                return (
+                    f"Forbidden: sys.{node.attr} (line {node.lineno}). "
+                    f"System introspection is not allowed."
+                )
+
+            # --- Banned attributes on any object (gradient_checkpointing_disable) ---
+            if node.attr in BANNED_ATTRS_ANY_OBJECT:
+                return (
+                    f"Forbidden: {node.attr} (line {node.lineno}). "
+                    f"Miners MUST NOT disable gradient checkpointing."
+                )
+
+            # --- gradient_checkpointing flag set to False ---
+            # Catches: model.gradient_checkpointing = False (or any obj)
+            if node.attr == "gradient_checkpointing":
+                # Check if this is a store (assignment target)
+                # ast.Attribute as store context means it's being assigned to
+                if isinstance(node.ctx, ast.Store):
+                    return (
+                        f"Forbidden: modifying gradient_checkpointing flag (line {node.lineno}). "
+                        f"Miners MUST NOT modify gradient checkpointing state."
+                    )
+
+        # =================================================================
+        # Check imports for banned modules
+        # =================================================================
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in BANNED_MODULES:
+                    return (
+                        f"Forbidden: import {alias.name} (line {node.lineno}). "
+                        f"Module '{alias.name}' is not allowed."
+                    )
+
+        if isinstance(node, ast.ImportFrom):
+            if node.module in BANNED_MODULES:
+                return (
+                    f"Forbidden: from {node.module} import ... (line {node.lineno}). "
+                    f"Module '{node.module}' is not allowed."
+                )
+
+    return None
 
 
 def _validate_return_type(result) -> tuple[bool, str | None, InnerStepsResult | None]:
@@ -605,9 +896,12 @@ class GradientCapturingOptimizer:
     from within the miner's inner_steps execution. This ensures we verify
     gradients produced by miner code, not validator code.
 
-    Protected attributes (optimizer, model, captured_gradients, step_count,
-    gradient_capture_time) cannot be overwritten by miner code - __setattr__
-    raises AttributeError if miner tries to replace them.
+    Protection layers:
+    1. __getattribute__: blocks reading hidden attrs + __dict__/vars()
+    2. __setattr__: blocks writing protected attrs
+    3. __delattr__: blocks deleting any protected/hidden attrs
+    4. __class__ property: blocks class replacement attacks
+    5. Method binding: step/zero_grad are bound at init, can't be replaced
 
     PERFORMANCE: Tracks overhead time separately and excludes it from wall_time
     for fair MFU/TPS calculation. MFU formula (6 * params * tokens) only accounts
@@ -625,8 +919,18 @@ class GradientCapturingOptimizer:
             "step_count",
             "gradient_capture_time",
             "_initialized",
+            # Method/class protections
+            "step",
+            "zero_grad",
+            "__class__",
+            "__dict__",
         }
     )
+
+    # Attributes that miner code must not be able to READ
+    # (prevents wrapper bypass via optimizer.optimizer, optimizer.model,
+    #  optimizer.__dict__, vars(optimizer), etc.)
+    _HIDDEN_ATTRS = frozenset({"optimizer", "model", "__dict__"})
 
     def __init__(self, optimizer: torch.optim.Optimizer, model: torch.nn.Module):
         # Use object.__setattr__ during init to bypass our protection
@@ -636,6 +940,19 @@ class GradientCapturingOptimizer:
         object.__setattr__(self, "step_count", 0)
         object.__setattr__(self, "gradient_capture_time", 0.0)
         object.__setattr__(self, "_initialized", True)
+
+    def __getattribute__(self, name):
+        """Block miner code from reading hidden internal attributes.
+
+        Blocks: optimizer, model, __dict__ (and vars() which uses __dict__)
+        """
+        # Use CLASS reference to prevent miner from clearing _HIDDEN_ATTRS
+        if name in GradientCapturingOptimizer._HIDDEN_ATTRS:
+            raise AttributeError(
+                f"Cannot access internal attribute '{name}' on optimizer wrapper. "
+                f"Use optimizer.step() and optimizer.zero_grad() directly."
+            )
+        return object.__getattribute__(self, name)
 
     def __setattr__(self, name, value):
         """Prevent miner code from replacing security-critical attributes."""
@@ -648,60 +965,87 @@ class GradientCapturingOptimizer:
             raise AttributeError(f"Cannot modify protected attribute '{name}' on optimizer wrapper")
         object.__setattr__(self, name, value)
 
+    def __delattr__(self, name):
+        """Prevent miner code from deleting any attributes."""
+        raise AttributeError(f"Cannot delete attribute '{name}' on optimizer wrapper")
+
     def step(self, *args, **kwargs):
         """Capture gradients BEFORE optimizer.step() clears them."""
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
+        # Use object.__getattribute__ to bypass __getattribute__ protection
+        model = object.__getattribute__(self, "model")
+        opt = object.__getattribute__(self, "optimizer")
+
         # Now time ONLY the gradient capture (GPU->CPU copy for verification)
         # This is validator overhead and should be excluded from wall_time
         capture_start = time.perf_counter()
         # Use object.__setattr__ to update protected attrs internally
-        object.__setattr__(self, "captured_gradients", _capture_gradients(self.model))
+        object.__setattr__(self, "captured_gradients", _capture_gradients(model))
+        cur_capture_time = object.__getattribute__(self, "gradient_capture_time")
         object.__setattr__(
             self,
             "gradient_capture_time",
-            self.gradient_capture_time + (time.perf_counter() - capture_start),
+            cur_capture_time + (time.perf_counter() - capture_start),
         )
 
         # Actual optimizer step (part of miner's training)
-        object.__setattr__(self, "step_count", self.step_count + 1)
-        return self.optimizer.step(*args, **kwargs)
+        cur_step_count = object.__getattribute__(self, "step_count")
+        object.__setattr__(self, "step_count", cur_step_count + 1)
+        return opt.step(*args, **kwargs)
 
     def zero_grad(self, set_to_none: bool = False):
         """Forward to underlying optimizer."""
-        return self.optimizer.zero_grad(set_to_none=set_to_none)
+        opt = object.__getattribute__(self, "optimizer")
+        return opt.zero_grad(set_to_none=set_to_none)
 
     @property
     def param_groups(self):
         """Forward param_groups access to underlying optimizer."""
-        return self.optimizer.param_groups
+        opt = object.__getattribute__(self, "optimizer")
+        return opt.param_groups
 
     @param_groups.setter
     def param_groups(self, value):
         """Forward param_groups setter to underlying optimizer."""
-        self.optimizer.param_groups = value
+        opt = object.__getattribute__(self, "optimizer")
+        opt.param_groups = value
 
     def state_dict(self):
         """Forward to underlying optimizer."""
-        return self.optimizer.state_dict()
+        opt = object.__getattribute__(self, "optimizer")
+        return opt.state_dict()
 
     def load_state_dict(self, state_dict):
         """Forward to underlying optimizer."""
-        return self.optimizer.load_state_dict(state_dict)
+        opt = object.__getattribute__(self, "optimizer")
+        return opt.load_state_dict(state_dict)
 
     def add_param_group(self, param_group):
         """Forward to underlying optimizer."""
-        return self.optimizer.add_param_group(param_group)
+        opt = object.__getattribute__(self, "optimizer")
+        return opt.add_param_group(param_group)
 
     @property
     def state(self):
         """Forward state access to underlying optimizer."""
-        return self.optimizer.state
+        opt = object.__getattribute__(self, "optimizer")
+        return opt.state
 
     def __getattr__(self, name):
-        """Forward any other attribute access to underlying optimizer."""
-        return getattr(self.optimizer, name)
+        """Forward any other attribute access to underlying optimizer.
+
+        SECURITY: Also block hidden attrs here since __getattr__ is called
+        as a fallback when __getattribute__ raises AttributeError.
+        """
+        if name in GradientCapturingOptimizer._HIDDEN_ATTRS:
+            raise AttributeError(
+                f"Cannot access internal attribute '{name}' on optimizer wrapper. "
+                f"Use optimizer.step() and optimizer.zero_grad() directly."
+            )
+        opt = object.__getattribute__(self, "optimizer")
+        return getattr(opt, name)
 
 
 def _run_reference(
@@ -1124,12 +1468,17 @@ class Actor:
             }
 
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Pre-evaluation memory check: evict cache if GPU is under pressure
+        # This prevents OOM from accumulated leaks across evaluations
+        _check_gpu_memory_pressure()
+
         deadline = time.monotonic() + timeout
         seed_value = abs(hash(seed)) % (2**32)
         _set_deterministic(seed_value)
 
-        # Validate code structure
-        code_ok, code_error = _validate_code_structure(code)
+        # Validate code structure and scan for forbidden patterns
+        code_ok, code_error, code_error_code = _validate_code_structure(code)
         if not code_ok:
             return {
                 "task_id": task_id,
@@ -1139,6 +1488,7 @@ class Actor:
                 "wall_time_seconds": 0.0,
                 "success": False,
                 "error": code_error,
+                "error_code": code_error_code,
                 "seed": seed,
                 "code": code,
             }
@@ -1204,24 +1554,22 @@ class Actor:
 
             seq_len = sequence_length or EVAL_SEQUENCE_LENGTH
 
-            # Run reference implementation (captures gradients for verification)
-            data_iter_ref = _create_data_iterator(data, batch_size, seq_len)
-            optimizer_ref = _create_optimizer(model)
-
             initial_state = _CACHE.get("initial_state")
             if initial_state is None:
                 initial_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 _CACHE["initial_state"] = initial_state
 
-            reference, reference_grad = _run_reference(
-                model, data_iter_ref, optimizer_ref, steps, device, capture_final_gradients=True
-            )
-
-            # Reset model for miner's code
-            model.load_state_dict(initial_state)
+            # =================================================================
+            # WARMUP FIRST - Catch broken code BEFORE wasting GPU on reference
+            # =================================================================
+            # Run cheap warmup (2 steps) to detect basic errors early.
+            # If this fails, we skip the expensive reference run entirely.
+            # SECURITY: Use GradientCapturingOptimizer for warmup too, so
+            # miners cannot detect warmup vs evaluation by checking optimizer type.
             warmup_steps = 2
             data_iter_warmup = _create_data_iterator(data, batch_size, seq_len)
-            optimizer_warmup = _create_optimizer(model)
+            warmup_base_opt = _create_optimizer(model)
+            optimizer_warmup = GradientCapturingOptimizer(warmup_base_opt, model)
 
             logger.info(f"Running {warmup_steps} warmup step(s) to check for basic errors...")
             try:
@@ -1327,8 +1675,25 @@ class Actor:
                     "code": code,
                 }
 
-            # Reset model state after warmup
+            # Reset model state after warmup and restore gradient checkpointing
             model.load_state_dict(initial_state)
+            if hasattr(model, "gradient_checkpointing_enable"):
+                model.gradient_checkpointing_enable()
+
+            # =================================================================
+            # REFERENCE RUN - Only after warmup passes (saves GPU on failures)
+            # =================================================================
+            data_iter_ref = _create_data_iterator(data, batch_size, seq_len)
+            optimizer_ref = _create_optimizer(model)
+
+            reference, reference_grad = _run_reference(
+                model, data_iter_ref, optimizer_ref, steps, device, capture_final_gradients=True
+            )
+
+            # Reset model for miner's full evaluation
+            model.load_state_dict(initial_state)
+            if hasattr(model, "gradient_checkpointing_enable"):
+                model.gradient_checkpointing_enable()
 
             # =================================================================
             # FULL EVALUATION - Run actual timed evaluation with gradient capture
@@ -1371,6 +1736,80 @@ class Actor:
                 f"Timing: total={total_time:.2f}s, grad_capture={gradient_capture_time:.2f}s, "
                 f"wall_time={wall_time:.2f}s (used for MFU/TPS)"
             )
+
+            # SECURITY: Verify torch state hasn't been tampered with
+            # Miners may change these for speed (non-deterministic = ~5-10% faster,
+            # disable checkpointing = ~30% faster backward). We check at runtime
+            # because AST scans can't catch all dynamic manipulation methods.
+            if torch.backends.cudnn.deterministic is False:
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": (
+                        "torch.backends.cudnn.deterministic was set to False during evaluation. "
+                        "Miners MUST NOT modify deterministic settings."
+                    ),
+                    "error_code": "forbidden_code_pattern",
+                    "seed": seed,
+                    "code": code,
+                }
+
+            if torch.backends.cudnn.benchmark is True:
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": (
+                        "torch.backends.cudnn.benchmark was set to True during evaluation. "
+                        "Miners MUST NOT enable benchmark mode."
+                    ),
+                    "error_code": "forbidden_code_pattern",
+                    "seed": seed,
+                    "code": code,
+                }
+
+            if hasattr(model, "is_gradient_checkpointing") and not model.is_gradient_checkpointing:
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": (
+                        "Gradient checkpointing was disabled during evaluation. "
+                        "Miners MUST NOT disable gradient checkpointing."
+                    ),
+                    "error_code": "forbidden_code_pattern",
+                    "seed": seed,
+                    "code": code,
+                }
+
+            # Verify miner called optimizer.step() on every step (not bypassing wrapper)
+            miner_step_count = optimizer_miner.step_count
+            if miner_step_count != steps:
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": (
+                        f"optimizer.step() called {miner_step_count} times, expected {steps}. "
+                        f"Miners MUST call the provided optimizer.step() on every training step."
+                    ),
+                    "error_code": "step_count_mismatch",
+                    "seed": seed,
+                    "code": code,
+                }
 
             # Get gradients captured from the final step (inside miner's code)
             candidate_grad = optimizer_miner.captured_gradients
@@ -1561,12 +2000,26 @@ class Actor:
 
         finally:
             # SECURITY: Reset torch state to prevent cross-evaluation contamination
+            # (also clears dynamo caches and removes miner module from sys.modules)
             _reset_torch_state()
 
-            # Memory cleanup
+            # Restore gradient checkpointing on the cached model if miner disabled it
+            # (defense-in-depth: AST scan blocks this, but belt-and-suspenders)
+            cached_model = _CACHE.get("model")
+            if cached_model is not None and hasattr(cached_model, "gradient_checkpointing_enable"):
+                try:
+                    cached_model.gradient_checkpointing_enable()
+                except Exception:
+                    pass
+
+            # Aggressive memory cleanup
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            # Check GPU memory pressure and evict model cache if needed
+            # This prevents OOM on the next evaluation due to accumulated leaks
+            _check_gpu_memory_pressure()
 
 
 # =============================================================================
@@ -1630,12 +2083,24 @@ class EvaluateResponse(BaseModel):
 
 @app.get("/health")
 async def health():
-    """Health check endpoint for Basilica."""
-    return {
+    """Health check endpoint for Basilica with GPU memory diagnostics."""
+    info = {
         "status": "healthy",
         "gpu_available": torch.cuda.is_available(),
         "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
     }
+    if torch.cuda.is_available():
+        try:
+            free_mem, total_mem = torch.cuda.mem_get_info()
+            info["gpu_memory_free_gb"] = round(free_mem / (1024**3), 2)
+            info["gpu_memory_total_gb"] = round(total_mem / (1024**3), 2)
+            info["gpu_memory_used_pct"] = round(
+                (1.0 - free_mem / total_mem) * 100, 1
+            )
+            info["model_cached"] = _CACHE.get("model") is not None
+        except Exception:
+            pass
+    return info
 
 
 @app.post("/evaluate", response_model=EvaluateResponse)
