@@ -280,7 +280,8 @@ class Database:
             # Filter out pre-competition submissions
             if min_commit_block > 0:
                 submissions = [
-                    s for s in submissions
+                    s
+                    for s in submissions
                     if (_extract_commit_block(s.submission_id) or 0) >= min_commit_block
                 ]
 
@@ -347,7 +348,8 @@ class Database:
         # Filter out pre-competition submissions
         if min_commit_block > 0:
             all_submissions = [
-                s for s in all_submissions
+                s
+                for s in all_submissions
                 if (_extract_commit_block(s.submission_id) or 0) >= min_commit_block
             ]
 

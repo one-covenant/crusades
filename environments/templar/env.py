@@ -52,6 +52,11 @@ DETERMINISTIC_MODE = os.getenv("DETERMINISTIC_MODE", "1") == "1"
 EVAL_SEQUENCE_LENGTH = int(os.getenv("EVAL_SEQUENCE_LENGTH", "1024"))
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/templar_eval"))
 
+# Named constants for magic numbers
+GPU_MEMORY_PRESSURE_THRESHOLD = 0.80  # Fraction of GPU memory usage that triggers cache eviction
+GRADIENT_ZERO_THRESHOLD = 1e-10  # Threshold below which a gradient is considered zero
+ELEMENT_CHANGE_THRESHOLD = 1e-6  # Threshold for counting individual parameter element changes
+
 
 @dataclass
 class InnerStepsResult:
@@ -180,13 +185,12 @@ def _check_gpu_memory_pressure() -> bool:
         total_gb = total_mem / (1024**3)
 
         logger.info(
-            f"GPU memory: {free_gb:.1f}GB free / {total_gb:.1f}GB total "
-            f"({used_fraction:.0%} used)"
+            f"GPU memory: {free_gb:.1f}GB free / {total_gb:.1f}GB total ({used_fraction:.0%} used)"
         )
 
         # If more than 80% of GPU memory is used, evict the model cache
         # to prevent OOM on the next evaluation
-        if used_fraction > 0.80:
+        if used_fraction > GPU_MEMORY_PRESSURE_THRESHOLD:
             logger.warning(
                 f"GPU memory pressure detected ({used_fraction:.0%} used, "
                 f"{free_gb:.1f}GB free). Evicting model cache."
@@ -392,6 +396,92 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None, str | None]:
     return True, None, None
 
 
+# =========================================================================
+# AST scanner constants — forbidden names, modules, and attributes.
+# Defined at module level so they are created once and shared across calls.
+# =========================================================================
+
+# Function/builtin names that are always forbidden
+_BANNED_CALL_NAMES = frozenset(
+    {
+        "eval",  # Dynamic code execution (complete AST bypass)
+        "exec",  # Dynamic code execution (complete AST bypass)
+        "compile",  # Code compilation (used with eval/exec)
+        "__import__",  # Dynamic import (bypasses all module-level checks)
+        "globals",  # Access to global namespace (smuggles __builtins__)
+        "breakpoint",  # Debugger access
+        "autocast",  # Precision manipulation (from torch.cuda.amp import autocast)
+    }
+)
+
+# Attribute names on 'sys' that are always forbidden
+_BANNED_SYS_ATTRS = frozenset(
+    {
+        "modules",  # Module manipulation
+        "_getframe",  # Stack walking (reads validator locals including reference gradients)
+        "_current_frames",  # Stack walking
+        "_current_exceptions",  # Stack walking
+    }
+)
+
+# Attribute names on 'gc' that are always forbidden
+_BANNED_GC_ATTRS = frozenset(
+    {
+        "get_objects",  # Walk all process objects
+        "get_referents",  # Walk object references (finds real optimizer)
+        "get_referrers",  # Walk object referrers
+    }
+)
+
+# Module names that are always forbidden to import or reference
+_BANNED_MODULES = frozenset(
+    {
+        "ctypes",  # Memory manipulation
+        "inspect",  # Introspection (getattr_static, stack frames, etc.)
+        "importlib",  # Dynamic module loading
+        "code",  # Interactive interpreter
+        "codeop",  # Compile code with possibility of incomplete input
+        "dis",  # Bytecode disassembler (introspection)
+        "types",  # Type manipulation (FunctionType, CodeType)
+    }
+)
+
+# Names (variables/builtins) that are forbidden to READ at all
+_BANNED_NAMES = frozenset(
+    {
+        "__builtins__",  # Access to eval/exec/compile via __builtins__['eval']
+    }
+)
+
+# Attribute names that are always forbidden on ANY object (read or call)
+_BANNED_ATTRS_ANY_OBJECT = frozenset(
+    {
+        # Gradient checkpointing
+        "gradient_checkpointing_disable",  # Disabling gradient checkpointing
+        # Model hook manipulation (intercept/modify forward/backward pass)
+        "register_forward_hook",  # Intercept model forward outputs
+        "register_forward_pre_hook",  # Intercept model forward inputs
+        "register_backward_hook",  # Intercept backward gradients
+        "register_full_backward_hook",  # Full backward gradient hook
+        "remove_hook_from_module",  # Remove existing hooks (e.g. grad ckpt hooks)
+        # Attention backend manipulation (force faster but non-deterministic kernels)
+        "enable_flash_sdp",  # Toggle Flash SDP attention
+        "enable_math_sdp",  # Toggle Math SDP attention
+        "enable_mem_efficient_sdp",  # Toggle memory-efficient SDP attention
+        # Global precision manipulation
+        "set_float32_matmul_precision",  # Change matmul precision globally
+    }
+)
+
+# Attribute names on 'torch' that are forbidden (torch.compile, torch.autocast)
+_BANNED_TORCH_ATTRS = frozenset(
+    {
+        "compile",  # JIT compilation (non-deterministic with max-autotune, cache leaks)
+        "autocast",  # Precision manipulation (changes gradient computation)
+    }
+)
+
+
 def _scan_forbidden_patterns(tree: ast.AST) -> str | None:
     """Scan AST for forbidden code patterns that violate miner rules.
 
@@ -402,66 +492,13 @@ def _scan_forbidden_patterns(tree: ast.AST) -> str | None:
 
     Returns an error message if a forbidden pattern is found, None otherwise.
     """
-    # =========================================================================
-    # LAYER 1: Blanket-banned names and attribute accesses
-    # These builtins/modules have no legitimate use in inner_steps.
-    # =========================================================================
-
-    # Function/builtin names that are always forbidden
-    BANNED_CALL_NAMES = frozenset({
-        "eval",           # Dynamic code execution (complete AST bypass)
-        "exec",           # Dynamic code execution (complete AST bypass)
-        "compile",        # Code compilation (used with eval/exec)
-        "__import__",     # Dynamic import (bypasses all module-level checks)
-        "globals",        # Access to global namespace (smuggles __builtins__)
-        "breakpoint",     # Debugger access
-    })
-
-    # Attribute names on 'sys' that are always forbidden
-    BANNED_SYS_ATTRS = frozenset({
-        "modules",        # Module manipulation
-        "_getframe",      # Stack walking (reads validator locals including reference gradients)
-        "_current_frames",  # Stack walking
-        "_current_exceptions",  # Stack walking
-    })
-
-    # Attribute names on 'gc' that are always forbidden
-    BANNED_GC_ATTRS = frozenset({
-        "get_objects",    # Walk all process objects
-        "get_referents",  # Walk object references (finds real optimizer)
-        "get_referrers",  # Walk object referrers
-    })
-
-    # Module names that are always forbidden to import or reference
-    BANNED_MODULES = frozenset({
-        "ctypes",         # Memory manipulation
-        "inspect",        # Introspection (getattr_static, stack frames, etc.)
-        "importlib",      # Dynamic module loading
-        "code",           # Interactive interpreter
-        "codeop",         # Compile code with possibility of incomplete input
-        "dis",            # Bytecode disassembler (introspection)
-        "types",          # Type manipulation (FunctionType, CodeType)
-    })
-
-    # Names (variables/builtins) that are forbidden to READ at all
-    BANNED_NAMES = frozenset({
-        "__builtins__",   # Access to eval/exec/compile via __builtins__['eval']
-    })
-
-    # Attribute names that are always forbidden on any object
-    BANNED_ATTRS_ANY_OBJECT = frozenset({
-        "gradient_checkpointing_disable",   # Disabling gradient checkpointing
-    })
-
     for node in ast.walk(tree):
-
         # =================================================================
         # Check for banned name references (variables/builtins)
         # =================================================================
-        if isinstance(node, ast.Name) and node.id in BANNED_NAMES:
+        if isinstance(node, ast.Name) and node.id in _BANNED_NAMES:
             return (
-                f"Forbidden: {node.id} (line {node.lineno}). "
-                f"Accessing '{node.id}' is not allowed."
+                f"Forbidden: {node.id} (line {node.lineno}). Accessing '{node.id}' is not allowed."
             )
 
         # =================================================================
@@ -471,7 +508,7 @@ def _scan_forbidden_patterns(tree: ast.AST) -> str | None:
             func = node.func
 
             # --- Banned builtins: eval(), exec(), compile(), __import__(), globals() ---
-            if isinstance(func, ast.Name) and func.id in BANNED_CALL_NAMES:
+            if isinstance(func, ast.Name) and func.id in _BANNED_CALL_NAMES:
                 return (
                     f"Forbidden: {func.id}() (line {node.lineno}). "
                     f"Dynamic code execution is not allowed."
@@ -480,7 +517,7 @@ def _scan_forbidden_patterns(tree: ast.AST) -> str | None:
             # --- gc.get_objects / gc.get_referents / gc.get_referrers ---
             if (
                 isinstance(func, ast.Attribute)
-                and func.attr in BANNED_GC_ATTRS
+                and func.attr in _BANNED_GC_ATTRS
                 and isinstance(func.value, ast.Name)
                 and func.value.id == "gc"
             ):
@@ -493,7 +530,7 @@ def _scan_forbidden_patterns(tree: ast.AST) -> str | None:
             # Catches: __import__('gc').get_objects() etc.
             if (
                 isinstance(func, ast.Attribute)
-                and func.attr in BANNED_GC_ATTRS
+                and func.attr in _BANNED_GC_ATTRS
                 and isinstance(func.value, ast.Call)
                 and isinstance(func.value.func, ast.Name)
                 and func.value.func.id == "__import__"
@@ -515,27 +552,38 @@ def _scan_forbidden_patterns(tree: ast.AST) -> str | None:
                     f"Direct object protocol manipulation is not allowed."
                 )
 
+            # --- torch.compile() / torch.autocast() ---
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr in _BANNED_TORCH_ATTRS
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "torch"
+            ):
+                return (
+                    f"Forbidden: torch.{func.attr}() (line {node.lineno}). "
+                    f"Miners MUST NOT use torch.{func.attr}()."
+                )
+
         # =================================================================
         # Check attribute accesses
         # =================================================================
         if isinstance(node, ast.Attribute):
-
             # --- sys.modules / sys._getframe / sys._current_frames ---
             if (
                 isinstance(node.value, ast.Name)
                 and node.value.id == "sys"
-                and node.attr in BANNED_SYS_ATTRS
+                and node.attr in _BANNED_SYS_ATTRS
             ):
                 return (
                     f"Forbidden: sys.{node.attr} (line {node.lineno}). "
                     f"System introspection is not allowed."
                 )
 
-            # --- Banned attributes on any object (gradient_checkpointing_disable) ---
-            if node.attr in BANNED_ATTRS_ANY_OBJECT:
+            # --- Banned attributes on any object ---
+            if node.attr in _BANNED_ATTRS_ANY_OBJECT:
                 return (
-                    f"Forbidden: {node.attr} (line {node.lineno}). "
-                    f"Miners MUST NOT disable gradient checkpointing."
+                    f"Forbidden: .{node.attr} (line {node.lineno}). "
+                    f"This operation is not allowed in miner code."
                 )
 
             # --- gradient_checkpointing flag set to False ---
@@ -554,14 +602,14 @@ def _scan_forbidden_patterns(tree: ast.AST) -> str | None:
         # =================================================================
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name in BANNED_MODULES:
+                if alias.name in _BANNED_MODULES:
                     return (
                         f"Forbidden: import {alias.name} (line {node.lineno}). "
                         f"Module '{alias.name}' is not allowed."
                     )
 
         if isinstance(node, ast.ImportFrom):
-            if node.module in BANNED_MODULES:
+            if node.module in _BANNED_MODULES:
                 return (
                     f"Forbidden: from {node.module} import ... (line {node.lineno}). "
                     f"Module '{node.module}' is not allowed."
@@ -716,7 +764,7 @@ def _capture_gradients(model: torch.nn.Module) -> GradientInfo:
             grad_flat = param.grad.detach().cpu().float().view(-1)
             total_norm_sq += grad_flat.pow(2).sum().item()
             # Check if gradient is actually non-zero (not just allocated)
-            if grad_flat.abs().sum().item() > 1e-10:
+            if grad_flat.abs().sum().item() > GRADIENT_ZERO_THRESHOLD:
                 layers_with_grad += 1
                 grad_vectors_cpu.append(grad_flat)
             else:
@@ -785,7 +833,7 @@ def _verify_params_changed(
     model: torch.nn.Module,
     initial_state: dict,
     min_changed_ratio: float = 0.5,
-    element_threshold: float = 1e-6,
+    element_threshold: float = ELEMENT_CHANGE_THRESHOLD,
 ) -> tuple[bool, str | None, dict]:
     """Verify that minimum % of individual parameter elements changed during training.
 
@@ -1113,8 +1161,6 @@ def _run_reference(
 def _verify_gradients(
     reference_grad: GradientInfo | None,
     candidate_grad: GradientInfo | None,
-    cosine_min: float = 0.8,  # Legacy, unused - kept for signature compat
-    norm_ratio_min: float = 0.5,  # Legacy, unused - kept for signature compat
     norm_ratio_max: float = 1.02,  # Relative error threshold: 1.02 = 2% max error
 ) -> tuple[bool, str | None, dict]:
     """Verify candidate gradients match reference using relative error |g - g_truth| / |g_truth|.
@@ -1126,8 +1172,6 @@ def _verify_gradients(
     Args:
         reference_grad: Reference implementation gradients
         candidate_grad: Miner's implementation gradients
-        cosine_min: (legacy, kept for signature compat) Not used in new check
-        norm_ratio_min: (legacy, kept for signature compat) Not used in new check
         norm_ratio_max: Maximum allowed relative error |g - g_truth| / |g_truth|
             Repurposed: norm_ratio_max is used as the relative error threshold.
             Production default: 0.01 (1% relative error)
@@ -1264,8 +1308,6 @@ def _verify_outputs(
     reference_grad: GradientInfo | None = None,
     candidate_grad: GradientInfo | None = None,
     max_loss_difference: float = 0.5,
-    gradient_cosine_min: float = 0.8,
-    gradient_norm_ratio_min: float = 0.5,
     gradient_norm_ratio_max: float = 1.02,
 ) -> tuple[bool, str | None, dict]:
     """Verify candidate outputs match reference.
@@ -1282,9 +1324,7 @@ def _verify_outputs(
         reference_grad: Reference gradients for comparison
         candidate_grad: Candidate gradients for comparison
         max_loss_difference: Maximum allowed |candidate_loss - reference_loss|
-        gradient_cosine_min: Minimum gradient cosine similarity
-        gradient_norm_ratio_min: Min gradient norm ratio
-        gradient_norm_ratio_max: Max gradient norm ratio
+        gradient_norm_ratio_max: Max gradient norm ratio (relative error threshold)
 
     Returns:
         Tuple of (success, error_message, verification_details)
@@ -1363,8 +1403,6 @@ def _verify_outputs(
     grad_ok, grad_error, grad_details = _verify_gradients(
         reference_grad,
         candidate_grad,
-        cosine_min=gradient_cosine_min,
-        norm_ratio_min=gradient_norm_ratio_min,
         norm_ratio_max=gradient_norm_ratio_max,
     )
     details["gradient_verification"] = grad_details
@@ -1407,8 +1445,6 @@ class Actor:
         min_trainable_params_ratio: float = 1.0,
         min_params_changed_ratio: float = 0.5,
         # Gradient verification (replaces logits)
-        gradient_cosine_min: float = 0.8,
-        gradient_norm_ratio_min: float = 0.5,
         gradient_norm_ratio_max: float = 1.02,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
@@ -1432,9 +1468,7 @@ class Actor:
             use_random_init: Use random weights (anti-cheat)
             min_trainable_params_ratio: Min % params that must be trainable
             min_params_changed_ratio: Min % params that must change
-            gradient_cosine_min: Min gradient cosine similarity
-            gradient_norm_ratio_min: Min gradient norm ratio
-            gradient_norm_ratio_max: Max gradient norm ratio
+            gradient_norm_ratio_max: Max gradient norm ratio (relative error threshold)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             model_params_override: Override model param count (None = auto-detect)
 
@@ -1708,8 +1742,22 @@ class Actor:
             base_optimizer = _create_optimizer(model)
             optimizer_miner = GradientCapturingOptimizer(base_optimizer, model)
 
+            # SECURITY: Snapshot torch global state BEFORE miner code runs.
+            # Compared after miner returns to detect dynamic manipulation that
+            # the AST scanner can't catch (e.g. via string concatenation tricks).
+            _pre_state = {}
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+                if hasattr(torch.backends.cuda, "flash_sdp_enabled"):
+                    _pre_state["flash_sdp"] = torch.backends.cuda.flash_sdp_enabled()
+                if hasattr(torch.backends.cuda, "math_sdp_enabled"):
+                    _pre_state["math_sdp"] = torch.backends.cuda.math_sdp_enabled()
+                if hasattr(torch.backends.cuda, "mem_efficient_sdp_enabled"):
+                    _pre_state["mem_efficient_sdp"] = (
+                        torch.backends.cuda.mem_efficient_sdp_enabled()
+                    )
+            if hasattr(torch, "get_float32_matmul_precision"):
+                _pre_state["matmul_precision"] = torch.get_float32_matmul_precision()
 
             start = time.perf_counter()
 
@@ -1791,6 +1839,56 @@ class Actor:
                     "seed": seed,
                     "code": code,
                 }
+
+            # SECURITY: Verify SDP attention backend state wasn't changed.
+            # Switching attention kernels (flash/math/mem_efficient) can give
+            # speed gains with subtly different numerics.
+            _sdp_checks = [
+                ("flash_sdp", "flash_sdp_enabled", "enable_flash_sdp"),
+                ("math_sdp", "math_sdp_enabled", "enable_math_sdp"),
+                ("mem_efficient_sdp", "mem_efficient_sdp_enabled", "enable_mem_efficient_sdp"),
+            ]
+            for state_key, check_fn_name, setter_name in _sdp_checks:
+                if state_key in _pre_state and hasattr(torch.backends.cuda, check_fn_name):
+                    current_val = getattr(torch.backends.cuda, check_fn_name)()
+                    if current_val != _pre_state[state_key]:
+                        return {
+                            "task_id": task_id,
+                            "mfu": 0.0,
+                            "tps": 0.0,
+                            "total_tokens": 0,
+                            "wall_time_seconds": wall_time,
+                            "success": False,
+                            "error": (
+                                f"torch.backends.cuda.{setter_name}() was called during evaluation "
+                                f"(changed from {_pre_state[state_key]} to {current_val}). "
+                                f"Miners MUST NOT modify attention backend settings."
+                            ),
+                            "error_code": "forbidden_code_pattern",
+                            "seed": seed,
+                            "code": code,
+                        }
+
+            # SECURITY: Verify matmul precision wasn't changed.
+            if "matmul_precision" in _pre_state and hasattr(torch, "get_float32_matmul_precision"):
+                current_precision = torch.get_float32_matmul_precision()
+                if current_precision != _pre_state["matmul_precision"]:
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": wall_time,
+                        "success": False,
+                        "error": (
+                            f"torch.set_float32_matmul_precision() was called during evaluation "
+                            f"(changed from '{_pre_state['matmul_precision']}' to '{current_precision}'). "
+                            f"Miners MUST NOT modify matmul precision."
+                        ),
+                        "error_code": "forbidden_code_pattern",
+                        "seed": seed,
+                        "code": code,
+                    }
 
             # Verify miner called optimizer.step() on every step (not bypassing wrapper)
             miner_step_count = optimizer_miner.step_count
@@ -1934,8 +2032,6 @@ class Actor:
                 reference_grad=reference_grad,
                 candidate_grad=candidate_grad,
                 max_loss_difference=max_loss_difference,
-                gradient_cosine_min=gradient_cosine_min,
-                gradient_norm_ratio_min=gradient_norm_ratio_min,
                 gradient_norm_ratio_max=gradient_norm_ratio_max,
             )
 
@@ -2059,8 +2155,6 @@ class EvaluateRequest(BaseModel):
     min_trainable_params_ratio: float = 1.0
     min_params_changed_ratio: float = 0.5
     # Gradient verification
-    gradient_cosine_min: float = 0.8
-    gradient_norm_ratio_min: float = 0.5
     gradient_norm_ratio_max: float = 1.02
     # MFU calculation
     gpu_peak_tflops: float = 312.0
@@ -2094,9 +2188,7 @@ async def health():
             free_mem, total_mem = torch.cuda.mem_get_info()
             info["gpu_memory_free_gb"] = round(free_mem / (1024**3), 2)
             info["gpu_memory_total_gb"] = round(total_mem / (1024**3), 2)
-            info["gpu_memory_used_pct"] = round(
-                (1.0 - free_mem / total_mem) * 100, 1
-            )
+            info["gpu_memory_used_pct"] = round((1.0 - free_mem / total_mem) * 100, 1)
             info["model_cached"] = _CACHE.get("model") is not None
         except Exception:
             pass
@@ -2126,8 +2218,6 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         use_random_init=request.use_random_init,
         min_trainable_params_ratio=request.min_trainable_params_ratio,
         min_params_changed_ratio=request.min_params_changed_ratio,
-        gradient_cosine_min=request.gradient_cosine_min,
-        gradient_norm_ratio_min=request.gradient_norm_ratio_min,
         gradient_norm_ratio_max=request.gradient_norm_ratio_max,
         gpu_peak_tflops=request.gpu_peak_tflops,
     )

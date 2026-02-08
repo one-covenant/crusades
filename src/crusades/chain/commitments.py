@@ -39,18 +39,6 @@ BLOCKED_NETWORKS = [
     ipaddress.ip_network("fe80::/10"),  # IPv6 link-local
 ]
 
-# Allowlisted domains for code hosting (for future use - domain allowlisting)
-# Currently not enforced, but available for stricter security if needed
-ALLOWED_DOMAINS = [
-    "gist.githubusercontent.com",
-    "raw.githubusercontent.com",
-    "gist.github.com",
-    "github.com",
-    "gitlab.com",
-    "bitbucket.org",
-    "pastebin.com",
-]
-
 
 def is_ip_blocked(ip_str: str) -> bool:
     """Check if an IP address is in a blocked private/internal range.
@@ -448,19 +436,3 @@ class CommitmentReader:
 
         logger.info(f"Found {len(new_commitments)} new commitments since block {last_block}")
         return new_commitments
-
-
-def get_commitment_reader(
-    network: str = "finney",
-    netuid: int = 1,
-) -> CommitmentReader:
-    """Factory function to create a commitment reader.
-
-    Args:
-        network: Subtensor network
-        netuid: Subnet ID
-
-    Returns:
-        Configured CommitmentReader
-    """
-    return CommitmentReader(netuid=netuid, network=network)

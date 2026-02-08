@@ -38,6 +38,10 @@ from crusades.storage.models import EvaluationModel, SubmissionModel
 
 from .base_node import BaseNode
 
+# Named constants
+MAX_MINER_CODE_SIZE = 500_000  # 500KB max for miner train.py downloads
+CODE_DOWNLOAD_TIMEOUT = 30  # Seconds to wait for miner code download
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s UTC | %(levelname)s | %(name)s | %(message)s",
@@ -79,6 +83,9 @@ class Validator(BaseNode):
         # Timing
         self.last_weight_set_block: int = 0
         self.last_sync_time: float = 0
+
+        # Memory cleanup counter
+        self._loop_count: int = 0
 
     async def initialize(self) -> None:
         """Initialize validator components."""
@@ -141,7 +148,6 @@ class Validator(BaseNode):
         # Affinetes runner - all config comes from validated Pydantic models
         self.affinetes_runner = AffinetesRunner(
             mode=self.affinetes_mode,
-            basilica_endpoint=os.getenv("BASILICA_ENDPOINT"),
             basilica_api_key=os.getenv("BASILICA_API_TOKEN"),
             # Docker config
             docker_gpu_devices=hparams.docker.gpu_devices,
@@ -154,8 +160,6 @@ class Validator(BaseNode):
             max_loss_difference=hparams.verification.max_loss_difference,
             min_params_changed_ratio=hparams.verification.min_params_changed_ratio,
             # Gradient verification
-            gradient_cosine_min=hparams.verification.gradient_cosine_min,
-            gradient_norm_ratio_min=hparams.verification.gradient_norm_ratio_min,
             gradient_norm_ratio_max=hparams.verification.gradient_norm_ratio_max,
             # MFU calculation
             gpu_peak_tflops=hparams.mfu.gpu_peak_tflops,
@@ -402,9 +406,9 @@ class Validator(BaseNode):
             # Build opener with SSRF-safe redirect handler
             opener = urllib.request.build_opener(SSRFSafeRedirectHandler())
 
-            max_size = 500_000
+            max_size = MAX_MINER_CODE_SIZE
             req = urllib.request.Request(code_url, headers={"User-Agent": "templar-crusades"})
-            with opener.open(req, timeout=30) as response:
+            with opener.open(req, timeout=CODE_DOWNLOAD_TIMEOUT) as response:
                 # Read in chunks to prevent OOM from malicious large responses
                 chunks = []
                 total_bytes = 0
@@ -605,7 +609,7 @@ class Validator(BaseNode):
 
             # Check minimum success rate
             success_rate = len(successful_evals) / len(all_evals) if all_evals else 0
-            min_success_rate = getattr(hparams, "min_success_rate", 0.5)
+            min_success_rate = hparams.min_success_rate
 
             if success_rate < min_success_rate:
                 await self.db.update_submission_status(
@@ -772,9 +776,6 @@ class Validator(BaseNode):
 
     def _cleanup_memory(self):
         """Clean up GPU memory."""
-        if not hasattr(self, "_loop_count"):
-            self._loop_count = 0
-
         self._loop_count += 1
 
         if torch.cuda.is_available():
