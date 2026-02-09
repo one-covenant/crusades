@@ -75,8 +75,7 @@ class GradientCapturingOptimizer:
         object.__setattr__(self, "_initialized", True)
 
     def __setattr__(self, name, value):
-        # Use CLASS reference (not self) to prevent bypass via
-        # optimizer._PROTECTED_ATTRS = frozenset()
+        # Use class-level reference for protected attributes
         if (
             getattr(self, "_initialized", False)
             and name in GradientCapturingOptimizer._PROTECTED_ATTRS
@@ -163,8 +162,13 @@ def run_reference(model, data_iterator, optimizer, num_steps, device):
     """Run reference training and capture gradients on final step."""
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    # set_float32_matmul_precision("highest") controls matmul TF32 precision.
+    # Do NOT set cuda.matmul.allow_tf32 separately -- it would be overridden.
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)
 
     total_tokens = 0
     final_logits = None
@@ -175,16 +179,18 @@ def run_reference(model, data_iterator, optimizer, num_steps, device):
         batch = next(data_iterator)
         batch = batch.to(device, dtype=torch.long)
 
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            input_ids = batch[:, :-1]
-            labels = batch[:, 1:]
-            outputs = model(input_ids)
-            logits = outputs.logits if hasattr(outputs, "logits") else outputs
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                labels.reshape(-1),
-                ignore_index=-100,
-            )
+        # No autocast - model is already in bfloat16.
+        # Using autocast here would change loss computation precision
+        # and create gradient mismatches with miner code that doesn't use autocast.
+        input_ids = batch[:, :-1]
+        labels = batch[:, 1:]
+        outputs = model(input_ids)
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            labels.reshape(-1),
+            ignore_index=-100,
+        )
 
         loss.backward()
 
@@ -216,6 +222,7 @@ def verify_all(
     model,
     reference_grad: GradientInfo,
     candidate_grad: GradientInfo,
+    reference_final_state: dict | None = None,
     max_loss_difference: float = 0.3,
     min_changed_ratio: float = 0.8,
     gradient_norm_ratio_max: float = 1.02,
@@ -391,6 +398,58 @@ def verify_all(
         print("  [FAILED] Gradient vectors unavailable or shape mismatch")
         all_passed = False
 
+    # CHECK: Final weight verification (same as production validator CHECK 4/4)
+    check_num += 1
+    weight_relative_error_max = gradient_norm_ratio_max - 1.0
+    print(f"\n[CHECK {check_num}] Final model weights |w_miner - w_ref| / |w_ref|")
+    print(f"  Max allowed: {weight_relative_error_max:.4f} ({weight_relative_error_max * 100:.1f}%)")
+
+    if reference_final_state is not None:
+        w_diff_norm_sq = 0.0
+        w_ref_norm_sq = 0.0
+        w_total_elements = 0
+        w_mismatched_layers = 0
+
+        for name, param in model.named_parameters():
+            if name not in reference_final_state:
+                continue
+            ref_param = reference_final_state[name].to(param.device)
+            diff = param.data.float() - ref_param.float()
+
+            layer_diff_sq = (diff * diff).sum().item()
+            layer_ref_sq = (ref_param.float() * ref_param.float()).sum().item()
+
+            w_diff_norm_sq += layer_diff_sq
+            w_ref_norm_sq += layer_ref_sq
+            w_total_elements += param.numel()
+
+            if layer_ref_sq > 0:
+                layer_rel_error = (layer_diff_sq**0.5) / (layer_ref_sq**0.5)
+                if layer_rel_error > weight_relative_error_max:
+                    w_mismatched_layers += 1
+
+        w_ref_norm = w_ref_norm_sq**0.5
+        w_diff_norm = w_diff_norm_sq**0.5
+        w_relative_error = (
+            w_diff_norm / w_ref_norm if w_ref_norm > 0 else (0.0 if w_diff_norm == 0 else float("inf"))
+        )
+
+        print(f"  |w_miner - w_ref|: {w_diff_norm:.6f}")
+        print(f"  |w_ref|: {w_ref_norm:.6f}")
+        print(f"  Relative error: {w_relative_error:.6f}")
+        print(f"  Total elements: {w_total_elements:,}")
+        print(f"  Mismatched layers: {w_mismatched_layers}")
+
+        if w_relative_error > weight_relative_error_max:
+            print(
+                f"  [FAILED] Weight relative error {w_relative_error:.6f} > {weight_relative_error_max:.6f}"
+            )
+            all_passed = False
+        else:
+            print("  [PASSED]")
+    else:
+        print("  [SKIPPED] (no reference final state available)")
+
     # Summary
     print()
     print("=" * 70)
@@ -477,7 +536,7 @@ def main():
     print("Loading model with RANDOM INITIALIZATION (same as validator)...")
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_config(
-        config, torch_dtype=torch.bfloat16, trust_remote_code=True
+        config, torch_dtype=torch.bfloat16, trust_remote_code=True, attn_implementation="sdpa"
     )
     model = model.to(device)
     model.gradient_checkpointing_enable()
@@ -506,12 +565,19 @@ def main():
 
     # === Run reference ===
     print("Running reference baseline...")
-    optimizer_ref = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    use_fused = torch.cuda.is_available()
+    optimizer_ref = torch.optim.AdamW(
+        model.parameters(), lr=1e-4, weight_decay=0.1, betas=(0.9, 0.95), fused=use_fused
+    )
     reference, reference_grad = run_reference(
         model, create_iterator(), optimizer_ref, num_steps, device
     )
     print(f"  Reference loss: {reference.final_loss:.6f}")
     print(f"  Reference gradient norm: {reference_grad.norm:.4f}")
+
+    # Capture reference final weights for weight verification (same as production validator)
+    reference_final_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    print("  Captured reference final model state for weight verification")
     print()
 
     # === Reset model ===
@@ -520,7 +586,9 @@ def main():
 
     # === Warmup (same as validator) ===
     print("Running warmup (2 steps, not verified)...")
-    warmup_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    warmup_optimizer = torch.optim.AdamW(
+        model.parameters(), lr=1e-4, weight_decay=0.1, betas=(0.9, 0.95), fused=use_fused
+    )
     try:
         warmup_result = train_module.inner_steps(
             model=model,
@@ -546,7 +614,9 @@ def main():
 
     # === Run miner's code with GradientCapturingOptimizer (same as validator) ===
     print("Running your inner_steps with GradientCapturingOptimizer...")
-    base_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    base_optimizer = torch.optim.AdamW(
+        model.parameters(), lr=1e-4, weight_decay=0.1, betas=(0.9, 0.95), fused=use_fused
+    )
     capturing_optimizer = GradientCapturingOptimizer(base_optimizer, model)
 
     try:
@@ -604,6 +674,7 @@ def main():
         model=model,
         reference_grad=reference_grad,
         candidate_grad=candidate_grad,
+        reference_final_state=reference_final_state,
         max_loss_difference=max_loss_difference,
         min_changed_ratio=min_changed_ratio,
         gradient_norm_ratio_max=gradient_norm_ratio_max,

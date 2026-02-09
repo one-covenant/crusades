@@ -89,18 +89,14 @@ class CodeUrlInfo:
     def is_valid(self) -> bool:
         """Check if code URL is valid (basic format check only).
 
-        Note: Full SSRF validation is done by validate_url_security() which
-        resolves the hostname and checks for blocked IP ranges.
+        Note: Full validation is done by validate_url_security().
         """
         return bool(self.url) and (
             self.url.startswith("http://") or self.url.startswith("https://")
         )
 
     def validate_url_security(self) -> tuple[bool, str]:
-        """Validate URL for SSRF protection by resolving hostname and checking IP ranges.
-
-        This performs DNS resolution and checks that the resolved IP is not in
-        a private/internal network range that could be used for SSRF attacks.
+        """Validate URL by resolving hostname and checking IP ranges.
 
         Returns:
             Tuple of (is_safe, error_message). If is_safe is True, error_message
@@ -431,8 +427,8 @@ class CommitmentReader:
         """
         all_commitments = self.get_all_commitments()
 
-        # Filter to only those revealed after last_block
-        new_commitments = [c for c in all_commitments if c.reveal_block > last_block]
+        # Filter to commitments revealed at or after last_block.
+        new_commitments = [c for c in all_commitments if c.reveal_block >= last_block]
 
         logger.info(f"Found {len(new_commitments)} new commitments since block {last_block}")
         return new_commitments

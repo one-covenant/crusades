@@ -26,11 +26,11 @@ class StorageConfig(BaseModel):
 
 
 class VerificationConfig(BaseModel):
-    """Verification settings using gradient-based checks."""
+    """Verification settings using gradient and weight-based checks."""
 
     max_loss_difference: float = 0.5
     min_params_changed_ratio: float = 0.8
-    gradient_norm_ratio_max: float = 2.0
+    gradient_norm_ratio_max: float = 1.04
 
 
 class MFUConfig(BaseModel):
@@ -101,7 +101,7 @@ class HParams(BaseModel):
     - All settings are defined in hparams.json (no hardcoded defaults)
 
     Versioning:
-    - Competition version is derived from __version__ major number
+    - Competition version is derived from __version__ major.minor number
     - Use crusades.COMPETITION_VERSION to get the current competition version
     """
 
@@ -112,10 +112,8 @@ class HParams(BaseModel):
     burn_rate: float
     burn_uid: int
 
-    # Competition start block — submissions committed before this block are ignored.
-    # Set this when deploying new security rules to invalidate old submissions.
-    # 0 means no filter (accept all blocks).
-    competition_start_block: int = 0
+    # Competition filtering
+    competition_start_block: int = 0  # Only evaluate submissions from this block onward
 
     # Evaluation settings
     evaluation_runs: int
@@ -170,7 +168,7 @@ class HParams(BaseModel):
 
         Raises:
             FileNotFoundError: If hparams.json doesn't exist
-            ValidationError: If required fields are missing
+            pydantic.ValidationError: If required fields are missing
         """
         if path is None:
             # Default to hparams/hparams.json relative to project root

@@ -38,10 +38,6 @@ from crusades.storage.models import EvaluationModel, SubmissionModel
 
 from .base_node import BaseNode
 
-# Named constants
-MAX_MINER_CODE_SIZE = 500_000  # 500KB max for miner train.py downloads
-CODE_DOWNLOAD_TIMEOUT = 30  # Seconds to wait for miner code download
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s UTC | %(levelname)s | %(name)s | %(message)s",
@@ -84,7 +80,7 @@ class Validator(BaseNode):
         self.last_weight_set_block: int = 0
         self.last_sync_time: float = 0
 
-        # Memory cleanup counter
+        # Memory cleanup tracking
         self._loop_count: int = 0
 
     async def initialize(self) -> None:
@@ -104,15 +100,6 @@ class Validator(BaseNode):
         )
 
         logger.info("Initializing validator (URL-Based Architecture)")
-
-        # Log competition start block for transparency
-        if hparams.competition_start_block > 0:
-            logger.info(
-                f"competition_start_block = {hparams.competition_start_block} "
-                f"— submissions before this block will be ignored"
-            )
-        else:
-            logger.info("competition_start_block = 0 (disabled — all blocks accepted)")
 
         # Database
         self.db = await get_database()
@@ -223,9 +210,8 @@ class Validator(BaseNode):
         await asyncio.sleep(10)
 
     async def process_blockchain_commitments(self) -> None:
-        """Read and process new gist commitments from blockchain."""
+        """Read and process new URL commitments from blockchain."""
         try:
-            hparams = get_hparams()
             new_commitments = self.commitment_reader.get_new_commitments_since(
                 self.last_processed_block
             )
@@ -245,15 +231,6 @@ class Validator(BaseNode):
                     if not commitment.has_valid_code_url():
                         logger.warning(
                             f"Skipping commitment without valid code URL: UID {commitment.uid}"
-                        )
-                        continue
-
-                    # Skip commitments from before the competition start block
-                    start_block = hparams.competition_start_block
-                    if start_block > 0 and commitment.reveal_block < start_block:
-                        logger.info(
-                            f"Skipping pre-competition commitment from UID {commitment.uid} "
-                            f"(reveal_block={commitment.reveal_block} < competition_start_block={start_block})"
                         )
                         continue
 
@@ -406,10 +383,10 @@ class Validator(BaseNode):
             # Build opener with SSRF-safe redirect handler
             opener = urllib.request.build_opener(SSRFSafeRedirectHandler())
 
-            max_size = MAX_MINER_CODE_SIZE
+            max_size = 500_000
             req = urllib.request.Request(code_url, headers={"User-Agent": "templar-crusades"})
-            with opener.open(req, timeout=CODE_DOWNLOAD_TIMEOUT) as response:
-                # Read in chunks to prevent OOM from malicious large responses
+            with opener.open(req, timeout=30) as response:
+                # Read in chunks with size limit
                 chunks = []
                 total_bytes = 0
                 while True:
@@ -459,27 +436,12 @@ class Validator(BaseNode):
             f"Found {len(evaluating)} submissions in EVALUATING status (v{competition_version})"
         )
 
-        # Filter out pre-competition submissions
-        start_block = hparams.competition_start_block
-        if start_block > 0:
-            filtered = []
-            for s in evaluating:
-                commit_block = self._extract_commit_block(s.submission_id)
-                if commit_block is not None and commit_block < start_block:
-                    logger.info(
-                        f"Skipping pre-competition submission {s.submission_id} "
-                        f"(block {commit_block} < start_block {start_block}), marking FAILED"
-                    )
-                    await self.db.update_submission_status(
-                        s.submission_id,
-                        SubmissionStatus.FAILED_EVALUATION,
-                        error_message=f"Submitted before competition_start_block ({commit_block} < {start_block})",
-                    )
-                else:
-                    filtered.append(s)
-            evaluating = filtered
+        for sub_idx, submission in enumerate(evaluating):
+            # Check if we should set weights between submissions
+            # This ensures weight setting isn't blocked by long evaluation runs
+            if sub_idx > 0:
+                await self.maybe_set_weights()
 
-        for submission in evaluating:
             code_url = submission.bucket_path
 
             if not code_url or not code_url.startswith("http"):
@@ -689,11 +651,9 @@ class Validator(BaseNode):
         )
 
         # Get the current leaderboard winner (after this submission was marked FINISHED)
-        # Filter out submissions from before competition_start_block
         winner = await self.db.get_leaderboard_winner(
             threshold=current_threshold,
             spec_version=crusades.COMPETITION_VERSION,
-            min_commit_block=hparams.competition_start_block,
         )
 
         if winner is None:
@@ -753,33 +713,9 @@ class Validator(BaseNode):
             )
             logger.info(f"First leader established (immediate): {score:.2f}% MFU")
 
-    @staticmethod
-    def _extract_commit_block(submission_id: str) -> int | None:
-        """Extract the commit block number from a submission ID.
-
-        Handles both formats:
-          - New: v3_commit_79639_1  -> 79639
-          - Old: commit_79639_1    -> 79639
-
-        Returns None if the format is unrecognised.
-        """
-        try:
-            parts = submission_id.split("_")
-            if parts[0].startswith("v"):
-                # v3_commit_79639_1
-                return int(parts[2])
-            else:
-                # commit_79639_1
-                return int(parts[1])
-        except (IndexError, ValueError):
-            return None
-
     def _cleanup_memory(self):
-        """Clean up GPU memory."""
+        """Clean up GPU and system memory."""
         self._loop_count += 1
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
         if self._loop_count % 10 == 0:
             logger.info(f"Memory cleanup (iteration {self._loop_count})")
@@ -787,6 +723,8 @@ class Validator(BaseNode):
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
             gc.collect()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     async def maybe_sync(self) -> None:
         """Sync metagraph periodically."""
@@ -903,9 +841,7 @@ class Validator(BaseNode):
 
     async def _load_state(self) -> None:
         """Load persisted validator state from database."""
-        from crusades import COMPETITION_VERSION
-
-        current_version = COMPETITION_VERSION
+        current_version = crusades.COMPETITION_VERSION
 
         try:
             # Check if version changed - if so, reset state for fresh competition
@@ -964,10 +900,10 @@ class Validator(BaseNode):
 
     async def _save_state(self) -> None:
         """Persist validator state to database."""
-        from crusades import COMPETITION_VERSION
-
         try:
-            await self.db.set_validator_state("competition_version", str(COMPETITION_VERSION))
+            await self.db.set_validator_state(
+                "competition_version", str(crusades.COMPETITION_VERSION)
+            )
             await self.db.set_validator_state(
                 "last_processed_block", str(self.last_processed_block)
             )

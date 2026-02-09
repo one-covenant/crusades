@@ -88,7 +88,7 @@ class EvaluationResult:
         return cls(success=False, error=error, error_code=error_code, task_id=task_id)
 
     def is_verification_failure(self) -> bool:
-        """Check if this result failed due to verification/anti-cheat checks."""
+        """Check if this result failed due to verification checks."""
         if not self.error_code:
             return False
         try:
@@ -164,9 +164,9 @@ class AffinetesRunner:
         data_url: str | None = None,
         # Verification settings
         max_loss_difference: float = 0.5,
-        min_params_changed_ratio: float = 0.5,
+        min_params_changed_ratio: float = 0.8,
         # Gradient verification
-        gradient_norm_ratio_max: float = 2.0,
+        gradient_norm_ratio_max: float = 1.04,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
         validator_image: str | None = None,
@@ -192,7 +192,7 @@ class AffinetesRunner:
             data_url: Default data URL (HuggingFace dataset)
             max_loss_difference: Max allowed |candidate_loss - reference_loss|
             min_params_changed_ratio: Min % params that must change
-            gradient_norm_ratio_max: Max gradient norm ratio (relative error threshold)
+            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.04 = 4%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             validator_image: Docker image for local evaluation
             basilica_image: Docker image for Basilica (must be in registry)
@@ -263,7 +263,7 @@ class AffinetesRunner:
             task_id: Evaluation task identifier
 
         Returns:
-            EvaluationResult with TPS score
+            EvaluationResult with MFU score
         """
         model_url = model_url or self.default_model_url
         data_url = data_url or self.default_data_url
@@ -272,14 +272,12 @@ class AffinetesRunner:
             return EvaluationResult.failure(
                 "model_url and data_url are required",
                 task_id=task_id,
-                error_code=EvaluationErrorCode.DATA_LOAD_FAILED,
             )
 
         if not code or "def inner_steps" not in code:
             return EvaluationResult.failure(
                 "Invalid code: must contain 'def inner_steps' function",
                 task_id=task_id,
-                error_code=EvaluationErrorCode.NO_CODE,
             )
 
         if self.mode == "docker":
@@ -310,7 +308,6 @@ class AffinetesRunner:
             return EvaluationResult.failure(
                 f"Unknown mode: {self.mode}",
                 task_id=task_id,
-                error_code=EvaluationErrorCode.EXECUTION_FAILED,
             )
 
     async def _evaluate_docker(
@@ -341,7 +338,6 @@ class AffinetesRunner:
                 f"Validator image not found: {self.validator_image}. "
                 f"Build it first: cd environments/templar && docker build -t {self.validator_image} .",
                 task_id=task_id,
-                error_code=EvaluationErrorCode.DOCKER_FAILED,
             )
 
         # Write miner's code to temp file
@@ -439,25 +435,16 @@ asyncio.run(main())
                 ]
             )
 
-            # =================================================================
-            # SECURITY SANDBOX - Protect against malicious miner code
-            # =================================================================
+            # Docker sandbox configuration
             docker_cmd.extend(
                 [
-                    # NETWORK ISOLATION - Prevent miner code from making any network requests
-                    # Model and data are pre-cached in the Docker image
                     "--network",
                     "none",
-                    # Drop all Linux capabilities
                     "--cap-drop",
                     "ALL",
-                    # Prevent privilege escalation
                     "--security-opt",
                     "no-new-privileges",
-                    # Read-only root filesystem
                     "--read-only",
-                    # Limit number of processes (prevent fork bombs)
-                    # PyTorch with OpenMP needs many threads, 1024 is reasonable
                     "--pids-limit",
                     "1024",
                     # Writable /tmp for temporary files (exec needed for torch.compile)
@@ -576,7 +563,6 @@ asyncio.run(main())
                 return EvaluationResult.failure(
                     f"Evaluation timed out after {self.timeout}s",
                     task_id=task_id,
-                    error_code=EvaluationErrorCode.TIMEOUT,
                 )
 
             stdout_text = "\n".join(stdout_lines)
@@ -586,14 +572,9 @@ asyncio.run(main())
                 logger.error(f"Docker container failed with exit code {process.returncode}")
                 if stdout_text:
                     logger.error(f"Docker output: {stdout_text[:500]}")
-                # Check for OOM (exit code 137 = killed by OOM killer)
-                err_code = EvaluationErrorCode.DOCKER_FAILED
-                if process.returncode == 137:
-                    err_code = EvaluationErrorCode.OUT_OF_MEMORY
                 return EvaluationResult.failure(
                     f"Container failed with exit code: {process.returncode}. Output: {stdout_text[:200]}",
                     task_id=task_id,
-                    error_code=err_code,
                 )
 
             # Parse result
@@ -609,13 +590,11 @@ asyncio.run(main())
                         return EvaluationResult.failure(
                             f"Invalid result JSON: {e}",
                             task_id=task_id,
-                            error_code=EvaluationErrorCode.EXECUTION_FAILED,
                         )
 
             return EvaluationResult.failure(
                 f"No evaluation result in output. stdout: {stdout_text[:200]}",
                 task_id=task_id,
-                error_code=EvaluationErrorCode.EXECUTION_FAILED,
             )
 
         finally:
@@ -640,13 +619,13 @@ asyncio.run(main())
         """Run evaluation remotely via Basilica SDK.
 
         Uses BasilicaClient to deploy a custom Docker image and call
-        the /evaluate endpoint for TPS evaluation.
+        the /evaluate endpoint for MFU evaluation.
 
         Flow:
         1. Deploy image to Basilica (or reuse existing deployment)
         2. Wait for deployment to be ready (/health endpoint)
         3. POST to /evaluate with miner's code
-        4. Return TPS results
+        4. Return MFU results
         """
         logger.info("=" * 60)
         logger.info("[BASILICA] Starting remote GPU evaluation")
@@ -664,7 +643,6 @@ asyncio.run(main())
             return EvaluationResult.failure(
                 "basilica SDK not installed. Run: uv add basilica",
                 task_id=task_id,
-                error_code=EvaluationErrorCode.DOCKER_FAILED,
             )
 
         try:
@@ -677,7 +655,6 @@ asyncio.run(main())
                 return EvaluationResult.failure(
                     "Failed to create Basilica deployment",
                     task_id=task_id,
-                    error_code=EvaluationErrorCode.DOCKER_FAILED,
                 )
 
             logger.info("-" * 60)
@@ -744,7 +721,6 @@ asyncio.run(main())
                     return EvaluationResult.failure(
                         f"Basilica /evaluate error: {response.status_code} - {error_text}",
                         task_id=task_id,
-                        error_code=EvaluationErrorCode.EXECUTION_FAILED,
                     )
 
                 result_data = response.json()
@@ -771,7 +747,6 @@ asyncio.run(main())
             return EvaluationResult.failure(
                 f"Basilica timeout after {self.timeout}s",
                 task_id=task_id,
-                error_code=EvaluationErrorCode.TIMEOUT,
             )
         except Exception as e:
             logger.error(f"[BASILICA] Error: {e}")
@@ -779,7 +754,6 @@ asyncio.run(main())
             return EvaluationResult.failure(
                 f"Basilica error: {e}",
                 task_id=task_id,
-                error_code=EvaluationErrorCode.EXECUTION_FAILED,
             )
 
     async def _get_basilica_deployment(self):
