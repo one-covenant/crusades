@@ -17,6 +17,7 @@ import statistics
 import time
 import urllib.error
 import urllib.request
+from datetime import UTC
 from typing import Literal
 
 import bittensor as bt
@@ -83,6 +84,10 @@ class Validator(BaseNode):
         # Memory cleanup tracking
         self._loop_count: int = 0
 
+        # Start window: only evaluate submissions created after this time.
+        # Prevents re-evaluating stale submissions from before a restart.
+        self._start_window: float = 0.0
+
     async def initialize(self) -> None:
         """Initialize validator components."""
         global logger
@@ -100,6 +105,15 @@ class Validator(BaseNode):
         )
 
         logger.info("Initializing validator (URL-Based Architecture)")
+
+        # Start window — only evaluate submissions created after this moment.
+        # This prevents evaluating stale submissions from before a validator restart.
+        from datetime import datetime
+
+        self._start_window = datetime.now(UTC).timestamp()
+        logger.info(
+            f"Start window set: {datetime.fromtimestamp(self._start_window, tz=UTC).isoformat()}"
+        )
 
         # Database
         self.db = await get_database()
@@ -437,12 +451,26 @@ class Validator(BaseNode):
         """
         hparams = get_hparams()
         competition_version = crusades.COMPETITION_VERSION
-        # Only evaluate submissions from current version
-        evaluating = await self.db.get_evaluating_submissions(spec_version=competition_version)
+
+        # Convert start_window timestamp to datetime for DB query
+        from datetime import datetime
+
+        start_window_dt = (
+            datetime.fromtimestamp(self._start_window, tz=UTC)
+            if self._start_window > 0
+            else None
+        )
+
+        # Only evaluate submissions from current version, created after start window
+        evaluating = await self.db.get_evaluating_submissions(
+            spec_version=competition_version,
+            created_after=start_window_dt,
+        )
         num_runs = hparams.evaluation_runs
 
         logger.info(
-            f"Found {len(evaluating)} submissions in EVALUATING status (v{competition_version})"
+            f"Found {len(evaluating)} submissions in EVALUATING status "
+            f"(v{competition_version}, start_window={start_window_dt})"
         )
 
         if not evaluating:
