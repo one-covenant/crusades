@@ -160,9 +160,15 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 - Train all model parameters (don't freeze layers)
 
 **You MUST NOT:**
-- Access optimizer internals (e.g., `optimizer.optimizer`)
+- Access optimizer internals (e.g., `optimizer.optimizer`, `optimizer._opt_impl`)
 - Truncate or skip parts of input sequences
 - Return `None` for `final_logits`
+- Import forbidden modules: `gc`, `ctypes`, `subprocess`, `importlib`
+- Use dynamic code execution: `exec()`, `eval()`, `compile()`, `__import__()`
+- Modify torch backend settings (`cudnn.deterministic`, `cudnn.benchmark`, SDP toggles, `set_float32_matmul_precision`)
+- Modify `time.perf_counter` or `torch.cuda.synchronize`
+- Freeze layers or modify `requires_grad` settings
+- Report inflated token counts
 
 ---
 

@@ -409,15 +409,28 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
+        # Block: dynamic code execution (exec, eval, compile, __import__)
+        # These bypass AST-level checks by running arbitrary code at runtime.
+        # torch.compile is safe (ast.Attribute, not ast.Name).
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in ("exec", "eval", "compile", "__import__"):
+                line = getattr(node, "lineno", "?")
+                return False, f"Line {line}: {node.func.id}() is forbidden"
+
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name in ("ctypes", "_ctypes", "gc"):
+                if alias.name in ("ctypes", "_ctypes", "gc", "subprocess") or alias.name.startswith(
+                    "importlib"
+                ):
                     line = getattr(node, "lineno", "?")
                     return False, f"Line {line}: forbidden import"
 
-        if isinstance(node, ast.ImportFrom) and node.module in ("ctypes", "_ctypes", "gc"):
-            line = getattr(node, "lineno", "?")
-            return False, f"Line {line}: forbidden import"
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if node.module in ("ctypes", "_ctypes", "gc", "subprocess") or node.module.startswith(
+                "importlib"
+            ):
+                line = getattr(node, "lineno", "?")
+                return False, f"Line {line}: forbidden import"
 
         # Block: accessing .optimizer attribute (wrapper bypass attempt)
         if isinstance(node, ast.Attribute) and node.attr == "optimizer":
@@ -447,6 +460,10 @@ _FORBIDDEN_STRINGS = [
     "_grad_snapshot_gpu",
     "step_count",
     "GradientCapturingOptimizer",
+    # Dynamic code execution / import bypasses
+    "__import__",
+    "importlib",
+    "import_module",
 ]
 
 
@@ -832,6 +849,10 @@ class GradientCapturingOptimizer:
 
     This keeps the timed section free of validator overhead.
     Read-only after initialization.
+
+    Security: __getattribute__ blocks access to private internals (_opt_impl,
+    _grad_snapshot_gpu) so miners cannot introspect the wrapper via getattr()
+    or dir(). Internal methods use object.__getattribute__() to bypass the guard.
     """
 
     __slots__ = (
@@ -842,6 +863,25 @@ class GradientCapturingOptimizer:
         "num_steps",
         "_grad_snapshot_gpu",
         "_initialized",
+    )
+
+    # Attributes accessible to miner code. Everything else starting with "_"
+    # (except dunder methods) is blocked by __getattribute__.
+    _PUBLIC_ATTRS = frozenset(
+        {
+            "step",
+            "zero_grad",
+            "param_groups",
+            "state",
+            "state_dict",
+            "load_state_dict",
+            "add_param_group",
+            "finalize_gradients",
+            "captured_gradients",
+            "num_steps",
+            "model",
+            "step_count",
+        }
     )
 
     def __init__(
@@ -858,8 +898,36 @@ class GradientCapturingOptimizer:
         object.__setattr__(self, "_grad_snapshot_gpu", None)
         object.__setattr__(self, "_initialized", True)
 
+    def __getattribute__(self, name):
+        """Guard access to private internals.
+
+        Allows: public attrs, dunder methods (__class__, __repr__, etc.),
+        and non-underscore names (forwarded via __getattr__).
+        Blocks: _opt_impl, _grad_snapshot_gpu, _initialized, and any
+        other single-underscore private attr.
+        """
+        # Always allow dunder attrs (Python internals need them)
+        if name.startswith("__") and name.endswith("__"):
+            return object.__getattribute__(self, name)
+        # Allow explicitly public attrs
+        if name in GradientCapturingOptimizer._PUBLIC_ATTRS:
+            return object.__getattribute__(self, name)
+        # Block single-underscore private attrs (_opt_impl, _grad_snapshot_gpu, etc.)
+        if name.startswith("_"):
+            raise AttributeError(f"Access to '{name}' is not allowed on optimizer wrapper")
+        # Non-underscore names not in _PUBLIC_ATTRS: forward via __getattr__
+        return object.__getattribute__(self, name)
+
+    def __dir__(self):
+        """Only expose public API to dir(), hiding internal slots."""
+        return sorted(GradientCapturingOptimizer._PUBLIC_ATTRS)
+
     def __setattr__(self, name, value):
-        if getattr(self, "_initialized", False):
+        try:
+            initialized = object.__getattribute__(self, "_initialized")
+        except AttributeError:
+            initialized = False
+        if initialized:
             raise AttributeError(
                 f"Cannot modify attribute '{name}' on optimizer wrapper (read-only after init)"
             )
@@ -872,20 +940,22 @@ class GradientCapturingOptimizer:
         GPU-to-GPU clone is ~3ms for 3B params vs ~7s for GPU→CPU transfer.
         The slow CPU conversion happens in finalize_gradients() after the timer.
         """
-        current_step = self.step_count
+        current_step = object.__getattribute__(self, "step_count")
         object.__setattr__(self, "step_count", current_step + 1)
 
         # On final step, snapshot gradients on GPU (fast clone, stays on device)
-        if current_step == self.num_steps - 1:
+        if current_step == object.__getattribute__(self, "num_steps") - 1:
             snapshot = []
-            for param in self.model.parameters():
+            model = object.__getattribute__(self, "model")
+            for param in model.parameters():
                 if param.grad is not None:
                     snapshot.append(param.grad.detach().clone())
                 else:
                     snapshot.append(None)
             object.__setattr__(self, "_grad_snapshot_gpu", snapshot)
 
-        return self._opt_impl.step(*args, **kwargs)
+        opt = object.__getattribute__(self, "_opt_impl")
+        return opt.step(*args, **kwargs)
 
     def finalize_gradients(self) -> None:
         """Convert GPU gradient snapshot to GradientInfo (CPU).
@@ -893,7 +963,7 @@ class GradientCapturingOptimizer:
         Call AFTER the timer stops. This does the slow GPU→CPU transfer
         and norm computation outside the timed section.
         """
-        snapshot = self._grad_snapshot_gpu
+        snapshot = object.__getattribute__(self, "_grad_snapshot_gpu")
         if snapshot is None:
             return
 
@@ -942,38 +1012,49 @@ class GradientCapturingOptimizer:
 
     def zero_grad(self, set_to_none: bool = False):
         """Forward to underlying optimizer."""
-        return self._opt_impl.zero_grad(set_to_none=set_to_none)
+        opt = object.__getattribute__(self, "_opt_impl")
+        return opt.zero_grad(set_to_none=set_to_none)
 
     @property
     def param_groups(self):
         """Forward param_groups access to underlying optimizer."""
-        return self._opt_impl.param_groups
+        opt = object.__getattribute__(self, "_opt_impl")
+        return opt.param_groups
 
     @param_groups.setter
     def param_groups(self, value):
         """Forward param_groups setter to underlying optimizer."""
-        self._opt_impl.param_groups = value
+        opt = object.__getattribute__(self, "_opt_impl")
+        opt.param_groups = value
 
     def state_dict(self):
         """Forward to underlying optimizer."""
-        return self._opt_impl.state_dict()
+        opt = object.__getattribute__(self, "_opt_impl")
+        return opt.state_dict()
 
     def load_state_dict(self, state_dict):
         """Forward to underlying optimizer."""
-        return self._opt_impl.load_state_dict(state_dict)
+        opt = object.__getattribute__(self, "_opt_impl")
+        return opt.load_state_dict(state_dict)
 
     def add_param_group(self, param_group):
         """Forward to underlying optimizer."""
-        return self._opt_impl.add_param_group(param_group)
+        opt = object.__getattribute__(self, "_opt_impl")
+        return opt.add_param_group(param_group)
 
     @property
     def state(self):
         """Forward state access to underlying optimizer."""
-        return self._opt_impl.state
+        opt = object.__getattribute__(self, "_opt_impl")
+        return opt.state
 
     def __getattr__(self, name):
-        """Forward any other attribute access to underlying optimizer."""
-        return getattr(self._opt_impl, name)
+        """Forward non-private attribute access to underlying optimizer."""
+        # Block private attrs that fell through from __getattribute__ raising
+        if name.startswith("_") and not (name.startswith("__") and name.endswith("__")):
+            raise AttributeError(f"Access to '{name}' is not allowed on optimizer wrapper")
+        opt = object.__getattribute__(self, "_opt_impl")
+        return getattr(opt, name)
 
 
 def _run_reference(
