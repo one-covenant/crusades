@@ -427,7 +427,6 @@ _FORBIDDEN_STRINGS = [
     "__delattr__",
     "__class__",
     "perf_counter",
-    "capture_overhead_seconds",
     "get_objects",
     "get_referrers",
     "get_referents",
@@ -812,21 +811,14 @@ def _create_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
 
 
 class GradientCapturingOptimizer:
-    """Optimizer wrapper that captures gradients on the final step.
+    """Optimizer wrapper that snapshots gradients on the final step.
 
-    Intercepts optimizer.step() to capture gradients from within the
-    miner's inner_steps execution. Only captures on the last step to
-    minimize overhead (matching reference run behavior).
+    On the last step, clones gradient tensors on GPU (fast, ~3ms) before
+    optimizer.step() clears them. The slow CPU transfer + norm computation
+    happens AFTER the timer stops via finalize_gradients().
+
+    This keeps the timed section free of validator overhead.
     Read-only after initialization.
-
-    The capture_overhead_seconds attribute tracks the time spent on
-    gradient capture (cuda sync + GPU→CPU copy + norm computation).
-    The validator subtracts this from wall_time so miners aren't
-    penalized for validator-side verification overhead.
-
-    Security: all known bypass vectors for modifying this attribute
-    are blocked by the AST scanner (object.__setattr__, __class__
-    replacement, ctypes, gc introspection).
     """
 
     __slots__ = (
@@ -835,7 +827,7 @@ class GradientCapturingOptimizer:
         "captured_gradients",
         "step_count",
         "num_steps",
-        "capture_overhead_seconds",
+        "_grad_snapshot_gpu",
         "_initialized",
     )
 
@@ -850,7 +842,7 @@ class GradientCapturingOptimizer:
         object.__setattr__(self, "captured_gradients", None)
         object.__setattr__(self, "step_count", 0)
         object.__setattr__(self, "num_steps", num_steps)
-        object.__setattr__(self, "capture_overhead_seconds", 0.0)
+        object.__setattr__(self, "_grad_snapshot_gpu", None)
         object.__setattr__(self, "_initialized", True)
 
     def __setattr__(self, name, value):
@@ -861,27 +853,79 @@ class GradientCapturingOptimizer:
         object.__setattr__(self, name, value)
 
     def step(self, *args, **kwargs):
-        """Capture gradients on the final step before optimizer.step() clears them.
+        """On the final step, snapshot gradients on GPU before optimizer.step().
 
-        Only captures on the last step (step_count == num_steps - 1) to match
-        the reference run behavior and avoid adding overhead to every step.
-        The capture time is tracked so the validator can subtract it from wall_time.
+        Only clones on the last step (step_count == num_steps - 1).
+        GPU-to-GPU clone is ~3ms for 3B params vs ~7s for GPU→CPU transfer.
+        The slow CPU conversion happens in finalize_gradients() after the timer.
         """
         current_step = self.step_count
         object.__setattr__(self, "step_count", current_step + 1)
 
-        # Only capture gradients on the final step (same as reference run)
+        # On final step, snapshot gradients on GPU (fast clone, stays on device)
         if current_step == self.num_steps - 1:
-            _cuda_synchronize()
-            capture_start = _perf_counter()
-            object.__setattr__(self, "captured_gradients", _capture_gradients(self.model))
-            object.__setattr__(
-                self,
-                "capture_overhead_seconds",
-                _perf_counter() - capture_start,
-            )
+            snapshot = []
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    snapshot.append(param.grad.detach().clone())
+                else:
+                    snapshot.append(None)
+            object.__setattr__(self, "_grad_snapshot_gpu", snapshot)
 
         return self.optimizer.step(*args, **kwargs)
+
+    def finalize_gradients(self) -> None:
+        """Convert GPU gradient snapshot to GradientInfo (CPU).
+
+        Call AFTER the timer stops. This does the slow GPU→CPU transfer
+        and norm computation outside the timed section.
+        """
+        snapshot = self._grad_snapshot_gpu
+        if snapshot is None:
+            return
+
+        grad_vectors_cpu = []
+        total_norm_sq = 0.0
+        layers_with_grad = 0
+        layers_without_grad = 0
+
+        for grad_gpu in snapshot:
+            if grad_gpu is not None:
+                grad_flat = grad_gpu.cpu().float().view(-1)
+                total_norm_sq += grad_flat.pow(2).sum().item()
+                if grad_flat.abs().sum().item() > 1e-10:
+                    layers_with_grad += 1
+                    grad_vectors_cpu.append(grad_flat)
+                else:
+                    layers_without_grad += 1
+                    grad_vectors_cpu.append(grad_flat)
+            else:
+                layers_without_grad += 1
+                grad_vectors_cpu.append(None)
+
+        grad_norm = total_norm_sq**0.5
+        total_layers = layers_with_grad + layers_without_grad
+        if total_layers > 0:
+            coverage = layers_with_grad / total_layers
+            logger.info(
+                f"Gradient coverage: {layers_with_grad}/{total_layers} layers ({coverage:.1%})"
+            )
+            if layers_without_grad > 0:
+                logger.warning(f"WARNING: {layers_without_grad} layers have zero/no gradients!")
+
+        object.__setattr__(
+            self,
+            "captured_gradients",
+            GradientInfo(
+                grad_norm=grad_norm,
+                grad_vector=grad_vectors_cpu,
+                layers_with_grad=layers_with_grad,
+                total_layers=total_layers,
+            ),
+        )
+
+        # Free GPU snapshot memory
+        object.__setattr__(self, "_grad_snapshot_gpu", None)
 
     def zero_grad(self, set_to_none: bool = False):
         """Forward to underlying optimizer."""
@@ -1691,29 +1735,11 @@ class Actor:
             )
 
             _cuda_synchronize()
-            total_time = _perf_counter() - start
+            wall_time = _perf_counter() - start
+            logger.info(f"Timing: wall_time={wall_time:.2f}s (used for MFU/TPS)")
 
-            # Subtract gradient capture overhead from wall_time.
-            # The capture (cuda sync + GPU→CPU copy + norm computation) is
-            # validator-side verification overhead, not the miner's training.
-            # Protected by AST scanner blocking all known bypass vectors.
-            capture_overhead = optimizer_miner.capture_overhead_seconds
-
-            # Safety: capture_overhead must be non-negative and < 50% of total_time.
-            # If it exceeds 50%, something is wrong — fall back to total_time.
-            if capture_overhead < 0 or capture_overhead > total_time * 0.5:
-                logger.warning(
-                    f"Suspicious capture_overhead={capture_overhead:.2f}s "
-                    f"(total={total_time:.2f}s) — ignoring override"
-                )
-                capture_overhead = 0.0
-
-            wall_time = total_time - capture_overhead
-            logger.info(
-                f"Timing: total={total_time:.2f}s, "
-                f"capture_overhead={capture_overhead:.2f}s, "
-                f"wall_time={wall_time:.2f}s (used for MFU/TPS)"
-            )
+            # Convert GPU gradient snapshot to CPU (slow, but OUTSIDE the timer)
+            optimizer_miner.finalize_gradients()
 
             # Verify backend settings were not tampered with during timed eval
             _backend_violations = _check_backend_state()
