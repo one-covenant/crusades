@@ -78,7 +78,7 @@ Each submission undergoes the following verification checks:
 | **Loss Validity** | Loss must be positive, not NaN, close to reference | `max_loss_difference: 0.3` |
 | **Gradient Relative Error** | `\|g - g_truth\| / \|g_truth\|` must be small | `gradient_norm_ratio_max - 1.0` |
 | **Gradient Coverage** | All layers must have gradients | `100%` |
-| **Final Weight Verification** | Model weights after training must match reference | Same threshold as gradients |
+| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.04` |
 | **Trainable Params** | All params must be trainable | `100%` |
 | **Params Changed** | Most param elements must change during training | `min: 80%` |
 | **Success Rate** | Majority of runs must pass | `min_success_rate: 0.5` |
@@ -184,7 +184,7 @@ Edit `hparams/hparams.json`:
 {
     "netuid": 3,
     "burn_rate": 0.95,
-    "burn_uid": 2,
+    "burn_uid": 1,
     
     "evaluation_runs": 5,
     "eval_steps": 5,

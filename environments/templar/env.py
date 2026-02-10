@@ -811,10 +811,12 @@ def _create_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
 
 
 class GradientCapturingOptimizer:
-    """Optimizer wrapper that captures gradients before each step.
+    """Optimizer wrapper that captures gradients on the final step.
 
     Intercepts optimizer.step() to capture gradients from within the
-    miner's inner_steps execution. Read-only after initialization.
+    miner's inner_steps execution. Only captures on the last step to
+    minimize overhead (matching reference run behavior).
+    Read-only after initialization.
     """
 
     __slots__ = (
@@ -822,16 +824,21 @@ class GradientCapturingOptimizer:
         "model",
         "captured_gradients",
         "step_count",
-        "gradient_capture_time",
+        "num_steps",
         "_initialized",
     )
 
-    def __init__(self, optimizer: torch.optim.Optimizer, model: torch.nn.Module):
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        model: torch.nn.Module,
+        num_steps: int,
+    ):
         object.__setattr__(self, "optimizer", optimizer)
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "captured_gradients", None)
         object.__setattr__(self, "step_count", 0)
-        object.__setattr__(self, "gradient_capture_time", 0.0)
+        object.__setattr__(self, "num_steps", num_steps)
         object.__setattr__(self, "_initialized", True)
 
     def __setattr__(self, name, value):
@@ -842,16 +849,19 @@ class GradientCapturingOptimizer:
         object.__setattr__(self, name, value)
 
     def step(self, *args, **kwargs):
-        """Capture gradients before optimizer.step() clears them."""
-        _cuda_synchronize()
-        capture_start = _perf_counter()
-        object.__setattr__(self, "captured_gradients", _capture_gradients(self.model))
-        object.__setattr__(
-            self,
-            "gradient_capture_time",
-            self.gradient_capture_time + (_perf_counter() - capture_start),
-        )
-        object.__setattr__(self, "step_count", self.step_count + 1)
+        """Capture gradients on the final step before optimizer.step() clears them.
+
+        Only captures on the last step (step_count == num_steps - 1) to match
+        the reference run behavior and avoid adding overhead to every step.
+        """
+        current_step = self.step_count
+        object.__setattr__(self, "step_count", current_step + 1)
+
+        # Only capture gradients on the final step (same as reference run)
+        if current_step == self.num_steps - 1:
+            _cuda_synchronize()
+            object.__setattr__(self, "captured_gradients", _capture_gradients(self.model))
+
         return self.optimizer.step(*args, **kwargs)
 
     def zero_grad(self, set_to_none: bool = False):
@@ -1354,6 +1364,8 @@ class Actor:
         min_params_changed_ratio: float = 0.5,
         # Gradient verification
         gradient_norm_ratio_max: float = 1.02,
+        # Weight verification
+        weight_relative_error_max: float = 0.04,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
         model_params_override: int | None = None,
@@ -1377,6 +1389,7 @@ class Actor:
             min_trainable_params_ratio: Min % params that must be trainable
             min_params_changed_ratio: Min % params that must change
             gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.04 = 4%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.04 = 4%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             model_params_override: Override model param count (None = auto-detect)
 
@@ -1640,7 +1653,7 @@ class Actor:
             _log_vram("before-timed-eval")
             data_iter_miner = _create_data_iterator(data, batch_size, seq_len)
             base_optimizer = _create_optimizer(model)
-            optimizer_miner = GradientCapturingOptimizer(base_optimizer, model)
+            optimizer_miner = GradientCapturingOptimizer(base_optimizer, model, num_steps=steps)
 
             # Enforce backend settings to match reference run.
             # Miner warmup may have changed these for a speed boost;
@@ -1810,8 +1823,7 @@ class Actor:
                 model=model,
                 max_loss_difference=max_loss_difference,
                 gradient_norm_ratio_max=gradient_norm_ratio_max,
-                # Same threshold for weights: norm_ratio_max - 1.0 (e.g., 1.04 → 0.04)
-                weight_relative_error_max=gradient_norm_ratio_max - 1.0,
+                weight_relative_error_max=weight_relative_error_max,
             )
 
             total_tokens_int = expected_tokens  # Use validator-computed token count
@@ -1944,6 +1956,8 @@ class EvaluateRequest(BaseModel):
     min_params_changed_ratio: float = 0.5
     # Gradient verification
     gradient_norm_ratio_max: float = 1.02
+    # Weight verification
+    weight_relative_error_max: float = 0.04
     # MFU calculation
     gpu_peak_tflops: float = 312.0
 
@@ -1997,6 +2011,7 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         min_trainable_params_ratio=request.min_trainable_params_ratio,
         min_params_changed_ratio=request.min_params_changed_ratio,
         gradient_norm_ratio_max=request.gradient_norm_ratio_max,
+        weight_relative_error_max=request.weight_relative_error_max,
         gpu_peak_tflops=request.gpu_peak_tflops,
     )
 

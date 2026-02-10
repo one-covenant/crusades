@@ -148,6 +148,8 @@ class Validator(BaseNode):
             min_params_changed_ratio=hparams.verification.min_params_changed_ratio,
             # Gradient verification
             gradient_norm_ratio_max=hparams.verification.gradient_norm_ratio_max,
+            # Weight verification
+            weight_relative_error_max=hparams.verification.weight_relative_error_max,
             # MFU calculation
             gpu_peak_tflops=hparams.mfu.gpu_peak_tflops,
             # Basilica config

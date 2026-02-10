@@ -167,6 +167,8 @@ class AffinetesRunner:
         min_params_changed_ratio: float = 0.8,
         # Gradient verification
         gradient_norm_ratio_max: float = 1.04,
+        # Weight verification
+        weight_relative_error_max: float = 0.04,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
         validator_image: str | None = None,
@@ -193,6 +195,7 @@ class AffinetesRunner:
             max_loss_difference: Max allowed |candidate_loss - reference_loss|
             min_params_changed_ratio: Min % params that must change
             gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.04 = 4%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.04 = 4%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             validator_image: Docker image for local evaluation
             basilica_image: Docker image for Basilica (must be in registry)
@@ -216,6 +219,8 @@ class AffinetesRunner:
         self.min_params_changed_ratio = min_params_changed_ratio
         # Gradient verification
         self.gradient_norm_ratio_max = gradient_norm_ratio_max
+        # Weight verification
+        self.weight_relative_error_max = weight_relative_error_max
         # MFU calculation
         self.gpu_peak_tflops = gpu_peak_tflops
         self.validator_image = validator_image or self.DEFAULT_DOCKER_IMAGE
@@ -385,6 +390,8 @@ async def main():
         min_params_changed_ratio={self.min_params_changed_ratio},
         # Gradient verification
         gradient_norm_ratio_max={self.gradient_norm_ratio_max},
+        # Weight verification
+        weight_relative_error_max={self.weight_relative_error_max},
         # MFU calculation
         gpu_peak_tflops={self.gpu_peak_tflops},
     )
@@ -694,6 +701,8 @@ asyncio.run(main())
                 "min_params_changed_ratio": self.min_params_changed_ratio,
                 # Gradient verification
                 "gradient_norm_ratio_max": self.gradient_norm_ratio_max,
+                # Weight verification
+                "weight_relative_error_max": self.weight_relative_error_max,
                 # MFU calculation
                 "gpu_peak_tflops": self.gpu_peak_tflops,
             }

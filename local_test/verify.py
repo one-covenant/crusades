@@ -226,6 +226,7 @@ def verify_all(
     max_loss_difference: float = 0.3,
     min_changed_ratio: float = 0.8,
     gradient_norm_ratio_max: float = 1.02,
+    weight_relative_error_max: float = 0.04,
 ) -> bool:
     """Run all validator checks - SAME as production validator."""
     print()
@@ -400,7 +401,6 @@ def verify_all(
 
     # CHECK: Final weight verification (same as production validator CHECK 4/4)
     check_num += 1
-    weight_relative_error_max = gradient_norm_ratio_max - 1.0
     print(f"\n[CHECK {check_num}] Final model weights |w_miner - w_ref| / |w_ref|")
     print(
         f"  Max allowed: {weight_relative_error_max:.4f} ({weight_relative_error_max * 100:.1f}%)"
@@ -490,6 +490,7 @@ def main():
     max_loss_difference = verification.get("max_loss_difference", 0.3)
     min_changed_ratio = verification.get("min_params_changed_ratio", 0.8)
     gradient_norm_ratio_max = verification.get("gradient_norm_ratio_max", 1.02)
+    weight_relative_error_max = verification.get("weight_relative_error_max", 0.04)
 
     expected_tokens = batch_size * seq_len * num_steps
     expected_seq_len = seq_len - 1  # Causal LM: input_ids = batch[:, :-1]
@@ -502,8 +503,11 @@ def main():
     print(f"  Expected logits seq_len: {expected_seq_len}")
     print(f"  Max loss difference: {max_loss_difference}")
     print(f"  Min params changed: {min_changed_ratio:.0%}")
-    relative_err = gradient_norm_ratio_max - 1.0
-    print(f"  Max gradient relative error: {relative_err:.4f} ({relative_err * 100:.1f}%)")
+    gradient_err = gradient_norm_ratio_max - 1.0
+    print(f"  Max gradient relative error: {gradient_err:.4f} ({gradient_err * 100:.1f}%)")
+    print(
+        f"  Max weight relative error: {weight_relative_error_max:.4f} ({weight_relative_error_max * 100:.1f}%)"
+    )
     print()
 
     # Check paths
@@ -682,6 +686,7 @@ def main():
         max_loss_difference=max_loss_difference,
         min_changed_ratio=min_changed_ratio,
         gradient_norm_ratio_max=gradient_norm_ratio_max,
+        weight_relative_error_max=weight_relative_error_max,
     )
 
     sys.exit(0 if passed else 1)
