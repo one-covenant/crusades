@@ -1,132 +1,122 @@
 """
-Optimized train.py for Templar Crusades TPS benchmark.
+Reference training implementation for Templar Crusades.
 
-STRICT 2% gradient error threshold — ZERO numerical changes allowed.
-Only pure timing optimizations:
-1. gc trick: Free stale optimizer VRAM (~24GB)
-2. Wrapper bypass: Skip sync+capture on steps 1-4 (validator only)
-3. Prefetch stream: Overlap data transfer with compute
+This is the baseline implementation. Miners should optimize it for maximum MFU
+(Model FLOPs Utilization) while passing all verification checks.
+
+Usage:
+    1. Run setup: uv run local_test/setup_benchmark.py
+    2. Test locally: uv run local_test/train.py
+    3. Verify locally: uv run local_test/verify.py
+    4. Submit this file (or your optimized version) as a GitHub Gist!
+
+=== SUBMISSION ===
+
+You can submit this entire file as-is. The validator only calls the inner_steps
+function — the `if __name__ == "__main__":` block is for local testing and is
+ignored during evaluation.
+
+=== VERIFICATION RULES ===
+
+Your inner_steps function MUST:
+  - Use the provided optimizer (call optimizer.step() and optimizer.zero_grad())
+  - Process ALL tokens in each batch (no truncation)
+  - Return actual final_logits tensor (not None)
+  - Return logits with correct shape: (batch_size, seq_len - 1, vocab_size)
+  - Produce gradients that closely match the reference implementation
+  - Train all model parameters (don't freeze layers)
+  - Call optimizer.step() for each training step
+
+Your inner_steps function MUST NOT:
+  - Access optimizer internals (e.g., optimizer.optimizer)
+  - Truncate or skip parts of input sequences
+  - Return None for final_logits
+  - Report inflated token counts
+  - Modify the model's requires_grad settings
+  - Modify torch backend settings (deterministic, benchmark, SDP toggles, etc.)
 """
 
-import gc
+import json
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from transformers import AutoConfig, AutoModelForCausalLM
 
 
 @dataclass
 class InnerStepsResult:
-    """Result from inner_steps training loop."""
+    """Required return type from inner_steps function.
 
-    final_logits: torch.Tensor
-    total_tokens: int
-    final_loss: float
+    All fields are verified by the validator:
+    - final_logits: Must be a 3D tensor (batch, seq_len-1, vocab), NOT None
+    - total_tokens: Should equal batch_size * seq_len * num_steps
+    - final_loss: Must be a positive float, close to reference loss
+    """
 
-
-# Global state
-_gc_done = False
+    final_logits: torch.Tensor  # Output logits from last forward pass
+    total_tokens: int  # Total tokens processed across all steps
+    final_loss: float  # Loss value from last training step
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device):
-    global _gc_done
+    """
+    Run training steps and return results.
 
-    is_cuda = str(device).startswith("cuda")
+    This is the function the validator calls. It receives:
+    - model: Pre-loaded model (already on device, in train mode, with gradient checkpointing)
+    - data_iterator: Infinite iterator yielding batches of shape (batch_size, seq_len)
+    - optimizer: Pre-configured AdamW optimizer (wrapped by validator for gradient capture)
+    - num_steps: Number of training steps to run (must complete all of them)
+    - device: Target device (cuda or cpu)
 
-    # =========================================================================
-    # GC TRICK — free stale optimizer states (~24GB VRAM), run once
-    # =========================================================================
-    if not _gc_done:
-        _gc_done = True
-        if is_cuda:
-            for obj in gc.get_objects():
-                if isinstance(obj, torch.optim.Optimizer) and obj is not optimizer:
-                    if hasattr(obj, "state") and len(obj.state) > 0:
-                        obj.state.clear()
-            gc.collect()
-            torch.cuda.empty_cache()
+    The validator measures wall_time of this function and calculates:
+        MFU = (6 * model_params * batch_size * seq_len * num_steps) / (wall_time * gpu_peak_tflops)
 
-    # =========================================================================
-    # PER-CALL SETUP — match reference exactly
-    # DO NOT change: cudnn.benchmark, cudnn.deterministic, SDP settings,
-    # gradient_checkpointing, optimizer fused/foreach — any change risks
-    # exceeding 2% gradient error threshold
-    # =========================================================================
-    if hasattr(model, "config"):
-        model.config.use_cache = False
+    Higher MFU = you completed the same training faster = better score.
 
-    # =========================================================================
-    # DETECT WRAPPER — GradientCapturingOptimizer bypass
-    # Wrapper.step() = sync() + capture_gradients(GPU→CPU) + base.step()
-    # Validator only checks LAST captured_gradients
-    # Bypass steps 1-(N-1): skip sync+capture = ~140ms saved per step
-    # Numerically identical: same AdamW.step() math, just skip overhead
-    # =========================================================================
-    is_wrapped = hasattr(optimizer, "optimizer") and hasattr(optimizer, "captured_gradients")
-    base_opt = optimizer.optimizer if is_wrapped else optimizer
-
-    # =========================================================================
-    # PREFETCH FIRST BATCH — overlap data transfer with setup
-    # =========================================================================
-    if is_cuda:
-        pf_stream = torch.cuda.Stream()
-        with torch.cuda.stream(pf_stream):
-            next_batch = next(data_iterator).to(device, non_blocking=True)
-    else:
-        next_batch = next(data_iterator).to(device)
-
-    # =========================================================================
-    # TRAINING LOOP — match reference computation exactly
-    # =========================================================================
+    Returns:
+        InnerStepsResult with outputs for verification
+    """
     total_tokens = 0
     final_logits = None
     final_loss = 0.0
 
     for step in range(num_steps):
-        # Wait for prefetched batch
-        if is_cuda:
-            torch.cuda.current_stream().wait_stream(pf_stream)
-        batch = next_batch
+        # Get batch - shape: (batch_size, seq_len)
+        batch = next(data_iterator)
+        batch = batch.to(device, dtype=torch.long)
 
-        # Prefetch next batch (overlap with compute)
-        if step < num_steps - 1:
-            nb = next(data_iterator)
-            if is_cuda:
-                with torch.cuda.stream(pf_stream):
-                    next_batch = nb.to(device, non_blocking=True)
-            else:
-                next_batch = nb.to(device)
+        # Prepare inputs and labels (causal LM: predict next token)
+        # input_ids: all tokens except last, labels: all tokens except first
+        input_ids = batch[:, :-1]
+        labels = batch[:, 1:]
 
-        # Forward + backward — EXACT same code as reference
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            input_ids = batch[:, :-1]
-            labels = batch[:, 1:]
-            outputs = model(input_ids)
-            logits = outputs.logits if hasattr(outputs, "logits") else outputs
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                labels.reshape(-1),
-                ignore_index=-100,
-            )
+        # Forward pass
+        outputs = model(input_ids)
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs
 
+        # Compute loss
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            labels.reshape(-1),
+            ignore_index=-100,
+        )
+
+        # Backward pass
         loss.backward()
 
-        # Optimizer step — bypass wrapper on non-final steps
-        if is_wrapped and step < num_steps - 1:
-            # Same AdamW.step() math, skip sync+capture overhead
-            base_opt.step()
-            base_opt.zero_grad(set_to_none=True)
-        else:
-            # Final step: let wrapper capture gradients for verification
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+        # Update weights - MUST use the provided optimizer
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
+        # Track metrics
         total_tokens += batch.numel()
-
-        # Capture logits + loss on final step
-        if step == num_steps - 1:
-            final_logits = logits.detach().float()
-            final_loss = loss.item()
+        # Keep logits from the last step for verification
+        final_logits = logits.detach().float()
+        final_loss = loss.item()
 
     return InnerStepsResult(
         final_logits=final_logits,
@@ -136,20 +126,15 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 
 
 # =============================================================================
-# LOCAL TESTING
+# LOCAL TESTING - Run this file to test your implementation
 # =============================================================================
 if __name__ == "__main__":
-    import json
-    import time
-    from pathlib import Path
-
-    from transformers import AutoModelForCausalLM
-
     print("=" * 60)
-    print("TESTING train.py - Numerically Safe")
+    print("TESTING train.py - Basic Implementation")
     print("=" * 60)
     print()
 
+    # Load configuration
     hparams_path = Path(__file__).parent.parent / "hparams" / "hparams.json"
     hparams = {}
     if hparams_path.exists():
@@ -165,6 +150,7 @@ if __name__ == "__main__":
     print(f"Evaluations: {num_evals}")
     print()
 
+    # Check paths
     project_root = Path(__file__).parent.parent
     model_path = project_root / "benchmark" / "model"
     data_path = project_root / "benchmark" / "data" / "train.pt"
@@ -173,40 +159,37 @@ if __name__ == "__main__":
         print("Setup required! Run: uv run local_test/setup_benchmark.py")
         exit(1)
 
+    # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     print()
 
-    attn_impl = "sdpa"
-    try:
-        import flash_attn  # noqa: F401
-
-        attn_impl = "flash_attention_2"
-    except ImportError:
-        pass
-
-    print(f"Loading model (attn={attn_impl})...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
+    # Load model with RANDOM initialization (same as validator)
+    print("Loading model (random init, same as validator)...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_config(
+        config,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
         trust_remote_code=True,
-        attn_implementation=attn_impl,
+        attn_implementation="sdpa",
     )
-    model.gradient_checkpointing_enable()
+    model = model.to(device)
+    model.gradient_checkpointing_enable()  # Required to fit in GPU memory
     model.train()
+    for param in model.parameters():
+        param.requires_grad = True
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     print()
 
+    # Load data
     print("Loading data...")
     data = torch.load(data_path, weights_only=True)
-    if torch.cuda.is_available():
-        data = data.pin_memory()
     print(f"Samples: {data.shape[0]:,}, Sequence length: {data.shape[1]}")
     print()
 
+    # Create data iterator
     def create_iterator():
         idx = 0
         while True:
@@ -217,24 +200,27 @@ if __name__ == "__main__":
             yield data[idx:end_idx]
             idx = end_idx
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    # Create optimizer (same config as validator)
+    use_fused = torch.cuda.is_available()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=1e-4, weight_decay=0.1, betas=(0.9, 0.95), fused=use_fused
+    )
 
+    # Warmup
     print("Warmup...")
-    t0 = time.perf_counter()
     _ = inner_steps(model, create_iterator(), optimizer, num_steps=2, device=device)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    print(f"  Warmup: {t1 - t0:.1f}s")
-
-    if torch.cuda.is_available():
         torch.cuda.empty_cache()
     print()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    # Reset optimizer (same config as validator)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=1e-4, weight_decay=0.1, betas=(0.9, 0.95), fused=use_fused
+    )
 
+    # Run evaluations
     print(f"Running {num_evals} evaluations...")
-    tps_list = []
 
     for i in range(num_evals):
         if torch.cuda.is_available():
@@ -247,17 +233,9 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
 
         elapsed = time.perf_counter() - start
-        tps = result.total_tokens / elapsed
-        tps_list.append(tps)
         print(
-            f"  Eval {i + 1}: {elapsed:.2f}s, "
-            f"TPS={tps:,.0f}, "
-            f"tokens={result.total_tokens:,}, "
-            f"loss={result.final_loss:.4f}"
+            f"  Eval {i + 1}: {elapsed:.2f}s, tokens={result.total_tokens:,}, loss={result.final_loss:.4f}"
         )
 
     print()
-    tps_list.sort()
-    median_tps = tps_list[len(tps_list) // 2]
-    print(f"Median TPS: {median_tps:,.0f}")
     print("Done!")
