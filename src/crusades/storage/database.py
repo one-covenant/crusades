@@ -14,24 +14,6 @@ from .models import (
 )
 
 
-def _extract_commit_block(submission_id: str) -> int | None:
-    """Extract the commit block number from a submission ID.
-
-    Handles both formats:
-      - New: v3_commit_79639_1  -> 79639
-      - Old: commit_79639_1    -> 79639
-
-    Returns None if the format is unrecognised.
-    """
-    try:
-        parts = submission_id.split("_")
-        if parts[0].startswith("v"):
-            return int(parts[2])
-        else:
-            return int(parts[1])
-    except (IndexError, ValueError):
-        return None
-
 
 class Database:
     """Async database interface."""
@@ -251,7 +233,6 @@ class Database:
         self,
         threshold: float = 0.01,
         spec_version: int | None = None,
-        min_commit_block: int = 0,
     ) -> SubmissionModel | None:
         """Get the rank 1 submission from leaderboard with threshold.
 
@@ -261,7 +242,6 @@ class Database:
         Args:
             threshold: Minimum improvement ratio to beat incumbent
             spec_version: If provided, only consider submissions from this version
-            min_commit_block: If > 0, ignore submissions committed before this block
 
         Returns:
             The submission at rank 1, or None if no finished submissions.
@@ -276,14 +256,6 @@ class Database:
                 query = query.where(SubmissionModel.spec_version == spec_version)
             result = await session.execute(query.order_by(SubmissionModel.created_at.asc()))
             submissions = list(result.scalars().all())
-
-            # Filter out pre-competition submissions
-            if min_commit_block > 0:
-                submissions = [
-                    s
-                    for s in submissions
-                    if (_extract_commit_block(s.submission_id) or 0) >= min_commit_block
-                ]
 
             if not submissions:
                 return None
@@ -312,7 +284,6 @@ class Database:
         limit: int = 100,
         spec_version: int | None = None,
         threshold: float = 0.01,
-        min_commit_block: int = 0,
     ) -> list[SubmissionModel]:
         """Get leaderboard with threshold winner at #1, rest sorted by raw MFU.
 
@@ -323,13 +294,11 @@ class Database:
             limit: Maximum number of submissions to return
             spec_version: If provided, only show submissions from this version
             threshold: Adaptive threshold for determining #1
-            min_commit_block: If > 0, ignore submissions committed before this block
         """
         # Get threshold winner (position #1)
         winner = await self.get_leaderboard_winner(
             threshold=threshold,
             spec_version=spec_version,
-            min_commit_block=min_commit_block,
         )
 
         async with self.session_factory() as session:
@@ -344,14 +313,6 @@ class Database:
                 query.order_by(desc(SubmissionModel.final_score)).limit(limit + 1)
             )
             all_submissions = list(result.scalars().all())
-
-        # Filter out pre-competition submissions
-        if min_commit_block > 0:
-            all_submissions = [
-                s
-                for s in all_submissions
-                if (_extract_commit_block(s.submission_id) or 0) >= min_commit_block
-            ]
 
         # Build leaderboard: winner first, then others by raw score
         leaderboard: list[SubmissionModel] = []

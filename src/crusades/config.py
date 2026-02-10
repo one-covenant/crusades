@@ -112,9 +112,6 @@ class HParams(BaseModel):
     burn_rate: float
     burn_uid: int
 
-    # Competition filtering
-    competition_start_block: int = 0  # Only evaluate submissions from this block onward
-
     # Evaluation settings
     evaluation_runs: int
     eval_steps: int

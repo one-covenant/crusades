@@ -104,15 +104,9 @@ class WeightSetter:
         logger.info(f"Adaptive threshold: {current_threshold:.2%} at block {current_block}")
 
         # Get leaderboard rank 1 (with adaptive threshold, filtered by competition version)
-        # Also filter out submissions committed before competition_start_block
-        start_block = self.hparams.competition_start_block
-        if start_block > 0:
-            logger.info(f"Filtering leaderboard: only submissions from block >= {start_block}")
-
         winner = await self.db.get_leaderboard_winner(
             threshold=current_threshold,
             spec_version=COMPETITION_VERSION,
-            min_commit_block=start_block,
         )
 
         # If no valid winner, all emissions go to burn_uid
