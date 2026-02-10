@@ -14,7 +14,6 @@ from .models import (
 )
 
 
-
 class Database:
     """Async database interface."""
 

@@ -241,39 +241,60 @@ def _load_hf_dataset(
 
     logger.info(f"Loading dataset: {dataset_name} (samples={num_samples})")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Cache tokenizer to avoid reloading every eval (HF tokenizers leak via Rust FFI)
+    if _CACHE.get("tokenizer") is not None and _CACHE.get("tokenizer_model") == model_name:
+        tokenizer = _CACHE["tokenizer"]
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        _CACHE["tokenizer"] = tokenizer
+        _CACHE["tokenizer_model"] = model_name
 
     # Check for cached dataset (enables --network none operation)
     cached_path = os.getenv("CACHED_DATASET_PATH", "/home/appuser/.cache/templar/dataset.json")
 
     if Path(cached_path).exists():
-        # Load from cache and shuffle with validator seed
-        logger.info(f"Using cached dataset: {cached_path}")
-        with open(cached_path) as f:
-            all_samples = json.load(f)
+        # Tokenize ALL samples once and cache the full tensor.
+        # Subsequent evals just shuffle indices (fast) instead of
+        # re-tokenizing 10k samples (slow + leaks memory).
+        cache_key = f"tokenized_{cached_path}_{sequence_length}"
+        all_tokenized = _CACHE.get(cache_key)
 
-        # Shuffle with validator seed for unpredictability
+        if all_tokenized is None:
+            logger.info(f"First load — tokenizing cached dataset: {cached_path}")
+            with open(cached_path) as f:
+                all_samples = json.load(f)
+
+            tokens_list = []
+            for text in all_samples:
+                encoded = tokenizer(
+                    text,
+                    max_length=sequence_length,
+                    truncation=True,
+                    padding="max_length",
+                    return_tensors="pt",
+                )
+                tokens_list.append(encoded["input_ids"].squeeze(0))
+
+            if not tokens_list:
+                raise ValueError("No samples in cached dataset")
+
+            all_tokenized = torch.stack(tokens_list)
+            _CACHE[cache_key] = all_tokenized
+            logger.info(f"Tokenized and cached: {all_tokenized.shape}")
+        else:
+            logger.info(f"Using pre-tokenized cache: {all_tokenized.shape}")
+
+        # Shuffle indices with validator seed for unpredictability
+        total = all_tokenized.size(0)
+        indices = list(range(total))
         rng = random.Random(actual_seed)
-        rng.shuffle(all_samples)
+        rng.shuffle(indices)
+        selected = indices[:num_samples]
 
-        tokens_list = []
-        for text in all_samples[:num_samples]:
-            encoded = tokenizer(
-                text,
-                max_length=sequence_length,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
-            tokens_list.append(encoded["input_ids"].squeeze(0))
-
-        if not tokens_list:
-            raise ValueError("No samples in cached dataset")
-
-        data = torch.stack(tokens_list)
-        logger.info(f"Loaded cached data: shape={data.shape}, seed={actual_seed}")
+        data = all_tokenized[selected]
+        logger.info(f"Sampled data: shape={data.shape}, seed={actual_seed}")
         return data
 
     # Fallback: Load from HuggingFace (requires network)
@@ -1863,6 +1884,17 @@ class Actor:
                 model.zero_grad(set_to_none=True)
             except Exception:
                 pass
+
+            # Explicitly delete large objects to free VRAM/RAM before GC.
+            # Without this, local references keep optimizer states (~2x model
+            # VRAM), data tensors, gradient copies, and reference state alive,
+            # preventing gc.collect() + empty_cache() from reclaiming memory.
+            # noinspection PyUnusedLocal
+            optimizer_miner = base_optimizer = None  # type: ignore[assignment]
+            data_iter_miner = data = None  # type: ignore[assignment]
+            reference_final_state = candidate_grad = None  # type: ignore[assignment]
+            miner_result = parsed = miner_module = None  # type: ignore[assignment]
+            reference = reference_grad = None  # type: ignore[assignment]
 
             # Reset torch state (clears compile caches, removes miner module)
             _reset_torch_state()

@@ -402,7 +402,9 @@ def verify_all(
     check_num += 1
     weight_relative_error_max = gradient_norm_ratio_max - 1.0
     print(f"\n[CHECK {check_num}] Final model weights |w_miner - w_ref| / |w_ref|")
-    print(f"  Max allowed: {weight_relative_error_max:.4f} ({weight_relative_error_max * 100:.1f}%)")
+    print(
+        f"  Max allowed: {weight_relative_error_max:.4f} ({weight_relative_error_max * 100:.1f}%)"
+    )
 
     if reference_final_state is not None:
         w_diff_norm_sq = 0.0
@@ -431,7 +433,9 @@ def verify_all(
         w_ref_norm = w_ref_norm_sq**0.5
         w_diff_norm = w_diff_norm_sq**0.5
         w_relative_error = (
-            w_diff_norm / w_ref_norm if w_ref_norm > 0 else (0.0 if w_diff_norm == 0 else float("inf"))
+            w_diff_norm / w_ref_norm
+            if w_ref_norm > 0
+            else (0.0 if w_diff_norm == 0 else float("inf"))
         )
 
         print(f"  |w_miner - w_ref|: {w_diff_norm:.6f}")

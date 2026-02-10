@@ -71,6 +71,9 @@ Each submission undergoes the following verification checks:
 
 | Check | Description | Threshold |
 |-------|-------------|-----------|
+| **Logits Present** | Must return actual logits (not None) | Required |
+| **Logits Shape** | Logits must be 3D (batch, seq, vocab) | Required |
+| **Sequence Length** | Logits seq dim must match expected | `seq_len - 1` |
 | **Token Count** | Must process the expected number of tokens | Exact match |
 | **Loss Validity** | Loss must be positive, not NaN, close to reference | `max_loss_difference: 0.3` |
 | **Gradient Relative Error** | `\|g - g_truth\| / \|g_truth\|` must be small | `gradient_norm_ratio_max - 1.0` |
@@ -427,4 +430,4 @@ uv run scripts/view_submission.py v2_commit_12345_1
 uv run scripts/view_submission.py v2_commit_12345_1 --save
 ```
 
-uv run -m neurons.miner submit "https://gist.github.com/shivam-MBZUAI/47f4fdefefce6de9f4308783eb674f80"       --wallet.name templar_test       --wallet.hotkey M1       --network local
+uv run -m neurons.miner submit "https://gist.github.com/shivam-MBZUAI/c1e04cd9cb97403e7f57b084217d35c0"       --wallet.name templar_test       --wallet.hotkey M2       --network local
