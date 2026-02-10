@@ -837,6 +837,26 @@ asyncio.run(main())
             logger.error(traceback.format_exc())
             return None
 
+    async def delete_basilica_deployment(self) -> None:
+        """Delete the current Basilica deployment to ensure fresh GPU for next submission.
+
+        This eliminates MFU variance between fresh and reused deployments by
+        ensuring every submission gets a pristine GPU state.
+        """
+        global _basilica_deployment, _basilica_deployment_time
+
+        if _basilica_deployment is None:
+            return
+
+        try:
+            await _basilica_deployment.delete_async()
+            logger.info("[BASILICA] Deployment deleted (fresh GPU for next submission)")
+        except Exception as e:
+            logger.warning(f"[BASILICA] Failed to delete deployment: {e}")
+
+        _basilica_deployment = None
+        _basilica_deployment_time = 0
+
     async def build_validator_image(self, env_path: Path | None = None) -> bool:
         """Build the validator's evaluation Docker image.
 

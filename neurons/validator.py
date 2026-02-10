@@ -523,6 +523,12 @@ class Validator(BaseNode):
                     fatal_error = True
                     break
 
+            # Delete Basilica deployment after each submission to ensure fresh GPU state
+            # for the next submission. This eliminates MFU variance between fresh/reused
+            # instances caused by CUDA graph compilation sensitivity to GPU memory state.
+            if self.affinetes_mode == "basilica":
+                await self.affinetes_runner.delete_basilica_deployment()
+
             # Persist state (URL already recorded during commitment processing)
             await self._save_state()
 

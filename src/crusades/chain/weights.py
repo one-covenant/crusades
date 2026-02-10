@@ -137,10 +137,7 @@ class WeightSetter:
         # query (using the new high threshold) may fail to recognize that winner because
         # the threshold was computed FROM their improvement. Trust the DB's previous_winner
         # if it has a higher score than the leaderboard query returned.
-        if (
-            self._previous_winner_id is not None
-            and self._previous_winner_score > winner_score
-        ):
+        if self._previous_winner_id is not None and self._previous_winner_score > winner_score:
             # The immediate update identified a better winner that the threshold-based
             # leaderboard query missed. Look up that submission to use it instead.
             db_winner = await self.db.get_submission(self._previous_winner_id)
