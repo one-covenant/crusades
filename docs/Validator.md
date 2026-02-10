@@ -429,5 +429,3 @@ uv run scripts/view_submission.py v2_commit_12345_1
 # Save miner's code to file
 uv run scripts/view_submission.py v2_commit_12345_1 --save
 ```
-
-uv run -m neurons.miner submit "https://gist.github.com/shivam-MBZUAI/c1e04cd9cb97403e7f57b084217d35c0"       --wallet.name templar_test       --wallet.hotkey M2       --network local

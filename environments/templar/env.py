@@ -419,6 +419,14 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             line = getattr(node, "lineno", "?")
             return False, f"Line {line}: forbidden import"
 
+        # Block: accessing .optimizer attribute (wrapper bypass attempt)
+        if isinstance(node, ast.Attribute) and node.attr == "optimizer":
+            # Allow 'self.optimizer' inside class definitions, but block
+            # attempts to unwrap the GradientCapturingOptimizer via optimizer.optimizer
+            if not (isinstance(node.value, ast.Name) and node.value.id == "self"):
+                line = getattr(node, "lineno", "?")
+                return False, f"Line {line}: accessing .optimizer attribute is forbidden"
+
     return True, None
 
 
@@ -434,6 +442,11 @@ _FORBIDDEN_STRINGS = [
     "enable_mem_efficient_sdp",
     "enable_math_sdp",
     "set_float32_matmul_precision",
+    "captured_gradients",
+    "_opt_impl",
+    "_grad_snapshot_gpu",
+    "step_count",
+    "GradientCapturingOptimizer",
 ]
 
 
@@ -822,7 +835,7 @@ class GradientCapturingOptimizer:
     """
 
     __slots__ = (
-        "optimizer",
+        "_opt_impl",
         "model",
         "captured_gradients",
         "step_count",
@@ -837,7 +850,7 @@ class GradientCapturingOptimizer:
         model: torch.nn.Module,
         num_steps: int,
     ):
-        object.__setattr__(self, "optimizer", optimizer)
+        object.__setattr__(self, "_opt_impl", optimizer)
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "captured_gradients", None)
         object.__setattr__(self, "step_count", 0)
@@ -872,7 +885,7 @@ class GradientCapturingOptimizer:
                     snapshot.append(None)
             object.__setattr__(self, "_grad_snapshot_gpu", snapshot)
 
-        return self.optimizer.step(*args, **kwargs)
+        return self._opt_impl.step(*args, **kwargs)
 
     def finalize_gradients(self) -> None:
         """Convert GPU gradient snapshot to GradientInfo (CPU).
@@ -929,38 +942,38 @@ class GradientCapturingOptimizer:
 
     def zero_grad(self, set_to_none: bool = False):
         """Forward to underlying optimizer."""
-        return self.optimizer.zero_grad(set_to_none=set_to_none)
+        return self._opt_impl.zero_grad(set_to_none=set_to_none)
 
     @property
     def param_groups(self):
         """Forward param_groups access to underlying optimizer."""
-        return self.optimizer.param_groups
+        return self._opt_impl.param_groups
 
     @param_groups.setter
     def param_groups(self, value):
         """Forward param_groups setter to underlying optimizer."""
-        self.optimizer.param_groups = value
+        self._opt_impl.param_groups = value
 
     def state_dict(self):
         """Forward to underlying optimizer."""
-        return self.optimizer.state_dict()
+        return self._opt_impl.state_dict()
 
     def load_state_dict(self, state_dict):
         """Forward to underlying optimizer."""
-        return self.optimizer.load_state_dict(state_dict)
+        return self._opt_impl.load_state_dict(state_dict)
 
     def add_param_group(self, param_group):
         """Forward to underlying optimizer."""
-        return self.optimizer.add_param_group(param_group)
+        return self._opt_impl.add_param_group(param_group)
 
     @property
     def state(self):
         """Forward state access to underlying optimizer."""
-        return self.optimizer.state
+        return self._opt_impl.state
 
     def __getattr__(self, name):
         """Forward any other attribute access to underlying optimizer."""
-        return getattr(self.optimizer, name)
+        return getattr(self._opt_impl, name)
 
 
 def _run_reference(
