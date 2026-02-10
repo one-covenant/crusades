@@ -514,92 +514,122 @@ class Validator(BaseNode):
             )
 
     async def _evaluate_submissions_parallel(self, prepared: list, hparams, num_runs: int) -> None:
-        """Evaluate all submissions in parallel, each on its own fresh Basilica GPU.
+        """Evaluate submissions in parallel batches, each on its own fresh Basilica GPU.
 
-        Flow:
-        1. Spin up N deployments concurrently (one per submission)
-        2. Run all evaluation runs for each submission on its deployment
-        3. Delete all deployments concurrently
-        4. Finalize all submissions
+        Concurrency is controlled by basilica.max_parallel_evaluations in hparams.
+        Submissions are processed in batches of that size.
+
+        Per-batch flow:
+        1. Deploy — spin up N GPUs concurrently
+        2. Evaluate — run all eval runs per submission on its GPU concurrently
+        3. Delete — tear down all N GPUs concurrently
+        4. Finalize — score and persist results
         """
-        num_subs = len(prepared)
+        max_parallel = hparams.basilica.max_parallel_evaluations
+
+        total_subs = len(prepared)
         logger.info("=" * 60)
-        logger.info(f"[PARALLEL] Launching {num_subs} Basilica deployments concurrently")
-        logger.info("=" * 60)
-
-        # Step 1: Create all deployments in parallel
-        deploy_start = time.time()
-        deploy_tasks = [
-            self.affinetes_runner.create_basilica_deployment(name=f"templar-eval-{idx:02d}")
-            for idx in range(num_subs)
-        ]
-        deployments = await asyncio.gather(*deploy_tasks, return_exceptions=True)
-        deploy_elapsed = time.time() - deploy_start
-
-        # Map submissions to their deployments
-        sub_deployments = []
-        for idx, ((submission, miner_code, my_evals, runs_remaining), deploy_result) in enumerate(
-            zip(prepared, deployments)
-        ):
-            if isinstance(deploy_result, Exception):
-                logger.error(f"[PARALLEL] Deployment {idx} failed: {deploy_result}")
-                sub_deployments.append((submission, miner_code, my_evals, runs_remaining, None))
-            elif deploy_result is None:
-                logger.error(f"[PARALLEL] Deployment {idx} returned None")
-                sub_deployments.append((submission, miner_code, my_evals, runs_remaining, None))
-            else:
-                logger.info(f"[PARALLEL] Deployment {idx} ready: {deploy_result.url}")
-                sub_deployments.append(
-                    (submission, miner_code, my_evals, runs_remaining, deploy_result)
-                )
-
-        successful_deploys = sum(1 for *_, d in sub_deployments if d is not None)
         logger.info(
-            f"[PARALLEL] {successful_deploys}/{num_subs} deployments ready in {deploy_elapsed:.1f}s"
+            f"[PARALLEL] {total_subs} submissions to evaluate (max {max_parallel} concurrent)"
         )
+        logger.info("=" * 60)
 
-        # Step 2: Run evaluations in parallel (each submission on its own deployment)
-        eval_start = time.time()
-        eval_tasks = [
-            self._run_submission_evals_on_deployment(
-                submission, miner_code, my_evals, runs_remaining, num_runs, hparams, deployment
-            )
-            for submission, miner_code, my_evals, runs_remaining, deployment in sub_deployments
-        ]
-        eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
-        eval_elapsed = time.time() - eval_start
+        # Process in batches of max_parallel
+        for batch_start in range(0, total_subs, max_parallel):
+            batch = prepared[batch_start : batch_start + max_parallel]
+            batch_num = batch_start // max_parallel + 1
+            total_batches = (total_subs + max_parallel - 1) // max_parallel
+            batch_size = len(batch)
 
-        logger.info(f"[PARALLEL] All evaluations completed in {eval_elapsed:.1f}s")
+            logger.info(f"[PARALLEL] Batch {batch_num}/{total_batches}: {batch_size} submissions")
 
-        # Step 3: Delete all deployments concurrently
-        active_deployments = [d for *_, d in sub_deployments if d is not None]
-        if active_deployments:
-            logger.info(f"[PARALLEL] Deleting {len(active_deployments)} deployments...")
-            delete_tasks = [AffinetesRunner.delete_deployment(d) for d in active_deployments]
-            await asyncio.gather(*delete_tasks, return_exceptions=True)
-            logger.info("[PARALLEL] All deployments deleted")
-
-        # Step 4: Finalize all submissions
-        for idx, (submission, miner_code, my_evals, runs_remaining, _) in enumerate(
-            sub_deployments
-        ):
-            fatal_error = False
-            if isinstance(eval_results[idx], Exception):
-                logger.error(
-                    f"[PARALLEL] Eval task for {submission.submission_id} raised: "
-                    f"{eval_results[idx]}"
+            # --- Step 1: Deploy all GPUs in this batch concurrently ---
+            deploy_start = time.time()
+            deploy_tasks = [
+                self.affinetes_runner.create_basilica_deployment(
+                    name=f"templar-eval-{batch_start + idx:02d}"
                 )
-                fatal_error = True
-            elif isinstance(eval_results[idx], bool):
-                fatal_error = eval_results[idx]
+                for idx in range(batch_size)
+            ]
+            deployments = await asyncio.gather(*deploy_tasks, return_exceptions=True)
+            deploy_elapsed = time.time() - deploy_start
 
-            await self.db.update_submission_code(submission.submission_id, miner_code)
-            await self._finalize_submission(
-                submission.submission_id, num_runs, fatal_error=fatal_error
+            # Pair submissions with their deployments
+            batch_items = []
+            for idx, (
+                (submission, miner_code, my_evals, runs_remaining),
+                deploy_result,
+            ) in enumerate(zip(batch, deployments)):
+                if isinstance(deploy_result, Exception):
+                    logger.error(
+                        f"[PARALLEL] Deployment {batch_start + idx} failed: {deploy_result}"
+                    )
+                    deployment = None
+                elif deploy_result is None:
+                    logger.error(f"[PARALLEL] Deployment {batch_start + idx} returned None")
+                    deployment = None
+                else:
+                    logger.info(
+                        f"[PARALLEL] Deployment {batch_start + idx} ready: {deploy_result.url}"
+                    )
+                    deployment = deploy_result
+
+                batch_items.append((submission, miner_code, my_evals, runs_remaining, deployment))
+
+            successful = sum(1 for *_, d in batch_items if d is not None)
+            logger.info(
+                f"[PARALLEL] {successful}/{batch_size} deployments ready in {deploy_elapsed:.1f}s"
             )
 
-        await self._save_state()
-        await self.maybe_set_weights()
+            # --- Step 2: Run all evaluations concurrently ---
+            eval_start = time.time()
+            eval_tasks = [
+                self._run_submission_evals_on_deployment(
+                    submission,
+                    miner_code,
+                    my_evals,
+                    runs_remaining,
+                    num_runs,
+                    hparams,
+                    deployment,
+                )
+                for submission, miner_code, my_evals, runs_remaining, deployment in batch_items
+            ]
+            eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
+            eval_elapsed = time.time() - eval_start
+
+            logger.info(f"[PARALLEL] Batch {batch_num} evaluations done in {eval_elapsed:.1f}s")
+
+            # --- Step 3: Delete all deployments concurrently ---
+            active_deployments = [d for *_, d in batch_items if d is not None]
+            if active_deployments:
+                logger.info(f"[PARALLEL] Deleting {len(active_deployments)} deployments...")
+                delete_tasks = [AffinetesRunner.delete_deployment(d) for d in active_deployments]
+                await asyncio.gather(*delete_tasks, return_exceptions=True)
+                logger.info("[PARALLEL] Deployments deleted")
+
+            # --- Step 4: Finalize all submissions in this batch ---
+            for idx, (submission, miner_code, *_, _dep) in enumerate(batch_items):
+                fatal_error = False
+                if isinstance(eval_results[idx], Exception):
+                    logger.error(
+                        f"[PARALLEL] Eval task for {submission.submission_id} "
+                        f"raised: {eval_results[idx]}"
+                    )
+                    fatal_error = True
+                elif isinstance(eval_results[idx], bool):
+                    fatal_error = eval_results[idx]
+
+                await self.db.update_submission_code(submission.submission_id, miner_code)
+                await self._finalize_submission(
+                    submission.submission_id, num_runs, fatal_error=fatal_error
+                )
+
+            await self._save_state()
+
+            # Check if we should set weights between batches
+            if batch_start + max_parallel < total_subs:
+                await self.maybe_set_weights()
 
     async def _run_submission_evals_on_deployment(
         self,
