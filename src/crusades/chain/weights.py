@@ -132,6 +132,33 @@ class WeightSetter:
         # immediate threshold updates from validator._check_and_update_threshold_if_new_leader()
         await self._load_previous_winner()
 
+        # Race condition fix: the immediate update path may have already identified a
+        # higher-scoring winner and bumped the threshold. When that happens, the leaderboard
+        # query (using the new high threshold) may fail to recognize that winner because
+        # the threshold was computed FROM their improvement. Trust the DB's previous_winner
+        # if it has a higher score than the leaderboard query returned.
+        if (
+            self._previous_winner_id is not None
+            and self._previous_winner_score > winner_score
+        ):
+            # The immediate update identified a better winner that the threshold-based
+            # leaderboard query missed. Look up that submission to use it instead.
+            db_winner = await self.db.get_submission(self._previous_winner_id)
+            if db_winner is not None and db_winner.miner_hotkey:
+                db_hotkey = db_winner.miner_hotkey
+                if self.chain.is_registered(db_hotkey):
+                    db_uid = self.chain.get_uid_for_hotkey(db_hotkey)
+                    if db_uid is not None:
+                        logger.info(
+                            f"Using immediate-update winner over leaderboard query: "
+                            f"{self._previous_winner_id} ({self._previous_winner_score:.2f}% MFU) "
+                            f"> leaderboard winner ({winner_score:.2f}% MFU)"
+                        )
+                        winner = db_winner
+                        winner_hotkey = db_hotkey
+                        winner_uid = db_uid
+                        winner_score = self._previous_winner_score
+
         # If no previous winner in DB, initialize with current winner
         if self._previous_winner_id is None:
             self._previous_winner_id = winner.submission_id
