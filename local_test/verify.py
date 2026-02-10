@@ -76,10 +76,10 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
     violations = []
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr == "__setattr__":
+        if isinstance(node, ast.Attribute) and node.attr in ("__setattr__", "__delattr__"):
             if isinstance(node.value, ast.Name) and node.value.id == "object":
                 line = getattr(node, "lineno", "?")
-                violations.append(f"Line {line}: object.__setattr__ is forbidden")
+                violations.append(f"Line {line}: object.{node.attr} is forbidden")
 
         if isinstance(node, ast.Assign):
             for target in node.targets:

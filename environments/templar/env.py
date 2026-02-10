@@ -149,7 +149,9 @@ def _reset_torch_state():
 
 
 # Canonical backend settings used during reference and timed evaluation.
-# Any miner code that changes these gains an unfair speed advantage.
+# Both runs MUST use identical settings so gradients/weights can be compared.
+# Changing e.g. cudnn.benchmark or deterministic causes non-deterministic
+# algorithm selection, making the reference vs miner comparison unreliable.
 _REFERENCE_BACKEND_STATE = {
     "cudnn.deterministic": True,
     "cudnn.benchmark": False,
@@ -346,7 +348,7 @@ def _set_deterministic(seed: int) -> None:
 def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
     """AST scan to reject forbidden code patterns."""
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr == "__setattr__":
+        if isinstance(node, ast.Attribute) and node.attr in ("__setattr__", "__delattr__"):
             if isinstance(node.value, ast.Name) and node.value.id == "object":
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
