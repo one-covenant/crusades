@@ -427,6 +427,7 @@ _FORBIDDEN_STRINGS = [
     "__delattr__",
     "__class__",
     "perf_counter",
+    "capture_overhead_seconds",
     "get_objects",
     "get_referrers",
     "get_referents",
@@ -817,6 +818,15 @@ class GradientCapturingOptimizer:
     miner's inner_steps execution. Only captures on the last step to
     minimize overhead (matching reference run behavior).
     Read-only after initialization.
+
+    The capture_overhead_seconds attribute tracks the time spent on
+    gradient capture (cuda sync + GPU→CPU copy + norm computation).
+    The validator subtracts this from wall_time so miners aren't
+    penalized for validator-side verification overhead.
+
+    Security: all known bypass vectors for modifying this attribute
+    are blocked by the AST scanner (object.__setattr__, __class__
+    replacement, ctypes, gc introspection).
     """
 
     __slots__ = (
@@ -825,6 +835,7 @@ class GradientCapturingOptimizer:
         "captured_gradients",
         "step_count",
         "num_steps",
+        "capture_overhead_seconds",
         "_initialized",
     )
 
@@ -839,6 +850,7 @@ class GradientCapturingOptimizer:
         object.__setattr__(self, "captured_gradients", None)
         object.__setattr__(self, "step_count", 0)
         object.__setattr__(self, "num_steps", num_steps)
+        object.__setattr__(self, "capture_overhead_seconds", 0.0)
         object.__setattr__(self, "_initialized", True)
 
     def __setattr__(self, name, value):
@@ -853,6 +865,7 @@ class GradientCapturingOptimizer:
 
         Only captures on the last step (step_count == num_steps - 1) to match
         the reference run behavior and avoid adding overhead to every step.
+        The capture time is tracked so the validator can subtract it from wall_time.
         """
         current_step = self.step_count
         object.__setattr__(self, "step_count", current_step + 1)
@@ -860,7 +873,13 @@ class GradientCapturingOptimizer:
         # Only capture gradients on the final step (same as reference run)
         if current_step == self.num_steps - 1:
             _cuda_synchronize()
+            capture_start = _perf_counter()
             object.__setattr__(self, "captured_gradients", _capture_gradients(self.model))
+            object.__setattr__(
+                self,
+                "capture_overhead_seconds",
+                _perf_counter() - capture_start,
+            )
 
         return self.optimizer.step(*args, **kwargs)
 
@@ -1673,8 +1692,28 @@ class Actor:
 
             _cuda_synchronize()
             total_time = _perf_counter() - start
-            wall_time = total_time
-            logger.info(f"Timing: wall_time={wall_time:.2f}s (used for MFU/TPS)")
+
+            # Subtract gradient capture overhead from wall_time.
+            # The capture (cuda sync + GPU→CPU copy + norm computation) is
+            # validator-side verification overhead, not the miner's training.
+            # Protected by AST scanner blocking all known bypass vectors.
+            capture_overhead = optimizer_miner.capture_overhead_seconds
+
+            # Safety: capture_overhead must be non-negative and < 50% of total_time.
+            # If it exceeds 50%, something is wrong — fall back to total_time.
+            if capture_overhead < 0 or capture_overhead > total_time * 0.5:
+                logger.warning(
+                    f"Suspicious capture_overhead={capture_overhead:.2f}s "
+                    f"(total={total_time:.2f}s) — ignoring override"
+                )
+                capture_overhead = 0.0
+
+            wall_time = total_time - capture_overhead
+            logger.info(
+                f"Timing: total={total_time:.2f}s, "
+                f"capture_overhead={capture_overhead:.2f}s, "
+                f"wall_time={wall_time:.2f}s (used for MFU/TPS)"
+            )
 
             # Verify backend settings were not tampered with during timed eval
             _backend_violations = _check_backend_state()
