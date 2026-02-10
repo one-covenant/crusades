@@ -426,6 +426,13 @@ class Validator(BaseNode):
     async def evaluate_submissions(self) -> None:
         """Evaluate submissions by downloading from code URL.
 
+        In Basilica mode, submissions are evaluated in parallel — each gets its
+        own fresh GPU deployment spun up concurrently. This dramatically reduces
+        total evaluation time (e.g. 15 submissions that each take 5 min go from
+        75 min sequential to ~5 min parallel).
+
+        In Docker mode, submissions are evaluated sequentially (single local GPU).
+
         Only evaluates submissions matching current competition version.
         """
         hparams = get_hparams()
@@ -438,12 +445,12 @@ class Validator(BaseNode):
             f"Found {len(evaluating)} submissions in EVALUATING status (v{competition_version})"
         )
 
-        for sub_idx, submission in enumerate(evaluating):
-            # Check if we should set weights between submissions
-            # This ensures weight setting isn't blocked by long evaluation runs
-            if sub_idx > 0:
-                await self.maybe_set_weights()
+        if not evaluating:
+            return
 
+        # Prepare submissions: download code, filter invalid ones
+        prepared = []
+        for submission in evaluating:
             code_url = submission.bucket_path
 
             if not code_url or not code_url.startswith("http"):
@@ -457,9 +464,9 @@ class Validator(BaseNode):
                 continue
 
             runs_remaining = num_runs - len(my_evals)
-            logger.info(f"Evaluating {submission.submission_id}")
+            logger.info(f"Preparing {submission.submission_id}")
             logger.info(f"   URL: {code_url[:60]}...")
-            logger.info(f"   Runs: {len(my_evals) + 1}/{num_runs}")
+            logger.info(f"   Runs remaining: {runs_remaining}")
 
             # Download code from URL
             success, code_or_error = self._download_from_url(code_url)
@@ -473,73 +480,260 @@ class Validator(BaseNode):
                 )
                 continue
 
-            miner_code = code_or_error
-            logger.info(f"   Downloaded {len(miner_code)} bytes")
+            logger.info(f"   Downloaded {len(code_or_error)} bytes")
+            prepared.append((submission, code_or_error, my_evals, runs_remaining))
 
-            # Run evaluations
-            fatal_error = False
-            for run_idx in range(runs_remaining):
-                current_run = len(my_evals) + run_idx + 1
-                seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}"
+        if not prepared:
+            return
 
-                logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
+        # Parallel evaluation in Basilica mode
+        if self.affinetes_mode == "basilica":
+            await self._evaluate_submissions_parallel(prepared, hparams, num_runs)
+        else:
+            # Sequential evaluation in Docker mode (single local GPU)
+            await self._evaluate_submissions_sequential(prepared, hparams, num_runs)
 
-                result = await self.affinetes_runner.evaluate(
-                    code=miner_code,  # Pass code directly
-                    seed=seed,
-                    steps=hparams.eval_steps,
-                    batch_size=hparams.benchmark_batch_size,
-                    sequence_length=hparams.benchmark_sequence_length,
-                    data_samples=hparams.benchmark_data_samples,
-                    task_id=current_run,
-                )
+    async def _evaluate_submissions_sequential(
+        self, prepared: list, hparams, num_runs: int
+    ) -> None:
+        """Evaluate submissions one at a time (Docker mode)."""
+        for sub_idx, (submission, miner_code, my_evals, runs_remaining) in enumerate(prepared):
+            if sub_idx > 0:
+                await self.maybe_set_weights()
 
-                if result.success:
-                    logger.info(
-                        f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}"
-                    )
-                else:
-                    logger.warning(f"Run {current_run} FAILED: {result.error}")
+            fatal_error = await self._run_submission_evals(
+                submission, miner_code, my_evals, runs_remaining, num_runs, hparams
+            )
 
-                evaluation = EvaluationModel(
-                    submission_id=submission.submission_id,
-                    evaluator_hotkey=self.hotkey,
-                    mfu=result.mfu,  # MFU is primary metric
-                    tokens_per_second=result.tps,
-                    total_tokens=result.total_tokens,
-                    wall_time_seconds=result.wall_time_seconds,
-                    success=result.success,
-                    error=result.error,
-                )
-                await self.db.save_evaluation(evaluation)
-                self._cleanup_memory()
-
-                # Fatal errors are deterministic - same code will always fail the same way
-                # No point retrying, and if a previous run passed, that's a bug to investigate
-                if result.is_fatal():
-                    logger.warning(
-                        f"Fatal error detected ({result.error_code}), skipping remaining runs"
-                    )
-                    fatal_error = True
-                    break
-
-            # Delete Basilica deployment after each submission to ensure fresh GPU state
-            # for the next submission. This eliminates MFU variance between fresh/reused
-            # instances caused by CUDA graph compilation sensitivity to GPU memory state.
-            if self.affinetes_mode == "basilica":
-                await self.affinetes_runner.delete_basilica_deployment()
-
-            # Persist state (URL already recorded during commitment processing)
             await self._save_state()
-
-            # Store miner's code in database
             await self.db.update_submission_code(submission.submission_id, miner_code)
             logger.info(f"Stored code for {submission.submission_id} in database")
 
-            # Finalize submission (pass fatal_error to skip unnecessary checks)
             await self._finalize_submission(
                 submission.submission_id, num_runs, fatal_error=fatal_error
             )
+
+    async def _evaluate_submissions_parallel(self, prepared: list, hparams, num_runs: int) -> None:
+        """Evaluate all submissions in parallel, each on its own fresh Basilica GPU.
+
+        Flow:
+        1. Spin up N deployments concurrently (one per submission)
+        2. Run all evaluation runs for each submission on its deployment
+        3. Delete all deployments concurrently
+        4. Finalize all submissions
+        """
+        num_subs = len(prepared)
+        logger.info("=" * 60)
+        logger.info(f"[PARALLEL] Launching {num_subs} Basilica deployments concurrently")
+        logger.info("=" * 60)
+
+        # Step 1: Create all deployments in parallel
+        deploy_start = time.time()
+        deploy_tasks = [
+            self.affinetes_runner.create_basilica_deployment(name=f"templar-eval-{idx:02d}")
+            for idx in range(num_subs)
+        ]
+        deployments = await asyncio.gather(*deploy_tasks, return_exceptions=True)
+        deploy_elapsed = time.time() - deploy_start
+
+        # Map submissions to their deployments
+        sub_deployments = []
+        for idx, ((submission, miner_code, my_evals, runs_remaining), deploy_result) in enumerate(
+            zip(prepared, deployments)
+        ):
+            if isinstance(deploy_result, Exception):
+                logger.error(f"[PARALLEL] Deployment {idx} failed: {deploy_result}")
+                sub_deployments.append((submission, miner_code, my_evals, runs_remaining, None))
+            elif deploy_result is None:
+                logger.error(f"[PARALLEL] Deployment {idx} returned None")
+                sub_deployments.append((submission, miner_code, my_evals, runs_remaining, None))
+            else:
+                logger.info(f"[PARALLEL] Deployment {idx} ready: {deploy_result.url}")
+                sub_deployments.append(
+                    (submission, miner_code, my_evals, runs_remaining, deploy_result)
+                )
+
+        successful_deploys = sum(1 for *_, d in sub_deployments if d is not None)
+        logger.info(
+            f"[PARALLEL] {successful_deploys}/{num_subs} deployments ready in {deploy_elapsed:.1f}s"
+        )
+
+        # Step 2: Run evaluations in parallel (each submission on its own deployment)
+        eval_start = time.time()
+        eval_tasks = [
+            self._run_submission_evals_on_deployment(
+                submission, miner_code, my_evals, runs_remaining, num_runs, hparams, deployment
+            )
+            for submission, miner_code, my_evals, runs_remaining, deployment in sub_deployments
+        ]
+        eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
+        eval_elapsed = time.time() - eval_start
+
+        logger.info(f"[PARALLEL] All evaluations completed in {eval_elapsed:.1f}s")
+
+        # Step 3: Delete all deployments concurrently
+        active_deployments = [d for *_, d in sub_deployments if d is not None]
+        if active_deployments:
+            logger.info(f"[PARALLEL] Deleting {len(active_deployments)} deployments...")
+            delete_tasks = [AffinetesRunner.delete_deployment(d) for d in active_deployments]
+            await asyncio.gather(*delete_tasks, return_exceptions=True)
+            logger.info("[PARALLEL] All deployments deleted")
+
+        # Step 4: Finalize all submissions
+        for idx, (submission, miner_code, my_evals, runs_remaining, _) in enumerate(
+            sub_deployments
+        ):
+            fatal_error = False
+            if isinstance(eval_results[idx], Exception):
+                logger.error(
+                    f"[PARALLEL] Eval task for {submission.submission_id} raised: "
+                    f"{eval_results[idx]}"
+                )
+                fatal_error = True
+            elif isinstance(eval_results[idx], bool):
+                fatal_error = eval_results[idx]
+
+            await self.db.update_submission_code(submission.submission_id, miner_code)
+            await self._finalize_submission(
+                submission.submission_id, num_runs, fatal_error=fatal_error
+            )
+
+        await self._save_state()
+        await self.maybe_set_weights()
+
+    async def _run_submission_evals_on_deployment(
+        self,
+        submission,
+        miner_code: str,
+        my_evals: list,
+        runs_remaining: int,
+        num_runs: int,
+        hparams,
+        deployment,
+    ) -> bool:
+        """Run all evaluation runs for a submission on a specific Basilica deployment.
+
+        Returns True if a fatal error was encountered.
+        """
+        if deployment is None:
+            logger.error(f"[PARALLEL] No deployment for {submission.submission_id}, marking fatal")
+            return True
+
+        model_url = hparams.benchmark_model_name
+        data_url = hparams.benchmark_dataset_name
+
+        fatal_error = False
+        for run_idx in range(runs_remaining):
+            current_run = len(my_evals) + run_idx + 1
+            seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}"
+
+            logger.info(
+                f"[{submission.submission_id[:8]}] Run {current_run}/{num_runs} (seed: {seed})"
+            )
+
+            result = await self.affinetes_runner.evaluate_on_deployment(
+                deployment=deployment,
+                code=miner_code,
+                seed=seed,
+                model_url=model_url,
+                data_url=data_url,
+                steps=hparams.eval_steps,
+                batch_size=hparams.benchmark_batch_size,
+                sequence_length=hparams.benchmark_sequence_length,
+                data_samples=hparams.benchmark_data_samples,
+                task_id=current_run,
+            )
+
+            if result.success:
+                logger.info(
+                    f"[{submission.submission_id[:8]}] "
+                    f"Run {current_run} PASSED: MFU={result.mfu:.2f}%"
+                )
+            else:
+                logger.warning(
+                    f"[{submission.submission_id[:8]}] Run {current_run} FAILED: {result.error}"
+                )
+
+            evaluation = EvaluationModel(
+                submission_id=submission.submission_id,
+                evaluator_hotkey=self.hotkey,
+                mfu=result.mfu,
+                tokens_per_second=result.tps,
+                total_tokens=result.total_tokens,
+                wall_time_seconds=result.wall_time_seconds,
+                success=result.success,
+                error=result.error,
+            )
+            await self.db.save_evaluation(evaluation)
+
+            if result.is_fatal():
+                logger.warning(
+                    f"[{submission.submission_id[:8]}] "
+                    f"Fatal error ({result.error_code}), skipping remaining runs"
+                )
+                fatal_error = True
+                break
+
+        return fatal_error
+
+    async def _run_submission_evals(
+        self,
+        submission,
+        miner_code: str,
+        my_evals: list,
+        runs_remaining: int,
+        num_runs: int,
+        hparams,
+    ) -> bool:
+        """Run all evaluation runs for a submission (Docker mode, sequential).
+
+        Returns True if a fatal error was encountered.
+        """
+        fatal_error = False
+        for run_idx in range(runs_remaining):
+            current_run = len(my_evals) + run_idx + 1
+            seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}"
+
+            logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
+
+            result = await self.affinetes_runner.evaluate(
+                code=miner_code,
+                seed=seed,
+                steps=hparams.eval_steps,
+                batch_size=hparams.benchmark_batch_size,
+                sequence_length=hparams.benchmark_sequence_length,
+                data_samples=hparams.benchmark_data_samples,
+                task_id=current_run,
+            )
+
+            if result.success:
+                logger.info(
+                    f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}"
+                )
+            else:
+                logger.warning(f"Run {current_run} FAILED: {result.error}")
+
+            evaluation = EvaluationModel(
+                submission_id=submission.submission_id,
+                evaluator_hotkey=self.hotkey,
+                mfu=result.mfu,
+                tokens_per_second=result.tps,
+                total_tokens=result.total_tokens,
+                wall_time_seconds=result.wall_time_seconds,
+                success=result.success,
+                error=result.error,
+            )
+            await self.db.save_evaluation(evaluation)
+            self._cleanup_memory()
+
+            if result.is_fatal():
+                logger.warning(
+                    f"Fatal error detected ({result.error_code}), skipping remaining runs"
+                )
+                fatal_error = True
+                break
+
+        return fatal_error
 
     async def _finalize_submission(
         self, submission_id: str, num_runs: int, fatal_error: bool = False

@@ -184,7 +184,15 @@ Key settings in `hparams/hparams.json`:
 
 ---
 
-## TUI Dashboard
+## Monitoring
+
+### Grafana Dashboard
+
+Live validator metrics and logs:
+
+- **[Crusades Validator Dashboard](https://grafana.tplr.ai/d/cfc2uhde71reod/crusades-validator-uid-1?orgId=1&refresh=30s)**
+
+### TUI Dashboard
 
 Monitor crusades activity in real-time with the terminal dashboard.
 
