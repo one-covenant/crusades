@@ -1,4 +1,4 @@
-"""Configuration management for templar-crusades (Chi/Affinetes Architecture)."""
+"""Configuration management for templar-crusades."""
 
 import json
 from functools import cache

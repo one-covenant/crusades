@@ -71,7 +71,12 @@ class Database:
                 await session.commit()
 
     async def update_submission_score(self, submission_id: str, final_score: float) -> None:
-        """Update submission final score."""
+        """Update submission final score.
+
+        NOTE: This only sets the score — the caller is responsible for
+        setting the status via ``update_submission_status`` so that
+        failed submissions are not accidentally marked FINISHED.
+        """
         async with self.session_factory() as session:
             result = await session.execute(
                 select(SubmissionModel).where(SubmissionModel.submission_id == submission_id)
@@ -79,7 +84,6 @@ class Database:
             submission = result.scalar_one_or_none()
             if submission:
                 submission.final_score = final_score
-                submission.status = SubmissionStatus.FINISHED
                 await session.commit()
 
     async def update_submission_code(self, submission_id: str, code: str) -> None:

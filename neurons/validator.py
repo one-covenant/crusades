@@ -54,7 +54,7 @@ class Validator(BaseNode):
     Responsibilities:
     1. Read miner code URL commitments from blockchain
     2. Download train.py from URL and evaluate via affinetes
-    3. Calculate and set weights (winner-takes-all)
+    3. Calculate and set weights (burn_rate to burn_uid, remainder to winner)
     """
 
     def __init__(
@@ -229,11 +229,16 @@ class Validator(BaseNode):
     async def process_blockchain_commitments(self) -> None:
         """Read and process new URL commitments from blockchain."""
         try:
-            new_commitments = self.commitment_reader.get_new_commitments_since(
-                self.last_processed_block
+            # Run blocking blockchain RPC calls in a thread to avoid blocking
+            # the event loop (these make synchronous network calls).
+            new_commitments = await asyncio.to_thread(
+                self.commitment_reader.get_new_commitments_since,
+                self.last_processed_block,
             )
 
-            current_block = self.commitment_reader.get_current_block()
+            current_block = await asyncio.to_thread(
+                self.commitment_reader.get_current_block,
+            )
 
             if new_commitments:
                 logger.info(f"Found {len(new_commitments)} new commitments")
@@ -278,7 +283,9 @@ class Validator(BaseNode):
                         )
                     except Exception as e:
                         logger.error(f"Failed to create submission for {code_url[:60]}: {e}")
-                        # Don't record URL - will retry on next cycle
+                        # URL is not recorded so it won't be skipped as "already seen",
+                        # but last_processed_block advances past this commitment's block,
+                        # so a retry only happens if the miner resubmits.
 
             self.last_processed_block = current_block
             await self._save_state()
@@ -480,7 +487,7 @@ class Validator(BaseNode):
         for submission in evaluating:
             code_url = submission.bucket_path
 
-            if not code_url or not code_url.startswith("http"):
+            if not code_url or not code_url.startswith(("http://", "https://")):
                 logger.error(f"Invalid code URL for {submission.submission_id}: {code_url}")
                 continue
 
@@ -495,8 +502,8 @@ class Validator(BaseNode):
             logger.info(f"   URL: {code_url[:60]}...")
             logger.info(f"   Runs remaining: {runs_remaining}")
 
-            # Download code from URL
-            success, code_or_error = self._download_from_url(code_url)
+            # Download code from URL (run in thread to avoid blocking event loop)
+            success, code_or_error = await asyncio.to_thread(self._download_from_url, code_url)
 
             if not success:
                 logger.error(f"Failed to download code: {code_or_error}")
@@ -1118,7 +1125,7 @@ class Validator(BaseNode):
             if stored_version != current_version:
                 # Get current block to start fresh from NOW (ignore old commitments)
                 try:
-                    current_block = self.chain.subtensor.get_current_block()
+                    current_block = await asyncio.to_thread(self.chain.subtensor.get_current_block)
                 except Exception as e:
                     # Cannot determine current block - defer version reset to avoid
                     # reprocessing all historical commitments from block 0
@@ -1168,6 +1175,19 @@ class Validator(BaseNode):
     async def _save_state(self) -> None:
         """Persist validator state to database."""
         try:
+            # Prune old entries from evaluated_code_urls to prevent unbounded growth.
+            # Keep entries from the last 10,000 blocks (~33 hours at 12s/block).
+            max_url_age_blocks = 10_000
+            if self.last_processed_block > max_url_age_blocks:
+                cutoff = self.last_processed_block - max_url_age_blocks
+                before = len(self.evaluated_code_urls)
+                self.evaluated_code_urls = {
+                    url: info for url, info in self.evaluated_code_urls.items() if info[0] >= cutoff
+                }
+                pruned = before - len(self.evaluated_code_urls)
+                if pruned > 0:
+                    logger.info(f"Pruned {pruned} old entries from evaluated_code_urls")
+
             await self.db.set_validator_state(
                 "competition_version", str(crusades.COMPETITION_VERSION)
             )

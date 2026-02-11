@@ -340,11 +340,16 @@ class AffinetesRunner:
         logger.info("Running Docker evaluation")
         logger.info(f"   Code size: {len(code)} bytes")
 
-        # Check if validator image exists
+        # Check if validator image exists (use async subprocess to avoid blocking)
         check_cmd = ["docker", "image", "inspect", self.validator_image]
-        check_result = subprocess.run(check_cmd, capture_output=True)
+        check_proc = await asyncio.create_subprocess_exec(
+            *check_cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await check_proc.wait()
 
-        if check_result.returncode != 0:
+        if check_proc.returncode != 0:
             return EvaluationResult.failure(
                 f"Validator image not found: {self.validator_image}. "
                 f"Build it first: cd environments/templar && docker build -t {self.validator_image} .",
@@ -364,8 +369,37 @@ class AffinetesRunner:
         # Make readable by container's non-root user
         os.chmod(train_path, 0o644)
 
-        # Create evaluation script that reads code from mounted file
-        eval_script = f'''
+        # Write eval config as JSON to avoid f-string code injection.
+        # Previously, seed/model_url/data_url were interpolated directly
+        # into Python source; a value containing " or \n would break the
+        # generated script and allow arbitrary code execution in the container.
+        eval_config = {
+            "task_id": task_id,
+            "seed": seed,
+            "model_url": model_url,
+            "data_url": data_url,
+            "steps": steps,
+            "batch_size": batch_size,
+            "sequence_length": sequence_length,
+            "data_samples": data_samples,
+            "timeout": self.timeout,
+            "max_loss_difference": self.max_loss_difference,
+            "min_params_changed_ratio": self.min_params_changed_ratio,
+            "gradient_norm_ratio_max": self.gradient_norm_ratio_max,
+            "weight_relative_error_max": self.weight_relative_error_max,
+            "gpu_peak_tflops": self.gpu_peak_tflops,
+        }
+
+        config_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, prefix="eval_config_"
+        )
+        json.dump(eval_config, config_file)
+        config_file.close()
+        config_path = config_file.name
+        os.chmod(config_path, 0o644)
+
+        # Eval script reads parameters from JSON config file — no interpolation
+        eval_script = """
 import asyncio
 import json
 import sys
@@ -374,37 +408,35 @@ sys.path.insert(0, '/app')
 from env import Actor
 
 async def main():
-    # Read miner's code
     with open('/app/scripts/miner_train.py') as f:
         code = f.read()
+    with open('/app/scripts/eval_config.json') as f:
+        cfg = json.load(f)
 
     actor = Actor()
     result = await actor.evaluate(
-        task_id={task_id},
-        seed="{seed}",
-        model_url="{model_url}",
-        data_url="{data_url}",
-        steps={steps},
-        batch_size={batch_size},
-        sequence_length={sequence_length},
-        data_samples={data_samples},
-        timeout={self.timeout},
+        task_id=cfg["task_id"],
+        seed=cfg["seed"],
+        model_url=cfg["model_url"],
+        data_url=cfg["data_url"],
+        steps=cfg["steps"],
+        batch_size=cfg["batch_size"],
+        sequence_length=cfg["sequence_length"],
+        data_samples=cfg["data_samples"],
+        timeout=cfg["timeout"],
         code=code,
-        max_loss_difference={self.max_loss_difference},
+        max_loss_difference=cfg["max_loss_difference"],
         use_random_init=True,
         min_trainable_params_ratio=1.0,
-        min_params_changed_ratio={self.min_params_changed_ratio},
-        # Gradient verification
-        gradient_norm_ratio_max={self.gradient_norm_ratio_max},
-        # Weight verification
-        weight_relative_error_max={self.weight_relative_error_max},
-        # MFU calculation
-        gpu_peak_tflops={self.gpu_peak_tflops},
+        min_params_changed_ratio=cfg["min_params_changed_ratio"],
+        gradient_norm_ratio_max=cfg["gradient_norm_ratio_max"],
+        weight_relative_error_max=cfg["weight_relative_error_max"],
+        gpu_peak_tflops=cfg["gpu_peak_tflops"],
     )
     print("EVAL_RESULT:" + json.dumps(result))
 
 asyncio.run(main())
-'''
+"""
 
         # Write eval script to temp file
         with tempfile.NamedTemporaryFile(
@@ -429,6 +461,8 @@ asyncio.run(main())
                 f"{script_path}:/app/scripts/eval_script.py:ro",
                 "-v",
                 f"{train_path}:/app/scripts/miner_train.py:ro",
+                "-v",
+                f"{config_path}:/app/scripts/eval_config.json:ro",
             ]
 
             # Add GPU if configured
@@ -543,11 +577,7 @@ asyncio.run(main())
                 async def read_stream():
                     buffer = ""
                     while True:
-                        # Read in chunks to avoid buffer limit issues with long lines
-                        chunk = await asyncio.wait_for(
-                            process.stdout.read(8192),  # 8KB chunks
-                            timeout=self.timeout + 60,
-                        )
+                        chunk = await process.stdout.read(8192)  # 8KB chunks
                         if not chunk:
                             # Process remaining buffer at end
                             if buffer:
@@ -568,8 +598,13 @@ asyncio.run(main())
                             if _should_log(line):
                                 logger.info(f"   [DOCKER] {line}")
 
-                await read_stream()
-                await process.wait()
+                # Overall wall-clock timeout for the entire evaluation.
+                # A container that continuously prints output would bypass
+                # per-chunk timeouts; this catches that case.
+                await asyncio.wait_for(
+                    asyncio.gather(read_stream(), process.wait()),
+                    timeout=self.timeout + 60,
+                )
 
             except TimeoutError:
                 process.kill()
@@ -611,11 +646,11 @@ asyncio.run(main())
             )
 
         finally:
-            try:
-                os.unlink(script_path)
-                os.unlink(train_path)
-            except Exception:
-                pass
+            for path in (script_path, train_path, config_path):
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
 
     async def _evaluate_basilica(
         self,
