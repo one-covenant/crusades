@@ -23,6 +23,7 @@ import subprocess
 import tempfile
 import time
 import traceback
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -801,8 +802,11 @@ asyncio.run(main())
             deploy_start = time.time()
             client = BasilicaClient()
 
+            deploy_name = f"templar-eval-{uuid.uuid4().hex[:8]}"
+            logger.info(f"   Deployment name: {deploy_name}")
+
             deployment = client.deploy(
-                name="templar-eval",
+                name=deploy_name,
                 image=self.basilica_image,
                 port=8000,
                 ttl_seconds=self.basilica_ttl_seconds,
