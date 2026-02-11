@@ -346,60 +346,112 @@ def _set_deterministic(seed: int) -> None:
 
 
 def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
-    """AST scan to reject forbidden code patterns."""
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr in ("__setattr__", "__delattr__"):
-            if isinstance(node.value, ast.Name) and node.value.id == "object":
-                line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: forbidden pattern detected"
+    """AST scan to reject forbidden code patterns.
 
+    Defense-in-depth: the Docker sandbox (--network none, --cap-drop ALL,
+    --read-only) is the primary security boundary.  This scanner adds a
+    second layer that blocks known MFU-manipulation vectors that the
+    sandbox alone cannot prevent (e.g. monkey-patching the evaluation
+    harness via sys.modules).
+    """
+
+    # ---- Forbidden import modules ----
+    # Modules that enable sandbox escape, code generation, introspection,
+    # or tampering with the evaluation environment.
+    _FORBIDDEN_MODULES = frozenset({
+        "ctypes", "_ctypes",
+        "gc",
+        "subprocess",
+        "sys",           # sys.modules allows monkey-patching env.py internals
+        "os",            # file system / env var access
+        "signal",        # signal handler manipulation
+        "socket",        # network access (also blocked by --network none)
+        "pickle", "marshal", "shelve",  # deserialization-based code execution
+        "code", "codeop",              # interactive code compilation
+        "multiprocessing", "threading", # process/thread spawning
+    })
+
+    # Prefixes that are forbidden even as submodule imports
+    _FORBIDDEN_MODULE_PREFIXES = (
+        "importlib",
+        "ctypes",
+        "_ctypes",
+        "multiprocessing",
+    )
+
+    # ---- Forbidden builtin function names ----
+    # These are blocked as bare calls (ast.Name) AND as attribute calls
+    # (e.g. builtins.exec).
+    _FORBIDDEN_EXEC_NAMES = frozenset({
+        "exec", "eval", "compile", "__import__",
+    })
+
+    # Introspection builtins that enable dynamic attribute/module access
+    # and can bypass all other AST-level checks.
+    _FORBIDDEN_INTROSPECTION_NAMES = frozenset({
+        "getattr", "setattr", "delattr",
+        "globals", "locals", "vars", "dir",
+        "breakpoint",
+    })
+
+    for node in ast.walk(tree):
+
+        # ---- Block: __setattr__ / __delattr__ on ANY object ----
+        # (Previously only blocked on `object`; type.__setattr__ was a bypass)
+        if isinstance(node, ast.Attribute) and node.attr in ("__setattr__", "__delattr__"):
+            line = getattr(node, "lineno", "?")
+            return False, f"Line {line}: {node.attr} is forbidden"
+
+        # ---- Block: __class__ access (all uses) ----
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Attribute) and target.attr == "__class__":
                     line = getattr(node, "lineno", "?")
-                    return False, f"Line {line}: forbidden pattern detected"
+                    return False, f"Line {line}: __class__ assignment is forbidden"
 
         if isinstance(node, ast.Attribute) and node.attr == "__class__":
-            if not isinstance(getattr(node, "_parent", None), ast.AnnAssign):
-                line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: forbidden pattern detected"
+            line = getattr(node, "lineno", "?")
+            return False, f"Line {line}: __class__ access is forbidden"
 
+        # ---- Block: __subclasses__ ----
+        if isinstance(node, ast.Attribute) and node.attr == "__subclasses__":
+            line = getattr(node, "lineno", "?")
+            return False, f"Line {line}: __subclasses__ is forbidden"
+
+        # ---- Block: time.perf_counter ----
         if isinstance(node, ast.Attribute) and node.attr == "perf_counter":
             if isinstance(node.value, ast.Name) and node.value.id == "time":
                 line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: forbidden pattern detected"
+                return False, f"Line {line}: time.perf_counter is forbidden"
 
+        # ---- Block: assigning to .synchronize ----
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Attribute) and target.attr == "synchronize":
                     line = getattr(node, "lineno", "?")
-                    return False, f"Line {line}: forbidden pattern detected"
+                    return False, f"Line {line}: synchronize assignment is forbidden"
 
+        # ---- Block: __slots__ modification ----
         if isinstance(node, ast.Attribute) and node.attr == "__slots__":
             if isinstance(node.ctx, (ast.Store, ast.Del)):
                 line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: forbidden pattern detected"
+                return False, f"Line {line}: __slots__ modification is forbidden"
 
-        # Block: gc introspection (gc.get_objects, gc.get_referrers, gc.get_referents)
+        # ---- Block: gc introspection ----
         if isinstance(node, ast.Attribute) and node.attr in (
-            "get_objects",
-            "get_referrers",
-            "get_referents",
+            "get_objects", "get_referrers", "get_referents",
         ):
             if isinstance(node.value, ast.Name) and node.value.id == "gc":
                 line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: forbidden pattern detected"
+                return False, f"Line {line}: gc introspection is forbidden"
 
-        # Block: torch backend setting modifications (deterministic, benchmark)
-        if isinstance(node, ast.Attribute) and node.attr in (
-            "deterministic",
-            "benchmark",
-        ):
+        # ---- Block: torch backend modifications ----
+        if isinstance(node, ast.Attribute) and node.attr in ("deterministic", "benchmark"):
             if isinstance(node.ctx, ast.Store):
                 line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: forbidden pattern detected"
+                return False, f"Line {line}: torch backend modification is forbidden"
 
-        # Block: torch SDP toggle calls and float32_matmul_precision
+        # ---- Block: torch SDP toggles and matmul precision ----
         if isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Attribute) and func.attr in (
@@ -409,35 +461,52 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 "set_float32_matmul_precision",
             ):
                 line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: forbidden pattern detected"
+                return False, f"Line {line}: {func.attr}() is forbidden"
 
-        # Block: dynamic code execution (exec, eval, compile, __import__)
-        # These bypass AST-level checks by running arbitrary code at runtime.
-        # torch.compile is safe (ast.Attribute, not ast.Name).
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in ("exec", "eval", "compile", "__import__"):
-                line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: {node.func.id}() is forbidden"
+        # ---- Block: dynamic code execution / introspection builtins ----
+        # Catch both bare calls like exec(...) and attribute calls like
+        # builtins.exec(...) or __builtins__['exec'](...).
+        if isinstance(node, ast.Call):
+            func = node.func
+            # Bare name call: exec(...), getattr(...), etc.
+            if isinstance(func, ast.Name):
+                if func.id in _FORBIDDEN_EXEC_NAMES:
+                    line = getattr(node, "lineno", "?")
+                    return False, f"Line {line}: {func.id}() is forbidden"
+                if func.id in _FORBIDDEN_INTROSPECTION_NAMES:
+                    line = getattr(node, "lineno", "?")
+                    return False, f"Line {line}: {func.id}() is forbidden"
+                # Block chr() — used to construct forbidden strings at runtime
+                if func.id == "chr":
+                    line = getattr(node, "lineno", "?")
+                    return False, f"Line {line}: chr() is forbidden (string obfuscation)"
+            # Attribute call: builtins.exec(...), type.__setattr__(...), etc.
+            if isinstance(func, ast.Attribute):
+                if func.attr in _FORBIDDEN_EXEC_NAMES:
+                    line = getattr(node, "lineno", "?")
+                    return False, f"Line {line}: .{func.attr}() is forbidden"
+                if func.attr in _FORBIDDEN_INTROSPECTION_NAMES:
+                    line = getattr(node, "lineno", "?")
+                    return False, f"Line {line}: .{func.attr}() is forbidden"
 
+        # ---- Block: forbidden imports ----
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name in ("ctypes", "_ctypes", "gc", "subprocess") or alias.name.startswith(
-                    "importlib"
+                if alias.name in _FORBIDDEN_MODULES or any(
+                    alias.name.startswith(p) for p in _FORBIDDEN_MODULE_PREFIXES
                 ):
                     line = getattr(node, "lineno", "?")
-                    return False, f"Line {line}: forbidden import"
+                    return False, f"Line {line}: import {alias.name} is forbidden"
 
         if isinstance(node, ast.ImportFrom) and node.module:
-            if node.module in ("ctypes", "_ctypes", "gc", "subprocess") or node.module.startswith(
-                "importlib"
+            if node.module in _FORBIDDEN_MODULES or any(
+                node.module.startswith(p) for p in _FORBIDDEN_MODULE_PREFIXES
             ):
                 line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: forbidden import"
+                return False, f"Line {line}: from {node.module} import ... is forbidden"
 
-        # Block: accessing .optimizer attribute (wrapper bypass attempt)
+        # ---- Block: accessing .optimizer attribute (wrapper bypass) ----
         if isinstance(node, ast.Attribute) and node.attr == "optimizer":
-            # Allow 'self.optimizer' inside class definitions, but block
-            # attempts to unwrap the GradientCapturingOptimizer via optimizer.optimizer
             if not (isinstance(node.value, ast.Name) and node.value.id == "self"):
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: accessing .optimizer attribute is forbidden"
@@ -449,6 +518,7 @@ _FORBIDDEN_STRINGS = [
     "__setattr__",
     "__delattr__",
     "__class__",
+    "__subclasses__",
     "perf_counter",
     "get_objects",
     "get_referrers",
@@ -466,6 +536,10 @@ _FORBIDDEN_STRINGS = [
     "__import__",
     "importlib",
     "import_module",
+    # Introspection builtins (as strings, e.g. in getattr(obj, "exec"))
+    "sys.modules",
+    "__builtins__",
+    "co_varnames",
 ]
 
 

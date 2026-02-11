@@ -1,5 +1,7 @@
 """Database abstraction layer."""
 
+from datetime import datetime
+
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -69,7 +71,12 @@ class Database:
                 await session.commit()
 
     async def update_submission_score(self, submission_id: str, final_score: float) -> None:
-        """Update submission final score."""
+        """Update submission final score.
+
+        NOTE: This only sets the score — the caller is responsible for
+        setting the status via ``update_submission_status`` so that
+        failed submissions are not accidentally marked FINISHED.
+        """
         async with self.session_factory() as session:
             result = await session.execute(
                 select(SubmissionModel).where(SubmissionModel.submission_id == submission_id)
@@ -77,7 +84,6 @@ class Database:
             submission = result.scalar_one_or_none()
             if submission:
                 submission.final_score = final_score
-                submission.status = SubmissionStatus.FINISHED
                 await session.commit()
 
     async def update_submission_code(self, submission_id: str, code: str) -> None:
@@ -142,12 +148,16 @@ class Database:
             return list(result.scalars().all())
 
     async def get_evaluating_submissions(
-        self, spec_version: int | None = None
+        self,
+        spec_version: int | None = None,
+        created_after: datetime | None = None,
     ) -> list[SubmissionModel]:
         """Get submissions currently being evaluated.
 
         Args:
             spec_version: If provided, only return submissions matching this version
+            created_after: If provided, only return submissions created after this time
+                          (start_window filter to skip stale pre-restart submissions)
         """
         async with self.session_factory() as session:
             query = select(SubmissionModel).where(
@@ -155,6 +165,8 @@ class Database:
             )
             if spec_version is not None:
                 query = query.where(SubmissionModel.spec_version == spec_version)
+            if created_after is not None:
+                query = query.where(SubmissionModel.created_at >= created_after)
             result = await session.execute(query.order_by(SubmissionModel.created_at))
             return list(result.scalars().all())
 

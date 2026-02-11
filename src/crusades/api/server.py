@@ -15,7 +15,7 @@ Endpoints:
     GET /api/stats/overview  - Dashboard overview stats
     GET /api/stats/validator - Validator status
     GET /api/stats/recent    - Recent submissions
-    GET /api/stats/history   - TPS history for charts
+    GET /api/stats/history   - MFU history for charts
     GET /api/stats/queue     - Queue statistics
     GET /api/stats/threshold - Adaptive threshold stats
     GET /leaderboard         - Leaderboard entries
@@ -24,6 +24,7 @@ Endpoints:
     GET /api/submissions/{id}/code       - Submission code
 """
 
+import hmac
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -88,10 +89,12 @@ def create_app(api_key: str | None = None) -> FastAPI:
     )
 
     # CORS - allow website to call API
+    # Using allow_credentials=False with wildcard origin is safe.
+    # If you need credentials, restrict allow_origins to specific domains.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # In production, restrict to your domain
-        allow_credentials=True,
+        allow_origins=["*"],
+        allow_credentials=False,
         allow_methods=["GET"],
         allow_headers=["*"],
     )
@@ -107,9 +110,9 @@ app = create_app()
 
 
 def verify_api_key(x_api_key: str | None = Header(None)):
-    """Verify API key if configured."""
+    """Verify API key if configured (constant-time comparison)."""
     if app.state.api_key:
-        if not x_api_key or x_api_key != app.state.api_key:
+        if not x_api_key or not hmac.compare_digest(x_api_key, app.state.api_key):
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
@@ -140,7 +143,7 @@ async def get_overview(x_api_key: str | None = Header(None)) -> dict[str, Any]:
 
     Returns:
         - submissions_24h: Submissions in last 24 hours
-        - current_top_score: Current top TPS score
+        - current_top_score: Current top MFU score
         - score_improvement_24h: Score improvement percentage
         - total_submissions: Total submissions all time
         - active_miners: Active miners in last 24h
@@ -186,9 +189,9 @@ async def get_history(
     x_api_key: str | None = Header(None),
     limit: int = Query(100, ge=1, le=1000),
 ) -> list[dict[str, Any]]:
-    """Get TPS history for charts.
+    """Get MFU history for charts.
 
-    Returns list of TPS scores over time for chart visualization.
+    Returns list of MFU scores over time for chart visualization.
     Returns the most recent `limit` data points (newest submissions).
     """
     verify_api_key(x_api_key)
@@ -208,7 +211,7 @@ async def get_queue_stats(x_api_key: str | None = Header(None)) -> dict[str, Any
         - finished_count: Completed successfully
         - failed_count: Failed submissions
         - avg_wait_time_seconds: Average wait time
-        - avg_score: Average TPS score
+        - avg_score: Average MFU score
     """
     verify_api_key(x_api_key)
     client = get_db_client()
@@ -242,7 +245,7 @@ async def get_leaderboard(
 ) -> list[dict[str, Any]]:
     """Get leaderboard entries.
 
-    Returns ranked list of top submissions by TPS score.
+    Returns ranked list of top submissions by MFU score.
     """
     verify_api_key(x_api_key)
     client = get_db_client()

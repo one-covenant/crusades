@@ -1,10 +1,10 @@
 {
-    "netuid": 3,
-    "burn_rate": 0.95,
-    "burn_uid": 1,
+    "netuid": 1,
+    "burn_rate": 1.0,
+    "burn_uid": 2,
 
-    "evaluation_runs": 5,
-    "eval_steps": 5,
+    "evaluation_runs": 2,
+    "eval_steps": 3,
     "eval_timeout": 600,
     "min_success_rate": 0.5,
 
@@ -16,9 +16,9 @@
     "benchmark_sequence_length": 1024,
     "benchmark_batch_size": 4,
 
-    "set_weights_interval_blocks": 100,
-    "reveal_blocks": 100,
-    "min_blocks_between_commits": 300,
+    "set_weights_interval_blocks": 10,
+    "reveal_blocks": 5,
+    "min_blocks_between_commits": 10,
     "block_time": 12,
 
     "docker": {
@@ -34,7 +34,9 @@
         "gpu_models": ["A100"],
         "min_gpu_memory_gb": 80,
         "cpu": "8",
-        "memory": "80Gi"
+        "memory": "80Gi",
+        "deploy_timeout": 300,
+        "max_parallel_evaluations": 5
     },
 
     "verification": {

@@ -176,15 +176,23 @@ Key settings in `hparams/hparams.json`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `netuid` | 3 | Subnet ID |
-| `evaluation_runs` | 5 | Runs per submission (median taken) |
-| `eval_steps` | 5 | Training steps per evaluation |
+| `netuid` | 1 | Subnet ID |
+| `evaluation_runs` | 2 | Runs per submission (median taken) |
+| `eval_steps` | 3 | Training steps per evaluation |
 | `benchmark_model_name` | Qwen/Qwen2.5-3B | Model for evaluation |
 | `benchmark_batch_size` | 4 | Batch size for evaluation |
 
 ---
 
-## TUI Dashboard
+## Monitoring
+
+### Grafana Dashboard
+
+Live validator metrics and logs:
+
+- **[Crusades Validator Dashboard](https://grafana.tplr.ai/d/cfc2uhde71reod/crusades-validator-uid-1?orgId=1&refresh=30s)**
+
+### TUI Dashboard
 
 Monitor crusades activity in real-time with the terminal dashboard.
 

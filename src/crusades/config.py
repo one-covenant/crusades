@@ -1,4 +1,4 @@
-"""Configuration management for templar-crusades (Chi/Affinetes Architecture)."""
+"""Configuration management for templar-crusades."""
 
 import json
 from functools import cache
@@ -91,6 +91,8 @@ class BasilicaConfig(BaseModel):
     min_gpu_memory_gb: int = 40  # Minimum GPU memory in GB
     cpu: str = "4"  # CPU cores
     memory: str = "32Gi"  # Memory limit
+    deploy_timeout: int = 300  # Max seconds to wait for deployment to become ready
+    max_parallel_evaluations: int = 5  # Max concurrent Basilica deployments
 
 
 class HParams(BaseModel):

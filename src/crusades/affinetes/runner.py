@@ -180,31 +180,36 @@ class AffinetesRunner:
         basilica_min_gpu_memory_gb: int = 40,
         basilica_cpu: str = "4",
         basilica_memory: str = "32Gi",
+        basilica_deploy_timeout: int = 300,
     ):
         """Initialize the runner.
+
+        All default values here are fallbacks — production values come from
+        hparams.json via ``BasilicaConfig`` / ``HParams``.
 
         Args:
             mode: Execution mode ("docker" for local, "basilica" for remote)
             basilica_api_key: Basilica API key (or BASILICA_API_TOKEN env var)
             docker_gpu_devices: GPU devices for Docker ("all", "0", "0,1", "none")
-            docker_memory_limit: Docker memory limit (e.g., "32g")
-            docker_shm_size: Shared memory size for Docker (e.g., "8g")
-            timeout: Evaluation timeout in seconds
+            docker_memory_limit: Docker memory limit
+            docker_shm_size: Shared memory size for Docker
+            timeout: Evaluation timeout in seconds (from ``eval_timeout`` hparam)
             model_url: Default model URL (HuggingFace model ID)
             data_url: Default data URL (HuggingFace dataset)
             max_loss_difference: Max allowed |candidate_loss - reference_loss|
-            min_params_changed_ratio: Min % params that must change
-            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.04 = 4%)
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.04 = 4%)
+            min_params_changed_ratio: Min fraction of params that must change
+            gradient_norm_ratio_max: 1 + max_relative_error for gradient check
+            weight_relative_error_max: Max relative error for final weight check
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             validator_image: Docker image for local evaluation
             basilica_image: Docker image for Basilica (must be in registry)
-            basilica_ttl_seconds: TTL for Basilica deployment (default 1 hour)
-            basilica_gpu_count: Number of GPUs (1-8)
-            basilica_gpu_models: Acceptable GPU models (e.g., ["A100", "H100"])
+            basilica_ttl_seconds: TTL for Basilica deployment
+            basilica_gpu_count: Number of GPUs
+            basilica_gpu_models: Acceptable GPU models
             basilica_min_gpu_memory_gb: Minimum GPU memory in GB
-            basilica_cpu: CPU limit (e.g., "4")
-            basilica_memory: Memory limit (e.g., "32Gi")
+            basilica_cpu: CPU limit
+            basilica_memory: Memory limit
+            basilica_deploy_timeout: Max seconds to wait for deployment readiness
         """
         self.mode = mode
         self.basilica_api_key = basilica_api_key or os.getenv("BASILICA_API_TOKEN")
@@ -231,6 +236,7 @@ class AffinetesRunner:
         self.basilica_min_gpu_memory_gb = basilica_min_gpu_memory_gb
         self.basilica_cpu = basilica_cpu
         self.basilica_memory = basilica_memory
+        self.basilica_deploy_timeout = basilica_deploy_timeout
 
         if mode == "basilica":
             if not self.basilica_api_key:
@@ -334,11 +340,16 @@ class AffinetesRunner:
         logger.info("Running Docker evaluation")
         logger.info(f"   Code size: {len(code)} bytes")
 
-        # Check if validator image exists
+        # Check if validator image exists (use async subprocess to avoid blocking)
         check_cmd = ["docker", "image", "inspect", self.validator_image]
-        check_result = subprocess.run(check_cmd, capture_output=True)
+        check_proc = await asyncio.create_subprocess_exec(
+            *check_cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await check_proc.wait()
 
-        if check_result.returncode != 0:
+        if check_proc.returncode != 0:
             return EvaluationResult.failure(
                 f"Validator image not found: {self.validator_image}. "
                 f"Build it first: cd environments/templar && docker build -t {self.validator_image} .",
@@ -358,8 +369,37 @@ class AffinetesRunner:
         # Make readable by container's non-root user
         os.chmod(train_path, 0o644)
 
-        # Create evaluation script that reads code from mounted file
-        eval_script = f'''
+        # Write eval config as JSON to avoid f-string code injection.
+        # Previously, seed/model_url/data_url were interpolated directly
+        # into Python source; a value containing " or \n would break the
+        # generated script and allow arbitrary code execution in the container.
+        eval_config = {
+            "task_id": task_id,
+            "seed": seed,
+            "model_url": model_url,
+            "data_url": data_url,
+            "steps": steps,
+            "batch_size": batch_size,
+            "sequence_length": sequence_length,
+            "data_samples": data_samples,
+            "timeout": self.timeout,
+            "max_loss_difference": self.max_loss_difference,
+            "min_params_changed_ratio": self.min_params_changed_ratio,
+            "gradient_norm_ratio_max": self.gradient_norm_ratio_max,
+            "weight_relative_error_max": self.weight_relative_error_max,
+            "gpu_peak_tflops": self.gpu_peak_tflops,
+        }
+
+        config_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, prefix="eval_config_"
+        )
+        json.dump(eval_config, config_file)
+        config_file.close()
+        config_path = config_file.name
+        os.chmod(config_path, 0o644)
+
+        # Eval script reads parameters from JSON config file — no interpolation
+        eval_script = """
 import asyncio
 import json
 import sys
@@ -368,37 +408,35 @@ sys.path.insert(0, '/app')
 from env import Actor
 
 async def main():
-    # Read miner's code
     with open('/app/scripts/miner_train.py') as f:
         code = f.read()
+    with open('/app/scripts/eval_config.json') as f:
+        cfg = json.load(f)
 
     actor = Actor()
     result = await actor.evaluate(
-        task_id={task_id},
-        seed="{seed}",
-        model_url="{model_url}",
-        data_url="{data_url}",
-        steps={steps},
-        batch_size={batch_size},
-        sequence_length={sequence_length},
-        data_samples={data_samples},
-        timeout={self.timeout},
+        task_id=cfg["task_id"],
+        seed=cfg["seed"],
+        model_url=cfg["model_url"],
+        data_url=cfg["data_url"],
+        steps=cfg["steps"],
+        batch_size=cfg["batch_size"],
+        sequence_length=cfg["sequence_length"],
+        data_samples=cfg["data_samples"],
+        timeout=cfg["timeout"],
         code=code,
-        max_loss_difference={self.max_loss_difference},
+        max_loss_difference=cfg["max_loss_difference"],
         use_random_init=True,
         min_trainable_params_ratio=1.0,
-        min_params_changed_ratio={self.min_params_changed_ratio},
-        # Gradient verification
-        gradient_norm_ratio_max={self.gradient_norm_ratio_max},
-        # Weight verification
-        weight_relative_error_max={self.weight_relative_error_max},
-        # MFU calculation
-        gpu_peak_tflops={self.gpu_peak_tflops},
+        min_params_changed_ratio=cfg["min_params_changed_ratio"],
+        gradient_norm_ratio_max=cfg["gradient_norm_ratio_max"],
+        weight_relative_error_max=cfg["weight_relative_error_max"],
+        gpu_peak_tflops=cfg["gpu_peak_tflops"],
     )
     print("EVAL_RESULT:" + json.dumps(result))
 
 asyncio.run(main())
-'''
+"""
 
         # Write eval script to temp file
         with tempfile.NamedTemporaryFile(
@@ -423,6 +461,8 @@ asyncio.run(main())
                 f"{script_path}:/app/scripts/eval_script.py:ro",
                 "-v",
                 f"{train_path}:/app/scripts/miner_train.py:ro",
+                "-v",
+                f"{config_path}:/app/scripts/eval_config.json:ro",
             ]
 
             # Add GPU if configured
@@ -537,11 +577,7 @@ asyncio.run(main())
                 async def read_stream():
                     buffer = ""
                     while True:
-                        # Read in chunks to avoid buffer limit issues with long lines
-                        chunk = await asyncio.wait_for(
-                            process.stdout.read(8192),  # 8KB chunks
-                            timeout=self.timeout + 60,
-                        )
+                        chunk = await process.stdout.read(8192)  # 8KB chunks
                         if not chunk:
                             # Process remaining buffer at end
                             if buffer:
@@ -562,8 +598,13 @@ asyncio.run(main())
                             if _should_log(line):
                                 logger.info(f"   [DOCKER] {line}")
 
-                await read_stream()
-                await process.wait()
+                # Overall wall-clock timeout for the entire evaluation.
+                # A container that continuously prints output would bypass
+                # per-chunk timeouts; this catches that case.
+                await asyncio.wait_for(
+                    asyncio.gather(read_stream(), process.wait()),
+                    timeout=self.timeout + 60,
+                )
 
             except TimeoutError:
                 process.kill()
@@ -605,11 +646,11 @@ asyncio.run(main())
             )
 
         finally:
-            try:
-                os.unlink(script_path)
-                os.unlink(train_path)
-            except Exception:
-                pass
+            for path in (script_path, train_path, config_path):
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
 
     async def _evaluate_basilica(
         self,
@@ -787,7 +828,32 @@ asyncio.run(main())
             return _basilica_deployment
 
         # Create new deployment
-        logger.info("[BASILICA] Creating NEW deployment (no valid cached deployment)")
+        deployment = await self.create_basilica_deployment(name="templar-eval")
+        if deployment is not None:
+            _basilica_deployment = deployment
+            _basilica_deployment_time = now
+
+        return deployment
+
+    async def create_basilica_deployment(self, name: str = "templar-eval"):
+        """Create a new Basilica deployment and return it.
+
+        Unlike _get_basilica_deployment(), this always creates a fresh deployment
+        and does NOT cache it globally. Use this for parallel evaluations where
+        each submission needs its own isolated GPU.
+
+        Args:
+            name: Deployment name (DNS-safe). Each concurrent deployment needs
+                  a unique name.
+
+        Returns:
+            Deployment object, or None on failure.
+        """
+        if not BASILICA_AVAILABLE:
+            logger.error("[BASILICA] SDK not installed!")
+            return None
+
+        logger.info(f"[BASILICA] Creating NEW deployment '{name}'")
         logger.info(f"   Image: {self.basilica_image}")
         logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
         logger.info(f"   Min GPU memory: {self.basilica_min_gpu_memory_gb}GB")
@@ -795,18 +861,18 @@ asyncio.run(main())
         logger.info(
             f"   TTL: {self.basilica_ttl_seconds}s ({self.basilica_ttl_seconds / 60:.0f} min)"
         )
-        logger.info("[BASILICA] Requesting GPU from Basilica... (this may take 2-5 minutes)")
+        logger.info("[BASILICA] Requesting GPU from Basilica...")
 
         try:
             deploy_start = time.time()
             client = BasilicaClient()
 
-            deployment = client.deploy(
-                name="templar-eval",
+            deployment = await client.deploy_async(
+                name=name,
                 image=self.basilica_image,
                 port=8000,
                 ttl_seconds=self.basilica_ttl_seconds,
-                timeout=300,  # Wait up to 5 min for deployment (GPU provisioning can be slow)
+                timeout=self.basilica_deploy_timeout,
                 # GPU configuration
                 gpu_count=self.basilica_gpu_count,
                 gpu_models=self.basilica_gpu_models,
@@ -817,7 +883,7 @@ asyncio.run(main())
             )
 
             deploy_time = time.time() - deploy_start
-            logger.info(f"[BASILICA] Deployment created in {deploy_time:.1f}s")
+            logger.info(f"[BASILICA] Deployment '{name}' created in {deploy_time:.1f}s")
             logger.info(f"   Deployment URL: {deployment.url}")
             if hasattr(deployment, "id"):
                 logger.info(f"   Deployment ID: {deployment.id}")
@@ -826,19 +892,142 @@ asyncio.run(main())
                 f"   TTL: {self.basilica_ttl_seconds}s (expires in {self.basilica_ttl_seconds / 60:.0f} min)"
             )
 
-            _basilica_deployment = deployment
-            _basilica_deployment_time = now
-
             return deployment
 
         except Exception as e:
-            logger.error("[BASILICA] Failed to deploy!")
+            logger.error(f"[BASILICA] Failed to deploy '{name}'!")
             logger.error(f"   Error: {e}")
             logger.error(traceback.format_exc())
             return None
 
+    async def evaluate_on_deployment(
+        self,
+        deployment,
+        code: str,
+        seed: str,
+        model_url: str,
+        data_url: str,
+        steps: int,
+        batch_size: int,
+        sequence_length: int,
+        data_samples: int,
+        task_id: int,
+    ) -> "EvaluationResult":
+        """Run evaluation on a specific Basilica deployment.
+
+        This allows running evaluations on independently-managed deployments,
+        enabling parallel evaluation of multiple submissions on separate GPUs.
+
+        Args:
+            deployment: A Basilica Deployment object (with .url)
+            code: Miner's train.py code
+            seed: Random seed
+            model_url: HuggingFace model name
+            data_url: HuggingFace dataset name
+            steps: Number of training steps
+            batch_size: Batch size
+            sequence_length: Sequence length
+            data_samples: Number of data samples
+            task_id: Evaluation task identifier
+
+        Returns:
+            EvaluationResult with MFU score
+        """
+        logger.info("=" * 60)
+        logger.info(f"[BASILICA] Evaluation on deployment: {deployment.url}")
+        logger.info(f"   Task ID: {task_id}, Seed: {seed}")
+        logger.info(f"   Code size: {len(code)} bytes")
+
+        try:
+            # Check health endpoint first
+            async with httpx.AsyncClient(timeout=30) as client:
+                try:
+                    health_response = await client.get(f"{deployment.url}/health")
+                    if health_response.status_code == 200:
+                        logger.info("[BASILICA] Health check: OK")
+                    else:
+                        logger.warning(f"[BASILICA] Health check: {health_response.status_code}")
+                except Exception as e:
+                    logger.warning(f"[BASILICA] Health check failed: {e}")
+
+            # Call the /evaluate endpoint
+            payload = {
+                "task_id": task_id,
+                "seed": seed,
+                "model_url": model_url,
+                "data_url": data_url,
+                "steps": steps,
+                "batch_size": batch_size,
+                "timeout": self.timeout,
+                "sequence_length": sequence_length,
+                "data_samples": data_samples,
+                "code": code,
+                "max_loss_difference": self.max_loss_difference,
+                "use_random_init": True,
+                "min_trainable_params_ratio": 1.0,
+                "min_params_changed_ratio": self.min_params_changed_ratio,
+                # Gradient verification
+                "gradient_norm_ratio_max": self.gradient_norm_ratio_max,
+                # Weight verification
+                "weight_relative_error_max": self.weight_relative_error_max,
+                # MFU calculation
+                "gpu_peak_tflops": self.gpu_peak_tflops,
+            }
+
+            logger.info(f"[BASILICA] POST {deployment.url}/evaluate")
+            start_time = time.time()
+
+            async with httpx.AsyncClient(timeout=self.timeout + 120) as client:
+                response = await client.post(
+                    f"{deployment.url}/evaluate",
+                    json=payload,
+                )
+
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"[BASILICA] Response received in {elapsed:.1f}s "
+                    f"(status: {response.status_code})"
+                )
+
+                if response.status_code != 200:
+                    error_text = response.text[:500]
+                    logger.error(f"[BASILICA] Evaluation failed: {error_text}")
+                    return EvaluationResult.failure(
+                        f"Basilica /evaluate error: {response.status_code} - {error_text}",
+                        task_id=task_id,
+                    )
+
+                result_data = response.json()
+                result = EvaluationResult.from_dict(result_data)
+                result.code = code
+
+                logger.info("[BASILICA] Evaluation complete!")
+                logger.info(f"   Success: {result.success}")
+                logger.info(f"   MFU: {result.mfu:.2f}%")
+                logger.info(f"   TPS: {result.tps:,.2f} tokens/second")
+                if result.diagnostics:
+                    logger.info(f"   Diagnostics: {result.diagnostics}")
+                if result.error:
+                    logger.error(f"   Error: {result.error}")
+
+                return result
+
+        except TimeoutError:
+            logger.error(f"[BASILICA] Timeout after {self.timeout}s!")
+            return EvaluationResult.failure(
+                f"Basilica timeout after {self.timeout}s",
+                task_id=task_id,
+            )
+        except Exception as e:
+            logger.error(f"[BASILICA] Error: {e}")
+            logger.error(traceback.format_exc())
+            return EvaluationResult.failure(
+                f"Basilica error: {e}",
+                task_id=task_id,
+            )
+
     async def delete_basilica_deployment(self) -> None:
-        """Delete the current Basilica deployment to ensure fresh GPU for next submission.
+        """Delete the current cached Basilica deployment.
 
         This eliminates MFU variance between fresh and reused deployments by
         ensuring every submission gets a pristine GPU state.
@@ -856,6 +1045,21 @@ asyncio.run(main())
 
         _basilica_deployment = None
         _basilica_deployment_time = 0
+
+    @staticmethod
+    async def delete_deployment(deployment) -> None:
+        """Delete a specific Basilica deployment.
+
+        Args:
+            deployment: A Basilica Deployment object to delete.
+        """
+        if deployment is None:
+            return
+        try:
+            await deployment.delete_async()
+            logger.info(f"[BASILICA] Deployment deleted: {deployment.url}")
+        except Exception as e:
+            logger.warning(f"[BASILICA] Failed to delete deployment: {e}")
 
     async def build_validator_image(self, env_path: Path | None = None) -> bool:
         """Build the validator's evaluation Docker image.

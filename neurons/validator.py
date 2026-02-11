@@ -17,6 +17,7 @@ import statistics
 import time
 import urllib.error
 import urllib.request
+from datetime import UTC
 from typing import Literal
 
 import bittensor as bt
@@ -53,7 +54,7 @@ class Validator(BaseNode):
     Responsibilities:
     1. Read miner code URL commitments from blockchain
     2. Download train.py from URL and evaluate via affinetes
-    3. Calculate and set weights (winner-takes-all)
+    3. Calculate and set weights (burn_rate to burn_uid, remainder to winner)
     """
 
     def __init__(
@@ -83,6 +84,10 @@ class Validator(BaseNode):
         # Memory cleanup tracking
         self._loop_count: int = 0
 
+        # Start window: only evaluate submissions created after this time.
+        # Prevents re-evaluating stale submissions from before a restart.
+        self._start_window: float = 0.0
+
     async def initialize(self) -> None:
         """Initialize validator components."""
         global logger
@@ -100,6 +105,15 @@ class Validator(BaseNode):
         )
 
         logger.info("Initializing validator (URL-Based Architecture)")
+
+        # Start window — only evaluate submissions created after this moment.
+        # This prevents evaluating stale submissions from before a validator restart.
+        from datetime import datetime
+
+        self._start_window = datetime.now(UTC).timestamp()
+        logger.info(
+            f"Start window set: {datetime.fromtimestamp(self._start_window, tz=UTC).isoformat()}"
+        )
 
         # Database
         self.db = await get_database()
@@ -160,6 +174,7 @@ class Validator(BaseNode):
             basilica_min_gpu_memory_gb=hparams.basilica.min_gpu_memory_gb,
             basilica_cpu=hparams.basilica.cpu,
             basilica_memory=hparams.basilica.memory,
+            basilica_deploy_timeout=hparams.basilica.deploy_timeout,
         )
 
         # Load persisted state
@@ -214,11 +229,16 @@ class Validator(BaseNode):
     async def process_blockchain_commitments(self) -> None:
         """Read and process new URL commitments from blockchain."""
         try:
-            new_commitments = self.commitment_reader.get_new_commitments_since(
-                self.last_processed_block
+            # Run blocking blockchain RPC calls in a thread to avoid blocking
+            # the event loop (these make synchronous network calls).
+            new_commitments = await asyncio.to_thread(
+                self.commitment_reader.get_new_commitments_since,
+                self.last_processed_block,
             )
 
-            current_block = self.commitment_reader.get_current_block()
+            current_block = await asyncio.to_thread(
+                self.commitment_reader.get_current_block,
+            )
 
             if new_commitments:
                 logger.info(f"Found {len(new_commitments)} new commitments")
@@ -263,7 +283,9 @@ class Validator(BaseNode):
                         )
                     except Exception as e:
                         logger.error(f"Failed to create submission for {code_url[:60]}: {e}")
-                        # Don't record URL - will retry on next cycle
+                        # URL is not recorded so it won't be skipped as "already seen",
+                        # but last_processed_block advances past this commitment's block,
+                        # so a retry only happens if the miner resubmits.
 
             self.last_processed_block = current_block
             await self._save_state()
@@ -426,27 +448,46 @@ class Validator(BaseNode):
     async def evaluate_submissions(self) -> None:
         """Evaluate submissions by downloading from code URL.
 
+        In Basilica mode, submissions are evaluated in parallel — each gets its
+        own fresh GPU deployment spun up concurrently. Concurrency is controlled
+        by ``basilica.max_parallel_evaluations`` in hparams.
+
+        In Docker mode, submissions are evaluated sequentially (single local GPU).
+
         Only evaluates submissions matching current competition version.
+        Submissions created before the validator's start_window are skipped.
         """
         hparams = get_hparams()
         competition_version = crusades.COMPETITION_VERSION
-        # Only evaluate submissions from current version
-        evaluating = await self.db.get_evaluating_submissions(spec_version=competition_version)
+
+        # Convert start_window timestamp to datetime for DB query
+        from datetime import datetime
+
+        start_window_dt = (
+            datetime.fromtimestamp(self._start_window, tz=UTC) if self._start_window > 0 else None
+        )
+
+        # Only evaluate submissions from current version, created after start window
+        evaluating = await self.db.get_evaluating_submissions(
+            spec_version=competition_version,
+            created_after=start_window_dt,
+        )
         num_runs = hparams.evaluation_runs
 
         logger.info(
-            f"Found {len(evaluating)} submissions in EVALUATING status (v{competition_version})"
+            f"Found {len(evaluating)} submissions in EVALUATING status "
+            f"(v{competition_version}, start_window={start_window_dt})"
         )
 
-        for sub_idx, submission in enumerate(evaluating):
-            # Check if we should set weights between submissions
-            # This ensures weight setting isn't blocked by long evaluation runs
-            if sub_idx > 0:
-                await self.maybe_set_weights()
+        if not evaluating:
+            return
 
+        # Prepare submissions: download code, filter invalid ones
+        prepared = []
+        for submission in evaluating:
             code_url = submission.bucket_path
 
-            if not code_url or not code_url.startswith("http"):
+            if not code_url or not code_url.startswith(("http://", "https://")):
                 logger.error(f"Invalid code URL for {submission.submission_id}: {code_url}")
                 continue
 
@@ -457,12 +498,12 @@ class Validator(BaseNode):
                 continue
 
             runs_remaining = num_runs - len(my_evals)
-            logger.info(f"Evaluating {submission.submission_id}")
+            logger.info(f"Preparing {submission.submission_id}")
             logger.info(f"   URL: {code_url[:60]}...")
-            logger.info(f"   Runs: {len(my_evals) + 1}/{num_runs}")
+            logger.info(f"   Runs remaining: {runs_remaining}")
 
-            # Download code from URL
-            success, code_or_error = self._download_from_url(code_url)
+            # Download code from URL (run in thread to avoid blocking event loop)
+            success, code_or_error = await asyncio.to_thread(self._download_from_url, code_url)
 
             if not success:
                 logger.error(f"Failed to download code: {code_or_error}")
@@ -473,73 +514,298 @@ class Validator(BaseNode):
                 )
                 continue
 
-            miner_code = code_or_error
-            logger.info(f"   Downloaded {len(miner_code)} bytes")
+            logger.info(f"   Downloaded {len(code_or_error)} bytes")
+            prepared.append((submission, code_or_error, my_evals, runs_remaining))
 
-            # Run evaluations
-            fatal_error = False
-            for run_idx in range(runs_remaining):
-                current_run = len(my_evals) + run_idx + 1
-                seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}"
+        if not prepared:
+            return
 
-                logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
+        # Parallel evaluation in Basilica mode
+        if self.affinetes_mode == "basilica":
+            await self._evaluate_submissions_parallel(prepared, hparams, num_runs)
+        else:
+            # Sequential evaluation in Docker mode (single local GPU)
+            await self._evaluate_submissions_sequential(prepared, hparams, num_runs)
 
-                result = await self.affinetes_runner.evaluate(
-                    code=miner_code,  # Pass code directly
-                    seed=seed,
-                    steps=hparams.eval_steps,
-                    batch_size=hparams.benchmark_batch_size,
-                    sequence_length=hparams.benchmark_sequence_length,
-                    data_samples=hparams.benchmark_data_samples,
-                    task_id=current_run,
-                )
+    async def _evaluate_submissions_sequential(
+        self, prepared: list, hparams, num_runs: int
+    ) -> None:
+        """Evaluate submissions one at a time (Docker mode)."""
+        for sub_idx, (submission, miner_code, my_evals, runs_remaining) in enumerate(prepared):
+            if sub_idx > 0:
+                await self.maybe_set_weights()
 
-                if result.success:
-                    logger.info(
-                        f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}"
-                    )
-                else:
-                    logger.warning(f"Run {current_run} FAILED: {result.error}")
+            fatal_error = await self._run_submission_evals(
+                submission, miner_code, my_evals, runs_remaining, num_runs, hparams
+            )
 
-                evaluation = EvaluationModel(
-                    submission_id=submission.submission_id,
-                    evaluator_hotkey=self.hotkey,
-                    mfu=result.mfu,  # MFU is primary metric
-                    tokens_per_second=result.tps,
-                    total_tokens=result.total_tokens,
-                    wall_time_seconds=result.wall_time_seconds,
-                    success=result.success,
-                    error=result.error,
-                )
-                await self.db.save_evaluation(evaluation)
-                self._cleanup_memory()
-
-                # Fatal errors are deterministic - same code will always fail the same way
-                # No point retrying, and if a previous run passed, that's a bug to investigate
-                if result.is_fatal():
-                    logger.warning(
-                        f"Fatal error detected ({result.error_code}), skipping remaining runs"
-                    )
-                    fatal_error = True
-                    break
-
-            # Delete Basilica deployment after each submission to ensure fresh GPU state
-            # for the next submission. This eliminates MFU variance between fresh/reused
-            # instances caused by CUDA graph compilation sensitivity to GPU memory state.
-            if self.affinetes_mode == "basilica":
-                await self.affinetes_runner.delete_basilica_deployment()
-
-            # Persist state (URL already recorded during commitment processing)
             await self._save_state()
-
-            # Store miner's code in database
             await self.db.update_submission_code(submission.submission_id, miner_code)
             logger.info(f"Stored code for {submission.submission_id} in database")
 
-            # Finalize submission (pass fatal_error to skip unnecessary checks)
             await self._finalize_submission(
                 submission.submission_id, num_runs, fatal_error=fatal_error
             )
+
+    async def _evaluate_submissions_parallel(self, prepared: list, hparams, num_runs: int) -> None:
+        """Evaluate submissions in parallel batches, each on its own fresh Basilica GPU.
+
+        Concurrency is controlled by ``basilica.max_parallel_evaluations`` in hparams.
+        Submissions are processed in batches of that size.  Each submission gets
+        ``evaluation_runs`` runs on its dedicated deployment.
+
+        Per-batch flow:
+        1. Deploy — spin up N GPUs concurrently (N = max_parallel_evaluations)
+        2. Evaluate — run all eval runs per submission on its GPU concurrently
+        3. Delete — tear down all N GPUs concurrently
+        4. Finalize — score and persist results
+        5. Weight check between batches via ``set_weights_interval_blocks``
+        """
+        max_parallel = hparams.basilica.max_parallel_evaluations
+
+        total_subs = len(prepared)
+        logger.info("=" * 60)
+        logger.info(
+            f"[PARALLEL] {total_subs} submissions to evaluate (max {max_parallel} concurrent)"
+        )
+        logger.info("=" * 60)
+
+        # Process in batches of max_parallel
+        for batch_start in range(0, total_subs, max_parallel):
+            batch = prepared[batch_start : batch_start + max_parallel]
+            batch_num = batch_start // max_parallel + 1
+            total_batches = (total_subs + max_parallel - 1) // max_parallel
+            batch_size = len(batch)
+
+            logger.info(f"[PARALLEL] Batch {batch_num}/{total_batches}: {batch_size} submissions")
+
+            # --- Step 1: Deploy all GPUs in this batch concurrently ---
+            deploy_start = time.time()
+            deploy_tasks = [
+                self.affinetes_runner.create_basilica_deployment(
+                    name=f"templar-eval-{batch_start + idx:02d}"
+                )
+                for idx in range(batch_size)
+            ]
+            deployments = await asyncio.gather(*deploy_tasks, return_exceptions=True)
+            deploy_elapsed = time.time() - deploy_start
+
+            # Pair submissions with their deployments
+            batch_items = []
+            for idx, (
+                (submission, miner_code, my_evals, runs_remaining),
+                deploy_result,
+            ) in enumerate(zip(batch, deployments)):
+                if isinstance(deploy_result, Exception):
+                    logger.error(
+                        f"[PARALLEL] Deployment {batch_start + idx} failed: {deploy_result}"
+                    )
+                    deployment = None
+                elif deploy_result is None:
+                    logger.error(f"[PARALLEL] Deployment {batch_start + idx} returned None")
+                    deployment = None
+                else:
+                    logger.info(
+                        f"[PARALLEL] Deployment {batch_start + idx} ready: {deploy_result.url}"
+                    )
+                    deployment = deploy_result
+
+                batch_items.append((submission, miner_code, my_evals, runs_remaining, deployment))
+
+            successful = sum(1 for *_, d in batch_items if d is not None)
+            logger.info(
+                f"[PARALLEL] {successful}/{batch_size} deployments ready in {deploy_elapsed:.1f}s"
+            )
+
+            # --- Step 2: Run all evaluations concurrently ---
+            eval_start = time.time()
+            eval_tasks = [
+                self._run_submission_evals_on_deployment(
+                    submission,
+                    miner_code,
+                    my_evals,
+                    runs_remaining,
+                    num_runs,
+                    hparams,
+                    deployment,
+                )
+                for submission, miner_code, my_evals, runs_remaining, deployment in batch_items
+            ]
+            eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
+            eval_elapsed = time.time() - eval_start
+
+            logger.info(f"[PARALLEL] Batch {batch_num} evaluations done in {eval_elapsed:.1f}s")
+
+            # --- Step 3: Delete all deployments concurrently ---
+            active_deployments = [d for *_, d in batch_items if d is not None]
+            if active_deployments:
+                logger.info(f"[PARALLEL] Deleting {len(active_deployments)} deployments...")
+                delete_tasks = [AffinetesRunner.delete_deployment(d) for d in active_deployments]
+                await asyncio.gather(*delete_tasks, return_exceptions=True)
+                logger.info("[PARALLEL] Deployments deleted")
+
+            # --- Step 4: Finalize all submissions in this batch ---
+            for idx, (submission, miner_code, *_, _dep) in enumerate(batch_items):
+                fatal_error = False
+                if isinstance(eval_results[idx], Exception):
+                    logger.error(
+                        f"[PARALLEL] Eval task for {submission.submission_id} "
+                        f"raised: {eval_results[idx]}"
+                    )
+                    fatal_error = True
+                elif isinstance(eval_results[idx], bool):
+                    fatal_error = eval_results[idx]
+
+                await self.db.update_submission_code(submission.submission_id, miner_code)
+                await self._finalize_submission(
+                    submission.submission_id, num_runs, fatal_error=fatal_error
+                )
+
+            await self._save_state()
+
+            # Memory cleanup after each batch (free httpx clients, response data, etc.)
+            self._cleanup_memory()
+
+            # Check if we should set weights between batches
+            if batch_start + max_parallel < total_subs:
+                await self.maybe_set_weights()
+
+    async def _run_submission_evals_on_deployment(
+        self,
+        submission,
+        miner_code: str,
+        my_evals: list,
+        runs_remaining: int,
+        num_runs: int,
+        hparams,
+        deployment,
+    ) -> bool:
+        """Run all evaluation runs for a submission on a specific Basilica deployment.
+
+        Returns True if a fatal error was encountered.
+        """
+        if deployment is None:
+            logger.error(f"[PARALLEL] No deployment for {submission.submission_id}, marking fatal")
+            return True
+
+        model_url = hparams.benchmark_model_name
+        data_url = hparams.benchmark_dataset_name
+
+        fatal_error = False
+        for run_idx in range(runs_remaining):
+            current_run = len(my_evals) + run_idx + 1
+            seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}"
+
+            logger.info(
+                f"[{submission.submission_id[:8]}] Run {current_run}/{num_runs} (seed: {seed})"
+            )
+
+            result = await self.affinetes_runner.evaluate_on_deployment(
+                deployment=deployment,
+                code=miner_code,
+                seed=seed,
+                model_url=model_url,
+                data_url=data_url,
+                steps=hparams.eval_steps,
+                batch_size=hparams.benchmark_batch_size,
+                sequence_length=hparams.benchmark_sequence_length,
+                data_samples=hparams.benchmark_data_samples,
+                task_id=current_run,
+            )
+
+            if result.success:
+                logger.info(
+                    f"[{submission.submission_id[:8]}] "
+                    f"Run {current_run} PASSED: MFU={result.mfu:.2f}%"
+                )
+            else:
+                logger.warning(
+                    f"[{submission.submission_id[:8]}] Run {current_run} FAILED: {result.error}"
+                )
+
+            evaluation = EvaluationModel(
+                submission_id=submission.submission_id,
+                evaluator_hotkey=self.hotkey,
+                mfu=result.mfu,
+                tokens_per_second=result.tps,
+                total_tokens=result.total_tokens,
+                wall_time_seconds=result.wall_time_seconds,
+                success=result.success,
+                error=result.error,
+            )
+            await self.db.save_evaluation(evaluation)
+
+            if result.is_fatal():
+                logger.warning(
+                    f"[{submission.submission_id[:8]}] "
+                    f"Fatal error ({result.error_code}), skipping remaining runs"
+                )
+                fatal_error = True
+                break
+
+        return fatal_error
+
+    async def _run_submission_evals(
+        self,
+        submission,
+        miner_code: str,
+        my_evals: list,
+        runs_remaining: int,
+        num_runs: int,
+        hparams,
+    ) -> bool:
+        """Run all evaluation runs for a submission (Docker mode, sequential).
+
+        Each submission receives ``evaluation_runs`` (from hparams) total runs.
+        Runs already completed (tracked via ``my_evals``) are skipped.
+
+        Returns True if a fatal error was encountered.
+        """
+        fatal_error = False
+        for run_idx in range(runs_remaining):
+            current_run = len(my_evals) + run_idx + 1
+            seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}"
+
+            logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
+
+            result = await self.affinetes_runner.evaluate(
+                code=miner_code,
+                seed=seed,
+                steps=hparams.eval_steps,
+                batch_size=hparams.benchmark_batch_size,
+                sequence_length=hparams.benchmark_sequence_length,
+                data_samples=hparams.benchmark_data_samples,
+                task_id=current_run,
+            )
+
+            if result.success:
+                logger.info(
+                    f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}"
+                )
+            else:
+                logger.warning(f"Run {current_run} FAILED: {result.error}")
+
+            evaluation = EvaluationModel(
+                submission_id=submission.submission_id,
+                evaluator_hotkey=self.hotkey,
+                mfu=result.mfu,
+                tokens_per_second=result.tps,
+                total_tokens=result.total_tokens,
+                wall_time_seconds=result.wall_time_seconds,
+                success=result.success,
+                error=result.error,
+            )
+            await self.db.save_evaluation(evaluation)
+            self._cleanup_memory()
+
+            if result.is_fatal():
+                logger.warning(
+                    f"Fatal error detected ({result.error_code}), skipping remaining runs"
+                )
+                fatal_error = True
+                break
+
+        return fatal_error
 
     async def _finalize_submission(
         self, submission_id: str, num_runs: int, fatal_error: bool = False
@@ -859,7 +1125,7 @@ class Validator(BaseNode):
             if stored_version != current_version:
                 # Get current block to start fresh from NOW (ignore old commitments)
                 try:
-                    current_block = self.chain.subtensor.get_current_block()
+                    current_block = await asyncio.to_thread(self.chain.subtensor.get_current_block)
                 except Exception as e:
                     # Cannot determine current block - defer version reset to avoid
                     # reprocessing all historical commitments from block 0
@@ -909,6 +1175,19 @@ class Validator(BaseNode):
     async def _save_state(self) -> None:
         """Persist validator state to database."""
         try:
+            # Prune old entries from evaluated_code_urls to prevent unbounded growth.
+            # Keep entries from the last 10,000 blocks (~33 hours at 12s/block).
+            max_url_age_blocks = 10_000
+            if self.last_processed_block > max_url_age_blocks:
+                cutoff = self.last_processed_block - max_url_age_blocks
+                before = len(self.evaluated_code_urls)
+                self.evaluated_code_urls = {
+                    url: info for url, info in self.evaluated_code_urls.items() if info[0] >= cutoff
+                }
+                pruned = before - len(self.evaluated_code_urls)
+                if pruned > 0:
+                    logger.info(f"Pruned {pruned} old entries from evaluated_code_urls")
+
             await self.db.set_validator_state(
                 "competition_version", str(crusades.COMPETITION_VERSION)
             )
