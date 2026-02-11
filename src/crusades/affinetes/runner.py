@@ -180,31 +180,36 @@ class AffinetesRunner:
         basilica_min_gpu_memory_gb: int = 40,
         basilica_cpu: str = "4",
         basilica_memory: str = "32Gi",
+        basilica_deploy_timeout: int = 300,
     ):
         """Initialize the runner.
+
+        All default values here are fallbacks — production values come from
+        hparams.json via ``BasilicaConfig`` / ``HParams``.
 
         Args:
             mode: Execution mode ("docker" for local, "basilica" for remote)
             basilica_api_key: Basilica API key (or BASILICA_API_TOKEN env var)
             docker_gpu_devices: GPU devices for Docker ("all", "0", "0,1", "none")
-            docker_memory_limit: Docker memory limit (e.g., "32g")
-            docker_shm_size: Shared memory size for Docker (e.g., "8g")
-            timeout: Evaluation timeout in seconds
+            docker_memory_limit: Docker memory limit
+            docker_shm_size: Shared memory size for Docker
+            timeout: Evaluation timeout in seconds (from ``eval_timeout`` hparam)
             model_url: Default model URL (HuggingFace model ID)
             data_url: Default data URL (HuggingFace dataset)
             max_loss_difference: Max allowed |candidate_loss - reference_loss|
-            min_params_changed_ratio: Min % params that must change
-            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.04 = 4%)
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.04 = 4%)
+            min_params_changed_ratio: Min fraction of params that must change
+            gradient_norm_ratio_max: 1 + max_relative_error for gradient check
+            weight_relative_error_max: Max relative error for final weight check
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             validator_image: Docker image for local evaluation
             basilica_image: Docker image for Basilica (must be in registry)
-            basilica_ttl_seconds: TTL for Basilica deployment (default 1 hour)
-            basilica_gpu_count: Number of GPUs (1-8)
-            basilica_gpu_models: Acceptable GPU models (e.g., ["A100", "H100"])
+            basilica_ttl_seconds: TTL for Basilica deployment
+            basilica_gpu_count: Number of GPUs
+            basilica_gpu_models: Acceptable GPU models
             basilica_min_gpu_memory_gb: Minimum GPU memory in GB
-            basilica_cpu: CPU limit (e.g., "4")
-            basilica_memory: Memory limit (e.g., "32Gi")
+            basilica_cpu: CPU limit
+            basilica_memory: Memory limit
+            basilica_deploy_timeout: Max seconds to wait for deployment readiness
         """
         self.mode = mode
         self.basilica_api_key = basilica_api_key or os.getenv("BASILICA_API_TOKEN")
@@ -231,6 +236,7 @@ class AffinetesRunner:
         self.basilica_min_gpu_memory_gb = basilica_min_gpu_memory_gb
         self.basilica_cpu = basilica_cpu
         self.basilica_memory = basilica_memory
+        self.basilica_deploy_timeout = basilica_deploy_timeout
 
         if mode == "basilica":
             if not self.basilica_api_key:
@@ -820,7 +826,7 @@ asyncio.run(main())
         logger.info(
             f"   TTL: {self.basilica_ttl_seconds}s ({self.basilica_ttl_seconds / 60:.0f} min)"
         )
-        logger.info("[BASILICA] Requesting GPU from Basilica... (this may take 2-5 minutes)")
+        logger.info("[BASILICA] Requesting GPU from Basilica...")
 
         try:
             deploy_start = time.time()
@@ -831,7 +837,7 @@ asyncio.run(main())
                 image=self.basilica_image,
                 port=8000,
                 ttl_seconds=self.basilica_ttl_seconds,
-                timeout=300,  # Wait up to 5 min for deployment
+                timeout=self.basilica_deploy_timeout,
                 # GPU configuration
                 gpu_count=self.basilica_gpu_count,
                 gpu_models=self.basilica_gpu_models,

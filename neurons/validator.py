@@ -174,6 +174,7 @@ class Validator(BaseNode):
             basilica_min_gpu_memory_gb=hparams.basilica.min_gpu_memory_gb,
             basilica_cpu=hparams.basilica.cpu,
             basilica_memory=hparams.basilica.memory,
+            basilica_deploy_timeout=hparams.basilica.deploy_timeout,
         )
 
         # Load persisted state
@@ -441,13 +442,13 @@ class Validator(BaseNode):
         """Evaluate submissions by downloading from code URL.
 
         In Basilica mode, submissions are evaluated in parallel — each gets its
-        own fresh GPU deployment spun up concurrently. This dramatically reduces
-        total evaluation time (e.g. 15 submissions that each take 5 min go from
-        75 min sequential to ~5 min parallel).
+        own fresh GPU deployment spun up concurrently. Concurrency is controlled
+        by ``basilica.max_parallel_evaluations`` in hparams.
 
         In Docker mode, submissions are evaluated sequentially (single local GPU).
 
         Only evaluates submissions matching current competition version.
+        Submissions created before the validator's start_window are skipped.
         """
         hparams = get_hparams()
         competition_version = crusades.COMPETITION_VERSION
@@ -456,9 +457,7 @@ class Validator(BaseNode):
         from datetime import datetime
 
         start_window_dt = (
-            datetime.fromtimestamp(self._start_window, tz=UTC)
-            if self._start_window > 0
-            else None
+            datetime.fromtimestamp(self._start_window, tz=UTC) if self._start_window > 0 else None
         )
 
         # Only evaluate submissions from current version, created after start window
@@ -544,14 +543,16 @@ class Validator(BaseNode):
     async def _evaluate_submissions_parallel(self, prepared: list, hparams, num_runs: int) -> None:
         """Evaluate submissions in parallel batches, each on its own fresh Basilica GPU.
 
-        Concurrency is controlled by basilica.max_parallel_evaluations in hparams.
-        Submissions are processed in batches of that size.
+        Concurrency is controlled by ``basilica.max_parallel_evaluations`` in hparams.
+        Submissions are processed in batches of that size.  Each submission gets
+        ``evaluation_runs`` runs on its dedicated deployment.
 
         Per-batch flow:
-        1. Deploy — spin up N GPUs concurrently
+        1. Deploy — spin up N GPUs concurrently (N = max_parallel_evaluations)
         2. Evaluate — run all eval runs per submission on its GPU concurrently
         3. Delete — tear down all N GPUs concurrently
         4. Finalize — score and persist results
+        5. Weight check between batches via ``set_weights_interval_blocks``
         """
         max_parallel = hparams.basilica.max_parallel_evaluations
 
@@ -655,6 +656,9 @@ class Validator(BaseNode):
 
             await self._save_state()
 
+            # Memory cleanup after each batch (free httpx clients, response data, etc.)
+            self._cleanup_memory()
+
             # Check if we should set weights between batches
             if batch_start + max_parallel < total_subs:
                 await self.maybe_set_weights()
@@ -744,6 +748,9 @@ class Validator(BaseNode):
         hparams,
     ) -> bool:
         """Run all evaluation runs for a submission (Docker mode, sequential).
+
+        Each submission receives ``evaluation_runs`` (from hparams) total runs.
+        Runs already completed (tracked via ``my_evals``) are skipped.
 
         Returns True if a fatal error was encountered.
         """
