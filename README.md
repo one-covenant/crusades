@@ -42,6 +42,7 @@
 # Clone and setup
 git clone https://github.com/one-covenant/crusades
 cd crusades
+curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 
 # Create .env (for HuggingFace access)

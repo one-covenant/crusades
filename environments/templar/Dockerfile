@@ -8,12 +8,21 @@ RUN apt-get update && apt-get install -y \
     git curl ca-certificates build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# NOTE: build-essential is needed for pip install (some packages compile C extensions).
+# It is removed AFTER pip install below to prevent miner code from compiling
+# arbitrary native code via torch.utils.cpp_extension or similar.
+
 RUN useradd -m -s /bin/bash appuser
 WORKDIR /app
 
 COPY --chown=appuser:appuser environments/templar/requirements.txt /app/
 USER appuser
 RUN pip install --no-cache-dir --user -r requirements.txt
+
+# Remove build tools so miner code cannot compile native extensions at runtime
+USER root
+RUN apt-get purge -y build-essential gcc g++ make cpp && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+USER appuser
 
 # Copy hparams and download model/dataset based on config
 COPY --chown=appuser:appuser hparams/hparams.json /app/
