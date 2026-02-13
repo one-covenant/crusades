@@ -455,8 +455,6 @@ asyncio.run(main())
                     "--read-only",
                     "--pids-limit",
                     "1024",
-                    "--cpus",
-                    "4",
                     # Writable /tmp for temporary files (exec needed for torch.compile)
                     "--tmpfs",
                     "/tmp:rw,exec,nosuid,size=4g",
