@@ -47,9 +47,8 @@ logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("datasets").setLevel(logging.WARNING)
 
-# Saved references for use in evaluation timing
 _perf_counter = time.perf_counter
-_monotonic = time.monotonic  # Independent cross-validation timer
+_monotonic = time.monotonic
 _cuda_synchronize = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
 
 # Configuration from environment variables
@@ -101,24 +100,11 @@ _CACHE = {
 
 
 def _load_miner_module(train_path: Path):
-    """Dynamically load miner's train.py as a module.
-
-    Hides sensitive modules from sys.modules during miner code loading
-    to prevent monkey-patching of validator internals (e.g. _perf_counter).
-
-    Args:
-        train_path: Path to train.py
-
-    Returns:
-        Loaded module with inner_steps function
-    """
+    """Load miner's train.py as a module in an isolated context."""
     spec = importlib.util.spec_from_file_location("miner_train", train_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load {train_path}")
 
-    # Hide sensitive modules from sys.modules during miner code execution.
-    # This prevents miner code from using sys.modules to access and
-    # monkey-patch validator internals (e.g. env._perf_counter).
     _hidden_modules = {}
     _sensitive_keys = [k for k in sys.modules if k == "env" or k.endswith(".env") or k == __name__]
     for key in _sensitive_keys:
@@ -129,7 +115,6 @@ def _load_miner_module(train_path: Path):
         sys.modules["miner_train"] = module
         spec.loader.exec_module(module)
     finally:
-        # Restore hidden modules regardless of success/failure
         sys.modules.update(_hidden_modules)
 
     return module
@@ -145,19 +130,14 @@ def _reset_torch_state():
     torch.set_grad_enabled(True)
     torch.set_default_dtype(torch.float32)
 
-    # Clear torch.compile caches (miner code may have used torch.compile,
-    # which holds references to model tensors and compiled graphs)
     try:
         torch._dynamo.reset()
     except Exception:
         pass
 
-    # Remove miner module from sys.modules to release all references
-    # (closures, compiled functions, global state in the miner's code)
     if "miner_train" in sys.modules:
         del sys.modules["miner_train"]
 
-    # Restore saved references (in case miner code tampered with them)
     time.perf_counter = _perf_counter
     time.monotonic = _monotonic
     if torch.cuda.is_available():
@@ -166,21 +146,6 @@ def _reset_torch_state():
     logger.debug("Torch state reset complete")
 
 
-# Canonical backend settings used during reference and timed evaluation.
-# Both runs MUST use identical settings so gradients/weights can be compared.
-#
-# NOTE on determinism vs performance:
-# - cudnn.deterministic=False and cudnn.benchmark=True allow cuDNN to
-#   auto-tune and use faster (non-deterministic) algorithms.
-# - For BF16 transformer training, reproducibility comes from matching
-#   seeds, data, and model state — NOT from cuDNN determinism (transformers
-#   use mostly cuBLAS matmuls, not cuDNN convolutions).
-# - float32_matmul_precision="high" enables TF32 tensor cores for the
-#   small amount of FP32 compute (loss, layernorm). This is standard in
-#   all major training frameworks and does not meaningfully affect
-#   gradient/weight verification (which already has tolerance thresholds).
-# - Both reference and miner runs use identical settings, so any
-#   non-determinism cancels out in the comparison.
 _REFERENCE_BACKEND_STATE = {
     "cudnn.deterministic": False,
     "cudnn.benchmark": True,
@@ -193,13 +158,10 @@ _REFERENCE_BACKEND_STATE = {
 
 
 def _enforce_backend_state():
-    """Set all torch backend settings to the canonical reference values."""
+    """Set torch backend settings to canonical values."""
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.allow_tf32 = True
-    # "high" enables TF32 tensor cores for FP32 matmuls (~3x faster than
-    # "highest" for ops like loss computation and layernorm).
-    # This is standard practice for BF16 training (PaLM, LLaMA, etc.)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
@@ -207,10 +169,7 @@ def _enforce_backend_state():
 
 
 def _check_backend_state() -> list[str]:
-    """Check all torch backend settings against canonical reference values.
-
-    Returns a list of setting names that were tampered with (empty if all OK).
-    """
+    """Check torch backend settings. Returns list of violations."""
     violations = []
     if torch.backends.cudnn.deterministic:
         violations.append("cudnn.deterministic")
@@ -375,12 +334,7 @@ def _set_deterministic(seed: int) -> None:
 
 
 def _collect_main_guard_nodes(tree: ast.AST) -> set[int]:
-    """Collect AST node IDs inside `if __name__ == "__main__":` blocks.
-
-    These blocks only execute when the file is run directly, never when
-    imported by the validator. Scanning them would reject legitimate local
-    testing code (print, open, time.perf_counter, etc.).
-    """
+    """Collect AST node IDs inside `if __name__ == "__main__":` blocks."""
     skip_ids: set[int] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.If):
@@ -410,19 +364,12 @@ def _collect_main_guard_nodes(tree: ast.AST) -> set[int]:
 
 
 def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
-    """AST scan to reject forbidden code patterns.
-
-    Skips nodes inside `if __name__ == "__main__":` blocks since they
-    never execute when the module is imported by the validator.
-    """
+    """AST scan to reject forbidden code patterns."""
     main_guard_nodes = _collect_main_guard_nodes(tree)
     for node in ast.walk(tree):
         if id(node) in main_guard_nodes:
             continue
 
-        # Block: reassignment of __name__ — a miner could write
-        # __name__ = "__main__" to force the if-__main__ block to execute,
-        # bypassing all security checks that are skipped in that block.
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == "__name__":
@@ -450,9 +397,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
-        # Block: time.monotonic access — this is the authoritative timer for MFU.
-        # Without this, a miner could monkey-patch time.monotonic to report less
-        # wall time and inflate their MFU score.
         if isinstance(node, ast.Attribute) and node.attr == "monotonic":
             if isinstance(node.value, ast.Name) and node.value.id == "time":
                 line = getattr(node, "lineno", "?")
@@ -469,7 +413,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
-        # Block: gc introspection (gc.get_objects, gc.get_referrers, gc.get_referents)
         if isinstance(node, ast.Attribute) and node.attr in (
             "get_objects",
             "get_referrers",
@@ -479,7 +422,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
-        # Block: torch backend setting modifications (deterministic, benchmark)
         if isinstance(node, ast.Attribute) and node.attr in (
             "deterministic",
             "benchmark",
@@ -488,7 +430,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
-        # Block: torch SDP toggle calls and float32_matmul_precision
         if isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Attribute) and func.attr in (
@@ -500,12 +441,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
-        # Block: dynamic code execution (exec, eval, compile, __import__)
-        # These bypass AST-level checks by running arbitrary code at runtime.
-        # Must block both as bare Name calls (exec(...)) and as Attribute
-        # calls (builtins.exec(...), module.eval(...)).
-        # torch.compile is safe — it's "compile" on an ast.Attribute where
-        # the value is torch, not a bare Name.
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
                 if node.func.id in ("exec", "eval", "compile", "__import__"):
@@ -515,7 +450,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 if node.func.attr in ("exec", "eval", "__import__"):
                     line = getattr(node, "lineno", "?")
                     return False, f"Line {line}: .{node.func.attr}() is forbidden"
-                # Block .compile() except torch.compile (legitimate use)
                 if node.func.attr == "compile":
                     if not (
                         isinstance(node.func.value, ast.Name) and node.func.value.id == "torch"
@@ -526,35 +460,33 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                             f"Line {line}: .compile() is forbidden (only torch.compile is allowed)",
                         )
 
-        # Forbidden module list — these provide capabilities that miner code
-        # should never need and can be used to escape the sandbox.
         _forbidden_modules = {
             "ctypes",
-            "_ctypes",  # FFI / native memory access
-            "gc",  # garbage collector introspection
-            "subprocess",  # shell command execution
-            "sys",  # sys.modules, sys.path manipulation
-            "os",  # OS-level file/process operations
-            "pathlib",  # Path.read_text()/write_text() bypass open() block
-            "io",  # file I/O streams
-            "socket",  # network access
-            "http",  # HTTP client/server
-            "urllib",  # URL fetching
-            "requests",  # HTTP library
-            "shutil",  # file operations
-            "tempfile",  # temp file creation
-            "signal",  # signal handling
-            "threading",  # thread creation
-            "multiprocessing",  # process creation
-            "inspect",  # frame/code introspection
-            "ast",  # AST manipulation (meta-attacks)
-            "dis",  # bytecode disassembly
-            "code",  # interactive interpreter
-            "codeop",  # code compilation
-            "compileall",  # byte-compilation
-            "pickle",  # arbitrary code exec via deserialization
-            "shelve",  # pickle-based storage
-            "marshal",  # code object serialization
+            "_ctypes",
+            "gc",
+            "subprocess",
+            "sys",
+            "os",
+            "pathlib",
+            "io",
+            "socket",
+            "http",
+            "urllib",
+            "requests",
+            "shutil",
+            "tempfile",
+            "signal",
+            "threading",
+            "multiprocessing",
+            "inspect",
+            "ast",
+            "dis",
+            "code",
+            "codeop",
+            "compileall",
+            "pickle",
+            "shelve",
+            "marshal",
         }
 
         if isinstance(node, ast.Import):
@@ -579,35 +511,29 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden import"
 
-        # Block: dynamic attribute access, reflection, and string construction
-        # builtins. These allow monkey-patching validator internals, discovering
-        # objects at runtime, or constructing forbidden strings dynamically.
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in (
                 "setattr",
                 "getattr",
-                "delattr",  # direct attribute manipulation
+                "delattr",
                 "vars",
-                "dir",  # object introspection
+                "dir",
                 "globals",
-                "locals",  # scope introspection
-                "type",  # metaclass access / type creation
-                "memoryview",  # raw memory access
-                "open",  # file I/O
+                "locals",
+                "type",
+                "memoryview",
+                "open",
                 "chr",
-                "ord",  # string construction from ints (evades string scanner)
-                "breakpoint",  # debugger access
-                "input",  # stdin access
+                "ord",
+                "breakpoint",
+                "input",
                 "classmethod",
-                "staticmethod",  # descriptor manipulation
-                "property",  # descriptor creation
+                "staticmethod",
+                "property",
             ):
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: {node.func.id}() is forbidden"
 
-        # Block: accessing __builtins__ as a bare name OR as an attribute.
-        # e.g. torch.__builtins__ returns the builtins module, which gives
-        # access to exec/eval/setattr/getattr bypassing all other checks.
         if isinstance(node, ast.Name) and node.id == "__builtins__":
             line = getattr(node, "lineno", "?")
             return False, f"Line {line}: __builtins__ access is forbidden"
@@ -615,31 +541,29 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             line = getattr(node, "lineno", "?")
             return False, f"Line {line}: __builtins__ access is forbidden"
 
-        # Block: accessing sys.modules (miner can reach validator modules)
         if isinstance(node, ast.Attribute) and node.attr == "modules":
             if isinstance(node.value, ast.Name) and node.value.id in ("sys", "_sys"):
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
-        # Block: accessing __dict__ on any object (bypasses getattr restrictions)
         if isinstance(node, ast.Attribute) and node.attr == "__dict__":
             line = getattr(node, "lineno", "?")
             return False, f"Line {line}: __dict__ access is forbidden"
 
-        # Block: accessing __globals__ or __code__ on functions (can reach module scope)
         if isinstance(node, ast.Attribute) and node.attr in (
             "__globals__",
             "__code__",
             "__func__",
             "__self__",
+            "__subclasses__",
+            "__bases__",
+            "__mro__",
+            "__init_subclass__",
         ):
             line = getattr(node, "lineno", "?")
             return False, f"Line {line}: forbidden pattern detected"
 
-        # Block: accessing .optimizer attribute (wrapper bypass attempt)
         if isinstance(node, ast.Attribute) and node.attr == "optimizer":
-            # Allow 'self.optimizer' inside class definitions, but block
-            # attempts to unwrap the GradientCapturingOptimizer via optimizer.optimizer
             if not (isinstance(node.value, ast.Name) and node.value.id == "self"):
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: accessing .optimizer attribute is forbidden"
@@ -651,6 +575,9 @@ _FORBIDDEN_STRINGS = [
     "__setattr__",
     "__delattr__",
     "__class__",
+    "__subclasses__",
+    "__bases__",
+    "__mro__",
     "perf_counter",
     "_perf_counter",
     "get_objects",
@@ -665,11 +592,9 @@ _FORBIDDEN_STRINGS = [
     "_grad_snapshot_gpu",
     "step_count",
     "GradientCapturingOptimizer",
-    # Dynamic code execution / import bypasses
     "__import__",
     "importlib",
     "import_module",
-    # Module/attribute manipulation (used to monkey-patch validator internals)
     "sys.modules",
     "setattr",
     "getattr",
@@ -680,6 +605,7 @@ _FORBIDDEN_STRINGS = [
     "__code__",
     "__func__",
     "__self__",
+    "__init_subclass__",
     "globals",
     "locals",
     "_cuda_synchronize",
@@ -707,9 +633,6 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
     except SyntaxError as exc:
         return False, f"Syntax error at line {exc.lineno}: {exc.msg}"
 
-    # Strip `if __name__ == "__main__":` blocks before security scanning.
-    # These blocks are for local testing only and never execute during
-    # evaluation (the validator imports inner_steps, it doesn't run __main__).
     scan_tree = ast.Module(
         body=[node for node in tree.body if not _is_main_guard(node)],
         type_ignores=tree.type_ignores,
@@ -719,7 +642,6 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
     if not safe:
         return False, f"Security violation: {danger_error}"
 
-    # Scan string literals for forbidden patterns (also skip __main__ blocks)
     for node in ast.walk(scan_tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             for pattern in _FORBIDDEN_STRINGS:
@@ -729,9 +651,6 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                         f"Security violation: Line {line}: forbidden string pattern detected"
                     )
 
-    # Detect byte-array string construction: bytes([...]).decode() or
-    # b"...".decode() used to build forbidden strings at runtime and evade
-    # the string-literal scanner above.
     for node in ast.walk(scan_tree):
         if (
             isinstance(node, ast.Call)
@@ -739,14 +658,11 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
             and node.func.attr == "decode"
         ):
             inner = node.func.value
-            # bytes([int, int, ...]).decode()
             if (
                 isinstance(inner, ast.Call)
                 and isinstance(inner.func, ast.Name)
                 and inner.func.id in ("bytes", "bytearray")
             ):
-                # Try to statically evaluate the byte array by extracting
-                # integer constants from the argument list, e.g. bytes([95, 112, ...])
                 try:
                     if inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List):
                         int_values = []
@@ -765,17 +681,14 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                     else:
                         raise ValueError("not a simple bytes([int, ...]) pattern")
                 except (ValueError, UnicodeDecodeError):
-                    # If we can't evaluate statically, block it conservatively
                     line = getattr(node, "lineno", "?")
                     return False, (
                         f"Security violation: Line {line}: dynamic bytes().decode() construction is forbidden"
                     )
-            # b"literal".decode()
             elif isinstance(inner, ast.Constant) and isinstance(inner.value, bytes):
                 try:
                     decoded_str = inner.value.decode()
                 except UnicodeDecodeError:
-                    # Invalid UTF-8 can't contain forbidden strings; skip
                     continue
                 for pattern in _FORBIDDEN_STRINGS:
                     if pattern in decoded_str:
@@ -1116,19 +1029,7 @@ def _create_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
 
 
 class GradientCapturingOptimizer:
-    """Optimizer wrapper that snapshots gradients on the final step.
-
-    On the last step, clones gradient tensors on GPU (fast, ~3ms) before
-    optimizer.step() clears them. The slow CPU transfer + norm computation
-    happens AFTER the timer stops via finalize_gradients().
-
-    This keeps the timed section free of validator overhead.
-    Read-only after initialization.
-
-    Security: __getattribute__ blocks access to private internals (_opt_impl,
-    _grad_snapshot_gpu) so miners cannot introspect the wrapper via getattr()
-    or dir(). Internal methods use object.__getattribute__() to bypass the guard.
-    """
+    """Optimizer wrapper for gradient verification."""
 
     __slots__ = (
         "_opt_impl",
@@ -1140,8 +1041,6 @@ class GradientCapturingOptimizer:
         "_initialized",
     )
 
-    # Attributes accessible to miner code. Everything else starting with "_"
-    # (except dunder methods) is blocked by __getattribute__.
     _PUBLIC_ATTRS = frozenset(
         {
             "step",
@@ -1174,27 +1073,15 @@ class GradientCapturingOptimizer:
         object.__setattr__(self, "_initialized", True)
 
     def __getattribute__(self, name):
-        """Guard access to private internals.
-
-        Allows: public attrs, dunder methods (__class__, __repr__, etc.),
-        and non-underscore names (forwarded via __getattr__).
-        Blocks: _opt_impl, _grad_snapshot_gpu, _initialized, and any
-        other single-underscore private attr.
-        """
-        # Always allow dunder attrs (Python internals need them)
         if name.startswith("__") and name.endswith("__"):
             return object.__getattribute__(self, name)
-        # Allow explicitly public attrs
         if name in GradientCapturingOptimizer._PUBLIC_ATTRS:
             return object.__getattribute__(self, name)
-        # Block single-underscore private attrs (_opt_impl, _grad_snapshot_gpu, etc.)
         if name.startswith("_"):
             raise AttributeError(f"Access to '{name}' is not allowed on optimizer wrapper")
-        # Non-underscore names not in _PUBLIC_ATTRS: forward via __getattr__
         return object.__getattribute__(self, name)
 
     def __dir__(self):
-        """Only expose public API to dir(), hiding internal slots."""
         return sorted(GradientCapturingOptimizer._PUBLIC_ATTRS)
 
     def __setattr__(self, name, value):
@@ -1209,12 +1096,6 @@ class GradientCapturingOptimizer:
         object.__setattr__(self, name, value)
 
     def step(self, *args, **kwargs):
-        """On the final step, snapshot gradients on GPU before optimizer.step().
-
-        Only clones on the last step (step_count == num_steps - 1).
-        GPU-to-GPU clone is ~3ms for 3B params vs ~7s for GPU→CPU transfer.
-        The slow CPU conversion happens in finalize_gradients() after the timer.
-        """
         current_step = object.__getattribute__(self, "step_count")
         object.__setattr__(self, "step_count", current_step + 1)
 
@@ -1233,11 +1114,6 @@ class GradientCapturingOptimizer:
         return opt.step(*args, **kwargs)
 
     def finalize_gradients(self) -> None:
-        """Convert GPU gradient snapshot to GradientInfo (CPU).
-
-        Call AFTER the timer stops. This does the slow GPU→CPU transfer
-        and norm computation outside the timed section.
-        """
         snapshot = object.__getattribute__(self, "_grad_snapshot_gpu")
         if snapshot is None:
             return
@@ -1324,8 +1200,6 @@ class GradientCapturingOptimizer:
         return opt.state
 
     def __getattr__(self, name):
-        """Forward non-private attribute access to underlying optimizer."""
-        # Block private attrs that fell through from __getattribute__ raising
         if name.startswith("_") and not (name.startswith("__") and name.endswith("__")):
             raise AttributeError(f"Access to '{name}' is not allowed on optimizer wrapper")
         opt = object.__getattribute__(self, "_opt_impl")
@@ -1357,9 +1231,6 @@ def _run_reference(
         batch = next(data_iterator)
         batch = batch.to(device, dtype=torch.long)
 
-        # No autocast - model is already in bfloat16.
-        # Using autocast here would change loss computation precision
-        # and create gradient mismatches with miner code that doesn't use autocast.
         input_ids = batch[:, :-1]
         labels = batch[:, 1:]
         outputs = model(input_ids)
@@ -1396,23 +1267,7 @@ def _verify_gradients(
     candidate_grad: GradientInfo | None,
     norm_ratio_max: float = 1.02,
 ) -> tuple[bool, str | None, dict]:
-    """Verify candidate gradients match reference using relative error |g - g_truth| / |g_truth|.
-
-    This is a direct comparison that catches any deviation including truncation,
-    layer freezing, and step skipping. The threshold should be near numerical
-    precision (bfloat16 has ~0.8% relative error for accumulated ops).
-
-    Args:
-        reference_grad: Reference implementation gradients
-        candidate_grad: Miner's implementation gradients
-        norm_ratio_max: Encoded as 1 + max_relative_error. e.g., 1.04 means 4% max error.
-            The relative error threshold is derived as norm_ratio_max - 1.0.
-
-    Returns:
-        Tuple of (success, error_message, details)
-    """
-    # Derive relative error threshold from norm_ratio_max
-    # e.g., 1.04 -> 0.04 (4% relative error allowed)
+    """Verify candidate gradients match reference."""
     relative_error_threshold = norm_ratio_max - 1.0
 
     details = {
@@ -2087,17 +1942,10 @@ class Actor:
             base_optimizer = _create_optimizer(model)
             optimizer_miner = GradientCapturingOptimizer(base_optimizer, model, num_steps=steps)
 
-            # Restore timing functions and backend settings after warmup.
-            # Miner warmup code has executed and may have tampered with
-            # time.perf_counter, time.monotonic, or torch backend settings.
             _reset_torch_state()
             _enforce_backend_state()
 
             _cuda_synchronize()
-            # Use the module-level saved references captured at import time
-            # (lines 51-52), before any miner code runs. Do NOT re-read from
-            # the time module here — miner warmup has already executed and
-            # could have tampered with time.perf_counter / time.monotonic.
             start_perf = _perf_counter()
             start_mono = _monotonic()
 
@@ -2115,9 +1963,6 @@ class Actor:
             wall_time_perf = end_perf - start_perf
             wall_time_mono = end_mono - start_mono
 
-            # Cross-validate timers: if perf_counter and monotonic diverge
-            # significantly, the timer was likely tampered with.
-            # Allow 10% tolerance for normal clock jitter.
             if wall_time_mono > 0 and abs(wall_time_perf - wall_time_mono) / wall_time_mono > 0.10:
                 logger.warning(
                     f"Timer integrity check FAILED: perf_counter={wall_time_perf:.4f}s "
@@ -2137,9 +1982,6 @@ class Actor:
                     "code": code,
                 }
 
-            # Use the monotonic timer as the authoritative source — it is
-            # a system clock that cannot be set backwards and is harder to
-            # tamper with from Python userspace.
             wall_time = wall_time_mono
             logger.info(
                 f"Timing: wall_time={wall_time:.2f}s "
