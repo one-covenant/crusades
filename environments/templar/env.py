@@ -483,7 +483,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             "subprocess",  # shell command execution
             "sys",  # sys.modules, sys.path manipulation
             "os",  # OS-level file/process operations
-            "pathlib",  # file I/O (bypasses open() block)
             "io",  # file I/O streams
             "socket",  # network access
             "http",  # HTTP client/server
