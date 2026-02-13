@@ -398,6 +398,14 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
+        # Block: time.monotonic access — this is the authoritative timer for MFU.
+        # Without this, a miner could monkey-patch time.monotonic to report less
+        # wall time and inflate their MFU score.
+        if isinstance(node, ast.Attribute) and node.attr == "monotonic":
+            if isinstance(node.value, ast.Name) and node.value.id == "time":
+                line = getattr(node, "lineno", "?")
+                return False, f"Line {line}: forbidden pattern detected"
+
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Attribute) and target.attr == "synchronize":
