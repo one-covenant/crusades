@@ -690,20 +690,26 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                 and isinstance(inner.func, ast.Name)
                 and inner.func.id in ("bytes", "bytearray")
             ):
-                # Try to statically evaluate the byte array
+                # Try to statically evaluate the byte array by extracting
+                # integer constants from the argument list, e.g. bytes([95, 112, ...])
                 try:
-                    decoded = ast.literal_eval(
-                        compile(ast.Expression(body=inner), "<eval>", "eval")
-                    )
-                    if isinstance(decoded, (bytes, bytearray)):
-                        decoded_str = decoded.decode()
+                    if inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List):
+                        int_values = []
+                        for elt in inner.args[0].elts:
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
+                                int_values.append(elt.value)
+                            else:
+                                raise ValueError("non-constant element")
+                        decoded_str = bytes(int_values).decode()
                         for pattern in _FORBIDDEN_STRINGS:
                             if pattern in decoded_str:
                                 line = getattr(node, "lineno", "?")
                                 return False, (
                                     f"Security violation: Line {line}: forbidden string constructed via bytes"
                                 )
-                except Exception:
+                    else:
+                        raise ValueError("not a simple bytes([int, ...]) pattern")
+                except (ValueError, UnicodeDecodeError):
                     # If we can't evaluate statically, block it conservatively
                     line = getattr(node, "lineno", "?")
                     return False, (
