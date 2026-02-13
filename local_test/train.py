@@ -39,7 +39,6 @@ Your inner_steps function MUST NOT:
 import json
 import time
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -129,6 +128,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 # LOCAL TESTING - Run this file to test your implementation
 # =============================================================================
 if __name__ == "__main__":
+    from pathlib import Path
+
     print("=" * 60)
     print("TESTING train.py - Basic Implementation")
     print("=" * 60)
