@@ -689,7 +689,10 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                 try:
                     decoded_str = inner.value.decode()
                 except UnicodeDecodeError:
-                    continue
+                    line = getattr(node, "lineno", "?")
+                    return False, (
+                        f"Security violation: Line {line}: undecodable byte literal in .decode() call"
+                    )
                 for pattern in _FORBIDDEN_STRINGS:
                     if pattern in decoded_str:
                         line = getattr(node, "lineno", "?")
@@ -1491,8 +1494,8 @@ def _verify_outputs(
     reference_final_state: dict | None = None,
     model: torch.nn.Module | None = None,
     max_loss_difference: float = 0.5,
-    gradient_norm_ratio_max: float = 1.02,
-    weight_relative_error_max: float = 0.05,
+    gradient_norm_ratio_max: float = 1.05,
+    weight_relative_error_max: float = 0.007,
 ) -> tuple[bool, str | None, dict]:
     """Verify candidate outputs match reference.
 
@@ -1650,9 +1653,9 @@ class Actor:
         min_trainable_params_ratio: float = 1.0,
         min_params_changed_ratio: float = 0.5,
         # Gradient verification
-        gradient_norm_ratio_max: float = 1.02,
+        gradient_norm_ratio_max: float = 1.05,
         # Weight verification
-        weight_relative_error_max: float = 0.04,
+        weight_relative_error_max: float = 0.007,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
         model_params_override: int | None = None,
@@ -1675,8 +1678,8 @@ class Actor:
             use_random_init: Use random weights
             min_trainable_params_ratio: Min % params that must be trainable
             min_params_changed_ratio: Min % params that must change
-            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.04 = 4%)
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.04 = 4%)
+            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.05 = 5%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.007 = 0.7%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             model_params_override: Override model param count (None = auto-detect)
 
@@ -2270,9 +2273,9 @@ class EvaluateRequest(BaseModel):
     min_trainable_params_ratio: float = 1.0
     min_params_changed_ratio: float = 0.5
     # Gradient verification
-    gradient_norm_ratio_max: float = 1.02
+    gradient_norm_ratio_max: float = 1.05
     # Weight verification
-    weight_relative_error_max: float = 0.04
+    weight_relative_error_max: float = 0.007
     # MFU calculation
     gpu_peak_tflops: float = 312.0
 

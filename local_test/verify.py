@@ -269,6 +269,9 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                 if base_module in _FORBIDDEN_MODULES or alias.name.startswith("importlib"):
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: import {alias.name} is forbidden")
+                if "cpp_extension" in alias.name:
+                    line = getattr(node, "lineno", "?")
+                    violations.append(f"Line {line}: import {alias.name} is forbidden")
 
         if isinstance(node, ast.ImportFrom) and node.module:
             base_module = node.module.split(".")[0]
@@ -379,6 +382,8 @@ def validate_code_structure(code: str) -> list[str]:
                 try:
                     decoded_str = inner.value.decode()
                 except UnicodeDecodeError:
+                    line = getattr(node, "lineno", "?")
+                    violations.append(f"Line {line}: undecodable byte literal in .decode() call")
                     continue
                 for pattern in _FORBIDDEN_STRINGS:
                     if pattern in decoded_str:
@@ -710,8 +715,8 @@ def main():
     verification = hparams.get("verification", {})
     max_loss_difference = verification.get("max_loss_difference", 0.3)
     min_changed_ratio = verification.get("min_params_changed_ratio", 0.8)
-    gradient_norm_ratio_max = verification.get("gradient_norm_ratio_max", 1.02)
-    weight_relative_error_max = verification.get("weight_relative_error_max", 0.04)
+    gradient_norm_ratio_max = verification.get("gradient_norm_ratio_max", 1.05)
+    weight_relative_error_max = verification.get("weight_relative_error_max", 0.007)
 
     expected_tokens = batch_size * seq_len * num_steps
     expected_seq_len = seq_len - 1

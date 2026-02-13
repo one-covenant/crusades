@@ -30,8 +30,8 @@ class VerificationConfig(BaseModel):
 
     max_loss_difference: float = 0.5
     min_params_changed_ratio: float = 0.8
-    gradient_norm_ratio_max: float = 1.04
-    weight_relative_error_max: float = 0.04
+    gradient_norm_ratio_max: float = 1.05
+    weight_relative_error_max: float = 0.007
 
 
 class MFUConfig(BaseModel):
