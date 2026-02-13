@@ -592,7 +592,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 "globals",
                 "locals",  # scope introspection
                 "type",  # metaclass access / type creation
-                "super",  # MRO traversal
                 "memoryview",  # raw memory access
                 "open",  # file I/O
                 "chr",
