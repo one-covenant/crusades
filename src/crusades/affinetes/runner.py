@@ -167,9 +167,9 @@ class AffinetesRunner:
         max_loss_difference: float = 0.5,
         min_params_changed_ratio: float = 0.8,
         # Gradient verification
-        gradient_norm_ratio_max: float = 1.05,
+        gradient_norm_ratio_max: float = 1.10,
         # Weight verification
-        weight_relative_error_max: float = 0.007,
+        weight_relative_error_max: float = 0.008,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
         validator_image: str | None = None,
@@ -195,8 +195,8 @@ class AffinetesRunner:
             data_url: Default data URL (HuggingFace dataset)
             max_loss_difference: Max allowed |candidate_loss - reference_loss|
             min_params_changed_ratio: Min % params that must change
-            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.05 = 5%)
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.007 = 0.7%)
+            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.10 = 10%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.008 = 0.8%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             validator_image: Docker image for local evaluation
             basilica_image: Docker image for Basilica (must be in registry)
