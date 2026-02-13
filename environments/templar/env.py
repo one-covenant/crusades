@@ -130,11 +130,6 @@ def _reset_torch_state():
     torch.set_grad_enabled(True)
     torch.set_default_dtype(torch.float32)
 
-    try:
-        torch._dynamo.reset()
-    except Exception:
-        pass
-
     if "miner_train" in sys.modules:
         del sys.modules["miner_train"]
 
