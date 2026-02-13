@@ -773,7 +773,11 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                     )
             # b"literal".decode()
             elif isinstance(inner, ast.Constant) and isinstance(inner.value, bytes):
-                decoded_str = inner.value.decode()
+                try:
+                    decoded_str = inner.value.decode()
+                except UnicodeDecodeError:
+                    # Invalid UTF-8 can't contain forbidden strings; skip
+                    continue
                 for pattern in _FORBIDDEN_STRINGS:
                     if pattern in decoded_str:
                         line = getattr(node, "lineno", "?")
@@ -2084,18 +2088,19 @@ class Actor:
             base_optimizer = _create_optimizer(model)
             optimizer_miner = GradientCapturingOptimizer(base_optimizer, model, num_steps=steps)
 
-            # Enforce backend settings to match reference run.
-            # Miner warmup may have changed these for a speed boost;
-            # reset them so the timed eval uses the same settings as reference.
+            # Restore timing functions and backend settings after warmup.
+            # Miner warmup code has executed and may have tampered with
+            # time.perf_counter, time.monotonic, or torch backend settings.
+            _reset_torch_state()
             _enforce_backend_state()
 
             _cuda_synchronize()
-            # Use fresh references from the time module, not cached module-level
-            # variables that miner code could have monkey-patched.
-            _fresh_perf_counter = time.perf_counter
-            _fresh_monotonic = time.monotonic
-            start_perf = _fresh_perf_counter()
-            start_mono = _fresh_monotonic()
+            # Use the module-level saved references captured at import time
+            # (lines 51-52), before any miner code runs. Do NOT re-read from
+            # the time module here — miner warmup has already executed and
+            # could have tampered with time.perf_counter / time.monotonic.
+            start_perf = _perf_counter()
+            start_mono = _monotonic()
 
             miner_result = miner_module.inner_steps(
                 model=model,
@@ -2106,8 +2111,8 @@ class Actor:
             )
 
             _cuda_synchronize()
-            end_perf = _fresh_perf_counter()
-            end_mono = _fresh_monotonic()
+            end_perf = _perf_counter()
+            end_mono = _monotonic()
             wall_time_perf = end_perf - start_perf
             wall_time_mono = end_mono - start_mono
 
