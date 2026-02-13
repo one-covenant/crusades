@@ -374,9 +374,51 @@ def _set_deterministic(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
-    """AST scan to reject forbidden code patterns."""
+def _collect_main_guard_nodes(tree: ast.AST) -> set[int]:
+    """Collect AST node IDs inside `if __name__ == "__main__":` blocks.
+
+    These blocks only execute when the file is run directly, never when
+    imported by the validator. Scanning them would reject legitimate local
+    testing code (print, open, time.perf_counter, etc.).
+    """
+    skip_ids: set[int] = set()
     for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            test = node.test
+            # Match: if __name__ == "__main__" or if "__main__" == __name__
+            is_main_guard = False
+            if isinstance(test, ast.Compare) and len(test.ops) == 1:
+                op = test.ops[0]
+                if isinstance(op, (ast.Eq, ast.Is)):
+                    left, right = test.left, test.comparators[0]
+                    if (
+                        isinstance(left, ast.Name)
+                        and left.id == "__name__"
+                        and isinstance(right, ast.Constant)
+                        and right.value == "__main__"
+                    ) or (
+                        isinstance(right, ast.Name)
+                        and right.id == "__name__"
+                        and isinstance(left, ast.Constant)
+                        and left.value == "__main__"
+                    ):
+                        is_main_guard = True
+            if is_main_guard:
+                for child in ast.walk(node):
+                    skip_ids.add(id(child))
+    return skip_ids
+
+
+def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
+    """AST scan to reject forbidden code patterns.
+
+    Skips nodes inside `if __name__ == "__main__":` blocks since they
+    never execute when the module is imported by the validator.
+    """
+    main_guard_nodes = _collect_main_guard_nodes(tree)
+    for node in ast.walk(tree):
+        if id(node) in main_guard_nodes:
+            continue
         if isinstance(node, ast.Attribute) and node.attr in ("__setattr__", "__delattr__"):
             if isinstance(node.value, ast.Name) and node.value.id == "object":
                 line = getattr(node, "lineno", "?")
@@ -542,10 +584,8 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 "super",  # MRO traversal
                 "memoryview",  # raw memory access
                 "open",  # file I/O
-                "print",  # stdout side-effects (not needed)
                 "chr",
                 "ord",  # string construction from ints (evades string scanner)
-                "id",  # object identity leaks memory addresses
                 "breakpoint",  # debugger access
                 "input",  # stdin access
                 "classmethod",
