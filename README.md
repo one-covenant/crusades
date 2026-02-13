@@ -164,12 +164,13 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 - Access optimizer internals (e.g., `optimizer.optimizer`, `optimizer._opt_impl`)
 - Truncate or skip parts of input sequences
 - Return `None` for `final_logits`
-- Import forbidden modules: `gc`, `ctypes`, `subprocess`, `importlib`, `os`, `sys`, `pathlib`, `inspect`, `pickle`, `signal`, `threading`, `multiprocessing`, `socket`, `http`, `io`, `ast`, etc.
+- Import forbidden modules: `gc`, `ctypes`, `subprocess`, `importlib`, `os`, `sys`, `inspect`, `pickle`, `signal`, `threading`, `multiprocessing`, `socket`, `http`, `io`, `ast`, etc.
 - Modify torch backend settings (`cudnn.deterministic`, `cudnn.benchmark`, SDP toggles, `set_float32_matmul_precision`)
 - Freeze layers or modify `requires_grad` settings
 - Report inflated token counts
 - Alias the `torch` module (e.g., `import torch as t`) — the security scanner only recognizes the literal name `torch` for allowlisted calls like `torch.compile`
-- Use `pathlib` at the top level — move any `pathlib` imports inside `if __name__ == "__main__":` (they are only needed for local testing)
+
+> **Note:** The validator skips the `if __name__ == "__main__":` block entirely. Modules like `pathlib` that are forbidden at the top level can still be imported inside `__main__` for local testing.
 
 ---
 
