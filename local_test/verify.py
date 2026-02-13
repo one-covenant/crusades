@@ -22,6 +22,7 @@ Fix any failures before submitting to avoid failed evaluations!
 import ast
 import importlib.util
 import json
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,21 @@ _FORBIDDEN_STRINGS = [
     "locals",
     "_cuda_synchronize",
     "_monotonic",
+    "__traceback__",
+    "tb_frame",
+    "tb_next",
+    "f_globals",
+    "f_builtins",
+    "f_locals",
+    "f_back",
+    "co_consts",
+    "co_names",
+    "__getattribute__",
+    "builtins",
+    "operator.attrgetter",
+    "operator.methodcaller",
+    "attrgetter",
+    "methodcaller",
 ]
 
 _FORBIDDEN_MODULES = {
@@ -102,6 +118,14 @@ _FORBIDDEN_MODULES = {
     "pickle",
     "shelve",
     "marshal",
+    "builtins",
+    "_builtins",
+    "operator",
+    "types",
+    "codecs",
+    "base64",
+    "pdb",
+    "pprint",
 }
 
 _BLOCKED_BUILTINS = {
@@ -254,6 +278,9 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                 if node.func.attr in ("exec", "eval", "__import__"):
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: .{node.func.attr}() is forbidden")
+                if node.func.attr in _BLOCKED_BUILTINS:
+                    line = getattr(node, "lineno", "?")
+                    violations.append(f"Line {line}: .{node.func.attr}() is forbidden")
                 if node.func.attr == "compile":
                     if not (
                         isinstance(node.func.value, ast.Name) and node.func.value.id == "torch"
@@ -307,6 +334,17 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
             "__bases__",
             "__mro__",
             "__init_subclass__",
+            "__traceback__",
+            "tb_frame",
+            "tb_next",
+            "f_globals",
+            "f_builtins",
+            "f_locals",
+            "f_code",
+            "f_back",
+            "co_consts",
+            "co_names",
+            "__getattribute__",
         ):
             line = getattr(node, "lineno", "?")
             violations.append(f"Line {line}: .{node.attr} access is forbidden")
@@ -1150,7 +1188,10 @@ def main():
                 print(f"  |g_truth|: {ref_norm:.6f}")
                 print(f"  Relative error: {relative_error:.6f}")
 
-                if relative_error > relative_error_threshold:
+                if not math.isfinite(relative_error):
+                    print(f"  [FAILED] Non-finite relative error ({relative_error})")
+                    results.append((check, False, f"Non-finite ({relative_error})"))
+                elif relative_error > relative_error_threshold:
                     print(f"  [FAILED] {relative_error:.6f} > {relative_error_threshold:.6f}")
                     results.append(
                         (check, False, f"{relative_error:.6f} > {relative_error_threshold:.6f}")
@@ -1190,7 +1231,10 @@ def main():
 
             if layer_ref_sq > 0:
                 layer_rel_error = (layer_diff_sq**0.5) / (layer_ref_sq**0.5)
-                if layer_rel_error > weight_relative_error_max:
+                if (
+                    not math.isfinite(layer_rel_error)
+                    or layer_rel_error > weight_relative_error_max
+                ):
                     w_mismatched_layers += 1
 
         w_ref_norm = w_ref_norm_sq**0.5
@@ -1207,7 +1251,10 @@ def main():
         print(f"  Total elements: {w_total_elements:,}")
         print(f"  Mismatched layers: {w_mismatched_layers}")
 
-        if w_relative_error > weight_relative_error_max:
+        if not math.isfinite(w_relative_error):
+            print(f"  [FAILED] Non-finite weight error ({w_relative_error})")
+            results.append((check, False, f"Non-finite ({w_relative_error})"))
+        elif w_relative_error > weight_relative_error_max:
             print(f"  [FAILED] {w_relative_error:.6f} > {weight_relative_error_max:.6f}")
             results.append(
                 (check, False, f"{w_relative_error:.6f} > {weight_relative_error_max:.6f}")

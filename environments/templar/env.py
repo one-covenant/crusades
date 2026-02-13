@@ -19,6 +19,7 @@ import gc
 import hashlib
 import importlib.util
 import logging
+import math
 import os
 import random
 import sys
@@ -482,6 +483,14 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             "pickle",
             "shelve",
             "marshal",
+            "builtins",
+            "_builtins",
+            "operator",
+            "types",
+            "codecs",
+            "base64",
+            "pdb",
+            "pprint",
         }
 
         if isinstance(node, ast.Import):
@@ -506,28 +515,33 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden import"
 
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in (
-                "setattr",
-                "getattr",
-                "delattr",
-                "vars",
-                "dir",
-                "globals",
-                "locals",
-                "type",
-                "memoryview",
-                "open",
-                "chr",
-                "ord",
-                "breakpoint",
-                "input",
-                "classmethod",
-                "staticmethod",
-                "property",
-            ):
+        # Block dangerous builtins as both bare names and attribute access
+        _forbidden_builtins = {
+            "setattr",
+            "getattr",
+            "delattr",
+            "vars",
+            "dir",
+            "globals",
+            "locals",
+            "type",
+            "memoryview",
+            "open",
+            "chr",
+            "ord",
+            "breakpoint",
+            "input",
+            "classmethod",
+            "staticmethod",
+            "property",
+        }
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in _forbidden_builtins:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: {node.func.id}() is forbidden"
+            if isinstance(node.func, ast.Attribute) and node.func.attr in _forbidden_builtins:
+                line = getattr(node, "lineno", "?")
+                return False, f"Line {line}: .{node.func.attr}() is forbidden"
 
         if isinstance(node, ast.Name) and node.id == "__builtins__":
             line = getattr(node, "lineno", "?")
@@ -554,6 +568,17 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             "__bases__",
             "__mro__",
             "__init_subclass__",
+            "__traceback__",
+            "tb_frame",
+            "tb_next",
+            "f_globals",
+            "f_builtins",
+            "f_locals",
+            "f_code",
+            "f_back",
+            "co_consts",
+            "co_names",
+            "__getattribute__",
         ):
             line = getattr(node, "lineno", "?")
             return False, f"Line {line}: forbidden pattern detected"
@@ -605,6 +630,21 @@ _FORBIDDEN_STRINGS = [
     "locals",
     "_cuda_synchronize",
     "_monotonic",
+    "__traceback__",
+    "tb_frame",
+    "tb_next",
+    "f_globals",
+    "f_builtins",
+    "f_locals",
+    "f_back",
+    "co_consts",
+    "co_names",
+    "__getattribute__",
+    "builtins",
+    "operator.attrgetter",
+    "operator.methodcaller",
+    "attrgetter",
+    "methodcaller",
 ]
 
 
@@ -1361,6 +1401,17 @@ def _verify_gradients(
         logger.info(f"   Max allowed: {relative_error_threshold:.6f}")
         logger.info(f"   Total gradient elements: {total_elements:,}")
 
+        # Guard against NaN injection — NaN > threshold is always False in IEEE 754
+        if not math.isfinite(relative_error):
+            error = (
+                f"Gradient relative error is non-finite ({relative_error}) - "
+                "possible NaN injection detected"
+            )
+            details["checks_failed"].append({"check": "gradient_nan_guard", "error": error})
+            details["error_code"] = "gradient_nan_injection"
+            logger.error(f"[FAILED] {error}")
+            return False, error, details
+
         if relative_error > relative_error_threshold:
             error = (
                 f"Gradient relative error {relative_error:.6f} exceeds threshold "
@@ -1433,10 +1484,10 @@ def _verify_final_weights(
         ref_norm_sq += layer_ref_sq
         total_elements += param.numel()
 
-        # Track layers with significant differences
+        # Track layers with significant differences (NaN-safe)
         if layer_ref_sq > 0:
             layer_rel_error = (layer_diff_sq**0.5) / (layer_ref_sq**0.5)
-            if layer_rel_error > max_relative_error:
+            if not math.isfinite(layer_rel_error) or layer_rel_error > max_relative_error:
                 mismatched_layers += 1
 
     ref_norm = ref_norm_sq**0.5
@@ -1459,6 +1510,17 @@ def _verify_final_weights(
     logger.info(f"   Max allowed: {max_relative_error:.6f}")
     logger.info(f"   Total elements: {total_elements:,}")
     logger.info(f"   Mismatched layers: {mismatched_layers}")
+
+    # Guard against NaN injection in weights
+    if not math.isfinite(relative_error):
+        error = (
+            f"Weight relative error is non-finite ({relative_error}) - "
+            "possible NaN injection detected"
+        )
+        details["checks_failed"].append({"check": "weight_nan_guard", "error": error})
+        details["error_code"] = "weight_nan_injection"
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
 
     if relative_error > max_relative_error:
         error = (
@@ -2221,8 +2283,16 @@ class Actor:
             miner_result = parsed = miner_module = None  # type: ignore[assignment]
             reference = reference_grad = None  # type: ignore[assignment]
 
-            # Reset torch state (clears compile caches, removes miner module)
+            # Reset torch state (removes miner module, restores timing functions)
             _reset_torch_state()
+
+            # Free torch.compile / CUDA Graph caches from miner's code.
+            # This MUST happen here (between evaluations) but NOT between
+            # warmup and timed run, so the compiled model persists for timing.
+            try:
+                torch._dynamo.reset()
+            except Exception:
+                pass
 
             # Memory cleanup
             gc.collect()
