@@ -184,7 +184,7 @@ Key settings in `hparams/hparams.json`:
 | `evaluation_runs` | 5 | Runs per submission (median taken) |
 | `eval_steps` | 5 | Training steps per evaluation |
 | `benchmark_model_name` | Qwen/Qwen2.5-3B | Model for evaluation |
-| `benchmark_batch_size` | 16 | Batch size for evaluation |
+| `benchmark_batch_size` | 8 | Batch size for evaluation |
 
 ---
 
