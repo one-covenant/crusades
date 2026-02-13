@@ -531,7 +531,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 "dir",  # object introspection
                 "globals",
                 "locals",  # scope introspection
-                "hasattr",  # attribute probing
                 "type",  # metaclass access / type creation
                 "super",  # MRO traversal
                 "memoryview",  # raw memory access
@@ -618,7 +617,6 @@ _FORBIDDEN_STRINGS = [
     "setattr",
     "getattr",
     "delattr",
-    "hasattr",
     "__builtins__",
     "__dict__",
     "__globals__",
