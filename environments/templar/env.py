@@ -419,6 +419,16 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
     for node in ast.walk(tree):
         if id(node) in main_guard_nodes:
             continue
+
+        # Block: reassignment of __name__ — a miner could write
+        # __name__ = "__main__" to force the if-__main__ block to execute,
+        # bypassing all security checks that are skipped in that block.
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "__name__":
+                    line = getattr(node, "lineno", "?")
+                    return False, f"Line {line}: reassignment of __name__ is forbidden"
+
         if isinstance(node, ast.Attribute) and node.attr in ("__setattr__", "__delattr__"):
             if isinstance(node.value, ast.Name) and node.value.id == "object":
                 line = getattr(node, "lineno", "?")
@@ -525,6 +535,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             "subprocess",  # shell command execution
             "sys",  # sys.modules, sys.path manipulation
             "os",  # OS-level file/process operations
+            "pathlib",  # Path.read_text()/write_text() bypass open() block
             "io",  # file I/O streams
             "socket",  # network access
             "http",  # HTTP client/server
