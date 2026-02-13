@@ -31,14 +31,18 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM
 
 # =========================================================================
-# Security checks — same as production env.py _validate_code_structure
+# Security checks — mirrors production env.py _validate_code_structure
 # =========================================================================
 
 _FORBIDDEN_STRINGS = [
     "__setattr__",
     "__delattr__",
     "__class__",
+    "__subclasses__",
+    "__bases__",
+    "__mro__",
     "perf_counter",
+    "_perf_counter",
     "get_objects",
     "get_referrers",
     "get_referents",
@@ -51,15 +55,77 @@ _FORBIDDEN_STRINGS = [
     "_grad_snapshot_gpu",
     "step_count",
     "GradientCapturingOptimizer",
-    # Dynamic code execution / import bypasses
     "__import__",
     "importlib",
     "import_module",
+    "sys.modules",
+    "setattr",
+    "getattr",
+    "delattr",
+    "__builtins__",
+    "__dict__",
+    "__globals__",
+    "__code__",
+    "__func__",
+    "__self__",
+    "__init_subclass__",
+    "globals",
+    "locals",
+    "_cuda_synchronize",
+    "_monotonic",
 ]
+
+_FORBIDDEN_MODULES = {
+    "ctypes",
+    "_ctypes",
+    "gc",
+    "subprocess",
+    "sys",
+    "os",
+    "pathlib",
+    "io",
+    "socket",
+    "http",
+    "urllib",
+    "requests",
+    "shutil",
+    "tempfile",
+    "signal",
+    "threading",
+    "multiprocessing",
+    "inspect",
+    "ast",
+    "dis",
+    "code",
+    "codeop",
+    "compileall",
+    "pickle",
+    "shelve",
+    "marshal",
+}
+
+_BLOCKED_BUILTINS = {
+    "setattr",
+    "getattr",
+    "delattr",
+    "vars",
+    "dir",
+    "globals",
+    "locals",
+    "type",
+    "memoryview",
+    "open",
+    "chr",
+    "ord",
+    "breakpoint",
+    "input",
+    "classmethod",
+    "staticmethod",
+    "property",
+}
 
 
 def _is_main_guard(node: ast.AST) -> bool:
-    """Check if an AST node is an `if __name__ == "__main__":` block."""
     return (
         isinstance(node, ast.If)
         and isinstance(node.test, ast.Compare)
@@ -71,11 +137,49 @@ def _is_main_guard(node: ast.AST) -> bool:
     )
 
 
+def _collect_main_guard_nodes(tree: ast.AST) -> set[int]:
+    skip_ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            test = node.test
+            is_main_guard = False
+            if isinstance(test, ast.Compare) and len(test.ops) == 1:
+                op = test.ops[0]
+                if isinstance(op, (ast.Eq, ast.Is)):
+                    left, right = test.left, test.comparators[0]
+                    if (
+                        isinstance(left, ast.Name)
+                        and left.id == "__name__"
+                        and isinstance(right, ast.Constant)
+                        and right.value == "__main__"
+                    ) or (
+                        isinstance(right, ast.Name)
+                        and right.id == "__name__"
+                        and isinstance(left, ast.Constant)
+                        and left.value == "__main__"
+                    ):
+                        is_main_guard = True
+            if is_main_guard:
+                for child in ast.walk(node):
+                    skip_ids.add(id(child))
+    return skip_ids
+
+
 def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
-    """AST scan to find all forbidden code patterns. Returns list of violations."""
     violations = []
+    main_guard_nodes = _collect_main_guard_nodes(tree)
 
     for node in ast.walk(tree):
+        if id(node) in main_guard_nodes:
+            continue
+
+        # Block __name__ reassignment
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "__name__":
+                    line = getattr(node, "lineno", "?")
+                    violations.append(f"Line {line}: reassignment of __name__ is forbidden")
+
         if isinstance(node, ast.Attribute) and node.attr in ("__setattr__", "__delattr__"):
             if isinstance(node.value, ast.Name) and node.value.id == "object":
                 line = getattr(node, "lineno", "?")
@@ -97,6 +201,11 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: time.perf_counter is forbidden")
 
+        if isinstance(node, ast.Attribute) and node.attr == "monotonic":
+            if isinstance(node.value, ast.Name) and node.value.id == "time":
+                line = getattr(node, "lineno", "?")
+                violations.append(f"Line {line}: time.monotonic is forbidden")
+
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Attribute) and target.attr == "synchronize":
@@ -108,7 +217,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: __slots__ modification is forbidden")
 
-        # Block: gc introspection (gc.get_objects, gc.get_referrers, gc.get_referents)
         if isinstance(node, ast.Attribute) and node.attr in (
             "get_objects",
             "get_referrers",
@@ -118,16 +226,11 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: gc.{node.attr}() is forbidden")
 
-        # Block: torch backend setting modifications (deterministic, benchmark)
-        if isinstance(node, ast.Attribute) and node.attr in (
-            "deterministic",
-            "benchmark",
-        ):
+        if isinstance(node, ast.Attribute) and node.attr in ("deterministic", "benchmark"):
             if isinstance(node.ctx, ast.Store):
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: setting torch.backends.{node.attr} is forbidden")
 
-        # Block: torch SDP toggle calls and float32_matmul_precision
         if isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Attribute) and func.attr in (
@@ -139,33 +242,73 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: {func.attr}() is forbidden")
 
-        # Block: dynamic code execution (exec, eval, compile, __import__)
-        # These bypass AST-level checks by running arbitrary code at runtime.
-        # torch.compile is safe (ast.Attribute, not ast.Name).
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in ("exec", "eval", "compile", "__import__"):
-                line = getattr(node, "lineno", "?")
-                violations.append(f"Line {line}: {node.func.id}() is forbidden")
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id in ("exec", "eval", "compile", "__import__"):
+                    line = getattr(node, "lineno", "?")
+                    violations.append(f"Line {line}: {node.func.id}() is forbidden")
+                if node.func.id in _BLOCKED_BUILTINS:
+                    line = getattr(node, "lineno", "?")
+                    violations.append(f"Line {line}: {node.func.id}() is forbidden")
+            elif isinstance(node.func, ast.Attribute):
+                if node.func.attr in ("exec", "eval", "__import__"):
+                    line = getattr(node, "lineno", "?")
+                    violations.append(f"Line {line}: .{node.func.attr}() is forbidden")
+                if node.func.attr == "compile":
+                    if not (
+                        isinstance(node.func.value, ast.Name) and node.func.value.id == "torch"
+                    ):
+                        line = getattr(node, "lineno", "?")
+                        violations.append(
+                            f"Line {line}: .compile() is forbidden (only torch.compile allowed)"
+                        )
 
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name in ("ctypes", "_ctypes", "gc", "subprocess") or alias.name.startswith(
-                    "importlib"
-                ):
+                base_module = alias.name.split(".")[0]
+                if base_module in _FORBIDDEN_MODULES or alias.name.startswith("importlib"):
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: import {alias.name} is forbidden")
 
         if isinstance(node, ast.ImportFrom) and node.module:
-            if node.module in ("ctypes", "_ctypes", "gc", "subprocess") or node.module.startswith(
-                "importlib"
-            ):
+            base_module = node.module.split(".")[0]
+            if base_module in _FORBIDDEN_MODULES or node.module.startswith("importlib"):
+                line = getattr(node, "lineno", "?")
+                violations.append(f"Line {line}: from {node.module} import is forbidden")
+            if "cpp_extension" in node.module:
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: from {node.module} import is forbidden")
 
-        # Block: accessing .optimizer attribute (wrapper bypass attempt)
+        if isinstance(node, ast.Name) and node.id == "__builtins__":
+            line = getattr(node, "lineno", "?")
+            violations.append(f"Line {line}: __builtins__ access is forbidden")
+        if isinstance(node, ast.Attribute) and node.attr == "__builtins__":
+            line = getattr(node, "lineno", "?")
+            violations.append(f"Line {line}: __builtins__ access is forbidden")
+
+        if isinstance(node, ast.Attribute) and node.attr == "modules":
+            if isinstance(node.value, ast.Name) and node.value.id in ("sys", "_sys"):
+                line = getattr(node, "lineno", "?")
+                violations.append(f"Line {line}: sys.modules access is forbidden")
+
+        if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+            line = getattr(node, "lineno", "?")
+            violations.append(f"Line {line}: __dict__ access is forbidden")
+
+        if isinstance(node, ast.Attribute) and node.attr in (
+            "__globals__",
+            "__code__",
+            "__func__",
+            "__self__",
+            "__subclasses__",
+            "__bases__",
+            "__mro__",
+            "__init_subclass__",
+        ):
+            line = getattr(node, "lineno", "?")
+            violations.append(f"Line {line}: .{node.attr} access is forbidden")
+
         if isinstance(node, ast.Attribute) and node.attr == "optimizer":
-            # Allow 'self.optimizer' inside class definitions, but block
-            # attempts to unwrap the GradientCapturingOptimizer via optimizer.optimizer
             if not (isinstance(node.value, ast.Name) and node.value.id == "self"):
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: accessing .optimizer attribute is forbidden")
@@ -174,11 +317,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
 
 
 def validate_code_structure(code: str) -> list[str]:
-    """Validate that train.py passes all security checks (same as production).
-
-    Returns:
-        List of violation messages (empty = all passed).
-    """
+    """Validate that train.py passes all security checks (same as production)."""
     violations = []
 
     try:
@@ -186,7 +325,6 @@ def validate_code_structure(code: str) -> list[str]:
     except SyntaxError as exc:
         return [f"Syntax error at line {exc.lineno}: {exc.msg}"]
 
-    # Strip `if __name__ == "__main__":` blocks before scanning
     scan_tree = ast.Module(
         body=[node for node in tree.body if not _is_main_guard(node)],
         type_ignores=tree.type_ignores,
@@ -201,6 +339,51 @@ def validate_code_structure(code: str) -> list[str]:
                 if pattern in node.value:
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: forbidden string pattern '{pattern}' detected")
+
+    # Scan bytes().decode() and b"...".decode() for forbidden patterns
+    for node in ast.walk(scan_tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "decode"
+        ):
+            inner = node.func.value
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id in ("bytes", "bytearray")
+            ):
+                try:
+                    if inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List):
+                        int_values = []
+                        for elt in inner.args[0].elts:
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
+                                int_values.append(elt.value)
+                            else:
+                                raise ValueError("non-constant")
+                        decoded_str = bytes(int_values).decode()
+                        for pattern in _FORBIDDEN_STRINGS:
+                            if pattern in decoded_str:
+                                line = getattr(node, "lineno", "?")
+                                violations.append(
+                                    f"Line {line}: forbidden string via bytes().decode()"
+                                )
+                    else:
+                        raise ValueError("not simple")
+                except (ValueError, UnicodeDecodeError):
+                    line = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"Line {line}: dynamic bytes().decode() construction is forbidden"
+                    )
+            elif isinstance(inner, ast.Constant) and isinstance(inner.value, bytes):
+                try:
+                    decoded_str = inner.value.decode()
+                except UnicodeDecodeError:
+                    continue
+                for pattern in _FORBIDDEN_STRINGS:
+                    if pattern in decoded_str:
+                        line = getattr(node, "lineno", "?")
+                        violations.append(f"Line {line}: forbidden string via b'...'.decode()")
 
     inner_steps_found = False
     for node in ast.walk(tree):
@@ -224,8 +407,6 @@ def validate_code_structure(code: str) -> list[str]:
 
 @dataclass
 class InnerStepsResult:
-    """Result type for verification (mirrors train.py's InnerStepsResult)."""
-
     final_logits: torch.Tensor
     total_tokens: int
     final_loss: float
@@ -233,25 +414,14 @@ class InnerStepsResult:
 
 @dataclass
 class GradientInfo:
-    """Gradient information for verification. Matches production env.py."""
-
     grad_norm: float
-    grad_vector: list  # List of per-layer gradient tensors on CPU
+    grad_vector: list
     layers_with_grad: int
     total_layers: int
 
 
 class GradientCapturingOptimizer:
-    """Same wrapper as the production validator uses.
-
-    On the final step, clones gradient tensors on GPU (fast) before
-    optimizer.step() clears them. Call finalize_gradients() after
-    timing to do the slow CPU transfer.
-
-    Security: __getattribute__ blocks access to private internals (_opt_impl,
-    _grad_snapshot_gpu) so miners cannot introspect the wrapper via getattr()
-    or dir(). Internal methods use object.__getattribute__() to bypass the guard.
-    """
+    """Same wrapper as the production validator uses."""
 
     __slots__ = (
         "_opt_impl",
@@ -263,8 +433,6 @@ class GradientCapturingOptimizer:
         "_initialized",
     )
 
-    # Attributes accessible to miner code. Everything else starting with "_"
-    # (except dunder methods) is blocked by __getattribute__.
     _PUBLIC_ATTRS = frozenset(
         {
             "step",
@@ -292,27 +460,15 @@ class GradientCapturingOptimizer:
         object.__setattr__(self, "_initialized", True)
 
     def __getattribute__(self, name):
-        """Guard access to private internals.
-
-        Allows: public attrs, dunder methods (__class__, __repr__, etc.),
-        and non-underscore names (forwarded via __getattr__).
-        Blocks: _opt_impl, _grad_snapshot_gpu, _initialized, and any
-        other single-underscore private attr.
-        """
-        # Always allow dunder attrs (Python internals need them)
         if name.startswith("__") and name.endswith("__"):
             return object.__getattribute__(self, name)
-        # Allow explicitly public attrs
         if name in GradientCapturingOptimizer._PUBLIC_ATTRS:
             return object.__getattribute__(self, name)
-        # Block single-underscore private attrs (_opt_impl, _grad_snapshot_gpu, etc.)
         if name.startswith("_"):
             raise AttributeError(f"Access to '{name}' is not allowed on optimizer wrapper")
-        # Non-underscore names not in _PUBLIC_ATTRS: forward via __getattr__
         return object.__getattribute__(self, name)
 
     def __dir__(self):
-        """Only expose public API to dir(), hiding internal slots."""
         return sorted(GradientCapturingOptimizer._PUBLIC_ATTRS)
 
     def __setattr__(self, name, value):
@@ -330,7 +486,6 @@ class GradientCapturingOptimizer:
         current_step = object.__getattribute__(self, "step_count")
         object.__setattr__(self, "step_count", current_step + 1)
 
-        # On final step, snapshot gradients on GPU (fast clone, stays on device)
         if current_step == object.__getattribute__(self, "num_steps") - 1:
             snapshot = []
             model = object.__getattribute__(self, "model")
@@ -345,7 +500,6 @@ class GradientCapturingOptimizer:
         return opt.step(*args, **kwargs)
 
     def finalize_gradients(self) -> None:
-        """Convert GPU gradient snapshot to GradientInfo (CPU)."""
         snapshot = object.__getattribute__(self, "_grad_snapshot_gpu")
         if snapshot is None:
             return
@@ -414,12 +568,43 @@ class GradientCapturingOptimizer:
         return opt.state
 
     def __getattr__(self, name):
-        """Forward non-private attribute access to underlying optimizer."""
-        # Block private attrs that fell through from __getattribute__ raising
         if name.startswith("_") and not (name.startswith("__") and name.endswith("__")):
             raise AttributeError(f"Access to '{name}' is not allowed on optimizer wrapper")
         opt = object.__getattribute__(self, "_opt_impl")
         return getattr(opt, name)
+
+
+def _enforce_backend_state():
+    """Set torch backend to SAME values as production validator."""
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)
+
+
+def _check_backend_state() -> list[str]:
+    """Check torch backend settings match production. Returns violations."""
+    violations = []
+    if torch.backends.cudnn.deterministic:
+        violations.append("cudnn.deterministic was set to True")
+    if not torch.backends.cudnn.benchmark:
+        violations.append("cudnn.benchmark was set to False")
+    if not torch.backends.cudnn.allow_tf32:
+        violations.append("cudnn.allow_tf32 was set to False")
+    if torch.get_float32_matmul_precision() != "high":
+        violations.append(
+            f"float32_matmul_precision is '{torch.get_float32_matmul_precision()}', expected 'high'"
+        )
+    if not torch.backends.cuda.flash_sdp_enabled():
+        violations.append("flash_sdp was disabled")
+    if not torch.backends.cuda.mem_efficient_sdp_enabled():
+        violations.append("mem_efficient_sdp was disabled")
+    if not torch.backends.cuda.math_sdp_enabled():
+        violations.append("math_sdp was disabled")
+    return violations
 
 
 def load_train_module(train_path: Path):
@@ -431,10 +616,7 @@ def load_train_module(train_path: Path):
 
 
 def capture_gradients(model: torch.nn.Module) -> GradientInfo:
-    """Capture gradient information from model after backward pass.
-
-    Matches production env.py's _capture_gradients().
-    """
+    """Capture gradient information from model after backward pass."""
     grad_vectors_cpu = []
     total_norm_sq = 0.0
     layers_with_grad = 0
@@ -463,16 +645,8 @@ def capture_gradients(model: torch.nn.Module) -> GradientInfo:
 
 
 def run_reference(model, data_iterator, optimizer, num_steps, device):
-    """Run reference training and capture gradients on final step."""
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.allow_tf32 = True
-    # set_float32_matmul_precision("highest") controls matmul TF32 precision.
-    # Do NOT set cuda.matmul.allow_tf32 separately -- it would be overridden.
-    torch.set_float32_matmul_precision("highest")
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
-    torch.backends.cuda.enable_math_sdp(True)
+    """Run reference training with SAME backend settings as production validator."""
+    _enforce_backend_state()
 
     total_tokens = 0
     final_logits = None
@@ -483,9 +657,6 @@ def run_reference(model, data_iterator, optimizer, num_steps, device):
         batch = next(data_iterator)
         batch = batch.to(device, dtype=torch.long)
 
-        # No autocast - model is already in bfloat16.
-        # Using autocast here would change loss computation precision
-        # and create gradient mismatches with miner code that doesn't use autocast.
         input_ids = batch[:, :-1]
         labels = batch[:, 1:]
         outputs = model(input_ids)
@@ -522,7 +693,6 @@ def main():
     print("=" * 70)
     print()
 
-    # Track all results: list of (check_name, passed, detail)
     results: list[tuple[str, bool, str]] = []
 
     # Load configuration
@@ -544,7 +714,7 @@ def main():
     weight_relative_error_max = verification.get("weight_relative_error_max", 0.04)
 
     expected_tokens = batch_size * seq_len * num_steps
-    expected_seq_len = seq_len - 1  # Causal LM: input_ids = batch[:, :-1]
+    expected_seq_len = seq_len - 1
 
     print("Configuration:")
     print(f"  Batch size: {batch_size}")
@@ -557,11 +727,12 @@ def main():
     gradient_err = gradient_norm_ratio_max - 1.0
     print(f"  Max gradient relative error: {gradient_err:.4f} ({gradient_err * 100:.1f}%)")
     print(
-        f"  Max weight relative error: {weight_relative_error_max:.4f} ({weight_relative_error_max * 100:.1f}%)"
+        f"  Max weight relative error: {weight_relative_error_max:.4f}"
+        f" ({weight_relative_error_max * 100:.1f}%)"
     )
     print()
 
-    # Check paths (these are fatal — can't continue without files)
+    # Check paths
     model_path = project_root / "benchmark" / "model"
     data_path = project_root / "benchmark" / "data" / "train.pt"
     train_path = project_root / "local_test" / "train.py"
@@ -575,7 +746,7 @@ def main():
         sys.exit(1)
 
     # =====================================================================
-    # CHECK: Security scan (same as production validator)
+    # CHECK: Security scan
     # =====================================================================
     print("Security scan (same as production validator)...")
     code = train_path.read_text()
@@ -620,7 +791,6 @@ def main():
     model = model.to(device)
     model.gradient_checkpointing_enable()
     model.train()
-    # Ensure all parameters are trainable (same as production validator)
     for param in model.parameters():
         param.requires_grad = True
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -645,7 +815,7 @@ def main():
     # Save initial state
     initial_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
 
-    # === Run reference ===
+    # === Run reference with CORRECT backend settings ===
     print("Running reference baseline...")
     use_fused = torch.cuda.is_available()
     optimizer_ref = torch.optim.AdamW(
@@ -657,7 +827,6 @@ def main():
     print(f"  Reference loss: {reference.final_loss:.6f}")
     print(f"  Reference gradient norm: {reference_grad.grad_norm:.4f}")
 
-    # Capture reference final weights for weight verification (same as production validator)
     reference_final_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     print("  Captured reference final model state for weight verification")
     print()
@@ -704,16 +873,10 @@ def main():
     model.load_state_dict({k: v.to(device) for k, v in initial_state.items()})
     model.train()
 
-    # === Enforce backend state (same as production validator) ===
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("highest")
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
-    torch.backends.cuda.enable_math_sdp(True)
+    # === Enforce CORRECT backend state (same as production validator) ===
+    _enforce_backend_state()
 
-    # === Run miner's code with GradientCapturingOptimizer (same as validator) ===
+    # === Run miner's code with GradientCapturingOptimizer ===
     print("Running your inner_steps with GradientCapturingOptimizer...")
     base_optimizer = torch.optim.AdamW(
         model.parameters(), lr=1e-4, weight_decay=0.1, betas=(0.9, 0.95), fused=use_fused
@@ -746,15 +909,11 @@ def main():
         _print_summary(results)
         sys.exit(1)
 
-    # Finalize gradients (move GPU snapshot to CPU — same as production validator)
+    # Finalize gradients
     capturing_optimizer.finalize_gradients()
 
-    # Verify backend settings were not tampered with during eval (same as production validator)
-    backend_violations = []
-    if not torch.backends.cudnn.deterministic:
-        backend_violations.append("cudnn.deterministic changed to False")
-    if torch.backends.cudnn.benchmark:
-        backend_violations.append("cudnn.benchmark changed to True")
+    # Verify backend settings were not tampered with
+    backend_violations = _check_backend_state()
     if backend_violations:
         print("  [WARNING] Backend settings changed during eval:")
         for v in backend_violations:
@@ -763,7 +922,7 @@ def main():
         print("  Production validator would REJECT this submission.")
     print()
 
-    # Verify optimizer wrapper integrity (same as production validator)
+    # Verify optimizer wrapper integrity
     if type(capturing_optimizer) is not GradientCapturingOptimizer:
         print("  [FAILED] Optimizer wrapper type was replaced!")
         results.append(("Optimizer integrity", False, "Wrapper type changed"))
@@ -797,7 +956,7 @@ def main():
     print(f"  Optimizer step count: {capturing_optimizer.step_count}")
 
     # =====================================================================
-    # Run all verification checks (never exit early)
+    # Run all verification checks
     # =====================================================================
     print()
     print("=" * 70)
@@ -941,7 +1100,6 @@ def main():
         print("  [SKIPPED] No candidate gradients")
         results.append((check, False, "No gradients to compare"))
     else:
-        # Coverage
         if candidate_grad.total_layers > 0:
             coverage = candidate_grad.layers_with_grad / candidate_grad.total_layers
             print(
@@ -963,7 +1121,8 @@ def main():
                     continue
                 if ref_layer.shape != cand_layer.shape:
                     print(
-                        f"  [FAILED] Gradient shape mismatch: {ref_layer.shape} vs {cand_layer.shape}"
+                        f"  [FAILED] Gradient shape mismatch:"
+                        f" {ref_layer.shape} vs {cand_layer.shape}"
                     )
                     shape_ok = False
                     break
@@ -1065,7 +1224,6 @@ def main():
 
 
 def _print_summary(results: list[tuple[str, bool, str]]) -> None:
-    """Print final summary of all check results."""
     passed = [(name, detail) for name, ok, detail in results if ok]
     failed = [(name, detail) for name, ok, detail in results if not ok]
 
