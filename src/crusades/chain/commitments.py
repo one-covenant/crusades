@@ -85,6 +85,7 @@ class CodeUrlInfo:
     """Code URL information from miner commitment."""
 
     url: str
+    code_hash: str | None = None  # SHA256 hex digest for integrity verification
 
     def is_valid(self) -> bool:
         """Check if code URL is valid (basic format check only).
@@ -193,7 +194,10 @@ class MinerCommitment:
                 parsed = json.loads(data)
 
                 if "code_url" in parsed:
-                    code_url_info = CodeUrlInfo(url=parsed["code_url"])
+                    code_url_info = CodeUrlInfo(
+                        url=parsed["code_url"],
+                        code_hash=parsed.get("code_hash"),
+                    )
                     logger.debug(f"Code URL from UID {uid}: {code_url_info.url[:50]}...")
 
             except json.JSONDecodeError:
