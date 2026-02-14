@@ -20,13 +20,18 @@ This is a **Bittensor subnet** where miners compete to write the fastest `inner_
 
 **Commitment format** (`neurons/miner.py`):
 
-```json
-{"code_url": "https://example.com/train.py", "code_hash": "sha256hex..."}
+Packed format (fits 128-byte on-chain limit):
+```
+<32 hex hash>:<url>
+cf4817d9793e92a0b00b0afc241354f9:https://gist.githubusercontent.com/user/abc123/raw
 ```
 
-- Miner computes `sha256(code)` at submit time and includes it in the timelock-encrypted commitment
+- 32 hex chars = 128-bit truncated SHA256 (2^128 collision resistance)
+- 33 bytes overhead, leaving 95 bytes for URL
+- Miner computes `sha256(code)[:32]` at submit time
 - Validator verifies hash matches downloaded code before evaluation (rejects on mismatch)
-- Backward-compatible: old commitments without `code_hash` are accepted
+- Backward-compatible: also parses legacy JSON format `{"code_url": "...", "code_hash": "..."}`
+- CLI rejects commitments exceeding 128 bytes at submit time
 
 **SSRF Protection** (`src/crusades/chain/commitments.py`):
 
@@ -290,10 +295,11 @@ Since `sys` is a forbidden import and `env` is also a forbidden import, miners c
 The commitment previously contained only the URL, not a hash of the code. A miner could **change the code at the URL** after committing.
 
 **Mitigation** (implemented):
-- Miner CLI now computes `sha256(code)` at submit time and includes it in the commitment JSON: `{"code_url": "...", "code_hash": "sha256hex..."}`
+- Miner CLI computes `sha256(code)[:32]` (128-bit truncated) at submit time
+- Packed into commitment as `<32 hex hash>:<url>` to fit 128-byte on-chain limit
 - Validator verifies the hash matches the downloaded code before evaluation
 - Hash mismatch fails the submission with `"Code hash mismatch — URL content changed after commitment"`
-- Backward-compatible: old commitments without `code_hash` are accepted (hash check skipped)
+- Backward-compatible: old commitments without hash (JSON format) are accepted
 - First-committer-wins logic prevents URL reuse
 - Rate limiting (`min_blocks_between_commits: 300`)
 

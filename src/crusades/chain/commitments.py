@@ -7,15 +7,21 @@ URL-Based Architecture with Timelock Encryption:
 - After reveal_blocks, validators can read decrypted URL
 - Validator fetches code from URL and evaluates
 
-Commitment format:
-  {
-    "code_url": "https://example.com/train.py"
-  }
+Commitment formats (parsed in order):
+
+  Packed (current, fits 128-byte on-chain limit):
+    <32 hex hash>:<url>
+    Example: cf4817d9793e92a0...1354f9:https://example.com/train.py
+
+  JSON (legacy, backward-compatible):
+    {"code_url": "https://example.com/train.py"}
+    {"code_url": "https://example.com/train.py", "code_hash": "sha256hex..."}
 """
 
 import ipaddress
 import json
 import logging
+import re
 import socket
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -188,8 +194,17 @@ class MinerCommitment:
 
         code_url_info = None
 
-        # Parse JSON format
-        if data.startswith("{"):
+        # Try packed format first: <32 hex chars>:<url>
+        # This is the current format, fits 128-byte on-chain limit
+        packed_match = re.match(r"^([0-9a-f]{32}):(https?://.+)$", data)
+        if packed_match:
+            code_hash = packed_match.group(1)
+            code_url = packed_match.group(2)
+            code_url_info = CodeUrlInfo(url=code_url, code_hash=code_hash)
+            logger.debug(f"Packed commitment from UID {uid}: {code_url[:50]}...")
+
+        # Fall back to JSON format (legacy)
+        elif data.startswith("{"):
             try:
                 parsed = json.loads(data)
 
@@ -198,7 +213,7 @@ class MinerCommitment:
                         url=parsed["code_url"],
                         code_hash=parsed.get("code_hash"),
                     )
-                    logger.debug(f"Code URL from UID {uid}: {code_url_info.url[:50]}...")
+                    logger.debug(f"JSON commitment from UID {uid}: {code_url_info.url[:50]}...")
 
             except json.JSONDecodeError:
                 logger.debug(f"Invalid JSON in commitment from UID {uid}")

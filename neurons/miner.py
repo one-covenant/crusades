@@ -93,12 +93,13 @@ def validate_code_url(url: str) -> tuple[bool, str, str | None]:
                 return False, f"File too large ({len(code)} bytes). Max 500KB for single train.py", None
 
             # Compute code hash for commitment integrity verification
-            code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+            # Truncated to 128-bit (32 hex chars) — 2^128 collision resistance
+            code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()[:32]
 
             print(f"   [OK] URL accessible ({len(code)} bytes)")
             print("   [OK] Single file detected")
             print("   [OK] Contains inner_steps function")
-            print(f"   [OK] Code hash: {code_hash[:16]}...")
+            print(f"   [OK] Code hash: {code_hash}")
 
     except urllib.error.HTTPError as e:
         return False, f"Cannot access URL: HTTP {e.code}", None
@@ -161,13 +162,20 @@ def commit_to_chain(
     print(f"   Reveal blocks: {blocks_until_reveal} (from hparams.json)")
     print(f"   Block time: {block_time}s (from hparams.json)")
 
-    # Commitment data: code URL + hash for integrity verification
-    commitment_payload = {"code_url": code_url}
+    # Commitment data: packed format to fit 128-byte on-chain limit
+    # Format: <32 hex hash>:<url>  (33 bytes overhead, leaves 95 for URL)
+    # Falls back to JSON if no hash (shouldn't happen with current CLI)
     if code_hash:
-        commitment_payload["code_hash"] = code_hash
-    commitment_data = json.dumps(commitment_payload, separators=(",", ":"))
+        commitment_data = f"{code_hash}:{code_url}"
+    else:
+        commitment_data = json.dumps({"code_url": code_url}, separators=(",", ":"))
 
     print(f"   Commitment size: {len(commitment_data)} bytes")
+    if len(commitment_data) > 128:
+        return False, (
+            f"Commitment too large ({len(commitment_data)} bytes, max 128). "
+            f"Use a shorter URL (max ~95 chars)."
+        )
 
     # Commit using timelock encryption (drand)
     print("\nCommitting to chain...")
@@ -309,7 +317,11 @@ def cmd_validate(args):
         print("\n[OK] URL is valid!")
         print(f"   Final URL: {result}")
         if code_hash:
-            print(f"   Code hash: {code_hash[:16]}...")
+            print(f"   Code hash: {code_hash}")
+            packed_size = len(f"{code_hash}:{result}")
+            print(f"   Packed commitment: {packed_size}/128 bytes")
+            if packed_size > 128:
+                print(f"   [WARNING] Too large! Shorten URL by {packed_size - 128} chars")
         print("\nTo submit, run:")
         print(
             f"  uv run -m neurons.miner submit '{result}' --wallet.name <name> --wallet.hotkey <hotkey>"

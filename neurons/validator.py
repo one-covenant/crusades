@@ -482,14 +482,17 @@ class Validator(BaseNode):
 
             # Verify code hash if commitment included one (integrity check)
             # Old commitments without code_hash are skipped (backward-compatible)
+            # Hash may be truncated (32 hex = 128-bit) from packed format
             committed_hash = submission.code_hash
             if committed_hash and not committed_hash.startswith("http"):
-                actual_hash = hashlib.sha256(miner_code.encode("utf-8")).hexdigest()
+                full_hash = hashlib.sha256(miner_code.encode("utf-8")).hexdigest()
+                # Truncate actual hash to match committed length (32 or 64 chars)
+                actual_hash = full_hash[: len(committed_hash)]
                 if actual_hash != committed_hash:
                     logger.error(
                         f"Code hash mismatch! URL content changed after commitment.\n"
-                        f"   Committed: {committed_hash[:16]}...\n"
-                        f"   Actual:    {actual_hash[:16]}..."
+                        f"   Committed: {committed_hash}\n"
+                        f"   Actual:    {actual_hash}"
                     )
                     await self.db.update_submission_status(
                         submission.submission_id,
@@ -497,7 +500,7 @@ class Validator(BaseNode):
                         error_message="Code hash mismatch — URL content changed after commitment",
                     )
                     continue
-                logger.info(f"   Code hash verified: {actual_hash[:16]}...")
+                logger.info(f"   Code hash verified: {actual_hash}")
 
             # Run evaluations
             fatal_error = False
