@@ -470,6 +470,36 @@ def validate_code_structure(code: str) -> list[str]:
                         line = getattr(node, "lineno", "?")
                         violations.append(f"Line {line}: forbidden string via b'...'.decode()")
 
+    # Scan for str.join() obfuscation: "".join(["s","e","t","a","t","t","r"])
+    for node in ast.walk(scan_tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "join"
+            and isinstance(node.func.value, ast.Constant)
+            and isinstance(node.func.value.value, str)
+            and node.args
+            and len(node.args) == 1
+        ):
+            arg = node.args[0]
+            if isinstance(arg, (ast.List, ast.Tuple)):
+                chars = []
+                all_const = True
+                for elt in arg.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        chars.append(elt.value)
+                    else:
+                        all_const = False
+                        break
+                if all_const and chars:
+                    joined = node.func.value.value.join(chars)
+                    for pattern in _FORBIDDEN_STRINGS:
+                        if pattern in joined:
+                            line = getattr(node, "lineno", "?")
+                            violations.append(
+                                f"Line {line}: forbidden string constructed via str.join()"
+                            )
+
     inner_steps_found = False
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "inner_steps":
