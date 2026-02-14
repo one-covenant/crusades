@@ -254,15 +254,17 @@ Since `sys` is a forbidden import and `env` is also a forbidden import, miners c
 
 **Mitigation**: `ctypes` and `memoryview` are blocked, `torch._C` is now blocked. `torch.ops` remains allowed for legitimate operator registration.
 
-### 2. No Code Hash in Commitment — REAL RISK
+### 2. No Code Hash in Commitment — MITIGATED
 
-The commitment contains only the URL, not a hash of the code. After committing, the miner can **change the code at the URL** before the validator downloads it.
+The commitment previously contained only the URL, not a hash of the code. A miner could **change the code at the URL** after committing.
 
-**Mitigation**: 
+**Mitigation** (implemented):
+- Miner CLI now computes `sha256(code)` at submit time and includes it in the commitment JSON: `{"code_url": "...", "code_hash": "sha256hex..."}`
+- Validator verifies the hash matches the downloaded code before evaluation
+- Hash mismatch fails the submission with `"Code hash mismatch — URL content changed after commitment"`
+- Backward-compatible: old commitments without `code_hash` are accepted (hash check skipped)
 - First-committer-wins logic prevents URL reuse
 - Rate limiting (`min_blocks_between_commits: 300`)
-- Code is downloaded once and evaluated — can't change mid-evaluation
-- **TODO**: Consider adding a code hash to the commitment for integrity verification
 
 ### 3. Gradient/Weight Tolerance is Exploitable — SPECULATIVE
 
@@ -279,17 +281,19 @@ These tolerances exist because BF16 arithmetic is inherently noisy. An attacker 
 
 `torch.compile` is explicitly allowed. `/tmp` has `exec` permission for compiled kernels. A miner could use custom Triton kernels. This is **intended and legitimate** optimization.
 
-### 5. AST Bypass via Non-Literal String Construction — PARTIALLY MITIGATED
+### 5. AST Bypass via Non-Literal String Construction — MITIGATED
 
-The string scan checks `ast.Constant` values, `bytes().decode()`, and now `ast.Attribute.attr` names. Runtime string construction via list joins could still evade it:
+The string scan checks `ast.Constant` values, `bytes().decode()`, `ast.Attribute.attr` names, and now `str.join()` patterns:
 
 ```python
 name = "".join(["s", "e", "t", "a", "t", "t", "r"])
 ```
 
-**Mitigation**: Since `getattr`, `setattr`, `exec`, `eval` are all blocked as callable builtins, constructing the string alone isn't useful without a way to call it dynamically.
-
-**TODO**: Consider scanning `str.join()` calls on lists of single-character constants.
+**Mitigation** (implemented):
+- AST scanner reconstructs `str.join()` calls on lists/tuples of string constants at analysis time
+- The reconstructed string is checked against `_FORBIDDEN_STRINGS`
+- Handles any separator string (not just `""`)
+- Additionally, `getattr`, `setattr`, `exec`, `eval` are all blocked as callable builtins, so constructing the string alone isn't useful without a way to call it dynamically
 
 ### 6. `__getattr__` Override on User Classes — LOW RISK
 
@@ -340,10 +344,10 @@ The model architecture (`Qwen/Qwen2.5-3B`) and dataset (`fineweb`) are fixed and
 
 ### Moderate Concerns
 
-- No code hash in commitment (URL-only) — miner can swap code post-commit
 - 6% gradient tolerance + 0.8% weight tolerance provides room for approximate computation
 - `torch.ops` remains allowed (legitimate use but potential for custom operator abuse)
 - `exec` permission on tmpfs (required for torch.compile) is a necessary evil
+- Code hash verification is backward-compatible — old commitments without hash are still accepted
 
 ### Low Concerns
 
@@ -363,17 +367,15 @@ The model architecture (`Qwen/Qwen2.5-3B`) and dataset (`fineweb`) are fixed and
 4. ~~**CUDA event timing**~~: Done — three-way cross-check with untamperable GPU-level timing.
 5. ~~**Timer identity verification**~~: Done — `id()` comparison detects reference replacement.
 6. ~~**MFU sanity cap**~~: Done — physically impossible scores (>75%) are rejected.
+7. ~~**Add code hash to commitment**~~: Done — miner computes `sha256(code)` at submit time, validator verifies after download. Backward-compatible with old commitments.
+8. ~~**Scan for `str.join()` obfuscation**~~: Done — AST scanner reconstructs joined strings from list/tuple constants and checks against forbidden patterns.
 
 ### Open
 
-1. **Add code hash to commitment**: Include `sha256(code)` alongside the URL in the commitment JSON. Validator verifies hash matches downloaded code before evaluation.
+1. **Consider tightening gradient tolerance**: As the competition matures and legitimate optimizations plateau, reducing the 6% threshold would narrow the window for approximate computation cheats.
 
-2. **Scan for `str.join()` obfuscation**: Detect patterns like `"".join([...single chars...])` that construct forbidden strings at runtime.
+2. **Add `torch.ops` to monitored attributes**: While legitimate use exists, it could be used to register custom operators that bypass Python-level restrictions.
 
-3. **Consider tightening gradient tolerance**: As the competition matures and legitimate optimizations plateau, reducing the 6% threshold would narrow the window for approximate computation cheats.
+3. **Log and audit `torch.compile` usage**: Track whether miners use `torch.compile` and what backends they target, to detect unusual compilation patterns.
 
-4. **Add `torch.ops` to monitored attributes**: While legitimate use exists, it could be used to register custom operators that bypass Python-level restrictions.
-
-5. **Log and audit `torch.compile` usage**: Track whether miners use `torch.compile` and what backends they target, to detect unusual compilation patterns.
-
-6. **Add seccomp profiles**: Further restrict syscalls inside Docker beyond `--cap-drop ALL` for defense-in-depth.
+4. **Add seccomp profiles**: Further restrict syscalls inside Docker beyond `--cap-drop ALL` for defense-in-depth.
