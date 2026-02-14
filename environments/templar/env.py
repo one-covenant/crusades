@@ -2296,7 +2296,8 @@ class Actor:
             )
             logger.info(
                 f"Timing: wall_time={wall_time:.2f}s "
-                f"(perf_counter={wall_time_perf:.2f}s, monotonic={wall_time_mono:.2f}s)"
+                f"(perf_counter={wall_time_perf:.2f}s, monotonic={wall_time_mono:.2f}s"
+                f"{f', cuda_events={cuda_wall_time:.2f}s' if cuda_wall_time else ''})"
             )
 
             # Convert GPU gradient snapshot to CPU (slow, but OUTSIDE the timer)

@@ -18,6 +18,16 @@ This is a **Bittensor subnet** where miners compete to write the fastest `inner_
 
 ### Layer 1: Commitment & URL Security
 
+**Commitment format** (`neurons/miner.py`):
+
+```json
+{"code_url": "https://example.com/train.py", "code_hash": "sha256hex..."}
+```
+
+- Miner computes `sha256(code)` at submit time and includes it in the timelock-encrypted commitment
+- Validator verifies hash matches downloaded code before evaluation (rejects on mismatch)
+- Backward-compatible: old commitments without `code_hash` are accepted
+
 **SSRF Protection** (`src/crusades/chain/commitments.py`):
 
 - URL is resolved to IP and checked against private/internal ranges:
@@ -100,6 +110,16 @@ This catches string-based evasion like `getattr(x, "__" + "dict__")` and byte-en
 
 In addition to string constants, the scanner checks every `ast.Attribute` node's `.attr` value against the forbidden strings list. This catches patterns like `_e._perf_counter` where `_perf_counter` appears as an attribute name, not a string literal.
 
+#### `str.join()` Obfuscation Detection
+
+The scanner reconstructs `str.join()` calls on lists/tuples of string constants at AST analysis time and checks the result against `_FORBIDDEN_STRINGS`. This catches patterns like:
+
+```python
+"".join(["s", "e", "t", "a", "t", "t", "r"])  # → "setattr"
+```
+
+Handles any separator string, not just `""`.
+
 ### Layer 3: Docker Sandbox
 
 ```
@@ -146,21 +166,32 @@ The optimizer passed to the miner is a `GradientCapturingOptimizer` — a **tran
 
 #### Verification Checks (in order)
 
+**Pre-evaluation** (before code runs):
+
 | # | Check | Threshold | What It Catches |
 |---|-------|-----------|----------------|
-| 1 | Token count == expected | Exact match | Skipping batches, changing batch size |
-| 2 | Loss valid & close to reference | `\|diff\| < 0.3` | NaN injection, wrong loss function, skipping backward |
-| 3 | Gradient relative error | `\|g - g_ref\| / \|g_ref\| < 6%` | Modified backward pass, frozen layers, gradient manipulation |
-| 4 | Final weight relative error | `\|w - w_ref\| / \|w_ref\| < 0.8%` | Wrong optimizer, skipped steps, modified optimizer state |
-| 5 | All layers have gradients | 100% coverage | Layer freezing |
-| 6 | Parameter elements changed | ≥80% | No-op training |
-| 7 | Sequence length matches expected | Exact match | Sequence truncation (cheap speedup) |
-| 8 | Logits shape is 3D | `(batch, seq, vocab)` | Returning dummy data |
-| 9 | Backend settings unchanged | Exact match | Disabling flash attention, changing precision |
-| 10 | Timer integrity (3-way) | All pairs within 10% | Timer function replacement (see below) |
-| 11 | Timer function identity | `id()` unchanged | Direct timer reference replacement |
-| 12 | Optimizer wrapper type unchanged | `type(opt) is GradientCapturingOptimizer` | Replacing the wrapper |
-| 13 | MFU sanity cap | ≤75% | Physically impossible scores from any timing bypass |
+| 0 | Code hash verification | SHA256 match | URL content changed after commitment (miner swapped code) |
+
+**Post-evaluation** (after `inner_steps()` returns):
+
+| # | Check | Threshold | What It Catches |
+|---|-------|-----------|----------------|
+| 1 | Timer function identity | `id()` unchanged | Direct timer reference replacement |
+| 2 | Timer integrity (3-way) | All pairs within 10% | Timer function replacement (perf_counter vs monotonic vs CUDA events) |
+| 3 | Backend settings unchanged | Exact match | Disabling flash attention, changing precision |
+| 4 | Optimizer wrapper type unchanged | `type(opt) is GradientCapturingOptimizer` | Replacing the wrapper |
+| 5 | Gradients captured | Not None | Miner not calling `optimizer.step()` |
+| 6 | Return type valid | Has required attrs | Returning wrong type from `inner_steps()` |
+| 7 | Logits not None | Not None | Returning dummy data |
+| 8 | Logits shape is 3D | `(batch, seq, vocab)` | Wrong output shape |
+| 9 | Sequence length matches expected | Exact match | Sequence truncation (cheap speedup) |
+| 10 | Parameter elements changed | ≥80% | No-op training |
+| 11 | Token count == expected | Exact match | Skipping batches, changing batch size |
+| 12 | Loss valid & close to reference | `\|diff\| < 0.3` | NaN injection, wrong loss function, skipping backward |
+| 13 | Gradient relative error | `\|g - g_ref\| / \|g_ref\| < 6%` | Modified backward pass, frozen layers, gradient manipulation |
+| 14 | Final weight relative error | `\|w - w_ref\| / \|w_ref\| < 0.8%` | Wrong optimizer, skipped steps, modified optimizer state |
+| 15 | All layers have gradients | 100% coverage | Layer freezing |
+| 16 | MFU sanity cap | ≤75% | Physically impossible scores from any timing bypass |
 
 #### Timing Integrity (Three-Way Cross-Check)
 
@@ -330,14 +361,15 @@ The model architecture (`Qwen/Qwen2.5-3B`) and dataset (`fineweb`) are fixed and
 ### Strong
 
 - Docker sandbox (`--network none`, read-only, dropped capabilities)
-- AST scanner — comprehensive, blocks most escape vectors including attribute-name scanning
+- AST scanner — comprehensive, blocks most escape vectors including attribute-name and `str.join()` scanning
 - Three-way timer integrity check (perf_counter + monotonic + CUDA events)
 - Timer function identity verification (`id()` comparison)
 - MFU sanity cap (75%) — safety net against any timing bypass
+- Code hash in commitment — `sha256(code)` verified at download time, prevents URL content mutation
 - Gradient + weight verification — strong mathematical proof-of-work
 - `GradientCapturingOptimizer` — `__slots__`, read-only after init, private attr blocking
 - SSRF protection with redirect validation
-- String-level + attribute-level scanning catches obfuscation attempts
+- String-level + attribute-level + `str.join()` scanning catches obfuscation attempts
 - Module isolation during both import and execution phases
 - `torch._C` and dynamo/inductor config writes blocked
 - `env`, `logging`, `__main__`, `miner_train` all forbidden imports
