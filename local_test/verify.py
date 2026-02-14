@@ -89,6 +89,11 @@ _FORBIDDEN_STRINGS = [
     "operator.methodcaller",
     "attrgetter",
     "methodcaller",
+    # Prevent access to validator env internals
+    "_CACHE",
+    "initial_state",
+    "_hidden_modules",
+    "_sensitive_keys",
 ]
 
 _FORBIDDEN_MODULES = {
@@ -126,6 +131,13 @@ _FORBIDDEN_MODULES = {
     "base64",
     "pdb",
     "pprint",
+    # Block importing the validator's env module (timer tampering attack)
+    "env",
+    "__main__",
+    "miner_train",
+    # logging.Logger.manager.loggerDict holds refs to all loggers —
+    # traversable to reach the env module's logger and back to env itself
+    "logging",
 }
 
 _BLOCKED_BUILTINS = {
@@ -266,6 +278,25 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: {func.attr}() is forbidden")
 
+        # Block torch._C access (low-level C++ bindings escape hatch)
+        if isinstance(node, ast.Attribute) and node.attr == "_C":
+            if isinstance(node.value, ast.Name) and node.value.id == "torch":
+                line = getattr(node, "lineno", "?")
+                violations.append(f"Line {line}: torch._C access is forbidden")
+
+        # Block torch._dynamo.config and torch._inductor.config writes
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Attribute):
+                    if target.value.attr == "config" and isinstance(
+                        target.value.value, ast.Attribute
+                    ):
+                        if target.value.value.attr in ("_dynamo", "_inductor"):
+                            line = getattr(node, "lineno", "?")
+                            violations.append(
+                                f"Line {line}: modifying torch.{target.value.value.attr}.config is forbidden"
+                            )
+
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
                 if node.func.id in ("exec", "eval", "compile", "__import__"):
@@ -380,6 +411,17 @@ def validate_code_structure(code: str) -> list[str]:
                 if pattern in node.value:
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: forbidden string pattern '{pattern}' detected")
+
+    # Scan attribute names (e.g. _e._perf_counter) — AST string scan only
+    # catches ast.Constant values, not ast.Attribute.attr names
+    for node in ast.walk(scan_tree):
+        if isinstance(node, ast.Attribute):
+            for pattern in _FORBIDDEN_STRINGS:
+                if node.attr == pattern:
+                    line = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"Line {line}: forbidden attribute name '{node.attr}'"
+                    )
 
     # Scan bytes().decode() and b"...".decode() for forbidden patterns
     for node in ast.walk(scan_tree):
