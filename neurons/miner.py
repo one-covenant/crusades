@@ -11,7 +11,7 @@ Timelock encryption keeps it hidden until reveal_blocks pass.
 """
 
 import argparse
-import json
+import hashlib
 import sys
 import urllib.error
 import urllib.request
@@ -21,7 +21,7 @@ import bittensor as bt
 from crusades.config import HParams
 
 
-def validate_code_url(url: str) -> tuple[bool, str]:
+def validate_code_url(url: str) -> tuple[bool, str, str | None]:
     """Validate that the URL points to a SINGLE valid train.py file.
 
     Accepts ANY URL that returns valid Python code with inner_steps function.
@@ -33,14 +33,16 @@ def validate_code_url(url: str) -> tuple[bool, str]:
         url: The URL to validate
 
     Returns:
-        Tuple of (is_valid, error_message_or_validated_url)
+        Tuple of (is_valid, error_message_or_validated_url, code_hash_or_none)
+        code_hash is sha256 hex digest of the code content, included in commitment
+        so validators can verify URL content hasn't changed after commit.
     """
     if not url:
-        return False, "URL cannot be empty"
+        return False, "URL cannot be empty", None
 
     # Must be HTTP or HTTPS
     if not url.startswith("http://") and not url.startswith("https://"):
-        return False, "URL must start with http:// or https://"
+        return False, "URL must start with http:// or https://", None
 
     # Block obvious directory/folder URLs
     blocked_patterns = [
@@ -54,11 +56,11 @@ def validate_code_url(url: str) -> tuple[bool, str]:
     ]
     for pattern in blocked_patterns:
         if pattern in url.lower():
-            return False, "URL appears to be a folder/page, not a single file. Use raw file URL."
+            return False, "URL appears to be a folder/page, not a single file. Use raw file URL.", None
 
     # For GitHub blob URLs, suggest raw format
     if "github.com" in url and "/blob/" in url:
-        return False, "Use raw.githubusercontent.com URL instead of github.com/blob/"
+        return False, "Use raw.githubusercontent.com URL instead of github.com/blob/", None
 
     # For GitHub Gist URLs, convert to raw format
     final_url = url
@@ -75,37 +77,43 @@ def validate_code_url(url: str) -> tuple[bool, str]:
 
             # Check it's not HTML (indicates folder/page, not file)
             if "<html" in code.lower()[:500] or "<!doctype html" in code.lower()[:500]:
-                return False, "URL returns HTML page, not a code file. Use raw file URL."
+                return False, "URL returns HTML page, not a code file. Use raw file URL.", None
 
             # Check it's not JSON (could be API response listing files)
             if code.strip().startswith("{") and '"files"' in code[:500]:
-                return False, "URL returns JSON (possibly file listing), not a single code file."
+                return False, "URL returns JSON (possibly file listing), not a single code file.", None
 
             # Basic validation - must contain inner_steps
             if "def inner_steps" not in code:
-                return False, "Code must contain 'def inner_steps' function"
+                return False, "Code must contain 'def inner_steps' function", None
 
             # Size sanity check (single file should be < 100KB typically)
             if len(code) > 500_000:  # 500KB max
-                return False, f"File too large ({len(code)} bytes). Max 500KB for single train.py"
+                return False, f"File too large ({len(code)} bytes). Max 500KB for single train.py", None
+
+            # Compute code hash for commitment integrity verification
+            # Truncated to 128-bit (32 hex chars) — 2^128 collision resistance
+            code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()[:32]
 
             print(f"   [OK] URL accessible ({len(code)} bytes)")
             print("   [OK] Single file detected")
             print("   [OK] Contains inner_steps function")
+            print(f"   [OK] Code hash: {code_hash}")
 
     except urllib.error.HTTPError as e:
-        return False, f"Cannot access URL: HTTP {e.code}"
+        return False, f"Cannot access URL: HTTP {e.code}", None
     except urllib.error.URLError as e:
-        return False, f"Cannot access URL: {e.reason}"
+        return False, f"Cannot access URL: {e.reason}", None
     except Exception as e:
-        return False, f"Error validating URL: {e}"
+        return False, f"Error validating URL: {e}", None
 
-    return True, final_url
+    return True, final_url, code_hash
 
 
 def commit_to_chain(
     wallet: bt.wallet,
     code_url: str,
+    code_hash: str | None = None,
     network: str = "finney",
 ) -> tuple[bool, dict | str]:
     """Commit code URL to blockchain (timelock encrypted).
@@ -116,6 +124,7 @@ def commit_to_chain(
     Args:
         wallet: Bittensor wallet
         code_url: URL containing train.py code
+        code_hash: SHA256 hex digest of code content (for integrity verification)
         network: Subtensor network (finney, test, or local)
 
     Returns:
@@ -152,15 +161,16 @@ def commit_to_chain(
     print(f"   Reveal blocks: {blocks_until_reveal} (from hparams.json)")
     print(f"   Block time: {block_time}s (from hparams.json)")
 
-    # Commitment data - just the code URL!
-    commitment_data = json.dumps(
-        {
-            "code_url": code_url,
-        },
-        separators=(",", ":"),
-    )
+    # Commitment data: packed format to fit 128-byte on-chain limit
+    # Format: <32 hex hash>:<url>  (33 bytes overhead, leaves 95 for URL)
+    commitment_data = f"{code_hash}:{code_url}"
 
     print(f"   Commitment size: {len(commitment_data)} bytes")
+    if len(commitment_data) > 128:
+        return False, (
+            f"Commitment too large ({len(commitment_data)} bytes, max 128). "
+            f"Use a shorter URL (max ~95 chars)."
+        )
 
     # Commit using timelock encryption (drand)
     print("\nCommitting to chain...")
@@ -220,7 +230,7 @@ def cmd_submit(args):
     print("Validating URL...")
     print(f"   URL: {args.code_url}")
 
-    valid, result = validate_code_url(args.code_url)
+    valid, result, code_hash = validate_code_url(args.code_url)
     if not valid:
         print(f"\n[FAILED] Invalid URL: {result}")
         return 1
@@ -234,6 +244,7 @@ def cmd_submit(args):
     success, result = commit_to_chain(
         wallet=wallet,
         code_url=final_url,
+        code_hash=code_hash,
         network=args.network,
     )
 
@@ -295,11 +306,17 @@ def cmd_validate(args):
     print("=" * 60)
     print(f"\nValidating: {args.code_url}")
 
-    valid, result = validate_code_url(args.code_url)
+    valid, result, code_hash = validate_code_url(args.code_url)
 
     if valid:
         print("\n[OK] URL is valid!")
         print(f"   Final URL: {result}")
+        if code_hash:
+            print(f"   Code hash: {code_hash}")
+            packed_size = len(f"{code_hash}:{result}")
+            print(f"   Packed commitment: {packed_size}/128 bytes")
+            if packed_size > 128:
+                print(f"   [WARNING] Too large! Shorten URL by {packed_size - 128} chars")
         print("\nTo submit, run:")
         print(
             f"  uv run -m neurons.miner submit '{result}' --wallet.name <name> --wallet.hotkey <hotkey>"

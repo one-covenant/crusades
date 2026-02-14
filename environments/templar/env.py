@@ -39,7 +39,9 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 if not logger.handlers:
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    )
     logger.addHandler(handler)
 
 # Suppress noisy loggers from libraries
@@ -50,7 +52,14 @@ logging.getLogger("datasets").setLevel(logging.WARNING)
 
 _perf_counter = time.perf_counter
 _monotonic = time.monotonic
-_cuda_synchronize = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
+_cuda_synchronize = (
+    torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
+)
+
+# Store identity of original timer functions for post-execution verification.
+# If miner code replaces these references, id() will differ.
+_perf_counter_id = id(_perf_counter)
+_monotonic_id = id(_monotonic)
 
 # Configuration from environment variables
 DETERMINISTIC_MODE = os.getenv("DETERMINISTIC_MODE", "1") == "1"
@@ -107,7 +116,9 @@ def _load_miner_module(train_path: Path):
         raise ImportError(f"Could not load {train_path}")
 
     _hidden_modules = {}
-    _sensitive_keys = [k for k in sys.modules if k == "env" or k.endswith(".env") or k == __name__]
+    _sensitive_keys = [
+        k for k in sys.modules if k == "env" or k.endswith(".env") or k == __name__
+    ]
     for key in _sensitive_keys:
         _hidden_modules[key] = sys.modules.pop(key)
 
@@ -224,7 +235,10 @@ def _load_hf_dataset(
     logger.info(f"Loading dataset: {dataset_name} (samples={num_samples})")
 
     # Cache tokenizer to avoid reloading every eval (HF tokenizers leak via Rust FFI)
-    if _CACHE.get("tokenizer") is not None and _CACHE.get("tokenizer_model") == model_name:
+    if (
+        _CACHE.get("tokenizer") is not None
+        and _CACHE.get("tokenizer_model") == model_name
+    ):
         tokenizer = _CACHE["tokenizer"]
     else:
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -234,7 +248,9 @@ def _load_hf_dataset(
         _CACHE["tokenizer_model"] = model_name
 
     # Check for cached dataset (enables --network none operation)
-    cached_path = os.getenv("CACHED_DATASET_PATH", "/home/appuser/.cache/templar/dataset.json")
+    cached_path = os.getenv(
+        "CACHED_DATASET_PATH", "/home/appuser/.cache/templar/dataset.json"
+    )
 
     if Path(cached_path).exists():
         # Tokenize ALL samples once and cache the full tensor.
@@ -372,7 +388,10 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                     line = getattr(node, "lineno", "?")
                     return False, f"Line {line}: reassignment of __name__ is forbidden"
 
-        if isinstance(node, ast.Attribute) and node.attr in ("__setattr__", "__delattr__"):
+        if isinstance(node, ast.Attribute) and node.attr in (
+            "__setattr__",
+            "__delattr__",
+        ):
             if isinstance(node.value, ast.Name) and node.value.id == "object":
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
@@ -437,6 +456,29 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
+        # Block torch._C access (low-level C++ bindings escape hatch)
+        if isinstance(node, ast.Attribute) and node.attr == "_C":
+            if isinstance(node.value, ast.Name) and node.value.id == "torch":
+                line = getattr(node, "lineno", "?")
+                return False, f"Line {line}: torch._C access is forbidden"
+
+        # Block torch._dynamo.config and torch._inductor.config writes
+        # (e.g. suppress_errors=True masks compilation errors)
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and isinstance(
+                    target.value, ast.Attribute
+                ):
+                    if target.value.attr == "config" and isinstance(
+                        target.value.value, ast.Attribute
+                    ):
+                        if target.value.value.attr in ("_dynamo", "_inductor"):
+                            line = getattr(node, "lineno", "?")
+                            return (
+                                False,
+                                f"Line {line}: modifying torch.{target.value.value.attr}.config is forbidden",
+                            )
+
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
                 if node.func.id in ("exec", "eval", "compile", "__import__"):
@@ -448,7 +490,8 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                     return False, f"Line {line}: .{node.func.attr}() is forbidden"
                 if node.func.attr == "compile":
                     if not (
-                        isinstance(node.func.value, ast.Name) and node.func.value.id == "torch"
+                        isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "torch"
                     ):
                         line = getattr(node, "lineno", "?")
                         return (
@@ -491,12 +534,21 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             "base64",
             "pdb",
             "pprint",
+            # Block importing the validator's env module (timer tampering attack)
+            "env",
+            "__main__",
+            "miner_train",
+            # logging.Logger.manager.loggerDict holds refs to all loggers —
+            # traversable to reach the env module's logger and back to env itself
+            "logging",
         }
 
         if isinstance(node, ast.Import):
             for alias in node.names:
                 base_module = alias.name.split(".")[0]
-                if base_module in _forbidden_modules or alias.name.startswith("importlib"):
+                if base_module in _forbidden_modules or alias.name.startswith(
+                    "importlib"
+                ):
                     line = getattr(node, "lineno", "?")
                     return False, f"Line {line}: forbidden import"
                 # Block torch.utils.cpp_extension
@@ -539,7 +591,10 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             if isinstance(node.func, ast.Name) and node.func.id in _forbidden_builtins:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: {node.func.id}() is forbidden"
-            if isinstance(node.func, ast.Attribute) and node.func.attr in _forbidden_builtins:
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in _forbidden_builtins
+            ):
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: .{node.func.attr}() is forbidden"
 
@@ -586,7 +641,10 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
         if isinstance(node, ast.Attribute) and node.attr == "optimizer":
             if not (isinstance(node.value, ast.Name) and node.value.id == "self"):
                 line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: accessing .optimizer attribute is forbidden"
+                return (
+                    False,
+                    f"Line {line}: accessing .optimizer attribute is forbidden",
+                )
 
     return True, None
 
@@ -645,6 +703,11 @@ _FORBIDDEN_STRINGS = [
     "operator.methodcaller",
     "attrgetter",
     "methodcaller",
+    # Prevent access to validator env internals
+    "_CACHE",
+    "initial_state",
+    "_hidden_modules",
+    "_sensitive_keys",
 ]
 
 
@@ -686,6 +749,17 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                         f"Security violation: Line {line}: forbidden string pattern detected"
                     )
 
+    # Scan attribute names (e.g. _e._perf_counter) — AST string scan only
+    # catches ast.Constant values, not ast.Attribute.attr names
+    for node in ast.walk(scan_tree):
+        if isinstance(node, ast.Attribute):
+            for pattern in _FORBIDDEN_STRINGS:
+                if node.attr == pattern:
+                    line = getattr(node, "lineno", "?")
+                    return False, (
+                        f"Security violation: Line {line}: forbidden attribute name '{node.attr}'"
+                    )
+
     for node in ast.walk(scan_tree):
         if (
             isinstance(node, ast.Call)
@@ -699,10 +773,16 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                 and inner.func.id in ("bytes", "bytearray")
             ):
                 try:
-                    if inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List):
+                    if (
+                        inner.args
+                        and len(inner.args) == 1
+                        and isinstance(inner.args[0], ast.List)
+                    ):
                         int_values = []
                         for elt in inner.args[0].elts:
-                            if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
+                            if isinstance(elt, ast.Constant) and isinstance(
+                                elt.value, int
+                            ):
                                 int_values.append(elt.value)
                             else:
                                 raise ValueError("non-constant element")
@@ -735,13 +815,48 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                             f"Security violation: Line {line}: forbidden string constructed via bytes literal"
                         )
 
+    # Scan for str.join() obfuscation: "".join(["s","e","t","a","t","t","r"])
+    # Reconstructs the joined string and checks against forbidden patterns
+    for node in ast.walk(scan_tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "join"
+            and isinstance(node.func.value, ast.Constant)
+            and isinstance(node.func.value.value, str)
+            and node.args
+            and len(node.args) == 1
+        ):
+            arg = node.args[0]
+            # Handle list/tuple of string constants
+            if isinstance(arg, (ast.List, ast.Tuple)):
+                chars = []
+                all_const = True
+                for elt in arg.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        chars.append(elt.value)
+                    else:
+                        all_const = False
+                        break
+                if all_const and chars:
+                    joined = node.func.value.value.join(chars)
+                    for pattern in _FORBIDDEN_STRINGS:
+                        if pattern in joined:
+                            line = getattr(node, "lineno", "?")
+                            return False, (
+                                f"Security violation: Line {line}: forbidden string constructed via str.join()"
+                            )
+
     inner_steps_found = False
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "inner_steps":
             inner_steps_found = True
             args = node.args
             if len(args.args) < 5:
-                return False, f"inner_steps has {len(args.args)} args, expected at least 5"
+                return (
+                    False,
+                    f"inner_steps has {len(args.args)} args, expected at least 5",
+                )
             break
 
     if not inner_steps_found:
@@ -755,7 +870,9 @@ def _validate_return_type(result) -> tuple[bool, str | None, InnerStepsResult | 
     if isinstance(result, InnerStepsResult):
         return True, None, result
 
-    if all(hasattr(result, attr) for attr in ("final_logits", "total_tokens", "final_loss")):
+    if all(
+        hasattr(result, attr) for attr in ("final_logits", "total_tokens", "final_loss")
+    ):
         return (
             True,
             None,
@@ -785,7 +902,9 @@ def _load_model(model_path: str, use_random_init: bool = False):
 
     if use_random_init:
         # Random initialization
-        logger.info(f"Loading model config from {model_path} with RANDOM initialization")
+        logger.info(
+            f"Loading model config from {model_path} with RANDOM initialization"
+        )
 
         # Use local cache only (Docker runs with --network=none)
         config = AutoConfig.from_pretrained(
@@ -911,9 +1030,13 @@ def _capture_gradients(model: torch.nn.Module) -> GradientInfo:
     total_layers = layers_with_grad + layers_without_grad
     if total_layers > 0:
         coverage = layers_with_grad / total_layers
-        logger.info(f"Gradient coverage: {layers_with_grad}/{total_layers} layers ({coverage:.1%})")
+        logger.info(
+            f"Gradient coverage: {layers_with_grad}/{total_layers} layers ({coverage:.1%})"
+        )
         if layers_without_grad > 0:
-            logger.warning(f"WARNING: {layers_without_grad} layers have zero/no gradients!")
+            logger.warning(
+                f"WARNING: {layers_without_grad} layers have zero/no gradients!"
+            )
 
     return GradientInfo(
         grad_norm=grad_norm,
@@ -1018,7 +1141,11 @@ def _get_cached_model(model_path: str, use_random_init: bool = False):
     cached_random_init = _CACHE.get("use_random_init")
 
     # Cache hit only if path AND init mode match
-    if cached is not None and cached_path == model_path and cached_random_init == use_random_init:
+    if (
+        cached is not None
+        and cached_path == model_path
+        and cached_random_init == use_random_init
+    ):
         if _CACHE.get("initial_state"):
             cached.load_state_dict(_CACHE["initial_state"])
         return cached
@@ -1027,7 +1154,9 @@ def _get_cached_model(model_path: str, use_random_init: bool = False):
     _CACHE["model"] = model
     _CACHE["model_path"] = model_path
     _CACHE["use_random_init"] = use_random_init
-    _CACHE["initial_state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    _CACHE["initial_state"] = {
+        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+    }
     return model
 
 
@@ -1036,7 +1165,9 @@ def _create_data_iterator(
 ) -> Iterator[torch.Tensor]:
     """Create infinite data iterator."""
     if data.size(1) < sequence_length:
-        raise ValueError(f"Data sequence length {data.size(1)} < required {sequence_length}")
+        raise ValueError(
+            f"Data sequence length {data.size(1)} < required {sequence_length}"
+        )
 
     data = data[:, :sequence_length]
     num_samples = data.size(0)
@@ -1116,7 +1247,9 @@ class GradientCapturingOptimizer:
         if name in GradientCapturingOptimizer._PUBLIC_ATTRS:
             return object.__getattribute__(self, name)
         if name.startswith("_"):
-            raise AttributeError(f"Access to '{name}' is not allowed on optimizer wrapper")
+            raise AttributeError(
+                f"Access to '{name}' is not allowed on optimizer wrapper"
+            )
         return object.__getattribute__(self, name)
 
     def __dir__(self):
@@ -1183,7 +1316,9 @@ class GradientCapturingOptimizer:
                 f"Gradient coverage: {layers_with_grad}/{total_layers} layers ({coverage:.1%})"
             )
             if layers_without_grad > 0:
-                logger.warning(f"WARNING: {layers_without_grad} layers have zero/no gradients!")
+                logger.warning(
+                    f"WARNING: {layers_without_grad} layers have zero/no gradients!"
+                )
 
         object.__setattr__(
             self,
@@ -1239,7 +1374,9 @@ class GradientCapturingOptimizer:
 
     def __getattr__(self, name):
         if name.startswith("_") and not (name.startswith("__") and name.endswith("__")):
-            raise AttributeError(f"Access to '{name}' is not allowed on optimizer wrapper")
+            raise AttributeError(
+                f"Access to '{name}' is not allowed on optimizer wrapper"
+            )
         opt = object.__getattribute__(self, "_opt_impl")
         return getattr(opt, name)
 
@@ -1320,7 +1457,9 @@ def _verify_gradients(
 
     if reference_grad is None or candidate_grad is None:
         error = "Missing gradient information for verification"
-        details["checks_failed"].append({"check": "gradient_availability", "error": error})
+        details["checks_failed"].append(
+            {"check": "gradient_availability", "error": error}
+        )
         logger.error(f"[FAILED] {error}")
         return False, error, details
 
@@ -1343,7 +1482,9 @@ def _verify_gradients(
                 f"Not all layers have gradients: {candidate_grad.layers_with_grad}/{candidate_grad.total_layers} "
                 f"({grad_coverage:.1%}) - possible layer freezing detected"
             )
-            details["checks_failed"].append({"check": "gradient_coverage", "error": error})
+            details["checks_failed"].append(
+                {"check": "gradient_coverage", "error": error}
+            )
             details["error_code"] = "gradient_coverage_failed"
             logger.error(f"[FAILED] {error}")
             return False, error, details
@@ -1373,7 +1514,9 @@ def _verify_gradients(
 
             if ref_layer.shape != cand_layer.shape:
                 error = f"Gradient shape mismatch at layer: ref={ref_layer.shape}, cand={cand_layer.shape}"
-                details["checks_failed"].append({"check": "gradient_shape", "error": error})
+                details["checks_failed"].append(
+                    {"check": "gradient_shape", "error": error}
+                )
                 logger.error(f"[FAILED] {error}")
                 return False, error, details
 
@@ -1407,7 +1550,9 @@ def _verify_gradients(
                 f"Gradient relative error is non-finite ({relative_error}) - "
                 "possible NaN injection detected"
             )
-            details["checks_failed"].append({"check": "gradient_nan_guard", "error": error})
+            details["checks_failed"].append(
+                {"check": "gradient_nan_guard", "error": error}
+            )
             details["error_code"] = "gradient_nan_injection"
             logger.error(f"[FAILED] {error}")
             return False, error, details
@@ -1417,7 +1562,9 @@ def _verify_gradients(
                 f"Gradient relative error {relative_error:.6f} exceeds threshold "
                 f"{relative_error_threshold:.6f} (|g - g_truth| / |g_truth|)"
             )
-            details["checks_failed"].append({"check": "gradient_relative_error", "error": error})
+            details["checks_failed"].append(
+                {"check": "gradient_relative_error", "error": error}
+            )
             details["error_code"] = "gradient_relative_error_failed"
             logger.error(f"[FAILED] {error}")
             return False, error, details
@@ -1487,7 +1634,10 @@ def _verify_final_weights(
         # Track layers with significant differences (NaN-safe)
         if layer_ref_sq > 0:
             layer_rel_error = (layer_diff_sq**0.5) / (layer_ref_sq**0.5)
-            if not math.isfinite(layer_rel_error) or layer_rel_error > max_relative_error:
+            if (
+                not math.isfinite(layer_rel_error)
+                or layer_rel_error > max_relative_error
+            ):
                 mismatched_layers += 1
 
     ref_norm = ref_norm_sq**0.5
@@ -1527,7 +1677,9 @@ def _verify_final_weights(
             f"Final weight relative error {relative_error:.6f} exceeds threshold "
             f"{max_relative_error:.6f} (|w_miner - w_ref| / |w_ref|)"
         )
-        details["checks_failed"].append({"check": "weight_relative_error", "error": error})
+        details["checks_failed"].append(
+            {"check": "weight_relative_error", "error": error}
+        )
         details["error_code"] = "weight_mismatch"
         logger.error(f"[FAILED] {error}")
         return False, error, details
@@ -1610,7 +1762,9 @@ def _verify_outputs(
         logger.error(f"[FAILED] {error}")
         return False, error, details
     if candidate.final_loss <= 0:
-        error = f"Loss must be positive (cross-entropy > 0): got {candidate.final_loss:.4f}"
+        error = (
+            f"Loss must be positive (cross-entropy > 0): got {candidate.final_loss:.4f}"
+        )
         details["checks_failed"].append({"check": "loss_validity", "error": error})
         logger.error(f"[FAILED] {error}")
         return False, error, details
@@ -1633,7 +1787,9 @@ def _verify_outputs(
     logger.info(
         f"   Reference loss: {reference.final_loss:.4f}, Candidate loss: {candidate.final_loss:.4f}"
     )
-    logger.info(f"   Loss difference: {loss_difference:.4f} (max allowed: {max_loss_difference})")
+    logger.info(
+        f"   Loss difference: {loss_difference:.4f} (max allowed: {max_loss_difference})"
+    )
 
     if loss_difference > max_loss_difference:
         error = (
@@ -1656,7 +1812,9 @@ def _verify_outputs(
     details["gradient_verification"] = grad_details
 
     if not grad_ok:
-        details["checks_failed"].append({"check": "gradient_verification", "error": grad_error})
+        details["checks_failed"].append(
+            {"check": "gradient_verification", "error": grad_error}
+        )
         return False, grad_error, details
     details["checks_passed"].append("gradient_verification")
 
@@ -1671,7 +1829,9 @@ def _verify_outputs(
         details["weight_verification"] = weight_details
 
         if not weight_ok:
-            details["checks_failed"].append({"check": "weight_verification", "error": weight_error})
+            details["checks_failed"].append(
+                {"check": "weight_verification", "error": weight_error}
+            )
             return False, weight_error, details
         details["checks_passed"].append("weight_verification")
     else:
@@ -1838,7 +1998,9 @@ class Actor:
             _log_vram("before-model-load")
             model = _get_cached_model(model_url, use_random_init=use_random_init)
             model_params = model_params_override or _count_model_params(model)
-            logger.info(f"Model loaded: {model_params:,} parameters, random_init={use_random_init}")
+            logger.info(
+                f"Model loaded: {model_params:,} parameters, random_init={use_random_init}"
+            )
 
             data = _load_hf_dataset(
                 dataset_name=data_url,
@@ -1857,11 +2019,18 @@ class Actor:
 
             initial_state = _CACHE.get("initial_state")
             if initial_state is None:
-                initial_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                initial_state = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
                 _CACHE["initial_state"] = initial_state
 
             reference, reference_grad = _run_reference(
-                model, data_iter_ref, optimizer_ref, steps, device, capture_final_gradients=True
+                model,
+                data_iter_ref,
+                optimizer_ref,
+                steps,
+                device,
+                capture_final_gradients=True,
             )
 
             # Capture reference final weights for verification
@@ -1884,15 +2053,25 @@ class Actor:
             data_iter_warmup = _create_data_iterator(data, batch_size, seq_len)
             optimizer_warmup = _create_optimizer(model)
 
-            logger.info(f"Running {warmup_steps} warmup step(s) to check for basic errors...")
+            logger.info(
+                f"Running {warmup_steps} warmup step(s) to check for basic errors..."
+            )
             try:
-                warmup_result = miner_module.inner_steps(
-                    model=model,
-                    data_iterator=data_iter_warmup,
-                    optimizer=optimizer_warmup,
-                    num_steps=warmup_steps,
-                    device=device,
-                )
+                # Hide env module during miner execution to prevent timer tampering
+                _hidden_warmup = {}
+                for _mk in list(sys.modules):
+                    if _mk == "env" or _mk == __name__ or _mk.endswith(".env"):
+                        _hidden_warmup[_mk] = sys.modules.pop(_mk)
+                try:
+                    warmup_result = miner_module.inner_steps(
+                        model=model,
+                        data_iterator=data_iter_warmup,
+                        optimizer=optimizer_warmup,
+                        num_steps=warmup_steps,
+                        device=device,
+                    )
+                finally:
+                    sys.modules.update(_hidden_warmup)
 
                 # Quick validation of warmup result
                 if warmup_result is None:
@@ -1954,8 +2133,8 @@ class Actor:
                 logger.info("Warmup passed - proceeding with verification checks")
 
                 # Check trainable params AFTER warmup (miner code may modify requires_grad)
-                trainable_ok, trainable_error, trainable_details = _verify_trainable_params(
-                    model, min_trainable_params_ratio
+                trainable_ok, trainable_error, trainable_details = (
+                    _verify_trainable_params(model, min_trainable_params_ratio)
                 )
                 if not trainable_ok:
                     return {
@@ -1974,7 +2153,9 @@ class Actor:
 
             except Exception as e:
                 # Early termination - don't waste time on broken code
-                error_msg = f"Early termination (warmup failed): {type(e).__name__}: {str(e)}"
+                error_msg = (
+                    f"Early termination (warmup failed): {type(e).__name__}: {str(e)}"
+                )
                 logger.error(error_msg)
                 return {
                     "task_id": task_id,
@@ -2000,52 +2181,123 @@ class Actor:
             _log_vram("before-timed-eval")
             data_iter_miner = _create_data_iterator(data, batch_size, seq_len)
             base_optimizer = _create_optimizer(model)
-            optimizer_miner = GradientCapturingOptimizer(base_optimizer, model, num_steps=steps)
+            optimizer_miner = GradientCapturingOptimizer(
+                base_optimizer, model, num_steps=steps
+            )
 
             _reset_torch_state()
             _enforce_backend_state()
 
+            # CUDA events are recorded on the GPU command stream — immune to
+            # Python-level timer patches. Created BEFORE miner code runs.
+            _cuda_start_event = None
+            _cuda_end_event = None
+            if torch.cuda.is_available():
+                _cuda_start_event = torch.cuda.Event(enable_timing=True)
+                _cuda_end_event = torch.cuda.Event(enable_timing=True)
+
             _cuda_synchronize()
             start_perf = _perf_counter()
             start_mono = _monotonic()
+            if _cuda_start_event is not None:
+                _cuda_start_event.record()
 
-            miner_result = miner_module.inner_steps(
-                model=model,
-                data_iterator=data_iter_miner,
-                optimizer=optimizer_miner,
-                num_steps=steps,
-                device=device,
-            )
+            # Hide env module during timed miner execution to prevent timer tampering
+            _hidden_timed = {}
+            for _mk in list(sys.modules):
+                if _mk == "env" or _mk == __name__ or _mk.endswith(".env"):
+                    _hidden_timed[_mk] = sys.modules.pop(_mk)
+            try:
+                miner_result = miner_module.inner_steps(
+                    model=model,
+                    data_iterator=data_iter_miner,
+                    optimizer=optimizer_miner,
+                    num_steps=steps,
+                    device=device,
+                )
+            finally:
+                sys.modules.update(_hidden_timed)
 
-            _cuda_synchronize()
-            end_perf = _perf_counter()
-            end_mono = _monotonic()
-            wall_time_perf = end_perf - start_perf
-            wall_time_mono = end_mono - start_mono
-
-            if wall_time_mono > 0 and abs(wall_time_perf - wall_time_mono) / wall_time_mono > 0.10:
+            # Verify timer function references weren't replaced by miner code.
+            # Even with module hiding, check as defense-in-depth.
+            if id(_perf_counter) != _perf_counter_id or id(_monotonic) != _monotonic_id:
                 logger.warning(
-                    f"Timer integrity check FAILED: perf_counter={wall_time_perf:.4f}s "
-                    f"vs monotonic={wall_time_mono:.4f}s "
-                    f"(divergence={abs(wall_time_perf - wall_time_mono) / wall_time_mono * 100:.1f}%)"
+                    "Timer function identity changed — miner replaced timer references"
                 )
                 return {
                     "task_id": task_id,
                     "mfu": 0.0,
                     "tps": 0.0,
                     "total_tokens": 0,
-                    "wall_time_seconds": wall_time_mono,
+                    "wall_time_seconds": 0.0,
                     "success": False,
-                    "error": "Timer integrity violation detected",
+                    "error": "Timer function identity changed",
                     "error_code": "timer_tampering",
                     "seed": seed,
                     "code": code,
                 }
 
-            wall_time = wall_time_mono
+            if _cuda_end_event is not None:
+                _cuda_end_event.record()
+            _cuda_synchronize()
+            end_perf = _perf_counter()
+            end_mono = _monotonic()
+            wall_time_perf = end_perf - start_perf
+            wall_time_mono = end_mono - start_mono
+
+            # CUDA event wall time (untamperable from Python)
+            cuda_wall_time = None
+            if _cuda_start_event is not None and _cuda_end_event is not None:
+                cuda_wall_time = (
+                    _cuda_start_event.elapsed_time(_cuda_end_event) / 1000.0
+                )
+
+            # Three-way timer cross-check: perf_counter vs monotonic vs CUDA events
+            # If ANY pair diverges by >10%, it's timer tampering
+            def _timer_divergence(a: float, b: float) -> float:
+                return abs(a - b) / max(b, 1e-9)
+
+            _timer_pairs = [
+                ("perf_counter", wall_time_perf, "monotonic", wall_time_mono),
+            ]
+            if cuda_wall_time is not None and cuda_wall_time > 0:
+                _timer_pairs.append(
+                    ("perf_counter", wall_time_perf, "cuda_events", cuda_wall_time)
+                )
+                _timer_pairs.append(
+                    ("monotonic", wall_time_mono, "cuda_events", cuda_wall_time)
+                )
+
+            for name_a, val_a, name_b, val_b in _timer_pairs:
+                if val_b > 0 and _timer_divergence(val_a, val_b) > 0.10:
+                    logger.warning(
+                        f"Timer integrity check FAILED: {name_a}={val_a:.4f}s "
+                        f"vs {name_b}={val_b:.4f}s "
+                        f"(divergence={_timer_divergence(val_a, val_b) * 100:.1f}%)"
+                    )
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": cuda_wall_time or wall_time_mono,
+                        "success": False,
+                        "error": f"Timer integrity violation: {name_a} vs {name_b}",
+                        "error_code": "timer_tampering",
+                        "seed": seed,
+                        "code": code,
+                    }
+
+            # Use CUDA event time as canonical (untamperable), fall back to monotonic
+            wall_time = (
+                cuda_wall_time
+                if cuda_wall_time is not None and cuda_wall_time > 0
+                else wall_time_mono
+            )
             logger.info(
                 f"Timing: wall_time={wall_time:.2f}s "
-                f"(perf_counter={wall_time_perf:.2f}s, monotonic={wall_time_mono:.2f}s)"
+                f"(perf_counter={wall_time_perf:.2f}s, monotonic={wall_time_mono:.2f}s"
+                f"{f', cuda_events={cuda_wall_time:.2f}s' if cuda_wall_time else ''})"
             )
 
             # Convert GPU gradient snapshot to CPU (slow, but OUTSIDE the timer)
@@ -2054,7 +2306,9 @@ class Actor:
             # Verify backend settings were not tampered with during timed eval
             _backend_violations = _check_backend_state()
             if _backend_violations:
-                logger.warning(f"Backend settings changed during eval: {_backend_violations}")
+                logger.warning(
+                    f"Backend settings changed during eval: {_backend_violations}"
+                )
                 return {
                     "task_id": task_id,
                     "mfu": 0.0,
@@ -2163,7 +2417,9 @@ class Actor:
                     "seed": seed,
                     "code": code,
                 }
-            logger.info(f"[PASSED] Sequence length check: {logits_seq_len} == {expected_seq_len}")
+            logger.info(
+                f"[PASSED] Sequence length check: {logits_seq_len} == {expected_seq_len}"
+            )
 
             # Verify sufficient parameters changed during training
             params_ok, params_error, params_details = _verify_params_changed(
@@ -2203,7 +2459,31 @@ class Actor:
 
             total_tokens_int = expected_tokens  # Use validator-computed token count
             tps = float(total_tokens_int) / max(wall_time, 1e-6)
-            mfu = _calculate_mfu(total_tokens_int, wall_time, model_params, gpu_peak_tflops)
+            mfu = _calculate_mfu(
+                total_tokens_int, wall_time, model_params, gpu_peak_tflops
+            )
+
+            # MFU sanity cap — no legitimate code can exceed this on current hardware.
+            # Safety net: even if a novel timing attack evades all other checks,
+            # physically impossible MFU values are rejected.
+            MAX_PLAUSIBLE_MFU = 75.0
+            if mfu > MAX_PLAUSIBLE_MFU:
+                logger.warning(
+                    f"MFU {mfu:.1f}% exceeds plausible maximum {MAX_PLAUSIBLE_MFU}% — "
+                    "likely timer manipulation"
+                )
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": f"MFU {mfu:.1f}% exceeds plausible maximum {MAX_PLAUSIBLE_MFU}%",
+                    "error_code": "implausible_mfu",
+                    "seed": seed,
+                    "code": code,
+                }
 
             # Diagnostics
             diagnostics = {

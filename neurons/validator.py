@@ -10,6 +10,7 @@ URL-Based Architecture:
 import argparse
 import asyncio
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -318,7 +319,7 @@ class Validator(BaseNode):
             submission_id=submission_id,
             miner_hotkey=commitment.hotkey,
             miner_uid=commitment.uid,
-            code_hash=commitment.code_url_info.url,  # Use code URL as identifier
+            code_hash=commitment.code_url_info.code_hash,  # 128-bit truncated SHA256
             bucket_path=commitment.code_url_info.url,  # Store code URL
             status=SubmissionStatus.EVALUATING,
             payment_verified=True,
@@ -475,6 +476,24 @@ class Validator(BaseNode):
 
             miner_code = code_or_error
             logger.info(f"   Downloaded {len(miner_code)} bytes")
+
+            # Verify code hash from commitment (integrity check)
+            # Hash is 32-char truncated SHA256 from packed commitment format
+            committed_hash = submission.code_hash
+            actual_hash = hashlib.sha256(miner_code.encode("utf-8")).hexdigest()[:32]
+            if actual_hash != committed_hash:
+                logger.error(
+                    f"Code hash mismatch! URL content changed after commitment.\n"
+                    f"   Committed: {committed_hash}\n"
+                    f"   Actual:    {actual_hash}"
+                )
+                await self.db.update_submission_status(
+                    submission.submission_id,
+                    SubmissionStatus.FAILED_EVALUATION,
+                    error_message="Code hash mismatch — URL content changed after commitment",
+                )
+                continue
+            logger.info(f"   Code hash verified: {actual_hash}")
 
             # Run evaluations
             fatal_error = False
