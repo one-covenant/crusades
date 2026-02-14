@@ -30,8 +30,8 @@ cf4817d9793e92a0b00b0afc241354f9:https://gist.githubusercontent.com/user/abc123/
 - 33 bytes overhead, leaving 95 bytes for URL
 - Miner computes `sha256(code)[:32]` at submit time
 - Validator verifies hash matches downloaded code before evaluation (rejects on mismatch)
-- Backward-compatible: also parses legacy JSON format `{"code_url": "...", "code_hash": "..."}`
 - CLI rejects commitments exceeding 128 bytes at submit time
+- Commitments without valid packed format are rejected
 
 **SSRF Protection** (`src/crusades/chain/commitments.py`):
 
@@ -299,7 +299,7 @@ The commitment previously contained only the URL, not a hash of the code. A mine
 - Packed into commitment as `<32 hex hash>:<url>` to fit 128-byte on-chain limit
 - Validator verifies the hash matches the downloaded code before evaluation
 - Hash mismatch fails the submission with `"Code hash mismatch — URL content changed after commitment"`
-- Backward-compatible: old commitments without hash (JSON format) are accepted
+- Commitments without valid packed format (`<hash>:<url>`) are rejected
 - First-committer-wins logic prevents URL reuse
 - Rate limiting (`min_blocks_between_commits: 300`)
 
@@ -385,7 +385,7 @@ The model architecture (`Qwen/Qwen2.5-3B`) and dataset (`fineweb`) are fixed and
 - 6% gradient tolerance + 0.8% weight tolerance provides room for approximate computation
 - `torch.ops` remains allowed (legitimate use but potential for custom operator abuse)
 - `exec` permission on tmpfs (required for torch.compile) is a necessary evil
-- Code hash verification is backward-compatible — old commitments without hash are still accepted
+- URL length limited to ~95 chars due to 128-byte packed commitment format
 
 ### Low Concerns
 
@@ -405,7 +405,7 @@ The model architecture (`Qwen/Qwen2.5-3B`) and dataset (`fineweb`) are fixed and
 4. ~~**CUDA event timing**~~: Done — three-way cross-check with untamperable GPU-level timing.
 5. ~~**Timer identity verification**~~: Done — `id()` comparison detects reference replacement.
 6. ~~**MFU sanity cap**~~: Done — physically impossible scores (>75%) are rejected.
-7. ~~**Add code hash to commitment**~~: Done — miner computes `sha256(code)` at submit time, validator verifies after download. Backward-compatible with old commitments.
+7. ~~**Add code hash to commitment**~~: Done — miner computes `sha256(code)[:32]` at submit time, packed as `<hash>:<url>` to fit 128-byte on-chain limit. Validator verifies after download.
 8. ~~**Scan for `str.join()` obfuscation**~~: Done — AST scanner reconstructs joined strings from list/tuple constants and checks against forbidden patterns.
 
 ### Open

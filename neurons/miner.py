@@ -12,7 +12,6 @@ Timelock encryption keeps it hidden until reveal_blocks pass.
 
 import argparse
 import hashlib
-import json
 import sys
 import urllib.error
 import urllib.request
@@ -164,11 +163,7 @@ def commit_to_chain(
 
     # Commitment data: packed format to fit 128-byte on-chain limit
     # Format: <32 hex hash>:<url>  (33 bytes overhead, leaves 95 for URL)
-    # Falls back to JSON if no hash (shouldn't happen with current CLI)
-    if code_hash:
-        commitment_data = f"{code_hash}:{code_url}"
-    else:
-        commitment_data = json.dumps({"code_url": code_url}, separators=(",", ":"))
+    commitment_data = f"{code_hash}:{code_url}"
 
     print(f"   Commitment size: {len(commitment_data)} bytes")
     if len(commitment_data) > 128:

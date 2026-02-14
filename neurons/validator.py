@@ -315,14 +315,11 @@ class Validator(BaseNode):
             except (IndexError, ValueError):
                 pass
 
-        # Store committed code hash if available (for integrity verification on download)
-        committed_hash = commitment.code_url_info.code_hash or commitment.code_url_info.url
-
         submission = SubmissionModel(
             submission_id=submission_id,
             miner_hotkey=commitment.hotkey,
             miner_uid=commitment.uid,
-            code_hash=committed_hash,  # SHA256 hash from commitment (or URL for old commits)
+            code_hash=commitment.code_url_info.code_hash,  # 128-bit truncated SHA256
             bucket_path=commitment.code_url_info.url,  # Store code URL
             status=SubmissionStatus.EVALUATING,
             payment_verified=True,
@@ -480,27 +477,23 @@ class Validator(BaseNode):
             miner_code = code_or_error
             logger.info(f"   Downloaded {len(miner_code)} bytes")
 
-            # Verify code hash if commitment included one (integrity check)
-            # Old commitments without code_hash are skipped (backward-compatible)
-            # Hash may be truncated (32 hex = 128-bit) from packed format
+            # Verify code hash from commitment (integrity check)
+            # Hash is 32-char truncated SHA256 from packed commitment format
             committed_hash = submission.code_hash
-            if committed_hash and not committed_hash.startswith("http"):
-                full_hash = hashlib.sha256(miner_code.encode("utf-8")).hexdigest()
-                # Truncate actual hash to match committed length (32 or 64 chars)
-                actual_hash = full_hash[: len(committed_hash)]
-                if actual_hash != committed_hash:
-                    logger.error(
-                        f"Code hash mismatch! URL content changed after commitment.\n"
-                        f"   Committed: {committed_hash}\n"
-                        f"   Actual:    {actual_hash}"
-                    )
-                    await self.db.update_submission_status(
-                        submission.submission_id,
-                        SubmissionStatus.FAILED_EVALUATION,
-                        error_message="Code hash mismatch — URL content changed after commitment",
-                    )
-                    continue
-                logger.info(f"   Code hash verified: {actual_hash}")
+            actual_hash = hashlib.sha256(miner_code.encode("utf-8")).hexdigest()[:32]
+            if actual_hash != committed_hash:
+                logger.error(
+                    f"Code hash mismatch! URL content changed after commitment.\n"
+                    f"   Committed: {committed_hash}\n"
+                    f"   Actual:    {actual_hash}"
+                )
+                await self.db.update_submission_status(
+                    submission.submission_id,
+                    SubmissionStatus.FAILED_EVALUATION,
+                    error_message="Code hash mismatch — URL content changed after commitment",
+                )
+                continue
+            logger.info(f"   Code hash verified: {actual_hash}")
 
             # Run evaluations
             fatal_error = False

@@ -7,19 +7,15 @@ URL-Based Architecture with Timelock Encryption:
 - After reveal_blocks, validators can read decrypted URL
 - Validator fetches code from URL and evaluates
 
-Commitment formats (parsed in order):
-
-  Packed (current, fits 128-byte on-chain limit):
+Commitment format (packed, fits 128-byte on-chain limit):
     <32 hex hash>:<url>
     Example: cf4817d9793e92a0...1354f9:https://example.com/train.py
 
-  JSON (legacy, backward-compatible):
-    {"code_url": "https://example.com/train.py"}
-    {"code_url": "https://example.com/train.py", "code_hash": "sha256hex..."}
+  - 32 hex chars = 128-bit truncated SHA256
+  - 33 bytes overhead, leaves 95 bytes for URL
 """
 
 import ipaddress
-import json
 import logging
 import re
 import socket
@@ -192,36 +188,17 @@ class MinerCommitment:
             )
             return None
 
-        code_url_info = None
-
-        # Try packed format first: <32 hex chars>:<url>
-        # This is the current format, fits 128-byte on-chain limit
+        # Parse packed format: <32 hex chars>:<url>
+        # Fits 128-byte on-chain limit (33 bytes overhead, 95 for URL)
         packed_match = re.match(r"^([0-9a-f]{32}):(https?://.+)$", data)
-        if packed_match:
-            code_hash = packed_match.group(1)
-            code_url = packed_match.group(2)
-            code_url_info = CodeUrlInfo(url=code_url, code_hash=code_hash)
-            logger.debug(f"Packed commitment from UID {uid}: {code_url[:50]}...")
-
-        # Fall back to JSON format (legacy)
-        elif data.startswith("{"):
-            try:
-                parsed = json.loads(data)
-
-                if "code_url" in parsed:
-                    code_url_info = CodeUrlInfo(
-                        url=parsed["code_url"],
-                        code_hash=parsed.get("code_hash"),
-                    )
-                    logger.debug(f"JSON commitment from UID {uid}: {code_url_info.url[:50]}...")
-
-            except json.JSONDecodeError:
-                logger.debug(f"Invalid JSON in commitment from UID {uid}")
-
-        # If we couldn't parse code URL info, skip
-        if code_url_info is None:
-            logger.debug(f"Could not parse commitment from UID {uid}: {data[:50]}...")
+        if not packed_match:
+            logger.debug(f"Invalid commitment format from UID {uid}: {data[:50]}...")
             return None
+
+        code_hash = packed_match.group(1)
+        code_url = packed_match.group(2)
+        code_url_info = CodeUrlInfo(url=code_url, code_hash=code_hash)
+        logger.debug(f"Commitment from UID {uid}: {code_url[:50]}...")
 
         return cls(
             uid=uid,
