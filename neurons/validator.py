@@ -325,7 +325,8 @@ class Validator(BaseNode):
             submission_id=submission_id,
             miner_hotkey=commitment.hotkey,
             miner_uid=commitment.uid,
-            code_hash=commitment.code_url_info.code_hash,  # 128-bit truncated SHA256
+            # Normalize empty-string hash from legacy rows to None.
+            code_hash=commitment.code_url_info.code_hash or None,  # 128-bit truncated SHA256
             bucket_path=commitment.code_url_info.url,  # Store code URL
             status=SubmissionStatus.EVALUATING,
             payment_verified=True,
@@ -487,7 +488,7 @@ class Validator(BaseNode):
             # Hash is 32-char truncated SHA256 from packed commitment format
             committed_hash = submission.code_hash
             actual_hash = hashlib.sha256(miner_code.encode("utf-8")).hexdigest()[:32]
-            if committed_hash is None:
+            if not committed_hash:
                 logger.warning(
                     "   Legacy submission without code_hash — skipping hash verification. "
                     "This is a security risk; legacy submissions should be phased out."

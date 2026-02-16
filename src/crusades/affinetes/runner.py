@@ -831,7 +831,7 @@ asyncio.run(main())
             )
 
             self._basilica_deployment = deployment
-            self._basilica_deployment_time = now
+            self._basilica_deployment_time = time.time()
 
             return deployment
 

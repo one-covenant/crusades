@@ -50,6 +50,7 @@ class BaseNode(ABC):
 
         # Events
         self.stop_event = asyncio.Event()
+        self._signal_loop: asyncio.AbstractEventLoop | None = None
 
     def setup_signal_handlers(self) -> None:
         """Setup signal handlers for graceful shutdown.
@@ -60,6 +61,7 @@ class BaseNode(ABC):
         """
         try:
             loop = asyncio.get_running_loop()
+            self._signal_loop = loop
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, self._signal_handler_async)
         except (RuntimeError, NotImplementedError):
@@ -74,7 +76,10 @@ class BaseNode(ABC):
     def _signal_handler(self, signum: int, frame) -> None:
         """Handle shutdown signals (fallback for non-async context)."""
         logger.info(f"Received signal {signum}, initiating shutdown...")
-        self.stop_event.set()
+        if self._signal_loop is not None and not self._signal_loop.is_closed():
+            self._signal_loop.call_soon_threadsafe(self.stop_event.set)
+        else:
+            self.stop_event.set()
 
     @property
     def hotkey(self) -> str:
