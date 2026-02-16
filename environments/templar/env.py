@@ -60,7 +60,11 @@ _REAL_SYNC_ID = id(_cuda_synchronize)
 
 # Configuration from environment variables
 DETERMINISTIC_MODE = os.getenv("DETERMINISTIC_MODE", "1") == "1"
-EVAL_SEQUENCE_LENGTH = int(os.getenv("EVAL_SEQUENCE_LENGTH", "1024"))
+try:
+    EVAL_SEQUENCE_LENGTH = int(os.getenv("EVAL_SEQUENCE_LENGTH", "1024"))
+except ValueError:
+    logger.warning("Invalid EVAL_SEQUENCE_LENGTH env var, defaulting to 1024")
+    EVAL_SEQUENCE_LENGTH = 1024
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/templar_eval"))
 
 
@@ -146,17 +150,6 @@ def _reset_torch_state():
         torch.cuda.synchronize = _cuda_synchronize
 
     logger.debug("Torch state reset complete")
-
-
-_REFERENCE_BACKEND_STATE = {
-    "cudnn.deterministic": False,
-    "cudnn.benchmark": True,
-    "cudnn.allow_tf32": True,
-    "float32_matmul_precision": "high",
-    "flash_sdp_enabled": True,
-    "mem_efficient_sdp_enabled": True,
-    "math_sdp_enabled": True,
-}
 
 
 def _enforce_backend_state():
@@ -396,6 +389,96 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
         "__build_class__",
     }
 
+    _forbidden_modules = {
+        "ctypes",
+        "_ctypes",
+        "gc",
+        "subprocess",
+        "sys",
+        "os",
+        "pathlib",
+        "io",
+        "_io",
+        "socket",
+        "http",
+        "urllib",
+        "requests",
+        "shutil",
+        "tempfile",
+        "signal",
+        "threading",
+        "_thread",
+        "multiprocessing",
+        "inspect",
+        "ast",
+        "dis",
+        "code",
+        "codeop",
+        "compileall",
+        "pickle",
+        "shelve",
+        "marshal",
+        "builtins",
+        "_builtins",
+        "operator",
+        "types",
+        "codecs",
+        "base64",
+        "pdb",
+        "pprint",
+        "runpy",
+        "linecache",
+        "pkgutil",
+        "atexit",
+        "site",
+        "zipimport",
+        # Stack inspection — reveals internal file paths and code structure
+        "traceback",
+        # Block importing the validator's own module (timer tampering attack)
+        "env",
+        "time",
+        "__main__",
+        "miner_train",
+        # logging.Logger.manager.loggerDict holds refs to all loggers —
+        # traversable to reach the env module's logger and back to env itself
+        "logging",
+        # unittest.mock.patch can replace any attribute on any object
+        "unittest",
+        "mock",
+        # functools.partial can wrap forbidden functions
+        "functools",
+        # weakref can observe GC behavior and hold references
+        "weakref",
+    }
+
+    # Dotted module paths that must be blocked even when the base module is allowed
+    _forbidden_dotted_modules = {
+        "torch.multiprocessing",
+        "torch.utils.dlpack",
+        "torch.distributed",
+        "numpy.ctypeslib",
+    }
+
+    _forbidden_builtins = {
+        "setattr",
+        "getattr",
+        "delattr",
+        "vars",
+        "dir",
+        "globals",
+        "locals",
+        "type",
+        "memoryview",
+        "open",
+        "chr",
+        "ord",
+        "breakpoint",
+        "input",
+        "classmethod",
+        "staticmethod",
+        "property",
+    }
+
     main_guard_nodes = _collect_main_guard_nodes(tree)
     for node in ast.walk(tree):
         if id(node) in main_guard_nodes:
@@ -521,58 +604,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                             f"Line {line}: .compile() is forbidden (only torch.compile is allowed)",
                         )
 
-        _forbidden_modules = {
-            "ctypes",
-            "_ctypes",
-            "gc",
-            "subprocess",
-            "sys",
-            "os",
-            "pathlib",
-            "io",
-            "socket",
-            "http",
-            "urllib",
-            "requests",
-            "shutil",
-            "tempfile",
-            "signal",
-            "threading",
-            "multiprocessing",
-            "inspect",
-            "ast",
-            "dis",
-            "code",
-            "codeop",
-            "compileall",
-            "pickle",
-            "shelve",
-            "marshal",
-            "builtins",
-            "_builtins",
-            "operator",
-            "types",
-            "codecs",
-            "base64",
-            "pdb",
-            "pprint",
-            # Block importing the validator's own module (timer tampering attack)
-            "env",
-            "time",
-            "__main__",
-            "miner_train",
-            # logging.Logger.manager.loggerDict holds refs to all loggers —
-            # traversable to reach the env module's logger and back to env itself
-            "logging",
-            # unittest.mock.patch can replace any attribute on any object
-            "unittest",
-            "mock",
-            # functools.partial can wrap forbidden functions
-            "functools",
-            # weakref can observe GC behavior and hold references
-            "weakref",
-        }
-
         if isinstance(node, ast.Import):
             for alias in node.names:
                 base_module = alias.name.split(".")[0]
@@ -583,6 +614,11 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 if "cpp_extension" in alias.name:
                     line = getattr(node, "lineno", "?")
                     return False, f"Line {line}: forbidden import"
+                # Block dangerous dotted module paths
+                for forbidden_path in _forbidden_dotted_modules:
+                    if alias.name == forbidden_path or alias.name.startswith(forbidden_path + "."):
+                        line = getattr(node, "lineno", "?")
+                        return False, f"Line {line}: forbidden import"
 
         if isinstance(node, ast.ImportFrom) and node.module:
             base_module = node.module.split(".")[0]
@@ -593,31 +629,22 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             if "cpp_extension" in node.module:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden import"
+            # Block dangerous dotted module paths (e.g. from torch import multiprocessing)
+            for forbidden_path in _forbidden_dotted_modules:
+                if node.module == forbidden_path or node.module.startswith(forbidden_path + "."):
+                    line = getattr(node, "lineno", "?")
+                    return False, f"Line {line}: forbidden import"
             for alias in node.names:
                 if "cpp_extension" in alias.name:
                     line = getattr(node, "lineno", "?")
                     return False, f"Line {line}: forbidden import"
+                # Block "from torch import multiprocessing" etc.
+                full_path = f"{node.module}.{alias.name}"
+                for forbidden_path in _forbidden_dotted_modules:
+                    if full_path == forbidden_path or full_path.startswith(forbidden_path + "."):
+                        line = getattr(node, "lineno", "?")
+                        return False, f"Line {line}: forbidden import"
 
-        # Block dangerous builtins as both bare names and attribute access
-        _forbidden_builtins = {
-            "setattr",
-            "getattr",
-            "delattr",
-            "vars",
-            "dir",
-            "globals",
-            "locals",
-            "type",
-            "memoryview",
-            "open",
-            "chr",
-            "ord",
-            "breakpoint",
-            "input",
-            "classmethod",
-            "staticmethod",
-            "property",
-        }
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id in _forbidden_builtins:
                 line = getattr(node, "lineno", "?")
@@ -625,6 +652,22 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             if isinstance(node.func, ast.Attribute) and node.func.attr in _forbidden_builtins:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: .{node.func.attr}() is forbidden"
+
+        # Block torch.load (uses pickle internally — bypasses pickle import ban)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "load"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "torch"
+        ):
+            line = getattr(node, "lineno", "?")
+            return False, f"Line {line}: torch.load() is forbidden (uses pickle internally)"
+
+        # Block numpy.ctypeslib access (grants access to blocked ctypes via numpy)
+        if isinstance(node, ast.Attribute) and node.attr == "ctypeslib":
+            line = getattr(node, "lineno", "?")
+            return False, f"Line {line}: ctypeslib access is forbidden"
 
         if isinstance(node, ast.Name) and node.id == "__builtins__":
             line = getattr(node, "lineno", "?")
@@ -764,15 +807,30 @@ _FORBIDDEN_STRINGS = [
 
 
 def _is_main_guard(node: ast.AST) -> bool:
-    """Check if an AST node is an `if __name__ == "__main__":` block."""
-    return (
+    """Check if an AST node is an `if __name__ == "__main__":` block.
+
+    Handles both `__name__ == "__main__"` and `"__main__" == __name__`
+    for consistency with _collect_main_guard_nodes.
+    """
+    if not (
         isinstance(node, ast.If)
         and isinstance(node.test, ast.Compare)
-        and isinstance(node.test.left, ast.Name)
-        and node.test.left.id == "__name__"
+        and len(node.test.ops) == 1
+        and isinstance(node.test.ops[0], (ast.Eq, ast.Is))
         and len(node.test.comparators) == 1
-        and isinstance(node.test.comparators[0], ast.Constant)
-        and node.test.comparators[0].value == "__main__"
+    ):
+        return False
+    left, right = node.test.left, node.test.comparators[0]
+    return (
+        isinstance(left, ast.Name)
+        and left.id == "__name__"
+        and isinstance(right, ast.Constant)
+        and right.value == "__main__"
+    ) or (
+        isinstance(right, ast.Name)
+        and right.id == "__name__"
+        and isinstance(left, ast.Constant)
+        and left.value == "__main__"
     )
 
 
@@ -894,22 +952,29 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                             )
 
     # Scan for string concatenation obfuscation: "__set" + "attr__"
+    # Walk full BinOp tree recursively to catch multi-level concat like "a" + "b" + "c"
+    def _collect_concat_parts(node: ast.AST) -> list[str] | None:
+        """Recursively collect all string constants from chained Add BinOps."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [node.value]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left_parts = _collect_concat_parts(node.left)
+            right_parts = _collect_concat_parts(node.right)
+            if left_parts is not None and right_parts is not None:
+                return left_parts + right_parts
+        return None
+
     for node in ast.walk(scan_tree):
-        if (
-            isinstance(node, ast.BinOp)
-            and isinstance(node.op, ast.Add)
-            and isinstance(node.left, ast.Constant)
-            and isinstance(node.left.value, str)
-            and isinstance(node.right, ast.Constant)
-            and isinstance(node.right.value, str)
-        ):
-            combined = node.left.value + node.right.value
-            for pattern in _FORBIDDEN_STRINGS:
-                if pattern in combined:
-                    line = getattr(node, "lineno", "?")
-                    return False, (
-                        f"Security violation: Line {line}: forbidden string constructed via concatenation"
-                    )
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            parts = _collect_concat_parts(node)
+            if parts and len(parts) >= 2:
+                combined = "".join(parts)
+                for pattern in _FORBIDDEN_STRINGS:
+                    if pattern in combined:
+                        line = getattr(node, "lineno", "?")
+                        return False, (
+                            f"Security violation: Line {line}: forbidden string constructed via concatenation"
+                        )
 
     # Scan for %-format obfuscation: "%s%s" % ("__set", "attr__")
     for node in ast.walk(scan_tree):
@@ -2004,7 +2069,7 @@ class Actor:
 
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + timeout
-        seed_value = abs(hash(seed)) % (2**32)
+        seed_value = int(hashlib.sha256(seed.encode()).hexdigest(), 16) % (2**32)
         _set_deterministic(seed_value)
 
         # Validate code structure
@@ -2611,6 +2676,7 @@ class Actor:
             }
 
         except Exception as e:
+            logger.error(f"Evaluation failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
             return {
                 "task_id": task_id,
                 "mfu": 0.0,
@@ -2618,7 +2684,7 @@ class Actor:
                 "total_tokens": 0,
                 "wall_time_seconds": 0.0,
                 "success": False,
-                "error": f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}",
+                "error": f"{type(e).__name__}: {e}",
                 "seed": seed,
                 "code": code,
             }
@@ -2634,8 +2700,7 @@ class Actor:
             # Without this, local references keep optimizer states (~2x model
             # VRAM), data tensors, gradient copies, and reference state alive,
             # preventing gc.collect() + empty_cache() from reclaiming memory.
-            # noinspection PyUnusedLocal
-            optimizer_miner = base_optimizer = None  # type: ignore[assignment]
+            optimizer_miner = base_optimizer = None  # type: ignore[assignment]  # noqa
             data_iter_miner = data = None  # type: ignore[assignment]
             reference_final_state = candidate_grad = None  # type: ignore[assignment]
             miner_result = parsed = miner_module = None  # type: ignore[assignment]

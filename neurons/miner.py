@@ -62,10 +62,6 @@ def validate_code_url(url: str) -> tuple[bool, str, str | None]:
                 None,
             )
 
-    # For GitHub blob URLs, suggest raw format
-    if "github.com" in url and "/blob/" in url:
-        return False, "Use raw.githubusercontent.com URL instead of github.com/blob/", None
-
     # For GitHub Gist URLs, convert to raw format
     final_url = url
     if "gist.github.com" in url.lower() and "/raw" not in url.lower():
@@ -104,7 +100,7 @@ def validate_code_url(url: str) -> tuple[bool, str, str | None]:
                 )
 
             # Compute code hash for commitment integrity verification
-            # Truncated to 128-bit (32 hex chars) — 2^128 collision resistance
+            # Truncated to 128-bit (32 hex chars) — 2^64 birthday-attack collision resistance
             code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()[:32]
 
             print(f"   [OK] URL accessible ({len(code)} bytes)")

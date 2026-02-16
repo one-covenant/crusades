@@ -24,13 +24,14 @@ Endpoints:
     GET /api/submissions/{id}/code       - Submission code
 """
 
+import hmac
 import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -73,6 +74,14 @@ async def lifespan(app: FastAPI):
     logger.info("Crusades API shutdown")
 
 
+def verify_api_key(request: Request, x_api_key: str | None = Header(None)):
+    """Verify API key if configured. Used as a global FastAPI dependency."""
+    configured_key = request.app.state.api_key
+    if configured_key:
+        if not x_api_key or not hmac.compare_digest(x_api_key, configured_key):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
 def create_app(api_key: str | None = None) -> FastAPI:
     """Create and configure the FastAPI app.
 
@@ -80,15 +89,16 @@ def create_app(api_key: str | None = None) -> FastAPI:
         api_key: Optional API key for authentication. If set, all requests
                  must include X-API-Key header.
     """
-    app = FastAPI(
+    new_app = FastAPI(
         title="Templar Crusades API",
         description="API for the Templar Crusades web dashboard",
         version="1.0.0",
         lifespan=lifespan,
+        dependencies=[Depends(verify_api_key)],
     )
 
     # CORS - allow website to call API
-    app.add_middleware(
+    new_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],  # In production, restrict to your domain
         allow_credentials=True,
@@ -97,20 +107,13 @@ def create_app(api_key: str | None = None) -> FastAPI:
     )
 
     # Store API key for authentication
-    app.state.api_key = api_key or os.getenv("DASHBOARD_API_KEY")
+    new_app.state.api_key = api_key or os.getenv("DASHBOARD_API_KEY")
 
-    return app
+    return new_app
 
 
 # Create default app instance
 app = create_app()
-
-
-def verify_api_key(x_api_key: str | None = Header(None)):
-    """Verify API key if configured."""
-    if app.state.api_key:
-        if not x_api_key or x_api_key != app.state.api_key:
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 # ============================================================
@@ -121,12 +124,7 @@ def verify_api_key(x_api_key: str | None = Header(None)):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    client = get_db_client()
-    is_mock = isinstance(client, MockClient)
-    return {
-        "status": "healthy",
-        "database": "mock" if is_mock else "sqlite",
-    }
+    return {"status": "healthy"}
 
 
 # ============================================================
@@ -135,7 +133,7 @@ async def health_check():
 
 
 @app.get("/api/stats/overview")
-async def get_overview(x_api_key: str | None = Header(None)) -> dict[str, Any]:
+async def get_overview() -> dict[str, Any]:
     """Get dashboard overview statistics.
 
     Returns:
@@ -145,13 +143,12 @@ async def get_overview(x_api_key: str | None = Header(None)) -> dict[str, Any]:
         - total_submissions: Total submissions all time
         - active_miners: Active miners in last 24h
     """
-    verify_api_key(x_api_key)
     client = get_db_client()
     return client.get_overview()
 
 
 @app.get("/api/stats/validator")
-async def get_validator_status(x_api_key: str | None = Header(None)) -> dict[str, Any]:
+async def get_validator_status() -> dict[str, Any]:
     """Get validator status.
 
     Returns:
@@ -162,28 +159,24 @@ async def get_validator_status(x_api_key: str | None = Header(None)) -> dict[str
         - queued_count, running_count, finished_count, failed_count
         - success_rate: Percentage of successful evaluations
     """
-    verify_api_key(x_api_key)
     client = get_db_client()
     return client.get_validator_status()
 
 
 @app.get("/api/stats/recent")
 async def get_recent_submissions(
-    x_api_key: str | None = Header(None),
     limit: int = Query(20, ge=1, le=100),
 ) -> list[dict[str, Any]]:
     """Get recent submissions.
 
     Returns list of recent submissions with status and scores.
     """
-    verify_api_key(x_api_key)
     client = get_db_client()
     return client.get_recent_submissions()[:limit]
 
 
 @app.get("/api/stats/history")
 async def get_history(
-    x_api_key: str | None = Header(None),
     limit: int = Query(100, ge=1, le=1000),
 ) -> list[dict[str, Any]]:
     """Get TPS history for charts.
@@ -191,7 +184,6 @@ async def get_history(
     Returns list of TPS scores over time for chart visualization.
     Returns the most recent `limit` data points (newest submissions).
     """
-    verify_api_key(x_api_key)
     client = get_db_client()
     history = client.get_history()
     # Return the most recent N data points (end of the list)
@@ -199,7 +191,7 @@ async def get_history(
 
 
 @app.get("/api/stats/queue")
-async def get_queue_stats(x_api_key: str | None = Header(None)) -> dict[str, Any]:
+async def get_queue_stats() -> dict[str, Any]:
     """Get queue statistics.
 
     Returns:
@@ -210,13 +202,12 @@ async def get_queue_stats(x_api_key: str | None = Header(None)) -> dict[str, Any
         - avg_wait_time_seconds: Average wait time
         - avg_score: Average TPS score
     """
-    verify_api_key(x_api_key)
     client = get_db_client()
     return client.get_queue_stats()
 
 
 @app.get("/api/stats/threshold")
-async def get_threshold(x_api_key: str | None = Header(None)) -> dict[str, Any]:
+async def get_threshold() -> dict[str, Any]:
     """Get adaptive threshold statistics.
 
     Returns:
@@ -225,7 +216,6 @@ async def get_threshold(x_api_key: str | None = Header(None)) -> dict[str, Any]:
         - last_update_block: Block when threshold was last updated
         - decayed_threshold: Current threshold after time-based decay
     """
-    verify_api_key(x_api_key)
     client = get_db_client()
     return client.get_adaptive_threshold()
 
@@ -237,14 +227,12 @@ async def get_threshold(x_api_key: str | None = Header(None)) -> dict[str, Any]:
 
 @app.get("/leaderboard")
 async def get_leaderboard(
-    x_api_key: str | None = Header(None),
     limit: int = Query(50, ge=1, le=100),
 ) -> list[dict[str, Any]]:
     """Get leaderboard entries.
 
     Returns ranked list of top submissions by TPS score.
     """
-    verify_api_key(x_api_key)
     client = get_db_client()
     return client.get_leaderboard(limit=limit)
 
@@ -257,13 +245,11 @@ async def get_leaderboard(
 @app.get("/api/submissions/{submission_id}")
 async def get_submission(
     submission_id: str,
-    x_api_key: str | None = Header(None),
 ) -> dict[str, Any]:
     """Get submission details.
 
     Returns full details for a specific submission.
     """
-    verify_api_key(x_api_key)
     client = get_db_client()
     submission = client.get_submission(submission_id)
     if not submission:
@@ -274,13 +260,11 @@ async def get_submission(
 @app.get("/api/submissions/{submission_id}/evaluations")
 async def get_submission_evaluations(
     submission_id: str,
-    x_api_key: str | None = Header(None),
 ) -> list[dict[str, Any]]:
     """Get evaluations for a submission.
 
     Returns list of all evaluation runs for the submission.
     """
-    verify_api_key(x_api_key)
     client = get_db_client()
     return client.get_submission_evaluations(submission_id)
 
@@ -295,13 +279,11 @@ class CodeResponse(BaseModel):
 @app.get("/api/submissions/{submission_id}/code", response_model=CodeResponse)
 async def get_submission_code(
     submission_id: str,
-    x_api_key: str | None = Header(None),
 ) -> CodeResponse:
     """Get code for a submission.
 
     Returns the miner's train.py code for the submission.
     """
-    verify_api_key(x_api_key)
     client = get_db_client()
     code = client.get_submission_code(submission_id)
 
@@ -333,8 +315,10 @@ def main():
 
     # Set environment variables
     os.environ["CRUSADES_DB_PATH"] = args.db
+    # Set API key directly on the app instance (not via env var indirection)
+    # to avoid the race where app is created at import-time before env var is set
     if args.api_key:
-        os.environ["DASHBOARD_API_KEY"] = args.api_key
+        app.state.api_key = args.api_key
 
     logging.basicConfig(
         level=logging.INFO,

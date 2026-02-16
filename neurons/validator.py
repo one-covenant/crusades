@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import statistics
 import time
 import urllib.error
@@ -75,7 +76,9 @@ class Validator(BaseNode):
         # State
         self.last_processed_block: int = 0
         # Map URL -> (reveal_block, hotkey) to track first committer
+        # Pruned to MAX_EVALUATED_URLS to prevent unbounded memory growth
         self.evaluated_code_urls: dict[str, tuple[int, str]] = {}
+        self.MAX_EVALUATED_URLS: int = 10_000
 
         # Timing
         self.last_weight_set_block: int = 0
@@ -86,19 +89,23 @@ class Validator(BaseNode):
 
     async def initialize(self) -> None:
         """Initialize validator components."""
-        global logger
-
         config = get_config()
         hparams = get_hparams()
 
         # Setup Loki logging for Grafana dashboard
         uid_str = str(self.uid) if self.uid is not None else "unknown"
-        logger = setup_loki_logger(
+        loki_logger = setup_loki_logger(
             service="crusades-validator",
             uid=uid_str,
             version=crusades.__version__,
             environment=config.subtensor_network or "finney",
         )
+        # Add Loki handlers to module logger instead of replacing it
+        for handler in loki_logger.handlers:
+            logger.addHandler(handler)
+
+        # Setup signal handlers within the running event loop
+        self.setup_signal_handlers()
 
         logger.info("Initializing validator (URL-Based Architecture)")
 
@@ -263,14 +270,14 @@ class Validator(BaseNode):
                             commitment.hotkey,
                         )
                     except Exception as e:
-                        logger.error(f"Failed to create submission for {code_url[:60]}: {e}")
+                        logger.exception(f"Failed to create submission for {code_url[:60]}: {e}")
                         # Don't record URL - will retry on next cycle
 
             self.last_processed_block = current_block
             await self._save_state()
 
         except Exception as e:
-            logger.error(f"Error processing commitments: {e}")
+            logger.exception(f"Error processing commitments: {e}")
 
     async def _create_submission_from_commitment(
         self,
@@ -313,7 +320,11 @@ class Validator(BaseNode):
                     )
                     return
             except (IndexError, ValueError):
-                pass
+                logger.warning(
+                    f"Failed to parse submission_id for rate limit check: "
+                    f"{last_submission.submission_id}. Applying rate limit defensively."
+                )
+                return
 
         submission = SubmissionModel(
             submission_id=submission_id,
@@ -482,7 +493,10 @@ class Validator(BaseNode):
             committed_hash = submission.code_hash
             actual_hash = hashlib.sha256(miner_code.encode("utf-8")).hexdigest()[:32]
             if committed_hash is None:
-                logger.warning("   Legacy submission without code_hash — skipping hash check")
+                logger.warning(
+                    "   Legacy submission without code_hash — skipping hash verification. "
+                    "This is a security risk; legacy submissions should be phased out."
+                )
             elif actual_hash != committed_hash:
                 logger.error(
                     f"Code hash mismatch! URL content changed after commitment.\n"
@@ -502,7 +516,7 @@ class Validator(BaseNode):
             fatal_error = False
             for run_idx in range(runs_remaining):
                 current_run = len(my_evals) + run_idx + 1
-                seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}"
+                seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}:{secrets.token_hex(16)}"
 
                 logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
 
@@ -928,8 +942,17 @@ class Validator(BaseNode):
             self.last_processed_block = 0
             self.evaluated_code_urls = {}
 
+    def _prune_evaluated_urls(self) -> None:
+        """Prune evaluated_code_urls to prevent unbounded memory growth."""
+        if len(self.evaluated_code_urls) > self.MAX_EVALUATED_URLS:
+            sorted_urls = sorted(
+                self.evaluated_code_urls.items(), key=lambda x: x[1][0], reverse=True
+            )
+            self.evaluated_code_urls = dict(sorted_urls[: self.MAX_EVALUATED_URLS])
+
     async def _save_state(self) -> None:
         """Persist validator state to database."""
+        self._prune_evaluated_urls()
         try:
             await self.db.set_validator_state(
                 "competition_version", str(crusades.COMPETITION_VERSION)
@@ -941,8 +964,8 @@ class Validator(BaseNode):
                 "evaluated_code_urls",
                 json.dumps({url: list(info) for url, info in self.evaluated_code_urls.items()}),
             )
-        except Exception as e:
-            logger.warning(f"Failed to save state: {e}")
+        except Exception:
+            logger.exception("Failed to save state")
 
     async def cleanup(self) -> None:
         """Cleanup resources."""

@@ -38,7 +38,6 @@ dependencies = [
     "accelerate>=0.20.0",
     "datasets>=2.14.0",
     "rich>=13.0.0",
-    "substrateinterface>=1.0.0",
     "substrate-interface>=1.8.1",
     "basilica-sdk>=0.13.0",  # Basilica cloud GPU SDK
     "python-logging-loki>=0.3.1",

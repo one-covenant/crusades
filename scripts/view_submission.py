@@ -131,9 +131,14 @@ def view_submission(db_path: str, submission_id: str, save: bool = False):
 
         if row["code_content"]:
             if save:
-                # Save to file
-                filename = f"{submission_id}_train.py"
-                with open(filename, "w") as f:
+                # Sanitize submission_id to prevent path traversal
+                safe_id = submission_id.replace("/", "_").replace("\\", "_").replace("..", "_")
+                filename = f"{safe_id}_train.py"
+                out_path = Path(filename).resolve()
+                if not str(out_path).startswith(str(Path.cwd())):
+                    print("ERROR: Invalid submission ID (path traversal detected)")
+                    return
+                with open(out_path, "w") as f:
                     f.write(row["code_content"])
                 print(f"Code saved to: {filename}")
             else:

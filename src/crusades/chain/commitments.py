@@ -350,7 +350,7 @@ class CommitmentReader:
                 return commitments
 
             except Exception as e:
-                logger.error(f"Failed to read revealed commitments: {e}")
+                logger.exception(f"Failed to read revealed commitments: {e}")
         else:
             logger.error("Subtensor does not support get_all_revealed_commitments()")
 

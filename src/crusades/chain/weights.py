@@ -201,8 +201,8 @@ class WeightSetter:
             await self._save_previous_winner(winner.submission_id, winner_score)
 
         # Calculate weight distribution
-        winner_weight = 1.0 - self.burn_rate  # e.g., 5%
-        burn_weight = self.burn_rate  # e.g., 95%
+        winner_weight = 1.0 - self.burn_rate
+        burn_weight = self.burn_rate
 
         logger.info(
             f"Setting weights with burn_rate={self.burn_rate:.0%}:\n"

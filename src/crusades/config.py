@@ -110,7 +110,7 @@ class HParams(BaseModel):
     netuid: int
 
     # Emissions distribution
-    burn_rate: float
+    burn_rate: float = Field(ge=0.0, le=1.0)
     burn_uid: int
 
     # Evaluation settings

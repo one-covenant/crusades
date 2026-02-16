@@ -43,9 +43,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Basilica deployment cache (reuse deployments within TTL)
-_basilica_deployment = None
-_basilica_deployment_time = 0
+# Legacy module-level references removed — deployment cache is now per-instance
 
 
 @dataclass
@@ -232,6 +230,10 @@ class AffinetesRunner:
         self.basilica_min_gpu_memory_gb = basilica_min_gpu_memory_gb
         self.basilica_cpu = basilica_cpu
         self.basilica_memory = basilica_memory
+
+        # Basilica deployment cache (per-instance, not global)
+        self._basilica_deployment = None
+        self._basilica_deployment_time: float = 0
 
         if mode == "basilica":
             if not self.basilica_api_key:
@@ -771,21 +773,19 @@ asyncio.run(main())
 
         Reuses existing deployment if within TTL, otherwise creates new one.
         """
-        global _basilica_deployment, _basilica_deployment_time
-
         # Check if existing deployment is still valid
         now = time.time()
         ttl_buffer = 300  # 5 minute buffer before TTL expires
 
         if (
-            _basilica_deployment is not None
-            and now - _basilica_deployment_time < self.basilica_ttl_seconds - ttl_buffer
+            self._basilica_deployment is not None
+            and now - self._basilica_deployment_time < self.basilica_ttl_seconds - ttl_buffer
         ):
-            remaining = self.basilica_ttl_seconds - (now - _basilica_deployment_time)
+            remaining = self.basilica_ttl_seconds - (now - self._basilica_deployment_time)
             logger.info("[BASILICA] Reusing existing deployment")
-            logger.info(f"   URL: {_basilica_deployment.url}")
+            logger.info(f"   URL: {self._basilica_deployment.url}")
             logger.info(f"   TTL remaining: {remaining:.0f}s ({remaining / 60:.1f} min)")
-            return _basilica_deployment
+            return self._basilica_deployment
 
         # Create new deployment
         logger.info("[BASILICA] Creating NEW deployment (no valid cached deployment)")
@@ -830,8 +830,8 @@ asyncio.run(main())
                 f"   TTL: {self.basilica_ttl_seconds}s (expires in {self.basilica_ttl_seconds / 60:.0f} min)"
             )
 
-            _basilica_deployment = deployment
-            _basilica_deployment_time = now
+            self._basilica_deployment = deployment
+            self._basilica_deployment_time = now
 
             return deployment
 
@@ -847,19 +847,17 @@ asyncio.run(main())
         This eliminates MFU variance between fresh and reused deployments by
         ensuring every submission gets a pristine GPU state.
         """
-        global _basilica_deployment, _basilica_deployment_time
-
-        if _basilica_deployment is None:
+        if self._basilica_deployment is None:
             return
 
         try:
-            await _basilica_deployment.delete_async()
+            await self._basilica_deployment.delete_async()
             logger.info("[BASILICA] Deployment deleted (fresh GPU for next submission)")
         except Exception as e:
             logger.warning(f"[BASILICA] Failed to delete deployment: {e}")
 
-        _basilica_deployment = None
-        _basilica_deployment_time = 0
+        self._basilica_deployment = None
+        self._basilica_deployment_time = 0
 
     async def build_validator_image(self, env_path: Path | None = None) -> bool:
         """Build the validator's evaluation Docker image.

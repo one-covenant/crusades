@@ -18,6 +18,7 @@ services:
     container_name: templar-crusades-validator
     restart: unless-stopped
     runtime: nvidia
+    user: "1000:1000"
     
     volumes:
       # Wallet access
@@ -56,7 +57,7 @@ services:
       - "com.centurylinklabs.watchtower.enable=true"
     
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      test: ["CMD", "python", "-c", "import crusades; print(crusades.__version__)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -69,6 +70,7 @@ services:
     profiles:
       - monitoring
     restart: unless-stopped
+    user: "1000:1000"
     
     volumes:
       - ./data:/app/data:ro
