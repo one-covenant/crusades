@@ -38,6 +38,7 @@ class MFUConfig(BaseModel):
     """MFU (Model FLOPs Utilization) calculation settings."""
 
     gpu_peak_tflops: float = 312.0  # A100 80GB peak TFLOPS (bfloat16)
+    max_plausible_mfu: float = 75.0  # Reject MFU above this as likely cheating
 
 
 class AdaptiveThresholdConfig(BaseModel):

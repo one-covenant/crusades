@@ -155,6 +155,7 @@ class Validator(BaseNode):
             weight_relative_error_max=hparams.verification.weight_relative_error_max,
             # MFU calculation
             gpu_peak_tflops=hparams.mfu.gpu_peak_tflops,
+            max_plausible_mfu=hparams.mfu.max_plausible_mfu,
             # Basilica config
             basilica_image=hparams.basilica.image,
             basilica_ttl_seconds=hparams.basilica.ttl_seconds,

@@ -2094,6 +2094,7 @@ class Actor:
         weight_relative_error_max: float = 0.008,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
+        max_plausible_mfu: float = 75.0,
         require_cuda_timing: bool = True,
         model_params_override: int | None = None,
     ) -> dict:
@@ -2694,7 +2695,6 @@ class Actor:
             # MFU sanity cap — no legitimate code can exceed this on current hardware.
             # Safety net: even if a novel timing attack evades all other checks,
             # physically impossible MFU values are rejected.
-            max_plausible_mfu = 75.0
             if mfu > max_plausible_mfu:
                 logger.warning(
                     f"MFU {mfu:.1f}% exceeds plausible maximum {max_plausible_mfu}% — "
@@ -2852,6 +2852,7 @@ class EvaluateRequest(BaseModel):
     weight_relative_error_max: float = 0.008
     # MFU calculation
     gpu_peak_tflops: float = 312.0
+    max_plausible_mfu: float = 75.0
     # Security hardening: require untamperable CUDA-event timing source
     require_cuda_timing: bool = True
 
@@ -2907,6 +2908,7 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         gradient_norm_ratio_max=request.gradient_norm_ratio_max,
         weight_relative_error_max=request.weight_relative_error_max,
         gpu_peak_tflops=request.gpu_peak_tflops,
+        max_plausible_mfu=request.max_plausible_mfu,
         require_cuda_timing=request.require_cuda_timing,
     )
 

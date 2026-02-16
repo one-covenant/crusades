@@ -171,6 +171,7 @@ class AffinetesRunner:
         weight_relative_error_max: float = 0.008,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
+        max_plausible_mfu: float = 75.0,
         validator_image: str | None = None,
         # Basilica-specific settings
         basilica_image: str | None = None,
@@ -197,6 +198,7 @@ class AffinetesRunner:
             gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.10 = 10%)
             weight_relative_error_max: Max relative error for final weight check (e.g., 0.008 = 0.8%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
+            max_plausible_mfu: Reject MFU above this threshold (anti-cheat)
             validator_image: Docker image for local evaluation
             basilica_image: Docker image for Basilica (must be in registry)
             basilica_ttl_seconds: TTL for Basilica deployment (default 1 hour)
@@ -223,6 +225,7 @@ class AffinetesRunner:
         self.weight_relative_error_max = weight_relative_error_max
         # MFU calculation
         self.gpu_peak_tflops = gpu_peak_tflops
+        self.max_plausible_mfu = max_plausible_mfu
         self.validator_image = validator_image or self.DEFAULT_DOCKER_IMAGE
         self.basilica_image = basilica_image or self.DEFAULT_BASILICA_IMAGE
         self.basilica_ttl_seconds = basilica_ttl_seconds
@@ -398,6 +401,7 @@ async def main():
         weight_relative_error_max={self.weight_relative_error_max},
         # MFU calculation
         gpu_peak_tflops={self.gpu_peak_tflops},
+        max_plausible_mfu={self.max_plausible_mfu},
     )
     print("EVAL_RESULT:" + json.dumps(result))
 
@@ -709,6 +713,7 @@ asyncio.run(main())
                 "weight_relative_error_max": self.weight_relative_error_max,
                 # MFU calculation
                 "gpu_peak_tflops": self.gpu_peak_tflops,
+                "max_plausible_mfu": self.max_plausible_mfu,
                 # Security hardening: only trust CUDA-event wall time.
                 "require_cuda_timing": True,
             }
