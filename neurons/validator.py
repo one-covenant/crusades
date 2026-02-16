@@ -40,12 +40,6 @@ from crusades.storage.models import EvaluationModel, SubmissionModel
 
 from .base_node import BaseNode
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s UTC | %(levelname)s | %(name)s | %(message)s",
-)
-# Force UTC for all log timestamps
-logging.Formatter.converter = time.gmtime
 logger = logging.getLogger(__name__)
 
 
@@ -100,9 +94,10 @@ class Validator(BaseNode):
             version=crusades.__version__,
             environment=config.subtensor_network or "finney",
         )
-        # Add Loki handlers to module logger instead of replacing it
-        for handler in loki_logger.handlers:
-            logger.addHandler(handler)
+        # Use the loki_logger (which is the "crusades" logger) as the parent
+        # for the __main__ logger so all logs go through a single handler chain.
+        logger.parent = loki_logger
+        logger.propagate = True
 
         # Setup signal handlers within the running event loop
         self.setup_signal_handlers()

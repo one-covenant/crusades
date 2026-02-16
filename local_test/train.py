@@ -36,8 +36,6 @@ Your inner_steps function MUST NOT:
   - Modify torch backend settings (deterministic, benchmark, SDP toggles, etc.)
 """
 
-import json
-import time
 from dataclasses import dataclass
 
 import torch
@@ -128,6 +126,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 # LOCAL TESTING - Run this file to test your implementation
 # =============================================================================
 if __name__ == "__main__":
+    import json
+    import time
     from pathlib import Path
 
     print("=" * 60)
