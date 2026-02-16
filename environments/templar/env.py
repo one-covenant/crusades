@@ -26,6 +26,7 @@ import sys
 import time
 import traceback
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -110,23 +111,29 @@ _CACHE = {
 }
 
 
+@contextmanager
+def _hide_sensitive_env_modules():
+    """Temporarily hide env modules during miner code execution."""
+    hidden_modules = {}
+    for module_key in list(sys.modules):
+        if module_key == "env" or module_key == __name__ or module_key.endswith(".env"):
+            hidden_modules[module_key] = sys.modules.pop(module_key)
+    try:
+        yield
+    finally:
+        sys.modules.update(hidden_modules)
+
+
 def _load_miner_module(train_path: Path):
     """Load miner's train.py as a module in an isolated context."""
     spec = importlib.util.spec_from_file_location("miner_train", train_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load {train_path}")
 
-    _hidden_modules = {}
-    _sensitive_keys = [k for k in sys.modules if k == "env" or k.endswith(".env") or k == __name__]
-    for key in _sensitive_keys:
-        _hidden_modules[key] = sys.modules.pop(key)
-
-    try:
+    with _hide_sensitive_env_modules():
         module = importlib.util.module_from_spec(spec)
         sys.modules["miner_train"] = module
         spec.loader.exec_module(module)
-    finally:
-        sys.modules.update(_hidden_modules)
 
     return module
 
@@ -2013,7 +2020,7 @@ class Actor:
         weight_relative_error_max: float = 0.008,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
-        require_cuda_timing: bool = False,
+        require_cuda_timing: bool = True,
         model_params_override: int | None = None,
     ) -> dict:
         """
@@ -2185,12 +2192,8 @@ class Actor:
 
             logger.info(f"Running {warmup_steps} warmup step(s) to check for basic errors...")
             try:
-                # Hide env module during miner execution to prevent timer tampering
-                _hidden_warmup = {}
-                for _mk in list(sys.modules):
-                    if _mk == "env" or _mk == __name__ or _mk.endswith(".env"):
-                        _hidden_warmup[_mk] = sys.modules.pop(_mk)
-                try:
+                # Hide env modules during miner execution to prevent timer tampering.
+                with _hide_sensitive_env_modules():
                     warmup_result = miner_module.inner_steps(
                         model=model,
                         data_iterator=data_iter_warmup,
@@ -2198,8 +2201,6 @@ class Actor:
                         num_steps=warmup_steps,
                         device=device,
                     )
-                finally:
-                    sys.modules.update(_hidden_warmup)
 
                 # Quick validation of warmup result
                 if warmup_result is None:
@@ -2359,12 +2360,8 @@ class Actor:
             if _cuda_start_event is not None:
                 _cuda_start_event.record()
 
-            # Hide env module during timed miner execution to prevent timer tampering
-            _hidden_timed = {}
-            for _mk in list(sys.modules):
-                if _mk == "env" or _mk == __name__ or _mk.endswith(".env"):
-                    _hidden_timed[_mk] = sys.modules.pop(_mk)
-            try:
+            # Hide env modules during timed miner execution to prevent timer tampering.
+            with _hide_sensitive_env_modules():
                 miner_result = miner_module.inner_steps(
                     model=model,
                     data_iterator=data_iter_miner,
@@ -2372,8 +2369,6 @@ class Actor:
                     num_steps=steps,
                     device=device,
                 )
-            finally:
-                sys.modules.update(_hidden_timed)
 
             if _cuda_end_event is not None:
                 _cuda_end_event.record()
@@ -2784,7 +2779,7 @@ class EvaluateRequest(BaseModel):
     # MFU calculation
     gpu_peak_tflops: float = 312.0
     # Security hardening: require untamperable CUDA-event timing source
-    require_cuda_timing: bool = False
+    require_cuda_timing: bool = True
 
 
 class EvaluateResponse(BaseModel):
