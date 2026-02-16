@@ -326,8 +326,7 @@ class Validator(BaseNode):
             submission_id=submission_id,
             miner_hotkey=commitment.hotkey,
             miner_uid=commitment.uid,
-            # Normalize empty-string hash from legacy rows to None.
-            code_hash=commitment.code_url_info.code_hash or None,  # 128-bit truncated SHA256
+            code_hash=commitment.code_url_info.code_hash or "",  # 128-bit truncated SHA256
             bucket_path=commitment.code_url_info.url,  # Store code URL
             status=SubmissionStatus.EVALUATING,
             payment_verified=True,
