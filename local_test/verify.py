@@ -44,6 +44,11 @@ _FORBIDDEN_STRINGS = [
     "__mro__",
     "perf_counter",
     "_perf_counter",
+    "monotonic",
+    "_monotonic",
+    "_REAL_PC_ID",
+    "_REAL_MONO_ID",
+    "_REAL_SYNC_ID",
     "get_objects",
     "get_referrers",
     "get_referents",
@@ -73,7 +78,6 @@ _FORBIDDEN_STRINGS = [
     "globals",
     "locals",
     "_cuda_synchronize",
-    "_monotonic",
     "__traceback__",
     "tb_frame",
     "tb_next",
@@ -89,6 +93,21 @@ _FORBIDDEN_STRINGS = [
     "operator.methodcaller",
     "attrgetter",
     "methodcaller",
+    # Block torch internal access even under aliased names
+    "_C",
+    "_dynamo",
+    "_inductor",
+    # Prevent access to validator env internals
+    "_CACHE",
+    "initial_state",
+    "_hidden_modules",
+    "_sensitive_keys",
+    # Block dynamic access to dangerous builtins via string construction
+    "__build_class__",
+    # Block unittest.mock for attribute patching
+    "mock.patch",
+    "MagicMock",
+    "unittest.mock",
 ]
 
 _FORBIDDEN_MODULES = {
@@ -126,6 +145,21 @@ _FORBIDDEN_MODULES = {
     "base64",
     "pdb",
     "pprint",
+    # Block importing the validator's own module (timer tampering attack)
+    "env",
+    "time",
+    "__main__",
+    "miner_train",
+    # logging.Logger.manager.loggerDict holds refs to all loggers —
+    # traversable to reach the env module's logger and back to env itself
+    "logging",
+    # unittest.mock.patch can replace any attribute on any object
+    "unittest",
+    "mock",
+    # functools.partial can wrap forbidden functions
+    "functools",
+    # weakref can observe GC behavior and hold references
+    "weakref",
 }
 
 _BLOCKED_BUILTINS = {
@@ -191,11 +225,45 @@ def _collect_main_guard_nodes(tree: ast.AST) -> set[int]:
 
 def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
     violations = []
+
+    # Builtins like __import__, exec, setattr are blocked as CALLS, but a miner
+    # can bypass by storing a reference: `_imp = __import__; _imp("sys")`.
+    # This set blocks them even when only *referenced* (ast.Name in Load context).
+    _forbidden_names = {
+        "__import__",
+        "exec",
+        "eval",
+        "compile",
+        "breakpoint",
+        "setattr",
+        "getattr",
+        "delattr",
+        "vars",
+        "dir",
+        "globals",
+        "locals",
+        "type",
+        "memoryview",
+        "open",
+        "chr",
+        "ord",
+        "input",
+        "classmethod",
+        "staticmethod",
+        "property",
+        "__build_class__",
+    }
+
     main_guard_nodes = _collect_main_guard_nodes(tree)
 
     for node in ast.walk(tree):
         if id(node) in main_guard_nodes:
             continue
+
+        # Block bare-name references to dangerous builtins (e.g. `_imp = __import__`)
+        if isinstance(node, ast.Name) and node.id in _forbidden_names:
+            line = getattr(node, "lineno", "?")
+            violations.append(f"Line {line}: reference to '{node.id}' is forbidden")
 
         # Block __name__ reassignment
         if isinstance(node, ast.Assign):
@@ -209,6 +277,25 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: object.{node.attr} is forbidden")
 
+        # Block torch._C access (low-level C++ bindings escape hatch)
+        if isinstance(node, ast.Attribute) and node.attr == "_C":
+            if isinstance(node.value, ast.Name) and node.value.id == "torch":
+                line = getattr(node, "lineno", "?")
+                violations.append(f"Line {line}: torch._C access is forbidden")
+
+        # Block torch._dynamo.config and torch._inductor.config writes
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Attribute):
+                    if target.value.attr == "config" and isinstance(
+                        target.value.value, ast.Attribute
+                    ):
+                        if target.value.value.attr in ("_dynamo", "_inductor"):
+                            line = getattr(node, "lineno", "?")
+                            violations.append(
+                                f"Line {line}: modifying torch.{target.value.value.attr}.config is forbidden"
+                            )
+
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Attribute) and target.attr == "__class__":
@@ -220,15 +307,19 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: __class__ access is forbidden")
 
-        if isinstance(node, ast.Attribute) and node.attr == "perf_counter":
-            if isinstance(node.value, ast.Name) and node.value.id == "time":
-                line = getattr(node, "lineno", "?")
-                violations.append(f"Line {line}: time.perf_counter is forbidden")
-
-        if isinstance(node, ast.Attribute) and node.attr == "monotonic":
-            if isinstance(node.value, ast.Name) and node.value.id == "time":
-                line = getattr(node, "lineno", "?")
-                violations.append(f"Line {line}: time.monotonic is forbidden")
+        # Block timer-related attribute access on ANY object (not just `time`).
+        # Prevents attacks like: import env as _e; _e._perf_counter = fake
+        if isinstance(node, ast.Attribute) and node.attr in (
+            "perf_counter",
+            "_perf_counter",
+            "monotonic",
+            "_monotonic",
+            "perf_counter_ns",
+            "monotonic_ns",
+            "_cuda_synchronize",
+        ):
+            line = getattr(node, "lineno", "?")
+            violations.append(f"Line {line}: accessing .{node.attr} is forbidden")
 
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -305,9 +396,16 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
             if base_module in _FORBIDDEN_MODULES or node.module.startswith("importlib"):
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: from {node.module} import is forbidden")
+            # Check both the module path AND the imported names to catch:
             if "cpp_extension" in node.module:
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: from {node.module} import is forbidden")
+            for alias in node.names:
+                if "cpp_extension" in alias.name:
+                    line = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"Line {line}: importing cpp_extension from {node.module} is forbidden"
+                    )
 
         if isinstance(node, ast.Name) and node.id == "__builtins__":
             line = getattr(node, "lineno", "?")
@@ -353,6 +451,19 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
             if not (isinstance(node.value, ast.Name) and node.value.id == "self"):
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: accessing .optimizer attribute is forbidden")
+
+        # Block dangerous builtins used as decorators (e.g. @property, @staticmethod)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for deco in node.decorator_list:
+                if isinstance(deco, ast.Name) and deco.id in _forbidden_names:
+                    line = getattr(deco, "lineno", "?")
+                    violations.append(f"Line {line}: decorator @{deco.id} is forbidden")
+
+        # Block AugAssign on __name__ (e.g. __name__ += "...")
+        if isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "__name__":
+                line = getattr(node, "lineno", "?")
+                violations.append(f"Line {line}: modification of __name__ is forbidden")
 
     return violations
 
@@ -427,6 +538,118 @@ def validate_code_structure(code: str) -> list[str]:
                     if pattern in decoded_str:
                         line = getattr(node, "lineno", "?")
                         violations.append(f"Line {line}: forbidden string via b'...'.decode()")
+
+    # Scan attribute names (e.g. _e._perf_counter) — AST string scan only
+    # catches ast.Constant values, not ast.Attribute.attr names
+    for node in ast.walk(scan_tree):
+        if isinstance(node, ast.Attribute):
+            for pattern in _FORBIDDEN_STRINGS:
+                if node.attr == pattern:
+                    line = getattr(node, "lineno", "?")
+                    violations.append(f"Line {line}: forbidden attribute name '{node.attr}'")
+
+    # Scan for str.join() obfuscation: "".join(["s","e","t","a","t","t","r"])
+    for node in ast.walk(scan_tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "join"
+            and isinstance(node.func.value, ast.Constant)
+            and isinstance(node.func.value.value, str)
+            and node.args
+            and len(node.args) == 1
+        ):
+            arg = node.args[0]
+            if isinstance(arg, (ast.List, ast.Tuple)):
+                chars = []
+                all_const = True
+                for elt in arg.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        chars.append(elt.value)
+                    else:
+                        all_const = False
+                        break
+                if all_const and chars:
+                    joined = node.func.value.value.join(chars)
+                    for pattern in _FORBIDDEN_STRINGS:
+                        if pattern in joined:
+                            line = getattr(node, "lineno", "?")
+                            violations.append(
+                                f"Line {line}: forbidden string constructed via str.join()"
+                            )
+
+    # Scan for string concatenation obfuscation: "__set" + "attr__"
+    for node in ast.walk(scan_tree):
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Add)
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)
+            and isinstance(node.right, ast.Constant)
+            and isinstance(node.right.value, str)
+        ):
+            combined = node.left.value + node.right.value
+            for pattern in _FORBIDDEN_STRINGS:
+                if pattern in combined:
+                    line = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"Line {line}: forbidden string constructed via concatenation"
+                    )
+
+    # Scan for %-format obfuscation: "%s%s" % ("__set", "attr__")
+    for node in ast.walk(scan_tree):
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Mod)
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)
+            and isinstance(node.right, ast.Tuple)
+        ):
+            parts = []
+            all_const = True
+            for elt in node.right.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    parts.append(elt.value)
+                else:
+                    all_const = False
+                    break
+            if all_const and parts:
+                try:
+                    formatted = node.left.value % tuple(parts)
+                    for pattern in _FORBIDDEN_STRINGS:
+                        if pattern in formatted:
+                            line = getattr(node, "lineno", "?")
+                            violations.append(
+                                f"Line {line}: forbidden string constructed via %-format"
+                            )
+                except (TypeError, ValueError):
+                    pass
+
+    # Scan for f-string obfuscation: f"{'__set'}{'attr__'}"
+    for node in ast.walk(scan_tree):
+        if isinstance(node, ast.JoinedStr):
+            parts = []
+            all_const = True
+            for val in node.values:
+                if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                    parts.append(val.value)
+                elif (
+                    isinstance(val, ast.FormattedValue)
+                    and isinstance(val.value, ast.Constant)
+                    and isinstance(val.value.value, str)
+                    and val.format_spec is None
+                    and val.conversion == -1
+                ):
+                    parts.append(val.value.value)
+                else:
+                    all_const = False
+                    break
+            if all_const and parts:
+                combined = "".join(parts)
+                for pattern in _FORBIDDEN_STRINGS:
+                    if pattern in combined:
+                        line = getattr(node, "lineno", "?")
+                        violations.append(f"Line {line}: forbidden string constructed via f-string")
 
     inner_steps_found = False
     for node in ast.walk(tree):
