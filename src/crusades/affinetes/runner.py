@@ -402,6 +402,7 @@ async def main():
         # MFU calculation
         gpu_peak_tflops={self.gpu_peak_tflops},
         max_plausible_mfu={self.max_plausible_mfu},
+        require_cuda_timing=True,
     )
     print("EVAL_RESULT:" + json.dumps(result))
 
@@ -714,8 +715,6 @@ asyncio.run(main())
                 # MFU calculation
                 "gpu_peak_tflops": self.gpu_peak_tflops,
                 "max_plausible_mfu": self.max_plausible_mfu,
-                # Security hardening: only trust CUDA-event wall time.
-                "require_cuda_timing": True,
             }
 
             logger.info("[BASILICA] Sending evaluation request...")

@@ -600,8 +600,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
-        # Block timer-related attribute access on ANY object (not just `time`).
-        # Prevents attacks like: import env as _e; _e._perf_counter = fake
+        # Block timer-related attribute access on ANY object.
         if isinstance(node, ast.Attribute) and node.attr in (
             "perf_counter",
             "_perf_counter",
@@ -2084,12 +2083,12 @@ class Actor:
         data_samples: int = 10000,
         code: str = "",  # Miner's code passed directly
         # Verification settings
-        max_loss_difference: float = 0.5,
+        max_loss_difference: float = 0.3,
         use_random_init: bool = True,
         min_trainable_params_ratio: float = 1.0,
-        min_params_changed_ratio: float = 0.5,
+        min_params_changed_ratio: float = 0.75,
         # Gradient verification
-        gradient_norm_ratio_max: float = 1.10,
+        gradient_norm_ratio_max: float = 1.06,
         # Weight verification
         weight_relative_error_max: float = 0.008,
         # MFU calculation
@@ -2388,11 +2387,8 @@ class Actor:
             _reset_torch_state()
             _enforce_backend_state()
 
-            # ── Runtime timer-tamper detection ────────────────────────────
-            # Verify that the module-level timer references still point to
-            # the original C functions captured at import time.  A miner
-            # that does `import env; env._perf_counter = fake` would change
-            # the id().  We check *before* and *after* the timed section.
+            # ── Runtime timer integrity check ────────────────────────────
+            # Verify timer references are unchanged before and after execution.
             def _timer_ids_ok() -> bool:
                 return (
                     id(_perf_counter) == _REAL_PC_ID
@@ -2415,8 +2411,7 @@ class Actor:
                     "code": code,
                 }
 
-            # CUDA events are recorded on the GPU command stream — immune to
-            # Python-level timer patches. Created BEFORE miner code runs.
+            # Hardware-level timing events. Created BEFORE miner code runs.
             _cuda_start_event = None
             _cuda_end_event = None
             if torch.cuda.is_available():
@@ -2508,7 +2503,7 @@ class Actor:
                         "code": code,
                     }
 
-            # In hardened mode, require CUDA event timing to avoid trusting Python clocks.
+            # Require CUDA event timing for wall time measurement.
             if require_cuda_timing and (cuda_wall_time is None or cuda_wall_time <= 0):
                 return {
                     "task_id": task_id,
@@ -2523,7 +2518,7 @@ class Actor:
                     "code": code,
                 }
 
-            # Use CUDA event time as canonical (untamperable), fall back to monotonic
+            # Use CUDA event time as canonical source, fall back to monotonic
             wall_time = (
                 cuda_wall_time
                 if cuda_wall_time is not None and cuda_wall_time > 0
@@ -2696,10 +2691,7 @@ class Actor:
             # Safety net: even if a novel timing attack evades all other checks,
             # physically impossible MFU values are rejected.
             if mfu > max_plausible_mfu:
-                logger.warning(
-                    f"MFU {mfu:.1f}% exceeds plausible maximum {max_plausible_mfu}% — "
-                    "likely timer manipulation"
-                )
+                logger.warning(f"MFU {mfu:.1f}% exceeds plausible maximum {max_plausible_mfu}%")
                 return {
                     "task_id": task_id,
                     "mfu": 0.0,
@@ -2842,19 +2834,17 @@ class EvaluateRequest(BaseModel):
     data_samples: int = 10000
     code: str  # Miner's train.py code
     # Verification settings
-    max_loss_difference: float = 0.5
+    max_loss_difference: float = 0.3
     use_random_init: bool = True
     min_trainable_params_ratio: float = 1.0
-    min_params_changed_ratio: float = 0.5
+    min_params_changed_ratio: float = 0.75
     # Gradient verification
-    gradient_norm_ratio_max: float = 1.10
+    gradient_norm_ratio_max: float = 1.06
     # Weight verification
     weight_relative_error_max: float = 0.008
     # MFU calculation
     gpu_peak_tflops: float = 312.0
     max_plausible_mfu: float = 75.0
-    # Security hardening: require untamperable CUDA-event timing source
-    require_cuda_timing: bool = True
 
 
 class EvaluateResponse(BaseModel):
@@ -2909,7 +2899,7 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         weight_relative_error_max=request.weight_relative_error_max,
         gpu_peak_tflops=request.gpu_peak_tflops,
         max_plausible_mfu=request.max_plausible_mfu,
-        require_cuda_timing=request.require_cuda_timing,
+        require_cuda_timing=True,
     )
 
     return EvaluateResponse(
