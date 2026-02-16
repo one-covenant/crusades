@@ -2013,6 +2013,7 @@ class Actor:
         weight_relative_error_max: float = 0.008,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
+        require_cuda_timing: bool = False,
         model_params_override: int | None = None,
     ) -> dict:
         """
@@ -2437,6 +2438,21 @@ class Actor:
                         "code": code,
                     }
 
+            # In hardened mode, require CUDA event timing to avoid trusting Python clocks.
+            if require_cuda_timing and (cuda_wall_time is None or cuda_wall_time <= 0):
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time_mono,
+                    "success": False,
+                    "error": "CUDA event timing unavailable; rejecting evaluation",
+                    "error_code": "timer_source_unavailable",
+                    "seed": seed,
+                    "code": code,
+                }
+
             # Use CUDA event time as canonical (untamperable), fall back to monotonic
             wall_time = (
                 cuda_wall_time
@@ -2714,8 +2730,9 @@ class Actor:
             # warmup and timed run, so the compiled model persists for timing.
             try:
                 torch._dynamo.reset()
-            except Exception:
-                logger.warning("torch._dynamo.reset() failed", exc_info=True)
+            except Exception as e:
+                logger.error("torch._dynamo.reset() failed - failing closed", exc_info=True)
+                raise RuntimeError("torch._dynamo.reset() failed; runtime state untrusted") from e
 
             # Memory cleanup
             gc.collect()
@@ -2766,6 +2783,8 @@ class EvaluateRequest(BaseModel):
     weight_relative_error_max: float = 0.008
     # MFU calculation
     gpu_peak_tflops: float = 312.0
+    # Security hardening: require untamperable CUDA-event timing source
+    require_cuda_timing: bool = False
 
 
 class EvaluateResponse(BaseModel):
@@ -2819,6 +2838,7 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         gradient_norm_ratio_max=request.gradient_norm_ratio_max,
         weight_relative_error_max=request.weight_relative_error_max,
         gpu_peak_tflops=request.gpu_peak_tflops,
+        require_cuda_timing=request.require_cuda_timing,
     )
 
     return EvaluateResponse(

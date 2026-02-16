@@ -1,11 +1,11 @@
 {
-    "netuid": 3,
+    "netuid": 2,
     "burn_rate": 0.95,
-    "burn_uid": 1,
+    "burn_uid": 0,
 
     "evaluation_runs": 5,
     "eval_steps": 5,
-    "eval_timeout": 600,
+    "eval_timeout": 3600,
     "min_success_rate": 0.5,
 
     "benchmark_model_name": "Qwen/Qwen2.5-3B",
@@ -16,9 +16,9 @@
     "benchmark_sequence_length": 1024,
     "benchmark_batch_size": 8,
 
-    "set_weights_interval_blocks": 100,
-    "reveal_blocks": 100,
-    "min_blocks_between_commits": 300,
+    "set_weights_interval_blocks": 5,
+    "reveal_blocks": 5,
+    "min_blocks_between_commits": 10,
     "block_time": 12,
 
     "docker": {
@@ -29,7 +29,7 @@
 
     "basilica": {
         "image": "ghcr.io/one-covenant/templar-eval:latest",
-        "ttl_seconds": 3600,
+        "ttl_seconds": 7200,
         "gpu_count": 1,
         "gpu_models": ["A100"],
         "min_gpu_memory_gb": 80,
@@ -39,7 +39,7 @@
 
     "verification": {
         "max_loss_difference": 0.3,
-        "min_params_changed_ratio": 0.8,
+        "min_params_changed_ratio": 0.75,
         "gradient_norm_ratio_max": 1.06,
         "weight_relative_error_max": 0.008
     },

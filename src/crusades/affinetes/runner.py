@@ -18,6 +18,7 @@ Environment Variables:
 import asyncio
 import json
 import logging
+import math
 import os
 import subprocess
 import tempfile
@@ -708,6 +709,8 @@ asyncio.run(main())
                 "weight_relative_error_max": self.weight_relative_error_max,
                 # MFU calculation
                 "gpu_peak_tflops": self.gpu_peak_tflops,
+                # Security hardening: only trust CUDA-event wall time.
+                "require_cuda_timing": True,
             }
 
             logger.info("[BASILICA] Sending evaluation request...")
@@ -736,6 +739,36 @@ asyncio.run(main())
                     )
 
                 result_data = response.json()
+                if not isinstance(result_data, dict):
+                    return EvaluationResult.failure(
+                        f"Basilica returned non-object response: {type(result_data).__name__}",
+                        task_id=task_id,
+                    )
+
+                # Strict response integrity checks
+                returned_seed = str(result_data.get("seed", ""))
+                if returned_seed and returned_seed != seed:
+                    return EvaluationResult.failure(
+                        f"Basilica response seed mismatch: expected {seed}, got {returned_seed}",
+                        task_id=task_id,
+                    )
+
+                returned_task_id = result_data.get("task_id")
+                if returned_task_id is not None and int(returned_task_id) != int(task_id):
+                    return EvaluationResult.failure(
+                        f"Basilica response task_id mismatch: expected {task_id}, got {returned_task_id}",
+                        task_id=task_id,
+                    )
+
+                for numeric_field in ("mfu", "tps", "wall_time_seconds"):
+                    if numeric_field in result_data:
+                        value = float(result_data[numeric_field])
+                        if not math.isfinite(value):
+                            return EvaluationResult.failure(
+                                f"Basilica response has non-finite {numeric_field}",
+                                task_id=task_id,
+                            )
+
                 result = EvaluationResult.from_dict(result_data)
                 result.code = code
 
