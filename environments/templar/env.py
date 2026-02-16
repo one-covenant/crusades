@@ -466,6 +466,33 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
         "numpy.ctypeslib",
     }
 
+    # torch imports that enable bypassing attribute-based guards when imported directly
+    _forbidden_torch_symbol_imports = {
+        "load",  # pickle escape hatch
+        "compile",  # bypasses strict "only torch.compile" call form
+        "set_float32_matmul_precision",  # backend tampering
+        "_C",  # low-level C++ escape hatch
+        "_dynamo",  # compile/runtime guard bypasses
+        "_inductor",  # compile/runtime guard bypasses
+    }
+
+    # Backend toggles can bypass attribute-call checks if imported as bare names
+    _forbidden_torch_backend_symbol_imports = {
+        "enable_flash_sdp",
+        "enable_mem_efficient_sdp",
+        "enable_math_sdp",
+    }
+
+    # torch attributes that should never be rebound or called via alias variables
+    _forbidden_torch_attribute_aliases = {
+        "load",
+        "compile",
+        "set_float32_matmul_precision",
+        "_C",
+        "_dynamo",
+        "_inductor",
+    }
+
     _forbidden_builtins = {
         "setattr",
         "getattr",
@@ -486,10 +513,44 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
         "property",
     }
 
+    # Track names that currently alias the torch module (e.g. "import torch as tl",
+    # or "tl = torch"). This lets us block torch.load() even through aliases.
+    torch_aliases = {"torch"}
+
     main_guard_nodes = _collect_main_guard_nodes(tree)
     for node in ast.walk(tree):
         if id(node) in main_guard_nodes:
             continue
+
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "torch":
+                    local_name = alias.asname or alias.name
+                    if local_name != "torch":
+                        line = getattr(node, "lineno", "?")
+                        return False, f"Line {line}: aliasing torch is forbidden"
+                    torch_aliases.add(local_name)
+
+        if isinstance(node, ast.Assign):
+            if isinstance(node.value, ast.Name) and node.value.id in torch_aliases:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        if target.id != "torch":
+                            line = getattr(node, "lineno", "?")
+                            return False, f"Line {line}: aliasing torch is forbidden"
+                        torch_aliases.add(target.id)
+
+        # Block rebinding sensitive torch attributes to local names
+        # (e.g. `c = torch.compile`, `ld = torch.load`, `dyn = torch._dynamo`)
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id in torch_aliases
+            and node.value.attr in _forbidden_torch_attribute_aliases
+        ):
+            line = getattr(node, "lineno", "?")
+            return False, f"Line {line}: aliasing torch.{node.value.attr} is forbidden"
 
         # Block bare-name references to dangerous builtins (e.g. `_imp = __import__`)
         if isinstance(node, ast.Name) and node.id in _forbidden_names:
@@ -509,7 +570,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
 
         # Block torch._C access (low-level C++ bindings escape hatch)
         if isinstance(node, ast.Attribute) and node.attr == "_C":
-            if isinstance(node.value, ast.Name) and node.value.id == "torch":
+            if isinstance(node.value, ast.Name) and node.value.id in torch_aliases:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: torch._C access is forbidden"
 
@@ -632,6 +693,18 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             if base_module in _forbidden_modules or node.module.startswith("importlib"):
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden import"
+            # Block direct symbol imports from torch that bypass call-shape checks.
+            if node.module == "torch":
+                for alias in node.names:
+                    if alias.name in _forbidden_torch_symbol_imports:
+                        line = getattr(node, "lineno", "?")
+                        return False, f"Line {line}: importing torch.{alias.name} is forbidden"
+            # Block direct backend symbol imports (e.g. from torch.backends.cuda import ...).
+            if node.module.startswith("torch.backends"):
+                for alias in node.names:
+                    if alias.name in _forbidden_torch_backend_symbol_imports:
+                        line = getattr(node, "lineno", "?")
+                        return False, f"Line {line}: importing torch backend toggle is forbidden"
             # Block torch.utils.cpp_extension — can compile and load arbitrary
             if "cpp_extension" in node.module:
                 line = getattr(node, "lineno", "?")
@@ -660,13 +733,14 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: .{node.func.attr}() is forbidden"
 
-        # Block torch.load (uses pickle internally — bypasses pickle import ban)
+        # Block torch.load (uses pickle internally — bypasses pickle import ban),
+        # including aliased torch names (e.g. tl.load(...)).
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "load"
             and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "torch"
+            and node.func.value.id in torch_aliases
         ):
             line = getattr(node, "lineno", "?")
             return False, f"Line {line}: torch.load() is forbidden (uses pickle internally)"
