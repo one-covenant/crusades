@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "templar-crusades"
-dynamic = ["version"]
+version = "0.7.0"
 description = "Bittensor subnet for training code efficiency crusades"
 readme = "README.md"
 license = { text = "MIT" }
@@ -58,9 +58,6 @@ crusades-validator = "neurons.validator:main"
 crusades-miner = "neurons.miner:main"
 crusades-api = "crusades.api.server:main"
 tplr = "crusades.tui.app:main"
-
-[tool.setuptools.dynamic]
-version = {attr = "crusades.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src", "."]
