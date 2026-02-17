@@ -45,7 +45,8 @@
     },
 
     "mfu": {
-        "gpu_peak_tflops": 312.0
+        "gpu_peak_tflops": 312.0,
+        "max_plausible_mfu": 75.0
     },
 
     "adaptive_threshold": {

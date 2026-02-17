@@ -50,19 +50,36 @@ class BaseNode(ABC):
 
         # Events
         self.stop_event = asyncio.Event()
+        self._signal_loop: asyncio.AbstractEventLoop | None = None
 
-        # Setup signal handlers
-        self._setup_signals()
+    def setup_signal_handlers(self) -> None:
+        """Setup signal handlers for graceful shutdown.
 
-    def _setup_signals(self) -> None:
-        """Setup signal handlers for graceful shutdown."""
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, self._signal_handler)
+        Must be called from within a running event loop (e.g. in initialize()).
+        Uses loop.add_signal_handler for proper async-context signal handling.
+        Falls back to signal.signal on platforms that don't support it (Windows).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            self._signal_loop = loop
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, self._signal_handler_async)
+        except (RuntimeError, NotImplementedError):
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(sig, self._signal_handler)
+
+    def _signal_handler_async(self) -> None:
+        """Handle shutdown signals (async-safe version for loop.add_signal_handler)."""
+        logger.info("Received shutdown signal, initiating shutdown...")
+        self.stop_event.set()
 
     def _signal_handler(self, signum: int, frame) -> None:
-        """Handle shutdown signals."""
+        """Handle shutdown signals (fallback for non-async context)."""
         logger.info(f"Received signal {signum}, initiating shutdown...")
-        self.stop_event.set()
+        if self._signal_loop is not None and not self._signal_loop.is_closed():
+            self._signal_loop.call_soon_threadsafe(self.stop_event.set)
+        else:
+            self.stop_event.set()
 
     @property
     def hotkey(self) -> str:

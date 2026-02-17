@@ -7,15 +7,17 @@ URL-Based Architecture with Timelock Encryption:
 - After reveal_blocks, validators can read decrypted URL
 - Validator fetches code from URL and evaluates
 
-Commitment format:
-  {
-    "code_url": "https://example.com/train.py"
-  }
+Commitment format (packed, fits 128-byte on-chain limit):
+    <32 hex hash>:<url>
+    Example: cf4817d9793e92a0...1354f9:https://example.com/train.py
+
+  - 32 hex chars = 128-bit truncated SHA256
+  - 33 bytes overhead, leaves 95 bytes for URL
 """
 
 import ipaddress
-import json
 import logging
+import re
 import socket
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -85,6 +87,7 @@ class CodeUrlInfo:
     """Code URL information from miner commitment."""
 
     url: str
+    code_hash: str | None = None  # SHA256 hex digest for integrity verification
 
     def is_valid(self) -> bool:
         """Check if code URL is valid (basic format check only).
@@ -185,24 +188,17 @@ class MinerCommitment:
             )
             return None
 
-        code_url_info = None
-
-        # Parse JSON format
-        if data.startswith("{"):
-            try:
-                parsed = json.loads(data)
-
-                if "code_url" in parsed:
-                    code_url_info = CodeUrlInfo(url=parsed["code_url"])
-                    logger.debug(f"Code URL from UID {uid}: {code_url_info.url[:50]}...")
-
-            except json.JSONDecodeError:
-                logger.debug(f"Invalid JSON in commitment from UID {uid}")
-
-        # If we couldn't parse code URL info, skip
-        if code_url_info is None:
-            logger.debug(f"Could not parse commitment from UID {uid}: {data[:50]}...")
+        # Parse packed format: <32 hex chars>:<url>
+        # Fits 128-byte on-chain limit (33 bytes overhead, 95 for URL)
+        packed_match = re.match(r"^([0-9a-f]{32}):(https?://.+)$", data)
+        if not packed_match:
+            logger.debug(f"Invalid commitment format from UID {uid}: {data[:50]}...")
             return None
+
+        code_hash = packed_match.group(1)
+        code_url = packed_match.group(2)
+        code_url_info = CodeUrlInfo(url=code_url, code_hash=code_hash)
+        logger.debug(f"Commitment from UID {uid}: {code_url[:50]}...")
 
         return cls(
             uid=uid,
@@ -354,7 +350,7 @@ class CommitmentReader:
                 return commitments
 
             except Exception as e:
-                logger.error(f"Failed to read revealed commitments: {e}")
+                logger.exception(f"Failed to read revealed commitments: {e}")
         else:
             logger.error("Subtensor does not support get_all_revealed_commitments()")
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "templar-crusades"
-version = "0.6.0"
+dynamic = ["version"]
 description = "Bittensor subnet for training code efficiency crusades"
 readme = "README.md"
 license = { text = "MIT" }
@@ -38,7 +38,6 @@ dependencies = [
     "accelerate>=0.20.0",
     "datasets>=2.14.0",
     "rich>=13.0.0",
-    "substrateinterface>=1.0.0",
     "substrate-interface>=1.8.1",
     "basilica-sdk>=0.13.0",  # Basilica cloud GPU SDK
     "python-logging-loki>=0.3.1",
@@ -59,6 +58,9 @@ crusades-validator = "neurons.validator:main"
 crusades-miner = "neurons.miner:main"
 crusades-api = "crusades.api.server:main"
 tplr = "crusades.tui.app:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "crusades.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src", "."]

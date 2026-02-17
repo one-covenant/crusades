@@ -26,6 +26,7 @@ import sys
 import time
 import traceback
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,9 +53,19 @@ _perf_counter = time.perf_counter
 _monotonic = time.monotonic
 _cuda_synchronize = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
 
+# Immutable identity fingerprints of the real timer functions, captured at import
+# time before any miner code runs.  Used by the runtime tamper check.
+_REAL_PC_ID = id(time.perf_counter)
+_REAL_MONO_ID = id(time.monotonic)
+_REAL_SYNC_ID = id(_cuda_synchronize)
+
 # Configuration from environment variables
 DETERMINISTIC_MODE = os.getenv("DETERMINISTIC_MODE", "1") == "1"
-EVAL_SEQUENCE_LENGTH = int(os.getenv("EVAL_SEQUENCE_LENGTH", "1024"))
+try:
+    EVAL_SEQUENCE_LENGTH = int(os.getenv("EVAL_SEQUENCE_LENGTH", "1024"))
+except ValueError:
+    logger.warning("Invalid EVAL_SEQUENCE_LENGTH env var, defaulting to 1024")
+    EVAL_SEQUENCE_LENGTH = 1024
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/templar_eval"))
 
 
@@ -100,23 +111,29 @@ _CACHE = {
 }
 
 
+@contextmanager
+def _hide_sensitive_env_modules():
+    """Temporarily hide env modules during miner code execution."""
+    hidden_modules = {}
+    for module_key in list(sys.modules):
+        if module_key == "env" or module_key == __name__ or module_key.endswith(".env"):
+            hidden_modules[module_key] = sys.modules.pop(module_key)
+    try:
+        yield
+    finally:
+        sys.modules.update(hidden_modules)
+
+
 def _load_miner_module(train_path: Path):
     """Load miner's train.py as a module in an isolated context."""
     spec = importlib.util.spec_from_file_location("miner_train", train_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load {train_path}")
 
-    _hidden_modules = {}
-    _sensitive_keys = [k for k in sys.modules if k == "env" or k.endswith(".env") or k == __name__]
-    for key in _sensitive_keys:
-        _hidden_modules[key] = sys.modules.pop(key)
-
-    try:
+    with _hide_sensitive_env_modules():
         module = importlib.util.module_from_spec(spec)
         sys.modules["miner_train"] = module
         spec.loader.exec_module(module)
-    finally:
-        sys.modules.update(_hidden_modules)
 
     return module
 
@@ -140,17 +157,6 @@ def _reset_torch_state():
         torch.cuda.synchronize = _cuda_synchronize
 
     logger.debug("Torch state reset complete")
-
-
-_REFERENCE_BACKEND_STATE = {
-    "cudnn.deterministic": False,
-    "cudnn.benchmark": True,
-    "cudnn.allow_tf32": True,
-    "float32_matmul_precision": "high",
-    "flash_sdp_enabled": True,
-    "mem_efficient_sdp_enabled": True,
-    "math_sdp_enabled": True,
-}
 
 
 def _enforce_backend_state():
@@ -361,10 +367,195 @@ def _collect_main_guard_nodes(tree: ast.AST) -> set[int]:
 
 def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
     """AST scan to reject forbidden code patterns."""
+    # --- Forbidden bare-name references ---
+    # Builtins like __import__, exec, setattr are blocked as CALLS, but a miner
+    # can bypass by storing a reference: `_imp = __import__; _imp("sys")`.
+    # This set blocks them even when only *referenced* (ast.Name in Load context).
+    _forbidden_names = {
+        "__import__",
+        "exec",
+        "eval",
+        "compile",
+        "breakpoint",
+        "setattr",
+        "getattr",
+        "delattr",
+        "vars",
+        "dir",
+        "globals",
+        "locals",
+        "type",
+        "memoryview",
+        "open",
+        "chr",
+        "ord",
+        "input",
+        "classmethod",
+        "staticmethod",
+        "property",
+        "__build_class__",
+    }
+
+    _forbidden_modules = {
+        "ctypes",
+        "_ctypes",
+        "gc",
+        "subprocess",
+        "sys",
+        "os",
+        "pathlib",
+        "io",
+        "_io",
+        "socket",
+        "http",
+        "urllib",
+        "requests",
+        "shutil",
+        "tempfile",
+        "signal",
+        "threading",
+        "_thread",
+        "multiprocessing",
+        "inspect",
+        "ast",
+        "dis",
+        "code",
+        "codeop",
+        "compileall",
+        "pickle",
+        "shelve",
+        "marshal",
+        "builtins",
+        "_builtins",
+        "operator",
+        "types",
+        "codecs",
+        "base64",
+        "pdb",
+        "pprint",
+        "runpy",
+        "linecache",
+        "pkgutil",
+        "atexit",
+        "site",
+        "zipimport",
+        # Stack inspection — reveals internal file paths and code structure
+        "traceback",
+        # Block importing the validator's own module (timer tampering attack)
+        "env",
+        "time",
+        "__main__",
+        "miner_train",
+        # logging.Logger.manager.loggerDict holds refs to all loggers —
+        # traversable to reach the env module's logger and back to env itself
+        "logging",
+        # unittest.mock.patch can replace any attribute on any object
+        "unittest",
+        "mock",
+        # functools.partial can wrap forbidden functions
+        "functools",
+        # weakref can observe GC behavior and hold references
+        "weakref",
+    }
+
+    # Dotted module paths that must be blocked even when the base module is allowed
+    _forbidden_dotted_modules = {
+        "torch.multiprocessing",
+        "torch.utils.dlpack",
+        "torch.distributed",
+        "numpy.ctypeslib",
+    }
+
+    # torch imports that enable bypassing attribute-based guards when imported directly
+    _forbidden_torch_symbol_imports = {
+        "load",  # pickle escape hatch
+        "compile",  # bypasses strict "only torch.compile" call form
+        "set_float32_matmul_precision",  # backend tampering
+        "_C",  # low-level C++ escape hatch
+        "_dynamo",  # compile/runtime guard bypasses
+        "_inductor",  # compile/runtime guard bypasses
+    }
+
+    # Backend toggles can bypass attribute-call checks if imported as bare names
+    _forbidden_torch_backend_symbol_imports = {
+        "enable_flash_sdp",
+        "enable_mem_efficient_sdp",
+        "enable_math_sdp",
+    }
+
+    # torch attributes that should never be rebound or called via alias variables
+    _forbidden_torch_attribute_aliases = {
+        "load",
+        "compile",
+        "set_float32_matmul_precision",
+        "_C",
+        "_dynamo",
+        "_inductor",
+    }
+
+    _forbidden_builtins = {
+        "setattr",
+        "getattr",
+        "delattr",
+        "vars",
+        "dir",
+        "globals",
+        "locals",
+        "type",
+        "memoryview",
+        "open",
+        "chr",
+        "ord",
+        "breakpoint",
+        "input",
+        "classmethod",
+        "staticmethod",
+        "property",
+    }
+
+    # Track names that currently alias the torch module (e.g. "import torch as tl",
+    # or "tl = torch"). This lets us block torch.load() even through aliases.
+    torch_aliases = {"torch"}
+
     main_guard_nodes = _collect_main_guard_nodes(tree)
     for node in ast.walk(tree):
         if id(node) in main_guard_nodes:
             continue
+
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "torch":
+                    local_name = alias.asname or alias.name
+                    if local_name != "torch":
+                        line = getattr(node, "lineno", "?")
+                        return False, f"Line {line}: aliasing torch is forbidden"
+                    torch_aliases.add(local_name)
+
+        if isinstance(node, ast.Assign):
+            if isinstance(node.value, ast.Name) and node.value.id in torch_aliases:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        if target.id != "torch":
+                            line = getattr(node, "lineno", "?")
+                            return False, f"Line {line}: aliasing torch is forbidden"
+                        torch_aliases.add(target.id)
+
+        # Block rebinding sensitive torch attributes to local names
+        # (e.g. `c = torch.compile`, `ld = torch.load`, `dyn = torch._dynamo`)
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id in torch_aliases
+            and node.value.attr in _forbidden_torch_attribute_aliases
+        ):
+            line = getattr(node, "lineno", "?")
+            return False, f"Line {line}: aliasing torch.{node.value.attr} is forbidden"
+
+        # Block bare-name references to dangerous builtins (e.g. `_imp = __import__`)
+        if isinstance(node, ast.Name) and node.id in _forbidden_names:
+            line = getattr(node, "lineno", "?")
+            return False, f"Line {line}: reference to '{node.id}' is forbidden"
 
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -377,6 +568,27 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
+        # Block torch._C access (low-level C++ bindings escape hatch)
+        if isinstance(node, ast.Attribute) and node.attr == "_C":
+            if isinstance(node.value, ast.Name) and node.value.id in torch_aliases:
+                line = getattr(node, "lineno", "?")
+                return False, f"Line {line}: torch._C access is forbidden"
+
+        # Block torch._dynamo.config and torch._inductor.config writes
+        # (e.g. suppress_errors=True masks compilation errors)
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Attribute):
+                    if target.value.attr == "config" and isinstance(
+                        target.value.value, ast.Attribute
+                    ):
+                        if target.value.value.attr in ("_dynamo", "_inductor"):
+                            line = getattr(node, "lineno", "?")
+                            return (
+                                False,
+                                f"Line {line}: modifying torch.{target.value.value.attr}.config is forbidden",
+                            )
+
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Attribute) and target.attr == "__class__":
@@ -388,15 +600,18 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
-        if isinstance(node, ast.Attribute) and node.attr == "perf_counter":
-            if isinstance(node.value, ast.Name) and node.value.id == "time":
-                line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: forbidden pattern detected"
-
-        if isinstance(node, ast.Attribute) and node.attr == "monotonic":
-            if isinstance(node.value, ast.Name) and node.value.id == "time":
-                line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: forbidden pattern detected"
+        # Block timer-related attribute access on ANY object.
+        if isinstance(node, ast.Attribute) and node.attr in (
+            "perf_counter",
+            "_perf_counter",
+            "monotonic",
+            "_monotonic",
+            "perf_counter_ns",
+            "monotonic_ns",
+            "_cuda_synchronize",
+        ):
+            line = getattr(node, "lineno", "?")
+            return False, f"Line {line}: forbidden pattern detected"
 
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -456,43 +671,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                             f"Line {line}: .compile() is forbidden (only torch.compile is allowed)",
                         )
 
-        _forbidden_modules = {
-            "ctypes",
-            "_ctypes",
-            "gc",
-            "subprocess",
-            "sys",
-            "os",
-            "pathlib",
-            "io",
-            "socket",
-            "http",
-            "urllib",
-            "requests",
-            "shutil",
-            "tempfile",
-            "signal",
-            "threading",
-            "multiprocessing",
-            "inspect",
-            "ast",
-            "dis",
-            "code",
-            "codeop",
-            "compileall",
-            "pickle",
-            "shelve",
-            "marshal",
-            "builtins",
-            "_builtins",
-            "operator",
-            "types",
-            "codecs",
-            "base64",
-            "pdb",
-            "pprint",
-        }
-
         if isinstance(node, ast.Import):
             for alias in node.names:
                 base_module = alias.name.split(".")[0]
@@ -503,38 +681,49 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 if "cpp_extension" in alias.name:
                     line = getattr(node, "lineno", "?")
                     return False, f"Line {line}: forbidden import"
+                # Block dangerous dotted module paths
+                for forbidden_path in _forbidden_dotted_modules:
+                    if alias.name == forbidden_path or alias.name.startswith(forbidden_path + "."):
+                        line = getattr(node, "lineno", "?")
+                        return False, f"Line {line}: forbidden import"
 
         if isinstance(node, ast.ImportFrom) and node.module:
             base_module = node.module.split(".")[0]
             if base_module in _forbidden_modules or node.module.startswith("importlib"):
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden import"
+            # Block direct symbol imports from torch that bypass call-shape checks.
+            if node.module == "torch":
+                for alias in node.names:
+                    if alias.name in _forbidden_torch_symbol_imports:
+                        line = getattr(node, "lineno", "?")
+                        return False, f"Line {line}: importing torch.{alias.name} is forbidden"
+            # Block direct backend symbol imports (e.g. from torch.backends.cuda import ...).
+            if node.module.startswith("torch.backends"):
+                for alias in node.names:
+                    if alias.name in _forbidden_torch_backend_symbol_imports:
+                        line = getattr(node, "lineno", "?")
+                        return False, f"Line {line}: importing torch backend toggle is forbidden"
             # Block torch.utils.cpp_extension — can compile and load arbitrary
-            # C/C++ code, bypassing all Python-level sandbox restrictions.
             if "cpp_extension" in node.module:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden import"
+            # Block dangerous dotted module paths (e.g. from torch import multiprocessing)
+            for forbidden_path in _forbidden_dotted_modules:
+                if node.module == forbidden_path or node.module.startswith(forbidden_path + "."):
+                    line = getattr(node, "lineno", "?")
+                    return False, f"Line {line}: forbidden import"
+            for alias in node.names:
+                if "cpp_extension" in alias.name:
+                    line = getattr(node, "lineno", "?")
+                    return False, f"Line {line}: forbidden import"
+                # Block "from torch import multiprocessing" etc.
+                full_path = f"{node.module}.{alias.name}"
+                for forbidden_path in _forbidden_dotted_modules:
+                    if full_path == forbidden_path or full_path.startswith(forbidden_path + "."):
+                        line = getattr(node, "lineno", "?")
+                        return False, f"Line {line}: forbidden import"
 
-        # Block dangerous builtins as both bare names and attribute access
-        _forbidden_builtins = {
-            "setattr",
-            "getattr",
-            "delattr",
-            "vars",
-            "dir",
-            "globals",
-            "locals",
-            "type",
-            "memoryview",
-            "open",
-            "chr",
-            "ord",
-            "breakpoint",
-            "input",
-            "classmethod",
-            "staticmethod",
-            "property",
-        }
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id in _forbidden_builtins:
                 line = getattr(node, "lineno", "?")
@@ -542,6 +731,23 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             if isinstance(node.func, ast.Attribute) and node.func.attr in _forbidden_builtins:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: .{node.func.attr}() is forbidden"
+
+        # Block torch.load (uses pickle internally — bypasses pickle import ban),
+        # including aliased torch names (e.g. tl.load(...)).
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "load"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in torch_aliases
+        ):
+            line = getattr(node, "lineno", "?")
+            return False, f"Line {line}: torch.load() is forbidden (uses pickle internally)"
+
+        # Block numpy.ctypeslib access (grants access to blocked ctypes via numpy)
+        if isinstance(node, ast.Attribute) and node.attr == "ctypeslib":
+            line = getattr(node, "lineno", "?")
+            return False, f"Line {line}: ctypeslib access is forbidden"
 
         if isinstance(node, ast.Name) and node.id == "__builtins__":
             line = getattr(node, "lineno", "?")
@@ -588,6 +794,19 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: accessing .optimizer attribute is forbidden"
 
+        # Block dangerous builtins used as decorators (e.g. @property, @staticmethod)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for deco in node.decorator_list:
+                if isinstance(deco, ast.Name) and deco.id in _forbidden_names:
+                    line = getattr(deco, "lineno", "?")
+                    return False, f"Line {line}: decorator @{deco.id} is forbidden"
+
+        # Block AugAssign on __name__ (e.g. __name__ += "...")
+        if isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "__name__":
+                line = getattr(node, "lineno", "?")
+                return False, f"Line {line}: modification of __name__ is forbidden"
+
     return True, None
 
 
@@ -600,6 +819,11 @@ _FORBIDDEN_STRINGS = [
     "__mro__",
     "perf_counter",
     "_perf_counter",
+    "monotonic",
+    "_monotonic",
+    "_REAL_PC_ID",
+    "_REAL_MONO_ID",
+    "_REAL_SYNC_ID",
     "get_objects",
     "get_referrers",
     "get_referents",
@@ -629,7 +853,6 @@ _FORBIDDEN_STRINGS = [
     "globals",
     "locals",
     "_cuda_synchronize",
-    "_monotonic",
     "__traceback__",
     "tb_frame",
     "tb_next",
@@ -645,19 +868,49 @@ _FORBIDDEN_STRINGS = [
     "operator.methodcaller",
     "attrgetter",
     "methodcaller",
+    # Block torch internal access even under aliased names
+    "_C",
+    "_dynamo",
+    "_inductor",
+    # Prevent access to validator env internals
+    "_CACHE",
+    "initial_state",
+    "_hidden_modules",
+    "_sensitive_keys",
+    # Block dynamic access to dangerous builtins via string construction
+    "__build_class__",
+    # Block unittest.mock for attribute patching
+    "mock.patch",
+    "MagicMock",
+    "unittest.mock",
 ]
 
 
 def _is_main_guard(node: ast.AST) -> bool:
-    """Check if an AST node is an `if __name__ == "__main__":` block."""
-    return (
+    """Check if an AST node is an `if __name__ == "__main__":` block.
+
+    Handles both `__name__ == "__main__"` and `"__main__" == __name__`
+    for consistency with _collect_main_guard_nodes.
+    """
+    if not (
         isinstance(node, ast.If)
         and isinstance(node.test, ast.Compare)
-        and isinstance(node.test.left, ast.Name)
-        and node.test.left.id == "__name__"
+        and len(node.test.ops) == 1
+        and isinstance(node.test.ops[0], (ast.Eq, ast.Is))
         and len(node.test.comparators) == 1
-        and isinstance(node.test.comparators[0], ast.Constant)
-        and node.test.comparators[0].value == "__main__"
+    ):
+        return False
+    left, right = node.test.left, node.test.comparators[0]
+    return (
+        isinstance(left, ast.Name)
+        and left.id == "__name__"
+        and isinstance(right, ast.Constant)
+        and right.value == "__main__"
+    ) or (
+        isinstance(right, ast.Name)
+        and right.id == "__name__"
+        and isinstance(left, ast.Constant)
+        and left.value == "__main__"
     )
 
 
@@ -733,6 +986,131 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                         line = getattr(node, "lineno", "?")
                         return False, (
                             f"Security violation: Line {line}: forbidden string constructed via bytes literal"
+                        )
+
+    # Scan attribute names (e.g. _e._perf_counter) — AST string scan only
+    # catches ast.Constant values, not ast.Attribute.attr names
+    for node in ast.walk(scan_tree):
+        if isinstance(node, ast.Attribute):
+            for pattern in _FORBIDDEN_STRINGS:
+                if node.attr == pattern:
+                    line = getattr(node, "lineno", "?")
+                    return False, (
+                        f"Security violation: Line {line}: forbidden attribute name '{node.attr}'"
+                    )
+
+    # Scan for str.join() obfuscation: "".join(["s","e","t","a","t","t","r"])
+    # Reconstructs the joined string and checks against forbidden patterns
+    for node in ast.walk(scan_tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "join"
+            and isinstance(node.func.value, ast.Constant)
+            and isinstance(node.func.value.value, str)
+            and node.args
+            and len(node.args) == 1
+        ):
+            arg = node.args[0]
+            # Handle list/tuple of string constants
+            if isinstance(arg, (ast.List, ast.Tuple)):
+                chars = []
+                all_const = True
+                for elt in arg.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        chars.append(elt.value)
+                    else:
+                        all_const = False
+                        break
+                if all_const and chars:
+                    joined = node.func.value.value.join(chars)
+                    for pattern in _FORBIDDEN_STRINGS:
+                        if pattern in joined:
+                            line = getattr(node, "lineno", "?")
+                            return False, (
+                                f"Security violation: Line {line}: forbidden string constructed via str.join()"
+                            )
+
+    # Scan for string concatenation obfuscation: "__set" + "attr__"
+    # Walk full BinOp tree recursively to catch multi-level concat like "a" + "b" + "c"
+    def _collect_concat_parts(node: ast.AST) -> list[str] | None:
+        """Recursively collect all string constants from chained Add BinOps."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [node.value]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left_parts = _collect_concat_parts(node.left)
+            right_parts = _collect_concat_parts(node.right)
+            if left_parts is not None and right_parts is not None:
+                return left_parts + right_parts
+        return None
+
+    for node in ast.walk(scan_tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            parts = _collect_concat_parts(node)
+            if parts and len(parts) >= 2:
+                combined = "".join(parts)
+                for pattern in _FORBIDDEN_STRINGS:
+                    if pattern in combined:
+                        line = getattr(node, "lineno", "?")
+                        return False, (
+                            f"Security violation: Line {line}: forbidden string constructed via concatenation"
+                        )
+
+    # Scan for %-format obfuscation: "%s%s" % ("__set", "attr__")
+    for node in ast.walk(scan_tree):
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Mod)
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)
+            and isinstance(node.right, ast.Tuple)
+        ):
+            parts = []
+            all_const = True
+            for elt in node.right.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    parts.append(elt.value)
+                else:
+                    all_const = False
+                    break
+            if all_const and parts:
+                try:
+                    formatted = node.left.value % tuple(parts)
+                    for pattern in _FORBIDDEN_STRINGS:
+                        if pattern in formatted:
+                            line = getattr(node, "lineno", "?")
+                            return False, (
+                                f"Security violation: Line {line}: forbidden string constructed via %-format"
+                            )
+                except (TypeError, ValueError):
+                    pass
+
+    # Scan for f-string obfuscation: f"{'__set'}{'attr__'}"
+    for node in ast.walk(scan_tree):
+        if isinstance(node, ast.JoinedStr):
+            parts = []
+            all_const = True
+            for val in node.values:
+                if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                    parts.append(val.value)
+                elif (
+                    isinstance(val, ast.FormattedValue)
+                    and isinstance(val.value, ast.Constant)
+                    and isinstance(val.value.value, str)
+                    and val.format_spec is None
+                    and val.conversion == -1
+                ):
+                    parts.append(val.value.value)
+                else:
+                    all_const = False
+                    break
+            if all_const and parts:
+                combined = "".join(parts)
+                for pattern in _FORBIDDEN_STRINGS:
+                    if pattern in combined:
+                        line = getattr(node, "lineno", "?")
+                        return False, (
+                            f"Security violation: Line {line}: forbidden string constructed via f-string"
                         )
 
     inner_steps_found = False
@@ -1705,16 +2083,18 @@ class Actor:
         data_samples: int = 10000,
         code: str = "",  # Miner's code passed directly
         # Verification settings
-        max_loss_difference: float = 0.5,
+        max_loss_difference: float = 0.3,
         use_random_init: bool = True,
         min_trainable_params_ratio: float = 1.0,
-        min_params_changed_ratio: float = 0.5,
+        min_params_changed_ratio: float = 0.75,
         # Gradient verification
-        gradient_norm_ratio_max: float = 1.10,
+        gradient_norm_ratio_max: float = 1.06,
         # Weight verification
         weight_relative_error_max: float = 0.008,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
+        max_plausible_mfu: float = 75.0,
+        require_cuda_timing: bool = True,
         model_params_override: int | None = None,
     ) -> dict:
         """
@@ -1771,7 +2151,7 @@ class Actor:
 
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + timeout
-        seed_value = abs(hash(seed)) % (2**32)
+        seed_value = int(hashlib.sha256(seed.encode()).hexdigest(), 16) % (2**32)
         _set_deterministic(seed_value)
 
         # Validate code structure
@@ -1886,13 +2266,15 @@ class Actor:
 
             logger.info(f"Running {warmup_steps} warmup step(s) to check for basic errors...")
             try:
-                warmup_result = miner_module.inner_steps(
-                    model=model,
-                    data_iterator=data_iter_warmup,
-                    optimizer=optimizer_warmup,
-                    num_steps=warmup_steps,
-                    device=device,
-                )
+                # Hide env modules during miner execution to prevent timer tampering.
+                with _hide_sensitive_env_modules():
+                    warmup_result = miner_module.inner_steps(
+                        model=model,
+                        data_iterator=data_iter_warmup,
+                        optimizer=optimizer_warmup,
+                        num_steps=warmup_steps,
+                        device=device,
+                    )
 
                 # Quick validation of warmup result
                 if warmup_result is None:
@@ -2005,30 +2387,124 @@ class Actor:
             _reset_torch_state()
             _enforce_backend_state()
 
-            _cuda_synchronize()
-            start_perf = _perf_counter()
-            start_mono = _monotonic()
+            # ── Runtime timer integrity check ────────────────────────────
+            # Verify timer references are unchanged before and after execution.
+            def _timer_ids_ok() -> bool:
+                return (
+                    id(_perf_counter) == _REAL_PC_ID
+                    and id(_monotonic) == _REAL_MONO_ID
+                    and id(_cuda_synchronize) == _REAL_SYNC_ID
+                )
 
-            miner_result = miner_module.inner_steps(
-                model=model,
-                data_iterator=data_iter_miner,
-                optimizer=optimizer_miner,
-                num_steps=steps,
-                device=device,
-            )
+            if not _timer_ids_ok():
+                logger.error("Timer references tampered BEFORE timed section!")
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": 0.0,
+                    "success": False,
+                    "error": "Timer tampering detected (pre-eval)",
+                    "error_code": "timer_tampering",
+                    "seed": seed,
+                    "code": code,
+                }
 
-            _cuda_synchronize()
-            end_perf = _perf_counter()
-            end_mono = _monotonic()
+            # Hardware-level timing events. Created BEFORE miner code runs.
+            _cuda_start_event = None
+            _cuda_end_event = None
+            if torch.cuda.is_available():
+                _cuda_start_event = torch.cuda.Event(enable_timing=True)
+                _cuda_end_event = torch.cuda.Event(enable_timing=True)
+
+            # Use verified local refs so even if module globals are swapped
+            # mid-flight the locals cannot be reached by miner code.
+            _pc = _perf_counter
+            _mo = _monotonic
+            _sy = _cuda_synchronize
+
+            _sy()
+            start_perf = _pc()
+            start_mono = _mo()
+            if _cuda_start_event is not None:
+                _cuda_start_event.record()
+
+            # Hide env modules during timed miner execution to prevent timer tampering.
+            with _hide_sensitive_env_modules():
+                miner_result = miner_module.inner_steps(
+                    model=model,
+                    data_iterator=data_iter_miner,
+                    optimizer=optimizer_miner,
+                    num_steps=steps,
+                    device=device,
+                )
+
+            if _cuda_end_event is not None:
+                _cuda_end_event.record()
+            _sy()
+            end_perf = _pc()
+            end_mono = _mo()
+
+            # Post-eval tamper check on module-level refs
+            if not _timer_ids_ok():
+                logger.error("Timer references tampered DURING timed section!")
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": 0.0,
+                    "success": False,
+                    "error": "Timer tampering detected (post-eval)",
+                    "error_code": "timer_tampering",
+                    "seed": seed,
+                    "code": code,
+                }
+
             wall_time_perf = end_perf - start_perf
             wall_time_mono = end_mono - start_mono
 
-            if wall_time_mono > 0 and abs(wall_time_perf - wall_time_mono) / wall_time_mono > 0.10:
-                logger.warning(
-                    f"Timer integrity check FAILED: perf_counter={wall_time_perf:.4f}s "
-                    f"vs monotonic={wall_time_mono:.4f}s "
-                    f"(divergence={abs(wall_time_perf - wall_time_mono) / wall_time_mono * 100:.1f}%)"
-                )
+            # CUDA event wall time (untamperable from Python)
+            cuda_wall_time = None
+            if _cuda_start_event is not None and _cuda_end_event is not None:
+                _cuda_end_event.synchronize()
+                cuda_wall_time = _cuda_start_event.elapsed_time(_cuda_end_event) / 1000.0
+
+            # Three-way timer cross-check: perf_counter vs monotonic vs CUDA events
+            # If ANY pair diverges by >10%, it's timer tampering
+            def _timer_divergence(a: float, b: float) -> float:
+                return abs(a - b) / max(b, 1e-9)
+
+            _timer_pairs = [
+                ("perf_counter", wall_time_perf, "monotonic", wall_time_mono),
+            ]
+            if cuda_wall_time is not None and cuda_wall_time > 0:
+                _timer_pairs.append(("perf_counter", wall_time_perf, "cuda_events", cuda_wall_time))
+                _timer_pairs.append(("monotonic", wall_time_mono, "cuda_events", cuda_wall_time))
+
+            for name_a, val_a, name_b, val_b in _timer_pairs:
+                if val_b > 0 and _timer_divergence(val_a, val_b) > 0.10:
+                    logger.warning(
+                        f"Timer integrity check FAILED: {name_a}={val_a:.4f}s "
+                        f"vs {name_b}={val_b:.4f}s "
+                        f"(divergence={_timer_divergence(val_a, val_b) * 100:.1f}%)"
+                    )
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": cuda_wall_time or wall_time_mono,
+                        "success": False,
+                        "error": f"Timer integrity violation: {name_a} vs {name_b}",
+                        "error_code": "timer_tampering",
+                        "seed": seed,
+                        "code": code,
+                    }
+
+            # Require CUDA event timing for wall time measurement.
+            if require_cuda_timing and (cuda_wall_time is None or cuda_wall_time <= 0):
                 return {
                     "task_id": task_id,
                     "mfu": 0.0,
@@ -2036,16 +2512,22 @@ class Actor:
                     "total_tokens": 0,
                     "wall_time_seconds": wall_time_mono,
                     "success": False,
-                    "error": "Timer integrity violation detected",
-                    "error_code": "timer_tampering",
+                    "error": "CUDA event timing unavailable; rejecting evaluation",
+                    "error_code": "timer_source_unavailable",
                     "seed": seed,
                     "code": code,
                 }
 
-            wall_time = wall_time_mono
+            # Use CUDA event time as canonical source, fall back to monotonic
+            wall_time = (
+                cuda_wall_time
+                if cuda_wall_time is not None and cuda_wall_time > 0
+                else wall_time_mono
+            )
             logger.info(
                 f"Timing: wall_time={wall_time:.2f}s "
-                f"(perf_counter={wall_time_perf:.2f}s, monotonic={wall_time_mono:.2f}s)"
+                f"(perf_counter={wall_time_perf:.2f}s, monotonic={wall_time_mono:.2f}s"
+                f"{f', cuda_events={cuda_wall_time:.2f}s' if cuda_wall_time else ''})"
             )
 
             # Convert GPU gradient snapshot to CPU (slow, but OUTSIDE the timer)
@@ -2205,6 +2687,24 @@ class Actor:
             tps = float(total_tokens_int) / max(wall_time, 1e-6)
             mfu = _calculate_mfu(total_tokens_int, wall_time, model_params, gpu_peak_tflops)
 
+            # MFU sanity cap — no legitimate code can exceed this on current hardware.
+            # Safety net: even if a novel timing attack evades all other checks,
+            # physically impossible MFU values are rejected.
+            if mfu > max_plausible_mfu:
+                logger.warning(f"MFU {mfu:.1f}% exceeds plausible maximum {max_plausible_mfu}%")
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": f"MFU {mfu:.1f}% exceeds plausible maximum {max_plausible_mfu}%",
+                    "error_code": "implausible_mfu",
+                    "seed": seed,
+                    "code": code,
+                }
+
             # Diagnostics
             diagnostics = {
                 "verification": verify_details,
@@ -2253,6 +2753,7 @@ class Actor:
             }
 
         except Exception as e:
+            logger.error(f"Evaluation failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
             return {
                 "task_id": task_id,
                 "mfu": 0.0,
@@ -2260,7 +2761,7 @@ class Actor:
                 "total_tokens": 0,
                 "wall_time_seconds": 0.0,
                 "success": False,
-                "error": f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}",
+                "error": f"{type(e).__name__}: {e}",
                 "seed": seed,
                 "code": code,
             }
@@ -2276,8 +2777,7 @@ class Actor:
             # Without this, local references keep optimizer states (~2x model
             # VRAM), data tensors, gradient copies, and reference state alive,
             # preventing gc.collect() + empty_cache() from reclaiming memory.
-            # noinspection PyUnusedLocal
-            optimizer_miner = base_optimizer = None  # type: ignore[assignment]
+            optimizer_miner = base_optimizer = None  # type: ignore[assignment]  # noqa
             data_iter_miner = data = None  # type: ignore[assignment]
             reference_final_state = candidate_grad = None  # type: ignore[assignment]
             miner_result = parsed = miner_module = None  # type: ignore[assignment]
@@ -2291,8 +2791,9 @@ class Actor:
             # warmup and timed run, so the compiled model persists for timing.
             try:
                 torch._dynamo.reset()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("torch._dynamo.reset() failed - failing closed", exc_info=True)
+                raise RuntimeError("torch._dynamo.reset() failed; runtime state untrusted") from e
 
             # Memory cleanup
             gc.collect()
@@ -2333,16 +2834,17 @@ class EvaluateRequest(BaseModel):
     data_samples: int = 10000
     code: str  # Miner's train.py code
     # Verification settings
-    max_loss_difference: float = 0.5
+    max_loss_difference: float = 0.3
     use_random_init: bool = True
     min_trainable_params_ratio: float = 1.0
-    min_params_changed_ratio: float = 0.5
+    min_params_changed_ratio: float = 0.75
     # Gradient verification
-    gradient_norm_ratio_max: float = 1.10
+    gradient_norm_ratio_max: float = 1.06
     # Weight verification
     weight_relative_error_max: float = 0.008
     # MFU calculation
     gpu_peak_tflops: float = 312.0
+    max_plausible_mfu: float = 75.0
 
 
 class EvaluateResponse(BaseModel):
@@ -2396,6 +2898,8 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         gradient_norm_ratio_max=request.gradient_norm_ratio_max,
         weight_relative_error_max=request.weight_relative_error_max,
         gpu_peak_tflops=request.gpu_peak_tflops,
+        max_plausible_mfu=request.max_plausible_mfu,
+        require_cuda_timing=True,
     )
 
     return EvaluateResponse(
