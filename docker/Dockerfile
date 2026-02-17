@@ -34,15 +34,15 @@ WORKDIR /app
 # Install uv for faster dependency management
 RUN pip install uv
 
-# Copy dependency files first (better layer caching)
+# Copy dependency spec and source code (source needed for dynamic version resolution)
 COPY --chown=appuser:appuser pyproject.toml uv.lock* ./
-
-# Install dependencies (system-wide so they're available)
-RUN uv pip install --system -e .
-
-# Copy source code
 COPY --chown=appuser:appuser src/ ./src/
 COPY --chown=appuser:appuser neurons/ ./neurons/
+
+# Install package in editable mode (reads __version__ from src/crusades/__init__.py)
+RUN uv pip install --system -e .
+
+# Copy remaining config/data files
 COPY --chown=appuser:appuser hparams/ ./hparams/
 COPY --chown=appuser:appuser environments/ ./environments/
 
