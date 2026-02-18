@@ -32,6 +32,7 @@ class VerificationConfig(BaseModel):
     min_params_changed_ratio: float = 0.8
     gradient_norm_ratio_max: float = 1.10
     weight_relative_error_max: float = 0.008
+    timer_divergence_threshold: float = 0.05
 
 
 class MFUConfig(BaseModel):
@@ -39,6 +40,7 @@ class MFUConfig(BaseModel):
 
     gpu_peak_tflops: float = 312.0  # A100 80GB peak TFLOPS (bfloat16)
     max_plausible_mfu: float = 75.0  # Reject MFU above this as likely cheating
+    min_mfu: float = 45.0  # Reject submissions below this floor
 
 
 class AdaptiveThresholdConfig(BaseModel):
