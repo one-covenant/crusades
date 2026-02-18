@@ -150,7 +150,7 @@ class VerifiedPaymentModel(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     submission_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
-    miner_hotkey: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    miner_hotkey: Mapped[str] = mapped_column(String(48), nullable=False)
     miner_coldkey: Mapped[str] = mapped_column(String(48), nullable=False)
     block_hash: Mapped[str] = mapped_column(String(66), nullable=False)
     extrinsic_index: Mapped[int] = mapped_column(Integer, nullable=False)

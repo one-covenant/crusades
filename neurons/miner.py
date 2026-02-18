@@ -140,15 +140,18 @@ def stake_submission_fee(
     """
     fee_tao = fee_rao / 1e9
     hotkey = wallet.hotkey.ss58_address
+    tx_fee_buffer_rao = 50_000_000  # 0.05 TAO reserve for transaction fees
 
     try:
         coldkey_addr = wallet.coldkey.ss58_address
         balance = subtensor.get_balance(coldkey_addr)
         balance_rao = balance.rao if hasattr(balance, "rao") else int(balance)
+        required_rao = fee_rao + tx_fee_buffer_rao
 
-        if balance_rao < fee_rao:
+        if balance_rao < required_rao:
             return False, (
-                f"Insufficient balance. Need {fee_rao} RAO ({fee_tao} TAO), "
+                f"Insufficient balance. Need {fee_rao} RAO ({fee_tao} TAO) "
+                f"+ ~{tx_fee_buffer_rao / 1e9:.2f} TAO tx fees, "
                 f"have {balance_rao} RAO ({balance_rao / 1e9:.4f} TAO)"
             )
     except Exception as e:
@@ -382,8 +385,8 @@ def cmd_submit(args):
                 print(
                     "If you need a refund, contact the validator operator with your payment details above."
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"\n(Could not check payment status: {e})")
         return 1
 
 

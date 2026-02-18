@@ -302,8 +302,8 @@ class Validator(BaseNode):
             return True
 
         if self.chain is None:
-            logger.warning("No chain connection - skipping payment verification")
-            return True
+            logger.error("No chain connection — cannot verify payment")
+            return False
 
         fee_rao = hparams.payment.fee_rao
         scan_blocks = hparams.payment.scan_blocks
@@ -432,8 +432,8 @@ class Validator(BaseNode):
             try:
                 await self.db.save_submission(failed_submission)
                 logger.warning(f"Submission {submission_id} FAILED: payment not verified")
-            except Exception as e:
-                logger.error(f"Failed to save failed submission: {e}")
+            except Exception:
+                logger.exception(f"Failed to save failed submission {submission_id}")
             return
 
         submission = SubmissionModel(

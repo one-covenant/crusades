@@ -1,6 +1,7 @@
 """Database abstraction layer."""
 
 from sqlalchemy import desc, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from ..config import get_hparams
@@ -402,7 +403,11 @@ class Database:
         extrinsic_index: int,
         amount_rao: int,
     ) -> None:
-        """Record a verified payment to prevent double-spend."""
+        """Record a verified payment to prevent double-spend.
+
+        Raises:
+            ValueError: If the payment extrinsic was already claimed by another submission.
+        """
         async with self.session_factory() as session:
             payment = VerifiedPaymentModel(
                 submission_id=submission_id,
@@ -412,8 +417,15 @@ class Database:
                 extrinsic_index=extrinsic_index,
                 amount_rao=amount_rao,
             )
-            session.add(payment)
-            await session.commit()
+            try:
+                session.add(payment)
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                raise ValueError(
+                    f"Payment at block {block_hash[:16]}... extrinsic {extrinsic_index} "
+                    f"already claimed by another submission"
+                )
 
     async def get_payment_for_submission(self, submission_id: str) -> VerifiedPaymentModel | None:
         """Get the payment record for a submission."""

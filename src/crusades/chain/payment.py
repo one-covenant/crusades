@@ -136,38 +136,15 @@ def _scan_block_for_stake(
     return None
 
 
-def verify_payment_on_chain(
+def _scan_block_range(
     subtensor: bt.subtensor,
+    start_block: int,
+    end_block: int,
     miner_coldkey: str,
-    commitment_block: int,
     netuid: int,
     min_amount_rao: int,
-    scan_blocks: int = 200,
 ) -> PaymentInfo | None:
-    """Scan a range of blocks for a valid staking payment from the miner.
-
-    Searches backwards from the commitment block for an add_stake extrinsic
-    that matches the miner's coldkey, the correct subnet, and the minimum amount.
-
-    Args:
-        subtensor: Subtensor connection
-        miner_coldkey: The miner's coldkey that should have staked
-        commitment_block: The block the commitment was revealed at
-        netuid: Subnet the stake should target
-        min_amount_rao: Minimum stake amount required (in RAO)
-        scan_blocks: How many blocks back to scan
-
-    Returns:
-        PaymentInfo if valid payment found, None otherwise
-    """
-    start_block = max(0, commitment_block - scan_blocks)
-    end_block = commitment_block
-
-    logger.info(
-        f"Scanning blocks {start_block}-{end_block} for stake payment "
-        f"from {miner_coldkey[:16]}... (min {min_amount_rao} RAO on netuid {netuid})"
-    )
-
+    """Scan a range of blocks (end_block down to start_block) for a matching stake."""
     for block_num in range(end_block, start_block - 1, -1):
         try:
             block_hash = subtensor.get_block_hash(block_num)
@@ -192,6 +169,60 @@ def verify_payment_on_chain(
         except Exception as e:
             logger.debug(f"Error scanning block {block_num}: {e}")
             continue
+
+    return None
+
+
+def verify_payment_on_chain(
+    subtensor: bt.subtensor,
+    miner_coldkey: str,
+    commitment_block: int,
+    netuid: int,
+    min_amount_rao: int,
+    scan_blocks: int = 200,
+    fast_scan_blocks: int = 15,
+) -> PaymentInfo | None:
+    """Scan a range of blocks for a valid staking payment from the miner.
+
+    Uses a two-phase approach: first checks the most recent blocks (where
+    the payment is most likely to be), then falls back to a full scan.
+
+    Args:
+        subtensor: Subtensor connection
+        miner_coldkey: The miner's coldkey that should have staked
+        commitment_block: The block the commitment was revealed at
+        netuid: Subnet the stake should target
+        min_amount_rao: Minimum stake amount required (in RAO)
+        scan_blocks: How many blocks back to scan (full range)
+        fast_scan_blocks: How many recent blocks to check first
+
+    Returns:
+        PaymentInfo if valid payment found, None otherwise
+    """
+    start_block = max(0, commitment_block - scan_blocks)
+    end_block = commitment_block
+    fast_boundary = max(end_block - fast_scan_blocks + 1, start_block)
+
+    logger.info(
+        f"Scanning blocks {start_block}-{end_block} for stake payment "
+        f"from {miner_coldkey[:16]}... (min {min_amount_rao} RAO on netuid {netuid})"
+    )
+
+    # Fast pass: most miners stake shortly before committing
+    payment = _scan_block_range(
+        subtensor, fast_boundary, end_block, miner_coldkey, netuid, min_amount_rao
+    )
+    if payment is not None:
+        return payment
+
+    # Full scan: check remaining older blocks
+    if fast_boundary > start_block:
+        logger.debug(f"Fast scan miss, scanning remaining blocks {start_block}-{fast_boundary - 1}")
+        payment = _scan_block_range(
+            subtensor, start_block, fast_boundary - 1, miner_coldkey, netuid, min_amount_rao
+        )
+        if payment is not None:
+            return payment
 
     logger.warning(
         f"No valid payment found in blocks {start_block}-{end_block} from {miner_coldkey[:16]}..."
