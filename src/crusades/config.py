@@ -32,6 +32,7 @@ class VerificationConfig(BaseModel):
     min_params_changed_ratio: float = 0.8
     gradient_norm_ratio_max: float = 1.10
     weight_relative_error_max: float = 0.008
+    timer_divergence_threshold: float = 0.05
 
 
 class MFUConfig(BaseModel):

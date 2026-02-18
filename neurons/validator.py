@@ -153,6 +153,8 @@ class Validator(BaseNode):
             gradient_norm_ratio_max=hparams.verification.gradient_norm_ratio_max,
             # Weight verification
             weight_relative_error_max=hparams.verification.weight_relative_error_max,
+            # Timer integrity
+            timer_divergence_threshold=hparams.verification.timer_divergence_threshold,
             # MFU calculation
             gpu_peak_tflops=hparams.mfu.gpu_peak_tflops,
             max_plausible_mfu=hparams.mfu.max_plausible_mfu,

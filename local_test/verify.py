@@ -31,201 +31,42 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM
 
+from crusades.core.security_defs import (
+    ALLOWED_TORCH_SUBMODULE_IMPORTS,
+    FORBIDDEN_ASSIGNMENT_ATTRS,
+    FORBIDDEN_ATTR_CALLS,
+    FORBIDDEN_BACKEND_TOGGLE_ATTRS,
+    FORBIDDEN_BUILTINS,
+    FORBIDDEN_CUDNN_ATTRS,
+    FORBIDDEN_DIRECT_CALLS,
+    FORBIDDEN_DOTTED_MODULES,
+    FORBIDDEN_GC_ATTRS,
+    FORBIDDEN_IMPORT_SUBSTRINGS,
+    FORBIDDEN_INTROSPECTION_ATTRS,
+    FORBIDDEN_MODULES,
+    FORBIDDEN_NAMES,
+    FORBIDDEN_OBJECT_DUNDER_ATTRS,
+    FORBIDDEN_STRINGS,
+    FORBIDDEN_SYS_MODULE_NAMES,
+    FORBIDDEN_TIMER_ATTRS,
+    FORBIDDEN_TORCH_ATTRIBUTE_ALIASES,
+    FORBIDDEN_TORCH_BACKEND_SYMBOL_IMPORTS,
+    FORBIDDEN_TORCH_CONFIG_MODULES,
+    FORBIDDEN_TORCH_SYMBOL_IMPORTS,
+)
+
 # =========================================================================
-# Security checks — mirrors production env.py _validate_code_structure
+# Security checks — policy loaded from crusades.core.security_defs
 # =========================================================================
 
-_FORBIDDEN_STRINGS = [
-    "__setattr__",
-    "__delattr__",
-    "__class__",
-    "__subclasses__",
-    "__bases__",
-    "__mro__",
-    "perf_counter",
-    "_perf_counter",
-    "monotonic",
-    "_monotonic",
-    "_REAL_PC_ID",
-    "_REAL_MONO_ID",
-    "_REAL_SYNC_ID",
-    "get_objects",
-    "get_referrers",
-    "get_referents",
-    "enable_flash_sdp",
-    "enable_mem_efficient_sdp",
-    "enable_math_sdp",
-    "set_float32_matmul_precision",
-    "captured_gradients",
-    "_opt_impl",
-    "_grad_snapshot_gpu",
-    "step_count",
-    "GradientCapturingOptimizer",
-    "__import__",
-    "importlib",
-    "import_module",
-    "sys.modules",
-    "setattr",
-    "getattr",
-    "delattr",
-    "__builtins__",
-    "__dict__",
-    "__globals__",
-    "__code__",
-    "__func__",
-    "__self__",
-    "__init_subclass__",
-    "globals",
-    "locals",
-    "_cuda_synchronize",
-    "__traceback__",
-    "tb_frame",
-    "tb_next",
-    "f_globals",
-    "f_builtins",
-    "f_locals",
-    "f_back",
-    "co_consts",
-    "co_names",
-    "__getattribute__",
-    "builtins",
-    "operator.attrgetter",
-    "operator.methodcaller",
-    "attrgetter",
-    "methodcaller",
-    # Block torch internal access even under aliased names
-    "_C",
-    "_dynamo",
-    "_inductor",
-    # Prevent access to validator env internals
-    "_CACHE",
-    "initial_state",
-    "_hidden_modules",
-    "_sensitive_keys",
-    # Block dynamic access to dangerous builtins via string construction
-    "__build_class__",
-    # Block unittest.mock for attribute patching
-    "mock.patch",
-    "MagicMock",
-    "unittest.mock",
-]
-
-_FORBIDDEN_MODULES = {
-    "ctypes",
-    "_ctypes",
-    "gc",
-    "subprocess",
-    "sys",
-    "os",
-    "pathlib",
-    "io",
-    "_io",
-    "socket",
-    "http",
-    "urllib",
-    "requests",
-    "shutil",
-    "tempfile",
-    "signal",
-    "threading",
-    "_thread",
-    "multiprocessing",
-    "inspect",
-    "ast",
-    "dis",
-    "code",
-    "codeop",
-    "compileall",
-    "pickle",
-    "shelve",
-    "marshal",
-    "builtins",
-    "_builtins",
-    "operator",
-    "types",
-    "codecs",
-    "base64",
-    "pdb",
-    "pprint",
-    "runpy",
-    "linecache",
-    "pkgutil",
-    "atexit",
-    "site",
-    "zipimport",
-    # Stack inspection — reveals internal file paths and code structure
-    "traceback",
-    # Block importing the validator's own module (timer tampering attack)
-    "env",
-    "time",
-    "__main__",
-    "miner_train",
-    # logging.Logger.manager.loggerDict holds refs to all loggers —
-    # traversable to reach the env module's logger and back to env itself
-    "logging",
-    # unittest.mock.patch can replace any attribute on any object
-    "unittest",
-    "mock",
-    # functools.partial can wrap forbidden functions
-    "functools",
-    # weakref can observe GC behavior and hold references
-    "weakref",
-}
-
-# Dotted module paths that must be blocked even when the base module is allowed
-_FORBIDDEN_DOTTED_MODULES = {
-    "torch.multiprocessing",
-    "torch.utils.dlpack",
-    "torch.distributed",
-    "numpy.ctypeslib",
-}
-
-# torch imports that enable bypassing attribute-based guards when imported directly
-_FORBIDDEN_TORCH_SYMBOL_IMPORTS = {
-    "load",
-    "compile",
-    "set_float32_matmul_precision",
-    "_C",
-    "_dynamo",
-    "_inductor",
-}
-
-# Backend toggles can bypass attribute-call checks if imported as bare names
-_FORBIDDEN_TORCH_BACKEND_SYMBOL_IMPORTS = {
-    "enable_flash_sdp",
-    "enable_mem_efficient_sdp",
-    "enable_math_sdp",
-}
-
-# torch attributes that should never be rebound or called via alias variables
-_FORBIDDEN_TORCH_ATTRIBUTE_ALIASES = {
-    "load",
-    "compile",
-    "set_float32_matmul_precision",
-    "_C",
-    "_dynamo",
-    "_inductor",
-}
-
-_BLOCKED_BUILTINS = {
-    "setattr",
-    "getattr",
-    "delattr",
-    "vars",
-    "dir",
-    "globals",
-    "locals",
-    "type",
-    "memoryview",
-    "open",
-    "chr",
-    "ord",
-    "breakpoint",
-    "input",
-    "classmethod",
-    "staticmethod",
-    "property",
-}
+# Local aliases for backward-compat with the rest of this file
+_FORBIDDEN_STRINGS = FORBIDDEN_STRINGS
+_FORBIDDEN_MODULES = FORBIDDEN_MODULES
+_FORBIDDEN_DOTTED_MODULES = FORBIDDEN_DOTTED_MODULES
+_FORBIDDEN_TORCH_SYMBOL_IMPORTS = FORBIDDEN_TORCH_SYMBOL_IMPORTS
+_FORBIDDEN_TORCH_BACKEND_SYMBOL_IMPORTS = FORBIDDEN_TORCH_BACKEND_SYMBOL_IMPORTS
+_FORBIDDEN_TORCH_ATTRIBUTE_ALIASES = FORBIDDEN_TORCH_ATTRIBUTE_ALIASES
+_BLOCKED_BUILTINS = FORBIDDEN_BUILTINS
 
 
 def _is_main_guard(node: ast.AST) -> bool:
@@ -287,33 +128,15 @@ def _collect_main_guard_nodes(tree: ast.AST) -> set[int]:
 def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
     violations = []
 
-    _forbidden_names = {
-        "__import__",
-        "exec",
-        "eval",
-        "compile",
-        "breakpoint",
-        "setattr",
-        "getattr",
-        "delattr",
-        "vars",
-        "dir",
-        "globals",
-        "locals",
-        "type",
-        "memoryview",
-        "open",
-        "chr",
-        "ord",
-        "input",
-        "classmethod",
-        "staticmethod",
-        "property",
-        "__build_class__",
-    }
+    _forbidden_names = FORBIDDEN_NAMES
 
     # Track names that currently alias the torch module
     torch_aliases: set[str] = {"torch"}
+
+    # Track names that alias torch submodules (e.g. "F" from
+    # "import torch.nn.functional as F").  Attribute assignment on any
+    # of these is forbidden — legitimate code never monkey-patches torch.
+    torch_submodule_aliases: set[str] = set()
 
     main_guard_nodes = _collect_main_guard_nodes(tree)
 
@@ -330,6 +153,9 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                         line = getattr(node, "lineno", "?")
                         violations.append(f"Line {line}: aliasing torch is forbidden")
                     torch_aliases.add(local_name)
+                elif alias.name.startswith("torch.") and alias.asname:
+                    if alias.name in ALLOWED_TORCH_SUBMODULE_IMPORTS:
+                        torch_submodule_aliases.add(alias.asname)
 
         if isinstance(node, ast.Assign):
             if isinstance(node.value, ast.Name) and node.value.id in torch_aliases:
@@ -339,6 +165,20 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                             line = getattr(node, "lineno", "?")
                             violations.append(f"Line {line}: aliasing torch is forbidden")
                         torch_aliases.add(target.id)
+
+        # Block attribute assignment on any torch module / submodule alias.
+        # Legitimate training code never monkey-patches torch internals
+        # (e.g. ``F.cross_entropy = fake_fn``).
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                    receiver = target.value.id
+                    if receiver in torch_aliases or receiver in torch_submodule_aliases:
+                        line = getattr(node, "lineno", "?")
+                        violations.append(
+                            f"Line {line}: assigning to {receiver}.{target.attr} is forbidden"
+                            " (monkey-patching torch modules is not allowed)"
+                        )
 
         # Block rebinding sensitive torch attributes to local names
         if (
@@ -363,7 +203,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: reassignment of __name__ is forbidden")
 
-        if isinstance(node, ast.Attribute) and node.attr in ("__setattr__", "__delattr__"):
+        if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_OBJECT_DUNDER_ATTRS:
             if isinstance(node.value, ast.Name) and node.value.id == "object":
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: object.{node.attr} is forbidden")
@@ -381,7 +221,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                     if target.value.attr == "config" and isinstance(
                         target.value.value, ast.Attribute
                     ):
-                        if target.value.value.attr in ("_dynamo", "_inductor"):
+                        if target.value.value.attr in FORBIDDEN_TORCH_CONFIG_MODULES:
                             line = getattr(node, "lineno", "?")
                             violations.append(
                                 f"Line {line}: modifying torch.{target.value.value.attr}.config is forbidden"
@@ -399,64 +239,47 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                 violations.append(f"Line {line}: __class__ access is forbidden")
 
         # Block timer-related attribute access on ANY object
-        if isinstance(node, ast.Attribute) and node.attr in (
-            "perf_counter",
-            "_perf_counter",
-            "monotonic",
-            "_monotonic",
-            "perf_counter_ns",
-            "monotonic_ns",
-            "_cuda_synchronize",
-        ):
+        if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_TIMER_ATTRS:
             line = getattr(node, "lineno", "?")
             violations.append(f"Line {line}: accessing .{node.attr} is forbidden")
 
         if isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Attribute) and target.attr == "synchronize":
+                if isinstance(target, ast.Attribute) and target.attr in FORBIDDEN_ASSIGNMENT_ATTRS:
                     line = getattr(node, "lineno", "?")
-                    violations.append(f"Line {line}: overriding synchronize is forbidden")
+                    violations.append(f"Line {line}: overriding {target.attr} is forbidden")
 
         if isinstance(node, ast.Attribute) and node.attr == "__slots__":
             if isinstance(node.ctx, (ast.Store, ast.Del)):
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: __slots__ modification is forbidden")
 
-        if isinstance(node, ast.Attribute) and node.attr in (
-            "get_objects",
-            "get_referrers",
-            "get_referents",
-        ):
+        if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_GC_ATTRS:
             if isinstance(node.value, ast.Name) and node.value.id == "gc":
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: gc.{node.attr}() is forbidden")
 
-        if isinstance(node, ast.Attribute) and node.attr in ("deterministic", "benchmark"):
+        if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_CUDNN_ATTRS:
             if isinstance(node.ctx, ast.Store):
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: setting torch.backends.{node.attr} is forbidden")
 
         if isinstance(node, ast.Call):
             func = node.func
-            if isinstance(func, ast.Attribute) and func.attr in (
-                "enable_flash_sdp",
-                "enable_mem_efficient_sdp",
-                "enable_math_sdp",
-                "set_float32_matmul_precision",
-            ):
+            if isinstance(func, ast.Attribute) and func.attr in FORBIDDEN_BACKEND_TOGGLE_ATTRS:
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: {func.attr}() is forbidden")
 
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
-                if node.func.id in ("exec", "eval", "compile", "__import__"):
+                if node.func.id in FORBIDDEN_DIRECT_CALLS:
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: {node.func.id}() is forbidden")
                 if node.func.id in _BLOCKED_BUILTINS:
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: {node.func.id}() is forbidden")
             elif isinstance(node.func, ast.Attribute):
-                if node.func.attr in ("exec", "eval", "__import__"):
+                if node.func.attr in FORBIDDEN_ATTR_CALLS:
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: .{node.func.attr}() is forbidden")
                 if node.func.attr in _BLOCKED_BUILTINS:
@@ -477,10 +300,10 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                 if base_module in _FORBIDDEN_MODULES or alias.name.startswith("importlib"):
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: import {alias.name} is forbidden")
-                if "cpp_extension" in alias.name:
-                    line = getattr(node, "lineno", "?")
-                    violations.append(f"Line {line}: import {alias.name} is forbidden")
-                # Block dangerous dotted module paths
+                for substr in FORBIDDEN_IMPORT_SUBSTRINGS:
+                    if substr in alias.name:
+                        line = getattr(node, "lineno", "?")
+                        violations.append(f"Line {line}: import {alias.name} is forbidden")
                 for forbidden_path in _FORBIDDEN_DOTTED_MODULES:
                     if alias.name == forbidden_path or alias.name.startswith(forbidden_path + "."):
                         line = getattr(node, "lineno", "?")
@@ -491,13 +314,11 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
             if base_module in _FORBIDDEN_MODULES or node.module.startswith("importlib"):
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: from {node.module} import is forbidden")
-            # Block direct symbol imports from torch
             if node.module == "torch":
                 for alias in node.names:
                     if alias.name in _FORBIDDEN_TORCH_SYMBOL_IMPORTS:
                         line = getattr(node, "lineno", "?")
                         violations.append(f"Line {line}: importing torch.{alias.name} is forbidden")
-            # Block direct backend symbol imports
             if node.module.startswith("torch.backends"):
                 for alias in node.names:
                     if alias.name in _FORBIDDEN_TORCH_BACKEND_SYMBOL_IMPORTS:
@@ -505,26 +326,27 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                         violations.append(
                             f"Line {line}: importing torch backend toggle is forbidden"
                         )
-            if "cpp_extension" in node.module:
-                line = getattr(node, "lineno", "?")
-                violations.append(f"Line {line}: from {node.module} import is forbidden")
-            # Block dangerous dotted module paths
+            for substr in FORBIDDEN_IMPORT_SUBSTRINGS:
+                if substr in node.module:
+                    line = getattr(node, "lineno", "?")
+                    violations.append(f"Line {line}: from {node.module} import is forbidden")
             for forbidden_path in _FORBIDDEN_DOTTED_MODULES:
                 if node.module == forbidden_path or node.module.startswith(forbidden_path + "."):
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: from {node.module} import is forbidden")
             for alias in node.names:
-                if "cpp_extension" in alias.name:
-                    line = getattr(node, "lineno", "?")
-                    violations.append(
-                        f"Line {line}: importing cpp_extension from {node.module} is forbidden"
-                    )
-                # Block "from torch import multiprocessing" etc.
+                for substr in FORBIDDEN_IMPORT_SUBSTRINGS:
+                    if substr in alias.name:
+                        line = getattr(node, "lineno", "?")
+                        violations.append(f"Line {line}: import {alias.name} is forbidden")
                 full_path = f"{node.module}.{alias.name}"
                 for forbidden_path in _FORBIDDEN_DOTTED_MODULES:
                     if full_path == forbidden_path or full_path.startswith(forbidden_path + "."):
                         line = getattr(node, "lineno", "?")
                         violations.append(f"Line {line}: import {full_path} is forbidden")
+                if full_path in ALLOWED_TORCH_SUBMODULE_IMPORTS:
+                    local_name = alias.asname or alias.name
+                    torch_submodule_aliases.add(local_name)
 
         # Block forbidden builtin calls
         if isinstance(node, ast.Call):
@@ -559,7 +381,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
             violations.append(f"Line {line}: __builtins__ access is forbidden")
 
         if isinstance(node, ast.Attribute) and node.attr == "modules":
-            if isinstance(node.value, ast.Name) and node.value.id in ("sys", "_sys"):
+            if isinstance(node.value, ast.Name) and node.value.id in FORBIDDEN_SYS_MODULE_NAMES:
                 line = getattr(node, "lineno", "?")
                 violations.append(f"Line {line}: sys.modules access is forbidden")
 
@@ -567,27 +389,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
             line = getattr(node, "lineno", "?")
             violations.append(f"Line {line}: __dict__ access is forbidden")
 
-        if isinstance(node, ast.Attribute) and node.attr in (
-            "__globals__",
-            "__code__",
-            "__func__",
-            "__self__",
-            "__subclasses__",
-            "__bases__",
-            "__mro__",
-            "__init_subclass__",
-            "__traceback__",
-            "tb_frame",
-            "tb_next",
-            "f_globals",
-            "f_builtins",
-            "f_locals",
-            "f_code",
-            "f_back",
-            "co_consts",
-            "co_names",
-            "__getattribute__",
-        ):
+        if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_INTROSPECTION_ATTRS:
             line = getattr(node, "lineno", "?")
             violations.append(f"Line {line}: .{node.attr} access is forbidden")
 
