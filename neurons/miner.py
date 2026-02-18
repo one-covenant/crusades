@@ -397,15 +397,18 @@ def cmd_submit(args):
         return 0
     else:
         print(f"\n[FAILED] Commit failed: {result}")
-        try:
-            _hparams = HParams.load()
-            if _hparams.payment.enabled:
-                print("\nNOTE: Your submission fee was already paid.")
-                print(
-                    "If you need a refund, contact the validator operator with your payment details above."
-                )
-        except Exception as e:
-            print(f"\n(Could not check payment status: {e})")
+        payment_failed = isinstance(result, str) and result.startswith("Payment failed")
+        if not payment_failed:
+            try:
+                _hparams = HParams.load()
+                if _hparams.payment.enabled:
+                    print("\nNOTE: Your submission fee was already paid.")
+                    print(
+                        "If you need a refund, contact the validator operator "
+                        "with your payment details above."
+                    )
+            except Exception as e:
+                print(f"\n(Could not check payment status: {e})")
         return 1
 
 
