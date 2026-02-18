@@ -44,6 +44,11 @@ FORBIDDEN_STRINGS: list[str] = [
     # CUDA event timing
     "elapsed_time",
     "_et_orig",
+    "_cuda_elapsed_time",
+    "_REAL_ET_ID",
+    # Cross-entropy reference poisoning
+    "_real_cross_entropy",
+    "_REAL_CE_ID",
     # GC / introspection
     "get_objects",
     "get_referrers",
