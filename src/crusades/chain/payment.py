@@ -69,11 +69,13 @@ def _scan_block_for_stake(
     miner_coldkey: str,
     netuid: int,
     min_amount_rao: int,
+    burn_hotkey: str | None = None,
 ) -> PaymentInfo | None:
     """Scan a single block for a matching add_stake extrinsic.
 
     Looks for SubtensorModule.add_stake calls from the miner's coldkey
-    to the correct subnet with sufficient amount.
+    to the correct subnet with sufficient amount.  When *burn_hotkey* is
+    provided, the stake must target that specific hotkey (the burn address).
 
     Args:
         subtensor: Subtensor connection
@@ -81,6 +83,7 @@ def _scan_block_for_stake(
         miner_coldkey: Expected source coldkey
         netuid: Expected subnet ID
         min_amount_rao: Minimum required stake amount in RAO
+        burn_hotkey: If set, the stake must target this hotkey
 
     Returns:
         PaymentInfo if a valid payment found, None otherwise
@@ -114,6 +117,16 @@ def _scan_block_for_stake(
             if ext_netuid != netuid:
                 continue
 
+            # Verify stake destination is the burn hotkey
+            if burn_hotkey is not None:
+                ext_hotkey = call_args.get("hotkey")
+                if ext_hotkey != burn_hotkey:
+                    logger.debug(
+                        f"Extrinsic {idx}: stake to {str(ext_hotkey)[:16]}... "
+                        f"instead of burn hotkey {burn_hotkey[:16]}... — skipping"
+                    )
+                    continue
+
             amount = call_args.get("amount_staked", 0)
             if amount < min_amount_rao:
                 continue
@@ -143,6 +156,7 @@ def _scan_block_range(
     miner_coldkey: str,
     netuid: int,
     min_amount_rao: int,
+    burn_hotkey: str | None = None,
 ) -> PaymentInfo | None:
     """Scan a range of blocks (end_block down to start_block) for a matching stake."""
     for block_num in range(end_block, start_block - 1, -1):
@@ -157,6 +171,7 @@ def _scan_block_range(
                 miner_coldkey=miner_coldkey,
                 netuid=netuid,
                 min_amount_rao=min_amount_rao,
+                burn_hotkey=burn_hotkey,
             )
 
             if payment is not None:
@@ -181,6 +196,7 @@ def verify_payment_on_chain(
     min_amount_rao: int,
     scan_blocks: int = 200,
     fast_scan_blocks: int = 15,
+    burn_hotkey: str | None = None,
 ) -> PaymentInfo | None:
     """Scan a range of blocks for a valid staking payment from the miner.
 
@@ -195,6 +211,7 @@ def verify_payment_on_chain(
         min_amount_rao: Minimum stake amount required (in RAO)
         scan_blocks: How many blocks back to scan (full range)
         fast_scan_blocks: How many recent blocks to check first
+        burn_hotkey: If set, verify the stake targeted this hotkey (burn address)
 
     Returns:
         PaymentInfo if valid payment found, None otherwise
@@ -210,7 +227,7 @@ def verify_payment_on_chain(
 
     # Fast pass: most miners stake shortly before committing
     payment = _scan_block_range(
-        subtensor, fast_boundary, end_block, miner_coldkey, netuid, min_amount_rao
+        subtensor, fast_boundary, end_block, miner_coldkey, netuid, min_amount_rao, burn_hotkey
     )
     if payment is not None:
         return payment
@@ -219,7 +236,13 @@ def verify_payment_on_chain(
     if fast_boundary > start_block:
         logger.debug(f"Fast scan miss, scanning remaining blocks {start_block}-{fast_boundary - 1}")
         payment = _scan_block_range(
-            subtensor, start_block, fast_boundary - 1, miner_coldkey, netuid, min_amount_rao
+            subtensor,
+            start_block,
+            fast_boundary - 1,
+            miner_coldkey,
+            netuid,
+            min_amount_rao,
+            burn_hotkey,
         )
         if payment is not None:
             return payment
@@ -237,16 +260,19 @@ async def verify_payment_on_chain_async(
     netuid: int,
     min_amount_rao: int,
     scan_blocks: int = 200,
+    burn_hotkey: str | None = None,
 ) -> PaymentInfo | None:
     """Async wrapper for verify_payment_on_chain."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
-        verify_payment_on_chain,
-        subtensor,
-        miner_coldkey,
-        commitment_block,
-        netuid,
-        min_amount_rao,
-        scan_blocks,
+        lambda: verify_payment_on_chain(
+            subtensor=subtensor,
+            miner_coldkey=miner_coldkey,
+            commitment_block=commitment_block,
+            netuid=netuid,
+            min_amount_rao=min_amount_rao,
+            scan_blocks=scan_blocks,
+            burn_hotkey=burn_hotkey,
+        ),
     )

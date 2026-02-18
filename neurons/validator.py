@@ -308,6 +308,21 @@ class Validator(BaseNode):
         fee_rao = hparams.payment.fee_rao
         scan_blocks = hparams.payment.scan_blocks
         netuid = hparams.netuid
+        burn_uid = hparams.burn_uid
+
+        # Resolve burn hotkey from metagraph so we can verify stake destination
+        burn_hotkey: str | None = None
+        try:
+            metagraph = self.chain.subtensor.metagraph(netuid)
+            if burn_uid < len(metagraph.hotkeys):
+                burn_hotkey = metagraph.hotkeys[burn_uid]
+                logger.debug(f"Burn hotkey for UID {burn_uid}: {burn_hotkey[:16]}...")
+        except Exception as e:
+            logger.warning(f"Could not resolve burn hotkey for UID {burn_uid}: {e}")
+
+        if burn_hotkey is None:
+            logger.error(f"Cannot resolve burn hotkey for UID {burn_uid} — cannot verify payment")
+            return False
 
         # Look up miner's coldkey from their hotkey
         miner_coldkey = get_hotkey_owner(
@@ -321,10 +336,11 @@ class Validator(BaseNode):
             return False
 
         logger.info(
-            f"Verifying payment for {commitment.hotkey[:16]}... (coldkey: {miner_coldkey[:16]}...)"
+            f"Verifying payment for {commitment.hotkey[:16]}... "
+            f"(coldkey: {miner_coldkey[:16]}..., burn: {burn_hotkey[:16]}...)"
         )
 
-        # Scan chain for matching staking extrinsic
+        # Scan chain for matching staking extrinsic targeting the burn hotkey
         payment = await verify_payment_on_chain_async(
             subtensor=self.chain.subtensor,
             miner_coldkey=miner_coldkey,
@@ -332,6 +348,7 @@ class Validator(BaseNode):
             netuid=netuid,
             min_amount_rao=fee_rao,
             scan_blocks=scan_blocks,
+            burn_hotkey=burn_hotkey,
         )
 
         if payment is None:

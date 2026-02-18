@@ -118,29 +118,46 @@ def validate_code_url(url: str) -> tuple[bool, str, str | None]:
     return True, final_url, code_hash
 
 
+def _resolve_burn_hotkey(subtensor: bt.subtensor, netuid: int, burn_uid: int) -> str | None:
+    """Look up the hotkey registered at burn_uid on the subnet."""
+    try:
+        metagraph = subtensor.metagraph(netuid)
+        if burn_uid < len(metagraph.hotkeys):
+            return metagraph.hotkeys[burn_uid]
+        return None
+    except Exception:
+        return None
+
+
 def stake_submission_fee(
     wallet: bt.wallet,
     subtensor: bt.subtensor,
     netuid: int,
     fee_rao: int,
+    burn_uid: int,
 ) -> tuple[bool, dict | str]:
-    """Stake TAO into the subnet as a submission fee.
+    """Stake TAO into the subnet's burn address as a submission fee.
 
-    Creates alpha tokens by staking TAO into the subnet's AMM pool.
-    The staking is done to the miner's own hotkey on the subnet.
+    Creates alpha tokens by staking TAO to the burn_uid's hotkey.
+    The miner cannot recover this stake — it belongs to the burn address.
 
     Args:
         wallet: Bittensor wallet (coldkey signs the transfer)
         subtensor: Subtensor connection
         netuid: Subnet to stake into
         fee_rao: Amount to stake in RAO (1 TAO = 1e9 RAO)
+        burn_uid: UID of the burn address on the subnet
 
     Returns:
         Tuple of (success, result_dict_or_error_message)
     """
     fee_tao = fee_rao / 1e9
-    hotkey = wallet.hotkey.ss58_address
     tx_fee_buffer_rao = 50_000_000  # 0.05 TAO reserve for transaction fees
+
+    # Resolve burn hotkey from metagraph
+    burn_hotkey = _resolve_burn_hotkey(subtensor, netuid, burn_uid)
+    if burn_hotkey is None:
+        return False, f"Could not resolve hotkey for burn_uid {burn_uid} on subnet {netuid}"
 
     try:
         coldkey_addr = wallet.coldkey.ss58_address
@@ -158,24 +175,25 @@ def stake_submission_fee(
         return False, f"Failed to check balance: {e}"
 
     print(f"\n{'=' * 60}")
-    print("SUBMISSION FEE")
+    print("SUBMISSION FEE (staked to burn address)")
     print(f"{'=' * 60}")
     print(f"   Amount: {fee_rao} RAO ({fee_tao} TAO)")
     print(f"   Subnet: {netuid}")
-    print(f"   Hotkey: {hotkey}")
+    print(f"   Burn UID: {burn_uid}")
+    print(f"   Burn hotkey: {burn_hotkey[:16]}...")
     print(f"   Balance: {balance_rao / 1e9:.4f} TAO")
-    print(f"\nThis stakes {fee_tao} TAO into subnet {netuid} as a submission fee.")
+    print(f"\nThis stakes {fee_tao} TAO to the subnet burn address (irrecoverable).")
 
     confirm = input("\nProceed with payment? [y/N]: ").strip().lower()
     if confirm != "y":
         return False, "Payment cancelled by user"
 
-    print("\nStaking submission fee...")
+    print("\nStaking submission fee to burn address...")
     try:
         amount = bt.Balance.from_rao(fee_rao)
         success = subtensor.add_stake(
             wallet=wallet,
-            hotkey_ss58=hotkey,
+            hotkey_ss58=burn_hotkey,
             netuid=netuid,
             amount=amount,
             wait_for_inclusion=True,
@@ -190,7 +208,7 @@ def stake_submission_fee(
                 "amount_rao": fee_rao,
                 "block": current_block,
                 "block_hash": block_hash,
-                "hotkey": hotkey,
+                "burn_hotkey": burn_hotkey,
                 "netuid": netuid,
             }
 
@@ -254,13 +272,14 @@ def commit_to_chain(
     # --- Payment step ---
     if hparams.payment.enabled:
         fee_rao = hparams.payment.fee_rao
-        print(f"\n--- SUBMISSION FEE ({fee_rao / 1e9} TAO) ---")
+        print(f"\n--- SUBMISSION FEE ({fee_rao / 1e9} TAO → burn address) ---")
 
         pay_success, pay_result = stake_submission_fee(
             wallet=wallet,
             subtensor=subtensor,
             netuid=netuid,
             fee_rao=fee_rao,
+            burn_uid=hparams.burn_uid,
         )
 
         if not pay_success:
