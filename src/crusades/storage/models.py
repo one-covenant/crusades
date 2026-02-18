@@ -4,6 +4,7 @@ import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Enum,
@@ -154,7 +155,7 @@ class VerifiedPaymentModel(Base):
     miner_coldkey: Mapped[str] = mapped_column(String(48), nullable=False)
     block_hash: Mapped[str] = mapped_column(String(66), nullable=False)
     extrinsic_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    amount_rao: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount_rao: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=lambda: datetime.now(UTC)
     )

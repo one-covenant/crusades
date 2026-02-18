@@ -5,7 +5,7 @@ from functools import cache
 from pathlib import Path
 from typing import Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -173,6 +173,22 @@ class HParams(BaseModel):
 
     # Storage (for evaluation records - not in hparams.json)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+
+    @model_validator(mode="after")
+    def _validate_scan_window(self) -> Self:
+        """Ensure payment.scan_blocks >= reveal_blocks.
+
+        The miner stakes ~reveal_blocks before the reveal. If scan_blocks
+        is smaller, the payment will always fall outside the scan window
+        and every verification will silently fail.
+        """
+        if self.payment.enabled and self.payment.scan_blocks < self.reveal_blocks:
+            raise ValueError(
+                f"payment.scan_blocks ({self.payment.scan_blocks}) must be >= "
+                f"reveal_blocks ({self.reveal_blocks}). Otherwise the validator "
+                f"will never find the miner's payment on-chain."
+            )
+        return self
 
     @classmethod
     def load(cls, path: Path | str | None = None) -> Self:

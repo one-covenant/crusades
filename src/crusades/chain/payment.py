@@ -107,7 +107,11 @@ def _scan_block_for_stake(
             if call_module != "SubtensorModule" or call_function != "add_stake":
                 continue
 
-            sender = ext_value.get("address", "")
+            raw_address = ext_value.get("address", "")
+            if isinstance(raw_address, dict):
+                sender = raw_address.get("Id", "")
+            else:
+                sender = raw_address
             if sender != miner_coldkey:
                 continue
 
