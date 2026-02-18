@@ -510,70 +510,67 @@ class Validator(BaseNode):
             else:
                 logger.info(f"   Code hash verified: {actual_hash}")
 
-            # Run evaluations
+            # Run evaluations — wrapped in try/finally so the Basilica deployment
+            # is always deleted even if an unexpected exception occurs mid-eval.
             fatal_error = False
-            for run_idx in range(runs_remaining):
-                current_run = len(my_evals) + run_idx + 1
-                seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}:{secrets.token_hex(16)}"
+            try:
+                for run_idx in range(runs_remaining):
+                    current_run = len(my_evals) + run_idx + 1
+                    seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}:{secrets.token_hex(16)}"
 
-                logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
+                    logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
 
-                result = await self.affinetes_runner.evaluate(
-                    code=miner_code,  # Pass code directly
-                    seed=seed,
-                    steps=hparams.eval_steps,
-                    batch_size=hparams.benchmark_batch_size,
-                    sequence_length=hparams.benchmark_sequence_length,
-                    data_samples=hparams.benchmark_data_samples,
-                    task_id=current_run,
-                )
-
-                if result.success:
-                    logger.info(
-                        f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}"
+                    result = await self.affinetes_runner.evaluate(
+                        code=miner_code,  # Pass code directly
+                        seed=seed,
+                        steps=hparams.eval_steps,
+                        batch_size=hparams.benchmark_batch_size,
+                        sequence_length=hparams.benchmark_sequence_length,
+                        data_samples=hparams.benchmark_data_samples,
+                        task_id=current_run,
                     )
-                else:
-                    logger.warning(f"Run {current_run} FAILED: {result.error}")
 
-                evaluation = EvaluationModel(
-                    submission_id=submission.submission_id,
-                    evaluator_hotkey=self.hotkey,
-                    mfu=result.mfu,  # MFU is primary metric
-                    tokens_per_second=result.tps,
-                    total_tokens=result.total_tokens,
-                    wall_time_seconds=result.wall_time_seconds,
-                    success=result.success,
-                    error=result.error,
-                )
-                await self.db.save_evaluation(evaluation)
-                self._cleanup_memory()
+                    if result.success:
+                        logger.info(
+                            f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}"
+                        )
+                    else:
+                        logger.warning(f"Run {current_run} FAILED: {result.error}")
 
-                # Fatal errors are deterministic - same code will always fail the same way
-                # No point retrying, and if a previous run passed, that's a bug to investigate
-                if result.is_fatal():
-                    logger.warning(
-                        f"Fatal error detected ({result.error_code}), skipping remaining runs"
+                    evaluation = EvaluationModel(
+                        submission_id=submission.submission_id,
+                        evaluator_hotkey=self.hotkey,
+                        mfu=result.mfu,  # MFU is primary metric
+                        tokens_per_second=result.tps,
+                        total_tokens=result.total_tokens,
+                        wall_time_seconds=result.wall_time_seconds,
+                        success=result.success,
+                        error=result.error,
                     )
-                    fatal_error = True
-                    break
+                    await self.db.save_evaluation(evaluation)
+                    self._cleanup_memory()
 
-            # Delete Basilica deployment after each submission to ensure fresh GPU state
-            # for the next submission. This eliminates MFU variance between fresh/reused
-            # instances caused by CUDA graph compilation sensitivity to GPU memory state.
-            if self.affinetes_mode == "basilica":
-                await self.affinetes_runner.delete_basilica_deployment()
+                    if result.is_fatal():
+                        logger.warning(
+                            f"Fatal error detected ({result.error_code}), skipping remaining runs"
+                        )
+                        fatal_error = True
+                        break
 
-            # Persist state (URL already recorded during commitment processing)
-            await self._save_state()
+                # Persist state (URL already recorded during commitment processing)
+                await self._save_state()
 
-            # Store miner's code in database
-            await self.db.update_submission_code(submission.submission_id, miner_code)
-            logger.info(f"Stored code for {submission.submission_id} in database")
+                # Store miner's code in database
+                await self.db.update_submission_code(submission.submission_id, miner_code)
+                logger.info(f"Stored code for {submission.submission_id} in database")
 
-            # Finalize submission (pass fatal_error to skip unnecessary checks)
-            await self._finalize_submission(
-                submission.submission_id, num_runs, fatal_error=fatal_error
-            )
+                # Finalize submission (pass fatal_error to skip unnecessary checks)
+                await self._finalize_submission(
+                    submission.submission_id, num_runs, fatal_error=fatal_error
+                )
+            finally:
+                if self.affinetes_mode == "basilica":
+                    await self.affinetes_runner.delete_basilica_deployment()
 
     async def _finalize_submission(
         self, submission_id: str, num_runs: int, fatal_error: bool = False
@@ -967,6 +964,8 @@ class Validator(BaseNode):
 
     async def cleanup(self) -> None:
         """Cleanup resources."""
+        if self.affinetes_mode == "basilica" and self.affinetes_runner:
+            await self.affinetes_runner.delete_basilica_deployment()
         await self._save_state()
         await super().cleanup()
         if self.db:
