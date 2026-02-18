@@ -76,11 +76,14 @@ Each submission undergoes the following verification checks:
 | **Sequence Length** | Logits seq dim must match expected | `seq_len - 1` |
 | **Token Count** | Must process the expected number of tokens | Exact match |
 | **Loss Validity** | Loss must be positive, not NaN, close to reference | `max_loss_difference: 0.3` |
-| **Gradient Relative Error** | `\|g - g_truth\| / \|g_truth\|` must be small | `gradient_norm_ratio_max - 1.0` |
+| **Gradient Relative Error** | `\|g - g_truth\| / \|g_truth\|` must be small | `gradient_norm_ratio_max: 1.06` (6%) |
 | **Gradient Coverage** | All layers must have gradients | `100%` |
 | **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.008` |
 | **Trainable Params** | All params must be trainable | `100%` |
 | **Params Changed** | Most param elements must change during training | `min: 80%` |
+| **Timer Integrity** | Multiple timer sources must agree | `timer_divergence_threshold: 1%` |
+| **Min MFU** | Floor threshold — submissions below are rejected | `min_mfu: 45%` |
+| **Max Plausible MFU** | Ceiling cap — no legitimate code exceeds this | `max_plausible_mfu: 75%` |
 | **Success Rate** | Majority of runs must pass | `min_success_rate: 0.5` |
 
 ### Adaptive Threshold & Leaderboard
@@ -199,8 +202,15 @@ Edit `hparams/hparams.json`:
     "verification": {
         "max_loss_difference": 0.3,
         "min_params_changed_ratio": 0.8,
-        "gradient_norm_ratio_max": 1.10,
-        "weight_relative_error_max": 0.008
+        "gradient_norm_ratio_max": 1.06,
+        "weight_relative_error_max": 0.008,
+        "timer_divergence_threshold": 0.01
+    },
+    
+    "mfu": {
+        "gpu_peak_tflops": 312.0,
+        "max_plausible_mfu": 75.0,
+        "min_mfu": 45.0
     },
     
     "adaptive_threshold": {
@@ -219,6 +229,11 @@ Edit `hparams/hparams.json`:
 | `min_success_rate` | Minimum passing runs to accept | `0.5` (50%) |
 | `gpu_devices` | Which GPUs to use | `"0"` |
 | `memory_limit` | Container memory limit | `"80g"` |
+| `gradient_norm_ratio_max` | Max gradient relative error (1 + %) | `1.06` (6%) |
+| `timer_divergence_threshold` | Max divergence between timer sources | `0.01` (1%) |
+| `min_mfu` | Floor MFU threshold — reject below this | `45.0` |
+| `max_plausible_mfu` | Ceiling MFU cap — no code exceeds this | `75.0` |
+| `gpu_peak_tflops` | GPU peak TFLOPS for MFU calculation | `312.0` (A100 bf16) |
 
 ### Step 4: Run Validator
 

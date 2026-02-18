@@ -36,6 +36,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from crusades.core.security_defs import (
+    ALLOWED_TORCH_ASSIGNMENT_PREFIXES,
     ALLOWED_TORCH_SUBMODULE_IMPORTS,
     FORBIDDEN_ASSIGNMENT_ATTRS,
     FORBIDDEN_ATTR_CALLS,
@@ -45,6 +46,7 @@ from crusades.core.security_defs import (
     FORBIDDEN_DIRECT_CALLS,
     FORBIDDEN_DOTTED_MODULES,
     FORBIDDEN_GC_ATTRS,
+    FORBIDDEN_GRAD_TOGGLE_CALLS,
     FORBIDDEN_IMPORT_SUBSTRINGS,
     FORBIDDEN_INTROSPECTION_ATTRS,
     FORBIDDEN_MODULES,
@@ -449,20 +451,65 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                             return False, f"Line {line}: aliasing torch is forbidden"
                         torch_aliases.add(target.id)
 
-        # Block attribute assignment on any torch module / submodule alias.
-        # Legitimate training code never monkey-patches torch internals
-        # (e.g. ``F.cross_entropy = fake_fn``).
+        # Block attribute mutation on torch modules / submodule aliases.
+        # Covers Assign, AugAssign (+=), and Delete (del) targets.
+        # Catches: F.cross_entropy = fake, torch.nn.functional.cross_entropy = fake,
+        #          torch.autograd.backward = fake, torch.Tensor.backward = fake,
+        #          del F.cross_entropy, F.cross_entropy += ..., etc.
+        # Allows: torch.backends.cuda.matmul.allow_bf16_... = True (legitimate config).
+        _attr_targets: list[ast.Attribute] = []
         if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
-                    receiver = target.value.id
-                    if receiver in torch_aliases or receiver in torch_submodule_aliases:
-                        line = getattr(node, "lineno", "?")
-                        return (
-                            False,
-                            f"Line {line}: assigning to {receiver}.{target.attr} is forbidden"
-                            " (monkey-patching torch modules is not allowed)",
-                        )
+            _attr_targets = [t for t in node.targets if isinstance(t, ast.Attribute)]
+        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Attribute):
+            _attr_targets = [node.target]
+        elif isinstance(node, ast.Delete):
+            _attr_targets = [t for t in node.targets if isinstance(t, ast.Attribute)]
+
+        for target in _attr_targets:
+            root_node = target.value
+            while isinstance(root_node, ast.Attribute):
+                root_node = root_node.value
+            if not isinstance(root_node, ast.Name):
+                continue
+            root_name = root_node.id
+
+            if root_name in torch_submodule_aliases:
+                line = getattr(node, "lineno", "?")
+                return (
+                    False,
+                    f"Line {line}: mutating {root_name}.{target.attr} is forbidden"
+                    " (monkey-patching torch modules is not allowed)",
+                )
+
+            if root_name in torch_aliases:
+                if isinstance(target.value, ast.Name):
+                    line = getattr(node, "lineno", "?")
+                    return (
+                        False,
+                        f"Line {line}: mutating {root_name}.{target.attr} is forbidden"
+                        " (monkey-patching torch modules is not allowed)",
+                    )
+                # Nested path — block unless parent is an allowed config prefix
+                parts: list[str] = []
+                walk = target.value
+                while isinstance(walk, ast.Attribute):
+                    parts.append(walk.attr)
+                    walk = walk.value
+                if isinstance(walk, ast.Name):
+                    parts.append(walk.id)
+                    parent_path = ".".join(reversed(parts))
+                    # Allow torch.backends.* config assignments
+                    if any(
+                        parent_path == pfx or parent_path.startswith(pfx + ".")
+                        for pfx in ALLOWED_TORCH_ASSIGNMENT_PREFIXES
+                    ):
+                        continue
+                    line = getattr(node, "lineno", "?")
+                    return (
+                        False,
+                        f"Line {line}: mutating {parent_path}.{target.attr}"
+                        " is forbidden (monkey-patching torch modules is not allowed)",
+                    )
 
         # Block rebinding sensitive torch attributes to local names
         # (e.g. `c = torch.compile`, `ld = torch.load`, `dyn = torch._dynamo`)
@@ -559,6 +606,13 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             if isinstance(func, ast.Attribute) and func.attr in FORBIDDEN_BACKEND_TOGGLE_ATTRS:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
+            if isinstance(func, ast.Attribute) and func.attr in FORBIDDEN_GRAD_TOGGLE_CALLS:
+                line = getattr(node, "lineno", "?")
+                return (
+                    False,
+                    f"Line {line}: {func.attr}() is forbidden"
+                    " (disabling gradients would bypass verification)",
+                )
 
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
@@ -594,7 +648,12 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                         line = getattr(node, "lineno", "?")
                         return False, f"Line {line}: forbidden import"
 
-        if isinstance(node, ast.ImportFrom) and node.module:
+        if isinstance(node, ast.ImportFrom):
+            if any(alias.name == "*" for alias in node.names):
+                line = getattr(node, "lineno", "?")
+                return False, f"Line {line}: star imports (from ... import *) are forbidden"
+            if not node.module:
+                continue
             base_module = node.module.split(".")[0]
             if base_module in _forbidden_modules or node.module.startswith("importlib"):
                 line = getattr(node, "lineno", "?")

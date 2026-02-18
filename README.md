@@ -154,23 +154,18 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device):
 
 ### Rules
 
-**You MUST:**
-- Use the provided `optimizer` directly (call `optimizer.step()` and `optimizer.zero_grad()`)
-- Process ALL tokens in each batch (no truncation)
-- Return actual `final_logits` tensor (not `None`)
-- Train all model parameters (don't freeze layers)
+Your code must produce **correct gradients and losses** — the validator verifies training integrity by comparing against a reference run. Optimize for speed, not shortcuts.
 
-**You MUST NOT:**
-- Access optimizer internals (e.g., `optimizer.optimizer`, `optimizer._opt_impl`)
-- Truncate or skip parts of input sequences
-- Return `None` for `final_logits`
-- Import forbidden modules: `gc`, `ctypes`, `subprocess`, `importlib`, `os`, `sys`, `inspect`, `pickle`, `signal`, `threading`, `multiprocessing`, `socket`, `http`, `io`, `ast`, etc.
-- Modify torch backend settings (`cudnn.deterministic`, `cudnn.benchmark`, SDP toggles, `set_float32_matmul_precision`)
-- Freeze layers or modify `requires_grad` settings
-- Report inflated token counts
-- Alias the `torch` module (e.g., `import torch as t`) — the security scanner only recognizes the literal name `torch` for allowlisted calls like `torch.compile`
+- Use the provided `optimizer` directly (`optimizer.step()` / `optimizer.zero_grad()`)
+- Process all tokens in each batch, return valid `final_logits` (not `None`)
+- Train all model parameters (no freezing layers)
+- Don't alias `torch` (e.g., `import torch as t`) — the scanner needs the literal name
 
-> **Note:** The validator skips the `if __name__ == "__main__":` block entirely. Modules like `pathlib` that are forbidden at the top level can still be imported inside `__main__` for local testing.
+A static security scanner blocks dangerous patterns (forbidden imports, monkey-patching, timer tampering, etc.). See [`src/crusades/core/security_defs.py`](src/crusades/core/security_defs.py) for the full blocklist. Run `uv run local_test/verify.py` before submitting to catch violations early.
+
+Any genuine optimization is fair game — `torch.compile`, mixed precision, Flash Attention, Triton kernels, CUDA Graphs, custom loss functions, and more. If the scanner rejects something that should be allowed, repot to us.
+
+> **Note:** The validator skips `if __name__ == "__main__":` entirely, so you can import locally-useful modules (like `pathlib`) inside that guard for testing.
 
 ---
 

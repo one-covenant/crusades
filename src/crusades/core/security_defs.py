@@ -53,11 +53,6 @@ FORBIDDEN_STRINGS: list[str] = [
     "get_objects",
     "get_referrers",
     "get_referents",
-    # Torch backend toggles
-    "enable_flash_sdp",
-    "enable_mem_efficient_sdp",
-    "enable_math_sdp",
-    "set_float32_matmul_precision",
     # Validator optimizer internals
     "captured_gradients",
     "_opt_impl",
@@ -191,24 +186,18 @@ FORBIDDEN_IMPORT_SUBSTRINGS: set[str] = {
 FORBIDDEN_TORCH_SYMBOL_IMPORTS: set[str] = {
     "load",
     "compile",
-    "set_float32_matmul_precision",
     "_C",
     "_dynamo",
     "_inductor",
 }
 
 # Backend toggles that bypass attribute-call checks if imported as bare names
-FORBIDDEN_TORCH_BACKEND_SYMBOL_IMPORTS: set[str] = {
-    "enable_flash_sdp",
-    "enable_mem_efficient_sdp",
-    "enable_math_sdp",
-}
+FORBIDDEN_TORCH_BACKEND_SYMBOL_IMPORTS: set[str] = set()
 
 # torch attributes that should never be rebound or called via alias variables
 FORBIDDEN_TORCH_ATTRIBUTE_ALIASES: set[str] = {
     "load",
     "compile",
-    "set_float32_matmul_precision",
     "_C",
     "_dynamo",
     "_inductor",
@@ -325,6 +314,22 @@ ALLOWED_TORCH_SUBMODULE_IMPORTS: set[str] = {
     "torch.cuda.amp",
 }
 
+# Prefixes of ``torch.*`` dotted paths where attribute *assignment* is
+# permitted.  Everything else under ``torch.*`` is blocked to prevent
+# monkey-patching (e.g. ``torch.autograd.backward = fake``).
+# Currently only ``torch.backends.*`` is needed for legitimate config
+# such as ``torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction``.
+ALLOWED_TORCH_ASSIGNMENT_PREFIXES: set[str] = {
+    "torch.backends",
+}
+
+# Gradient-control functions that must never be called — disabling
+# gradients would make backward() a no-op and bypass gradient verification.
+FORBIDDEN_GRAD_TOGGLE_CALLS: set[str] = {
+    "set_grad_enabled",
+    "inference_mode",
+}
+
 # ---------------------------------------------------------------------------
 # Attribute-level AST guards
 # ---------------------------------------------------------------------------
@@ -348,13 +353,10 @@ FORBIDDEN_CUDNN_ATTRS: set[str] = {
     "benchmark",
 }
 
-# Backend toggle / precision calls — blocked as Call attributes
-FORBIDDEN_BACKEND_TOGGLE_ATTRS: set[str] = {
-    "enable_flash_sdp",
-    "enable_mem_efficient_sdp",
-    "enable_math_sdp",
-    "set_float32_matmul_precision",
-}
+# Backend toggle / precision calls — no longer blocked; verification
+# catches any numerical divergence and miners bear the consequences of
+# changing precision settings.  Kept as empty set for backward compat.
+FORBIDDEN_BACKEND_TOGGLE_ATTRS: set[str] = set()
 
 # sys.modules access — blocked when receiver matches these names
 FORBIDDEN_SYS_MODULE_NAMES: set[str] = {
