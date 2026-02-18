@@ -546,7 +546,11 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 return False, f"Line {line}: forbidden pattern detected"
 
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_CUDNN_ATTRS:
-            if isinstance(node.ctx, ast.Store):
+            if (
+                isinstance(node.ctx, ast.Store)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "cudnn"
+            ):
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: forbidden pattern detected"
 
@@ -1906,6 +1910,7 @@ class Actor:
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
         max_plausible_mfu: float = 75.0,
+        min_mfu: float = 45.0,
         require_cuda_timing: bool = True,
         model_params_override: int | None = None,
     ) -> dict:
@@ -1931,6 +1936,7 @@ class Actor:
             weight_relative_error_max: Max relative error for final weight check (e.g., 0.008 = 0.8%)
             timer_divergence_threshold: Max divergence between timer sources (e.g., 0.05 = 5%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
+            min_mfu: Minimum MFU threshold — submissions below this are rejected
             model_params_override: Override model param count (None = auto-detect)
 
         Returns:
@@ -2554,6 +2560,21 @@ class Actor:
                     "code": code,
                 }
 
+            if verified and mfu < min_mfu:
+                logger.warning(f"MFU {mfu:.1f}% below minimum threshold {min_mfu}%")
+                return {
+                    "task_id": task_id,
+                    "mfu": mfu,
+                    "tps": tps,
+                    "total_tokens": total_tokens_int,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": f"MFU {mfu:.1f}% below minimum threshold {min_mfu}%",
+                    "error_code": "insufficient_mfu",
+                    "seed": seed,
+                    "code": code,
+                }
+
             # Diagnostics
             diagnostics = {
                 "verification": verify_details,
@@ -2696,6 +2717,7 @@ class EvaluateRequest(BaseModel):
     # MFU calculation
     gpu_peak_tflops: float = 312.0
     max_plausible_mfu: float = 75.0
+    min_mfu: float = 45.0
 
 
 class EvaluateResponse(BaseModel):
@@ -2751,6 +2773,7 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         timer_divergence_threshold=request.timer_divergence_threshold,
         gpu_peak_tflops=request.gpu_peak_tflops,
         max_plausible_mfu=request.max_plausible_mfu,
+        min_mfu=request.min_mfu,
         require_cuda_timing=True,
     )
 

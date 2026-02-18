@@ -260,9 +260,15 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                 violations.append(f"Line {line}: gc.{node.attr}() is forbidden")
 
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_CUDNN_ATTRS:
-            if isinstance(node.ctx, ast.Store):
+            if (
+                isinstance(node.ctx, ast.Store)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "cudnn"
+            ):
                 line = getattr(node, "lineno", "?")
-                violations.append(f"Line {line}: setting torch.backends.{node.attr} is forbidden")
+                violations.append(
+                    f"Line {line}: setting torch.backends.cudnn.{node.attr} is forbidden"
+                )
 
         if isinstance(node, ast.Call):
             func = node.func

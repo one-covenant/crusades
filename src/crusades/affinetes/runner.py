@@ -174,6 +174,7 @@ class AffinetesRunner:
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
         max_plausible_mfu: float = 75.0,
+        min_mfu: float = 45.0,
         validator_image: str | None = None,
         # Basilica-specific settings
         basilica_image: str | None = None,
@@ -202,6 +203,7 @@ class AffinetesRunner:
             timer_divergence_threshold: Max allowed divergence between timer sources (e.g., 0.05 = 5%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             max_plausible_mfu: Reject MFU above this threshold (anti-cheat)
+            min_mfu: Reject submissions below this MFU floor
             validator_image: Docker image for local evaluation
             basilica_image: Docker image for Basilica (must be in registry)
             basilica_ttl_seconds: TTL for Basilica deployment (default 1 hour)
@@ -231,6 +233,7 @@ class AffinetesRunner:
         # MFU calculation
         self.gpu_peak_tflops = gpu_peak_tflops
         self.max_plausible_mfu = max_plausible_mfu
+        self.min_mfu = min_mfu
         self.validator_image = validator_image or self.DEFAULT_DOCKER_IMAGE
         self.basilica_image = basilica_image or self.DEFAULT_BASILICA_IMAGE
         self.basilica_ttl_seconds = basilica_ttl_seconds
@@ -409,6 +412,7 @@ async def main():
         # MFU calculation
         gpu_peak_tflops={self.gpu_peak_tflops},
         max_plausible_mfu={self.max_plausible_mfu},
+        min_mfu={self.min_mfu},
         require_cuda_timing=True,
     )
     print("EVAL_RESULT:" + json.dumps(result))
@@ -724,6 +728,7 @@ asyncio.run(main())
                 # MFU calculation
                 "gpu_peak_tflops": self.gpu_peak_tflops,
                 "max_plausible_mfu": self.max_plausible_mfu,
+                "min_mfu": self.min_mfu,
             }
 
             logger.info("[BASILICA] Sending evaluation request...")

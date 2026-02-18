@@ -158,6 +158,7 @@ class Validator(BaseNode):
             # MFU calculation
             gpu_peak_tflops=hparams.mfu.gpu_peak_tflops,
             max_plausible_mfu=hparams.mfu.max_plausible_mfu,
+            min_mfu=hparams.mfu.min_mfu,
             # Basilica config
             basilica_image=hparams.basilica.image,
             basilica_ttl_seconds=hparams.basilica.ttl_seconds,
