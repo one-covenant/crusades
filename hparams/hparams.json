@@ -41,12 +41,14 @@
         "max_loss_difference": 0.3,
         "min_params_changed_ratio": 0.8,
         "gradient_norm_ratio_max": 1.06,
-        "weight_relative_error_max": 0.008
+        "weight_relative_error_max": 0.008,
+        "timer_divergence_threshold": 0.01
     },
 
     "mfu": {
         "gpu_peak_tflops": 312.0,
-        "max_plausible_mfu": 75.0
+        "max_plausible_mfu": 75.0,
+        "min_mfu": 45.0
     },
 
     "adaptive_threshold": {
