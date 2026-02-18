@@ -45,6 +45,16 @@ exec(open('/app/cache_dataset.py').read())" || [ -f /home/appuser/.cache/templar
 
 COPY --chown=appuser:appuser environments/templar/env.py /app/
 
+# Install crusades.core.security_defs (imported by env.py)
+# Only security_defs.py is needed — stub __init__.py files avoid pulling in
+# the full package (which requires Python >=3.12, unavailable in PyTorch images).
+USER root
+RUN mkdir -p /app/crusades/core \
+    && touch /app/crusades/__init__.py /app/crusades/core/__init__.py \
+    && chown -R appuser:appuser /app/crusades
+USER appuser
+COPY --chown=appuser:appuser src/crusades/core/security_defs.py /app/crusades/core/security_defs.py
+
 ENV PYTHONUNBUFFERED=1
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ENV PATH="/home/appuser/.local/bin:${PATH}"
