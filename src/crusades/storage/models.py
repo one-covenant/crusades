@@ -137,6 +137,36 @@ class AdaptiveThresholdModel(Base):
     )
 
 
+class VerifiedPaymentModel(Base):
+    """Database model for tracking verified submission payments.
+
+    Records staking transactions from miners that serve as submission fees.
+    Used to prevent double-spend (same payment claimed for multiple submissions).
+
+    Each record links a unique on-chain staking extrinsic to a submission.
+    """
+
+    __tablename__ = "verified_payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    submission_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    miner_hotkey: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    miner_coldkey: Mapped[str] = mapped_column(String(48), nullable=False)
+    block_hash: Mapped[str] = mapped_column(String(66), nullable=False)
+    extrinsic_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount_rao: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=lambda: datetime.now(UTC)
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_verified_payments_block_extrinsic", "block_hash", "extrinsic_index", unique=True
+        ),
+        Index("idx_verified_payments_miner", "miner_hotkey"),
+    )
+
+
 class EvaluationModel(Base):
     """Database model for evaluation results."""
 

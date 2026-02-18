@@ -56,6 +56,20 @@ class AdaptiveThresholdConfig(BaseModel):
     decay_interval_blocks: int = 100  # Blocks between decay steps (~20 min)
 
 
+class PaymentConfig(BaseModel):
+    """Submission payment settings.
+
+    Miners must stake TAO into the subnet as a fee before each submission.
+    This creates alpha tokens which can be burned daily, benefiting the subnet.
+
+    The validator verifies the staking event on-chain before evaluating.
+    """
+
+    enabled: bool = True
+    fee_rao: int = 100_000_000  # 0.1 TAO in RAO (1 TAO = 1e9 RAO)
+    scan_blocks: int = 200  # How many blocks around commitment to scan for payment
+
+
 class DockerConfig(BaseModel):
     """Docker execution settings for validator evaluations.
 
@@ -153,6 +167,9 @@ class HParams(BaseModel):
 
     # Adaptive threshold for leaderboard
     adaptive_threshold: AdaptiveThresholdConfig = Field(default_factory=AdaptiveThresholdConfig)
+
+    # Submission payment (alpha staking fee)
+    payment: PaymentConfig = Field(default_factory=PaymentConfig)
 
     # Storage (for evaluation records - not in hparams.json)
     storage: StorageConfig = Field(default_factory=StorageConfig)

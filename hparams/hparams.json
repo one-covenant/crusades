@@ -55,5 +55,11 @@
         "base_threshold": 0.05,
         "decay_percent": 0.05,
         "decay_interval_blocks": 100
+    },
+
+    "payment": {
+        "enabled": true,
+        "fee_rao": 100000000,
+        "scan_blocks": 200
     }
 }

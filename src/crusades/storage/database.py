@@ -11,6 +11,7 @@ from .models import (
     EvaluationModel,
     SubmissionModel,
     ValidatorStateModel,
+    VerifiedPaymentModel,
 )
 
 
@@ -376,6 +377,53 @@ class Database:
             else:
                 session.add(ValidatorStateModel(key=key, value=value))
             await session.commit()
+
+    # Payment verification operations
+
+    async def is_payment_used(self, block_hash: str, extrinsic_index: int) -> bool:
+        """Check if a payment extrinsic has already been claimed by a submission."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(func.count())
+                .select_from(VerifiedPaymentModel)
+                .where(
+                    VerifiedPaymentModel.block_hash == block_hash,
+                    VerifiedPaymentModel.extrinsic_index == extrinsic_index,
+                )
+            )
+            return (result.scalar() or 0) > 0
+
+    async def record_verified_payment(
+        self,
+        submission_id: str,
+        miner_hotkey: str,
+        miner_coldkey: str,
+        block_hash: str,
+        extrinsic_index: int,
+        amount_rao: int,
+    ) -> None:
+        """Record a verified payment to prevent double-spend."""
+        async with self.session_factory() as session:
+            payment = VerifiedPaymentModel(
+                submission_id=submission_id,
+                miner_hotkey=miner_hotkey,
+                miner_coldkey=miner_coldkey,
+                block_hash=block_hash,
+                extrinsic_index=extrinsic_index,
+                amount_rao=amount_rao,
+            )
+            session.add(payment)
+            await session.commit()
+
+    async def get_payment_for_submission(self, submission_id: str) -> VerifiedPaymentModel | None:
+        """Get the payment record for a submission."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(VerifiedPaymentModel).where(
+                    VerifiedPaymentModel.submission_id == submission_id
+                )
+            )
+            return result.scalar_one_or_none()
 
     # Adaptive threshold operations
 

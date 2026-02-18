@@ -31,6 +31,10 @@ from crusades.chain.commitments import (
     CommitmentReader,
     MinerCommitment,
 )
+from crusades.chain.payment import (
+    get_hotkey_owner,
+    verify_payment_on_chain_async,
+)
 from crusades.chain.weights import WeightSetter
 from crusades.config import get_config, get_hparams
 from crusades.core.protocols import SubmissionStatus
@@ -278,6 +282,90 @@ class Validator(BaseNode):
         except Exception as e:
             logger.exception(f"Error processing commitments: {e}")
 
+    async def _verify_submission_payment(
+        self,
+        commitment: MinerCommitment,
+        submission_id: str,
+    ) -> bool:
+        """Verify that the miner has paid the submission fee by staking into the subnet.
+
+        Scans recent blocks for an add_stake extrinsic from the miner's coldkey
+        and records the payment in the database to prevent double-spend.
+
+        Returns:
+            True if payment verified (or payments disabled), False otherwise
+        """
+        hparams = get_hparams()
+
+        if not hparams.payment.enabled:
+            logger.debug("Payment verification disabled in hparams")
+            return True
+
+        if self.chain is None:
+            logger.warning("No chain connection - skipping payment verification")
+            return True
+
+        fee_rao = hparams.payment.fee_rao
+        scan_blocks = hparams.payment.scan_blocks
+        netuid = hparams.netuid
+
+        # Look up miner's coldkey from their hotkey
+        miner_coldkey = get_hotkey_owner(
+            self.chain.subtensor, commitment.hotkey, block=commitment.reveal_block
+        )
+        if miner_coldkey is None:
+            logger.error(
+                f"Could not look up coldkey for hotkey {commitment.hotkey[:16]}... "
+                f"- cannot verify payment"
+            )
+            return False
+
+        logger.info(
+            f"Verifying payment for {commitment.hotkey[:16]}... (coldkey: {miner_coldkey[:16]}...)"
+        )
+
+        # Scan chain for matching staking extrinsic
+        payment = await verify_payment_on_chain_async(
+            subtensor=self.chain.subtensor,
+            miner_coldkey=miner_coldkey,
+            commitment_block=commitment.reveal_block,
+            netuid=netuid,
+            min_amount_rao=fee_rao,
+            scan_blocks=scan_blocks,
+        )
+
+        if payment is None:
+            logger.warning(
+                f"No valid payment found for {commitment.hotkey[:16]}... "
+                f"(required {fee_rao} RAO stake on netuid {netuid})"
+            )
+            return False
+
+        # Check for double-spend
+        already_used = await self.db.is_payment_used(payment.block_hash, payment.extrinsic_index)
+        if already_used:
+            logger.warning(
+                f"Payment at block {payment.block_hash[:16]}... extrinsic {payment.extrinsic_index} "
+                f"already used for another submission"
+            )
+            return False
+
+        # Record the payment
+        await self.db.record_verified_payment(
+            submission_id=submission_id,
+            miner_hotkey=commitment.hotkey,
+            miner_coldkey=miner_coldkey,
+            block_hash=payment.block_hash,
+            extrinsic_index=payment.extrinsic_index,
+            amount_rao=payment.amount_rao,
+        )
+
+        logger.info(
+            f"Payment verified: {payment.amount_rao} RAO at block "
+            f"{payment.block_hash[:16]}... extrinsic {payment.extrinsic_index}"
+        )
+        return True
+
     async def _create_submission_from_commitment(
         self,
         commitment: MinerCommitment,
@@ -325,12 +413,35 @@ class Validator(BaseNode):
                 )
                 return
 
+        # Verify payment before creating the submission
+        payment_verified = await self._verify_submission_payment(commitment, submission_id)
+
+        if not payment_verified:
+            # Create submission but mark it as failed
+            failed_submission = SubmissionModel(
+                submission_id=submission_id,
+                miner_hotkey=commitment.hotkey,
+                miner_uid=commitment.uid,
+                code_hash=commitment.code_url_info.code_hash or "",
+                bucket_path=commitment.code_url_info.url,
+                status=SubmissionStatus.FAILED_EVALUATION,
+                payment_verified=False,
+                spec_version=crusades.COMPETITION_VERSION,
+                error_message="Payment not verified: no valid stake payment found on-chain",
+            )
+            try:
+                await self.db.save_submission(failed_submission)
+                logger.warning(f"Submission {submission_id} FAILED: payment not verified")
+            except Exception as e:
+                logger.error(f"Failed to save failed submission: {e}")
+            return
+
         submission = SubmissionModel(
             submission_id=submission_id,
             miner_hotkey=commitment.hotkey,
             miner_uid=commitment.uid,
-            code_hash=commitment.code_url_info.code_hash or "",  # 128-bit truncated SHA256
-            bucket_path=commitment.code_url_info.url,  # Store code URL
+            code_hash=commitment.code_url_info.code_hash or "",
+            bucket_path=commitment.code_url_info.url,
             status=SubmissionStatus.EVALUATING,
             payment_verified=True,
             spec_version=crusades.COMPETITION_VERSION,
@@ -342,6 +453,7 @@ class Validator(BaseNode):
             logger.info(f"   Code URL: {commitment.code_url_info.url[:60]}...")
             logger.info(f"   UID: {commitment.uid}")
             logger.info(f"   Hotkey: {commitment.hotkey[:16]}...")
+            logger.info("   Payment: verified")
         except Exception as e:
             logger.error(f"Failed to save submission: {e}")
             logger.exception("Traceback:")

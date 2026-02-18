@@ -118,6 +118,92 @@ def validate_code_url(url: str) -> tuple[bool, str, str | None]:
     return True, final_url, code_hash
 
 
+def stake_submission_fee(
+    wallet: bt.wallet,
+    subtensor: bt.subtensor,
+    netuid: int,
+    fee_rao: int,
+) -> tuple[bool, dict | str]:
+    """Stake TAO into the subnet as a submission fee.
+
+    Creates alpha tokens by staking TAO into the subnet's AMM pool.
+    The staking is done to the miner's own hotkey on the subnet.
+
+    Args:
+        wallet: Bittensor wallet (coldkey signs the transfer)
+        subtensor: Subtensor connection
+        netuid: Subnet to stake into
+        fee_rao: Amount to stake in RAO (1 TAO = 1e9 RAO)
+
+    Returns:
+        Tuple of (success, result_dict_or_error_message)
+    """
+    fee_tao = fee_rao / 1e9
+    hotkey = wallet.hotkey.ss58_address
+
+    try:
+        coldkey_addr = wallet.coldkey.ss58_address
+        balance = subtensor.get_balance(coldkey_addr)
+        balance_rao = balance.rao if hasattr(balance, "rao") else int(balance)
+
+        if balance_rao < fee_rao:
+            return False, (
+                f"Insufficient balance. Need {fee_rao} RAO ({fee_tao} TAO), "
+                f"have {balance_rao} RAO ({balance_rao / 1e9:.4f} TAO)"
+            )
+    except Exception as e:
+        return False, f"Failed to check balance: {e}"
+
+    print(f"\n{'=' * 60}")
+    print("SUBMISSION FEE")
+    print(f"{'=' * 60}")
+    print(f"   Amount: {fee_rao} RAO ({fee_tao} TAO)")
+    print(f"   Subnet: {netuid}")
+    print(f"   Hotkey: {hotkey}")
+    print(f"   Balance: {balance_rao / 1e9:.4f} TAO")
+    print(f"\nThis stakes {fee_tao} TAO into subnet {netuid} as a submission fee.")
+
+    confirm = input("\nProceed with payment? [y/N]: ").strip().lower()
+    if confirm != "y":
+        return False, "Payment cancelled by user"
+
+    print("\nStaking submission fee...")
+    try:
+        amount = bt.Balance.from_rao(fee_rao)
+        success = subtensor.add_stake(
+            wallet=wallet,
+            hotkey_ss58=hotkey,
+            netuid=netuid,
+            amount=amount,
+            wait_for_inclusion=True,
+            wait_for_finalization=True,
+        )
+
+        if success:
+            current_block = subtensor.get_current_block()
+            block_hash = subtensor.get_block_hash(current_block)
+
+            result = {
+                "amount_rao": fee_rao,
+                "block": current_block,
+                "block_hash": block_hash,
+                "hotkey": hotkey,
+                "netuid": netuid,
+            }
+
+            print("\n[OK] Submission fee paid!")
+            print(f"   Block: {current_block}")
+            print(f"   Block hash: {block_hash}")
+            print("\n   SAVE THESE DETAILS - they are your proof of payment for disputes")
+
+            return True, result
+        else:
+            return False, "Staking transaction failed"
+
+    except Exception as e:
+        return False, f"Staking error: {e}"
+
+
 def commit_to_chain(
     wallet: bt.wallet,
     code_url: str,
@@ -161,6 +247,25 @@ def commit_to_chain(
     # Get miner UID
     uid = subtensor.get_uid_for_hotkey_on_subnet(hotkey_ss58=hotkey, netuid=netuid)
     print(f"   Miner UID: {uid}")
+
+    # --- Payment step ---
+    if hparams.payment.enabled:
+        fee_rao = hparams.payment.fee_rao
+        print(f"\n--- SUBMISSION FEE ({fee_rao / 1e9} TAO) ---")
+
+        pay_success, pay_result = stake_submission_fee(
+            wallet=wallet,
+            subtensor=subtensor,
+            netuid=netuid,
+            fee_rao=fee_rao,
+        )
+
+        if not pay_success:
+            return False, f"Payment failed: {pay_result}"
+
+        print("\n   Payment successful. Proceeding to commit...")
+    else:
+        print("\n   Payment disabled in hparams. Skipping fee.")
 
     print("\nCommitting to blockchain...")
     print(f"   Network: {network}")
@@ -262,13 +367,23 @@ def cmd_submit(args):
         print("=" * 60)
         print("\nYour code URL is now timelock encrypted on the blockchain.")
         print(f"After block {result['reveal_block']}, validators will:")
-        print("  1. Decrypt and retrieve your code URL")
-        print("  2. Fetch your train.py code")
-        print("  3. Evaluate and score your submission")
+        print("  1. Verify your submission fee payment on-chain")
+        print("  2. Decrypt and retrieve your code URL")
+        print("  3. Fetch your train.py code")
+        print("  4. Evaluate and score your submission")
         print("\nWARNING: Do NOT delete or modify your code until evaluation is complete!")
         return 0
     else:
         print(f"\n[FAILED] Commit failed: {result}")
+        try:
+            _hparams = HParams.load()
+            if _hparams.payment.enabled:
+                print("\nNOTE: Your submission fee was already paid.")
+                print(
+                    "If you need a refund, contact the validator operator with your payment details above."
+                )
+        except Exception:
+            pass
         return 1
 
 
