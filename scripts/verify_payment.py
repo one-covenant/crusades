@@ -208,12 +208,12 @@ def main():
 
     # If no payment found, scan nearby blocks (miner CLI often reports a
     # slightly later block than where the extrinsic actually landed).
-    SCAN_RANGE = 5
+    scan_range = 5
     found_block_num = None
     found_block_hash = None
     if not valid and block_num != "?":
-        print(f"\n  No payment in block {block_num}. Scanning ±{SCAN_RANGE} nearby blocks...")
-        for offset in range(-SCAN_RANGE, SCAN_RANGE + 1):
+        print(f"\n  No payment in block {block_num}. Scanning ±{scan_range} nearby blocks...")
+        for offset in range(-scan_range, scan_range + 1):
             if offset == 0:
                 continue
             try:
@@ -235,7 +235,8 @@ def main():
                         print(f"      Extrinsic #{p['extrinsic_index']}: {p['sender_coldkey']}")
                         print(f"      Amount: {p['amount_rao']:,} RAO ({p['amount_tao']:.4f} TAO)")
                     break
-            except Exception:
+            except Exception as e:
+                print(f"    (block {nearby_num}: fetch failed — {e})")
                 continue
 
     print(f"\n{'=' * 60}")
@@ -260,7 +261,7 @@ def main():
         print(f"    {p['sender_coldkey']}")
     else:
         print("  NO VALID PAYMENT FOUND")
-        print(f"  Searched block {block_num} ± {SCAN_RANGE} blocks.")
+        print(f"  Searched block {block_num} ± {scan_range} blocks.")
 
 
 if __name__ == "__main__":
