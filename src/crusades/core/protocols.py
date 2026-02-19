@@ -120,7 +120,7 @@ class SandboxResult:
         error: str | None = None,
         # Verification fields
         final_loss: float | None = None,
-        final_logits: "torch.Tensor | None" = None,  # noqa: F821
+        final_logits: Any = None,
         final_logits_path: str | None = None,
     ):
         self.success = success

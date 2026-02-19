@@ -12,6 +12,7 @@ the owner's coldkey.
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import time
 from dataclasses import dataclass
@@ -78,17 +79,23 @@ def resolve_payment_address(subtensor: bt.subtensor, netuid: int, burn_uid: int)
         return None
 
 
+_RPC_TIMEOUT_SECONDS = 30
+
+
 def _check_extrinsic_failed(
     subtensor: bt.subtensor, block_hash: str, extrinsic_index: int, retries: int = 2
 ) -> bool:
     """Check if an extrinsic in a block failed by examining events.
 
     Retries on transient RPC failures to avoid rejecting valid payments
-    due to network hiccups.
+    due to network hiccups. Each RPC call is capped at _RPC_TIMEOUT_SECONDS
+    to prevent a hung node from blocking the validator indefinitely.
     """
     for attempt in range(1 + retries):
         try:
-            events = subtensor.substrate.get_events(block_hash=block_hash)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(subtensor.substrate.get_events, block_hash=block_hash)
+                events = future.result(timeout=_RPC_TIMEOUT_SECONDS)
             for event in events:
                 if event.get("extrinsic_idx") != extrinsic_index:
                     continue
@@ -97,6 +104,15 @@ def _check_extrinsic_failed(
                 if module == "System" and event_id == "ExtrinsicFailed":
                     return True
             return False
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                f"get_events timed out after {_RPC_TIMEOUT_SECONDS}s "
+                f"(attempt {attempt + 1}/{1 + retries})"
+            )
+            if attempt >= retries:
+                logger.error("get_events timed out on all attempts. Assuming failed to be safe.")
+                return True
+            time.sleep(1)
         except Exception as e:
             if attempt < retries:
                 logger.warning(

@@ -290,9 +290,11 @@ class CommitmentReader:
         return self.subtensor.get_current_block()
 
     def _build_hotkey_to_uid_map(self) -> dict[str, int]:
-        """Build mapping from hotkey to UID."""
+        """Build mapping from hotkey to UID.
+
+        Uses the cached metagraph (synced by the validator's maybe_sync cycle).
+        """
         hotkey_to_uid: dict[str, int] = {}
-        self.sync()
         for uid in range(self.metagraph.n):
             hotkey_to_uid[self.metagraph.hotkeys[uid]] = uid
         return hotkey_to_uid
@@ -448,8 +450,8 @@ class CommitmentReader:
         """
         all_commitments = self.get_all_commitments()
 
-        # Filter to commitments revealed at or after last_block.
-        new_commitments = [c for c in all_commitments if c.reveal_block >= last_block]
+        # Strictly greater than: commitments at last_block were already processed.
+        new_commitments = [c for c in all_commitments if c.reveal_block > last_block]
 
         logger.info(f"Found {len(new_commitments)} new commitments since block {last_block}")
         return new_commitments

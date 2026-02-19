@@ -571,6 +571,12 @@ class Validator(BaseNode):
         2. Redirects don't lead to private IP addresses
         3. Response is a single Python file, not HTML/folder
 
+        Known limitation: DNS rebinding TOCTOU -- the hostname is resolved and
+        validated before the HTTP request, but a malicious DNS server could
+        return a different (private) IP for the second resolution during
+        ``opener.open()``. The risk is low because redirect destinations are
+        also validated, and the response body is size-limited and content-checked.
+
         Args:
             code_url: The URL containing train.py code
 

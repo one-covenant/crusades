@@ -28,11 +28,11 @@ class StorageConfig(BaseModel):
 class VerificationConfig(BaseModel):
     """Verification settings using gradient and weight-based checks."""
 
-    max_loss_difference: float = 0.5
+    max_loss_difference: float = 0.3
     min_params_changed_ratio: float = 0.8
-    gradient_norm_ratio_max: float = 1.10
-    weight_relative_error_max: float = 0.008
-    timer_divergence_threshold: float = 0.05
+    gradient_norm_ratio_max: float = 1.08
+    weight_relative_error_max: float = 0.006
+    timer_divergence_threshold: float = 0.005
 
 
 class MFUConfig(BaseModel):
@@ -40,7 +40,7 @@ class MFUConfig(BaseModel):
 
     gpu_peak_tflops: float = 312.0  # A100 80GB peak TFLOPS (bfloat16)
     max_plausible_mfu: float = 75.0  # Reject MFU above this as likely cheating
-    min_mfu: float = 45.0  # Reject submissions below this floor
+    min_mfu: float = 50.0  # Reject submissions below this floor
 
 
 class AdaptiveThresholdConfig(BaseModel):
@@ -51,9 +51,9 @@ class AdaptiveThresholdConfig(BaseModel):
     - Decays over time towards base_threshold (loses decay_percent each interval)
     """
 
-    base_threshold: float = 0.01  # Minimum threshold (1%)
+    base_threshold: float = 0.02  # Minimum threshold (2%)
     decay_percent: float = 0.05  # Percent to lose per interval (5% = loses 5% of excess)
-    decay_interval_blocks: int = 100  # Blocks between decay steps (~20 min)
+    decay_interval_blocks: int = 10  # Blocks between decay steps (~2 min)
 
 
 class PaymentConfig(BaseModel):
@@ -69,7 +69,7 @@ class PaymentConfig(BaseModel):
     and payments go directly to the specified SS58 address.
     """
 
-    enabled: bool = True
+    enabled: bool = False
     fee_rao: int = 100_000_000  # 0.1 TAO in RAO (1 TAO = 1e9 RAO)
     scan_blocks: int = 200  # How many blocks around commitment to scan for payment
     payment_address: str = ""  # Explicit SS58 coldkey; empty = derive from burn_uid

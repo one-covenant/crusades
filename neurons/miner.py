@@ -12,6 +12,7 @@ Timelock encryption keeps it hidden until reveal_blocks pass.
 
 import argparse
 import hashlib
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -66,7 +67,7 @@ def validate_code_url(url: str) -> tuple[bool, str, str | None]:
     # For GitHub Gist URLs, convert to raw format
     final_url = url
     if "gist.github.com" in url.lower() and "/raw" not in url.lower():
-        final_url = url.replace("gist.github.com", "gist.githubusercontent.com")
+        final_url = re.sub(r"gist\.github\.com", "gist.githubusercontent.com", url, flags=re.I)
         if not final_url.endswith("/raw"):
             final_url = final_url.rstrip("/") + "/raw"
 
@@ -321,6 +322,9 @@ def commit_to_chain(
     Returns:
         Tuple of (success, result_dict or error_message)
     """
+    if not code_hash:
+        return False, "code_hash is required (run validate_code_url first)"
+
     # Load settings from hparams
     hparams = HParams.load()
     netuid = hparams.netuid

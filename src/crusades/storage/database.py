@@ -1,6 +1,8 @@
 """Database abstraction layer."""
 
-from sqlalchemy import desc, func, select
+import logging
+
+from sqlalchemy import desc, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -15,6 +17,53 @@ from .models import (
     VerifiedPaymentModel,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def _migrate_missing_columns(connection) -> None:
+    """Add any columns defined in models but missing from the database.
+
+    SQLAlchemy's create_all only creates new tables; it won't add columns to
+    existing ones.  This lightweight migration inspects each table and issues
+    ALTER TABLE ADD COLUMN for anything missing, using the column's default
+    or NULL if no server_default is set.  Safe to run repeatedly.
+    """
+    inspector = inspect(connection)
+    existing_tables = inspector.get_table_names()
+
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue
+
+        existing_cols = {col["name"] for col in inspector.get_columns(table.name)}
+
+        for column in table.columns:
+            if column.name in existing_cols:
+                continue
+
+            col_type = column.type.compile(dialect=connection.dialect)
+            nullable = "NULL" if column.nullable else "NOT NULL"
+
+            default_clause = ""
+            if column.server_default is not None:
+                default_clause = f" DEFAULT {column.server_default.arg}"
+            elif not column.nullable and column.default is not None:
+                if hasattr(column.default, "arg") and isinstance(
+                    column.default.arg, (int, float, str, bool)
+                ):
+                    val = column.default.arg
+                    if isinstance(val, bool):
+                        val = 1 if val else 0
+                    elif isinstance(val, str):
+                        val = f"'{val}'"
+                    default_clause = f" DEFAULT {val}"
+                else:
+                    nullable = "NULL"
+
+            stmt = f"ALTER TABLE {table.name} ADD COLUMN {column.name} {col_type} {nullable}{default_clause}"
+            logger.info(f"Migration: adding column {table.name}.{column.name} ({col_type})")
+            connection.execute(text(stmt))
+
 
 class Database:
     """Async database interface."""
@@ -28,9 +77,10 @@ class Database:
         )
 
     async def initialize(self) -> None:
-        """Create tables if they don't exist."""
+        """Create tables if they don't exist, then add any missing columns."""
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(_migrate_missing_columns)
 
     async def close(self) -> None:
         """Close database connection."""
