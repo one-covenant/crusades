@@ -261,7 +261,7 @@ def pay_submission_fee(
         return False, f"transfer_stake error: {e} (alpha still staked under your coldkey)"
 
     # Locate the transfer_stake extrinsic so it can be embedded in the
-    # commitment for O(1) validator verification (instead of block scanning).
+    # commitment for O(1) validator verification.
     payment_ref = find_payment_extrinsic(
         subtensor=subtensor,
         miner_coldkey=coldkey_addr,
@@ -276,7 +276,9 @@ def pay_submission_fee(
         payment_block, payment_index = payment_ref
         print(f"\n   Payment extrinsic: block {payment_block}, index {payment_index}")
     else:
-        print("\n   Warning: could not locate payment extrinsic (validator will scan)")
+        print(
+            "\n   WARNING: could not locate payment extrinsic — validator will reject this submission"
+        )
 
     current_block = subtensor.get_current_block()
     block_hash = subtensor.get_block_hash(current_block)
@@ -394,9 +396,8 @@ def commit_to_chain(
     print(f"   Block time: {block_time}s (from hparams.json)")
 
     # Commitment data: packed format to fit 128-byte on-chain limit.
-    # If payment extrinsic ref is available, embed it for O(1) validator lookup:
     #   <32hex>:<block>:<index>:<url>   (~46 bytes overhead, ~82 for URL)
-    # Otherwise fall back to legacy format:
+    # Without payment ref (payment disabled):
     #   <32hex>:<url>                   (33 bytes overhead, 95 for URL)
     pay_block = pay_result_dict.get("payment_block") if pay_result_dict else None
     pay_index = pay_result_dict.get("payment_index") if pay_result_dict else None

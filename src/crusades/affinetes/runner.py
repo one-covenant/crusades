@@ -44,8 +44,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Legacy module-level references removed — deployment cache is now per-instance
-
 
 @dataclass
 class EvaluationResult:

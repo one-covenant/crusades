@@ -312,9 +312,9 @@ class Validator(BaseNode):
     ) -> bool:
         """Verify that the miner has paid the submission fee via alpha transfer.
 
-        When the commitment contains a payment extrinsic reference (block +
-        index), performs an O(1) direct lookup.  Falls back to scanning recent
-        blocks for legacy commitments without the reference.
+        Requires the commitment to contain a payment extrinsic reference
+        (block + index) for O(1) direct on-chain lookup.  Commitments
+        without the reference are rejected.
 
         Returns:
             True if payment verified (or payments disabled), False otherwise
