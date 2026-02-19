@@ -60,6 +60,6 @@
     "payment": {
         "enabled": true,
         "fee_rao": 100000000,
-        "scan_blocks": 200
+        "payment_address": ""
     }
 }
