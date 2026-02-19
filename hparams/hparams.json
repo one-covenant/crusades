@@ -40,9 +40,9 @@
     "verification": {
         "max_loss_difference": 0.3,
         "min_params_changed_ratio": 0.8,
-        "gradient_norm_ratio_max": 1.08,
-        "weight_relative_error_max": 0.006,
-        "timer_divergence_threshold": 0.005
+        "gradient_norm_ratio_max": 1.06,
+        "weight_relative_error_max": 0.003,
+        "timer_divergence_threshold": 0.003
     },
 
     "mfu": {
