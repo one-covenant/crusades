@@ -333,6 +333,7 @@ class Validator(BaseNode):
         )
 
         # Scan chain for matching transfer_stake extrinsic
+        # Allow 5% slippage: AMM conversion yields slightly less alpha than TAO input
         payment = await verify_payment_on_chain_async(
             subtensor=self.chain.subtensor,
             miner_coldkey=miner_coldkey,
@@ -340,7 +341,7 @@ class Validator(BaseNode):
             payment_address=payment_address,
             netuid=netuid,
             scan_blocks=scan_blocks,
-            min_amount=hparams.payment.fee_rao,
+            min_amount=int(hparams.payment.fee_rao * 0.95),
         )
 
         if payment is None:
