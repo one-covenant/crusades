@@ -818,8 +818,6 @@ asyncio.run(main())
                 f"Basilica error: {e}",
                 task_id=task_id,
             )
-        finally:
-            await self.delete_basilica_deployment()
 
     async def _get_basilica_deployment(self):
         """Get or create a Basilica deployment.
