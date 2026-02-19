@@ -74,6 +74,7 @@ class Validator(BaseNode):
 
         # State
         self.last_processed_block: int = 0
+        self.start_block: int = 0  # Set at startup; reject commitments before this
         # Map URL -> (reveal_block, hotkey) to track first committer
         # Pruned to MAX_EVALUATED_URLS to prevent unbounded memory growth
         self.evaluated_code_urls: dict[str, tuple[int, str]] = {}
@@ -177,6 +178,15 @@ class Validator(BaseNode):
         # Load persisted state
         await self._load_state()
 
+        # Record the block at which this validator session started.
+        # Only commitments with reveal_block >= start_block will be accepted,
+        # preventing miners from pre-submitting before the validator is live.
+        try:
+            self.start_block = self.chain.subtensor.get_current_block()
+        except Exception:
+            self.start_block = self.last_processed_block
+        logger.info(f"   Start window block: {self.start_block}")
+
         logger.info(f"   Affinetes mode: {self.affinetes_mode}")
         logger.info(f"   Model: {hparams.benchmark_model_name}")
         logger.info(f"   Dataset: {hparams.benchmark_dataset_name}")
@@ -248,6 +258,14 @@ class Validator(BaseNode):
                         )
                         continue
 
+                    # Reject commitments from before this validator session started
+                    if commitment.reveal_block < self.start_block:
+                        logger.info(
+                            f"Skipping commitment from UID {commitment.uid}: "
+                            f"reveal_block {commitment.reveal_block} < start_block {self.start_block}"
+                        )
+                        continue
+
                     # Use code URL as unique identifier - first committer wins
                     code_url = commitment.code_url_info.url
                     if code_url in self.evaluated_code_urls:
@@ -310,11 +328,19 @@ class Validator(BaseNode):
         scan_blocks = hparams.payment.scan_blocks
         netuid = hparams.netuid
 
-        # Derive payment destination: burn_uid → hotkey → coldkey owner
-        payment_address = resolve_payment_address(self.chain.subtensor, netuid, hparams.burn_uid)
-        if payment_address is None:
-            logger.error("Could not resolve payment address from burn_uid — cannot verify payment")
-            return False
+        # Use explicit payment_address if configured, otherwise derive from burn_uid
+        if hparams.payment.payment_address:
+            payment_address = hparams.payment.payment_address
+            logger.debug(f"Using explicit payment_address: {payment_address[:16]}...")
+        else:
+            payment_address = resolve_payment_address(
+                self.chain.subtensor, netuid, hparams.burn_uid
+            )
+            if payment_address is None:
+                logger.error(
+                    "Could not resolve payment address from burn_uid — cannot verify payment"
+                )
+                return False
 
         # Look up miner's coldkey from their hotkey
         miner_coldkey = get_hotkey_owner(

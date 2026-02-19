@@ -64,11 +64,15 @@ class PaymentConfig(BaseModel):
     at runtime. The validator scans for a SubtensorModule.transfer_stake
     extrinsic on-chain before evaluating. Unlike plain add_stake, a
     transfer_stake moves ownership to a different coldkey — irreversible.
+
+    If payment_address is set, it overrides the burn_uid → coldkey resolution
+    and payments go directly to the specified SS58 address.
     """
 
     enabled: bool = True
     fee_rao: int = 100_000_000  # 0.1 TAO in RAO (1 TAO = 1e9 RAO)
     scan_blocks: int = 200  # How many blocks around commitment to scan for payment
+    payment_address: str = ""  # Explicit SS58 coldkey; empty = derive from burn_uid
 
 
 class DockerConfig(BaseModel):

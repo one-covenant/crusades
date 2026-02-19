@@ -329,13 +329,16 @@ def commit_to_chain(
     if hparams.payment.enabled:
         fee_rao = hparams.payment.fee_rao
 
-        # Derive payment destination: burn_uid → hotkey → coldkey owner
-        payment_coldkey = resolve_payment_address(subtensor, netuid, hparams.burn_uid)
-        if payment_coldkey is None:
-            return (
-                False,
-                f"Payment failed: could not resolve payment address from burn_uid {hparams.burn_uid}",
-            )
+        # Use explicit payment_address if configured, otherwise derive from burn_uid
+        if hparams.payment.payment_address:
+            payment_coldkey = hparams.payment.payment_address
+        else:
+            payment_coldkey = resolve_payment_address(subtensor, netuid, hparams.burn_uid)
+            if payment_coldkey is None:
+                return (
+                    False,
+                    f"Payment failed: could not resolve payment address from burn_uid {hparams.burn_uid}",
+                )
 
         print(
             f"\n--- SUBMISSION FEE ({fee_rao / 1e9} TAO as alpha → {payment_coldkey[:16]}...) ---"
