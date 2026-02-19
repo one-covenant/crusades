@@ -13,6 +13,7 @@ the owner's coldkey.
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 
 import bittensor as bt
@@ -101,6 +102,7 @@ def _check_extrinsic_failed(
                 logger.warning(
                     f"Could not check extrinsic events (attempt {attempt + 1}/{1 + retries}): {e}"
                 )
+                time.sleep(1)
                 continue
             logger.error(
                 f"Could not check extrinsic events after {1 + retries} attempts: {e}. "
@@ -173,7 +175,7 @@ def _scan_block_for_transfer_stake(
                 continue
 
             origin_netuid = call_args.get("origin_netuid")
-            if origin_netuid != netuid:
+            if origin_netuid is None or int(origin_netuid) != int(netuid):
                 continue
 
             alpha_amount = call_args.get("alpha_amount", 0)
