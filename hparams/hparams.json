@@ -52,7 +52,7 @@
     },
 
     "adaptive_threshold": {
-        "base_threshold": 0.05,
+        "base_threshold": 0.02,
         "decay_percent": 0.05,
         "decay_interval_blocks": 100
     },
