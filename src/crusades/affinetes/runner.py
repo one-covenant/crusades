@@ -673,7 +673,7 @@ asyncio.run(main())
             )
 
         try:
-            # Get or create Basilica deployment
+            # Get or create Basilica deployment (cleaned up in finally block)
             logger.info("[BASILICA] Acquiring deployment...")
             deployment = await self._get_basilica_deployment()
 
@@ -818,13 +818,15 @@ asyncio.run(main())
                 f"Basilica error: {e}",
                 task_id=task_id,
             )
+        finally:
+            await self.delete_basilica_deployment()
 
     async def _get_basilica_deployment(self):
         """Get or create a Basilica deployment.
 
         Reuses existing deployment if within TTL, otherwise creates new one.
+        Always cleans up stale/expired deployments before creating fresh ones.
         """
-        # Check if existing deployment is still valid
         now = time.time()
         ttl_buffer = 300  # 5 minute buffer before TTL expires
 
@@ -838,8 +840,12 @@ asyncio.run(main())
             logger.info(f"   TTL remaining: {remaining:.0f}s ({remaining / 60:.1f} min)")
             return self._basilica_deployment
 
-        # Create new deployment
-        logger.info("[BASILICA] Creating NEW deployment (no valid cached deployment)")
+        # Delete stale cached deployment before creating a new one
+        if self._basilica_deployment is not None:
+            logger.info("[BASILICA] Deleting expired cached deployment before creating new one")
+            await self.delete_basilica_deployment()
+
+        logger.info("[BASILICA] Creating NEW deployment")
         logger.info(f"   Image: {self.basilica_image}")
         logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
         logger.info(f"   Min GPU memory: {self.basilica_min_gpu_memory_gb}GB")
@@ -849,24 +855,22 @@ asyncio.run(main())
         )
         logger.info("[BASILICA] Requesting GPU from Basilica... (this may take 2-5 minutes)")
 
+        deploy_name = f"templar-eval-{uuid.uuid4().hex[:8]}"
+        logger.info(f"   Deployment name: {deploy_name}")
+
         try:
             deploy_start = time.time()
             client = BasilicaClient()
-
-            deploy_name = f"templar-eval-{uuid.uuid4().hex[:8]}"
-            logger.info(f"   Deployment name: {deploy_name}")
 
             deployment = client.deploy(
                 name=deploy_name,
                 image=self.basilica_image,
                 port=8000,
                 ttl_seconds=self.basilica_ttl_seconds,
-                timeout=600,  # Wait up to 10 min for deployment (large images + GPU provisioning)
-                # GPU configuration
+                timeout=600,
                 gpu_count=self.basilica_gpu_count,
                 gpu_models=self.basilica_gpu_models,
                 min_gpu_memory_gb=self.basilica_min_gpu_memory_gb,
-                # Resource limits
                 cpu=self.basilica_cpu,
                 memory=self.basilica_memory,
             )
@@ -890,22 +894,31 @@ asyncio.run(main())
             logger.error("[BASILICA] Failed to deploy!")
             logger.error(f"   Error: {e}")
             logger.error(traceback.format_exc())
+            # deploy() may have created the deployment on Basilica before
+            # timing out — clean it up by name so it doesn't leak.
+            try:
+                client = BasilicaClient()
+                client.delete_deployment(deploy_name)
+                logger.info(f"[BASILICA] Cleaned up failed deployment '{deploy_name}'")
+            except Exception:
+                pass
             return None
 
     async def delete_basilica_deployment(self) -> None:
-        """Delete the current Basilica deployment to ensure fresh GPU for next submission.
+        """Delete the current Basilica deployment to free resources.
 
-        This eliminates MFU variance between fresh and reused deployments by
-        ensuring every submission gets a pristine GPU state.
+        Called in the finally block of every evaluation so deployments
+        don't leak on Basilica when evaluations fail or time out.
         """
         if self._basilica_deployment is None:
             return
 
+        name = getattr(self._basilica_deployment, "name", "unknown")
         try:
-            await self._basilica_deployment.delete_async()
-            logger.info("[BASILICA] Deployment deleted (fresh GPU for next submission)")
+            self._basilica_deployment.delete()
+            logger.info(f"[BASILICA] Deployment '{name}' deleted")
         except Exception as e:
-            logger.warning(f"[BASILICA] Failed to delete deployment: {e}")
+            logger.warning(f"[BASILICA] Failed to delete deployment '{name}': {e}")
 
         self._basilica_deployment = None
         self._basilica_deployment_time = 0
