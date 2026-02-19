@@ -19,6 +19,7 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 # PyTorch built-in SDPA).  Install separately: pre-built wheels need the
 # torch + CUDA version to match; if no wheel exists, the source build needs
 # the CUDA toolkit (switch base image to *-devel in that case).
+ENV MAX_JOBS=4
 RUN pip install --no-cache-dir --user --no-build-isolation "flash-attn>=2.5.0"
 
 # Remove g++/make but keep gcc for torch.compile inductor backend

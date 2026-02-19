@@ -861,7 +861,7 @@ asyncio.run(main())
                 image=self.basilica_image,
                 port=8000,
                 ttl_seconds=self.basilica_ttl_seconds,
-                timeout=300,  # Wait up to 5 min for deployment (GPU provisioning can be slow)
+                timeout=600,  # Wait up to 10 min for deployment (large images + GPU provisioning)
                 # GPU configuration
                 gpu_count=self.basilica_gpu_count,
                 gpu_models=self.basilica_gpu_models,
