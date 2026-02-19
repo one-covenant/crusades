@@ -198,6 +198,18 @@ def pay_submission_fee(
 
     # Step 1: Stake TAO → alpha
     print("\n[1/2] Staking TAO to create alpha...")
+
+    # Snapshot pre-existing alpha so we only transfer the newly created amount.
+    # get_stake returns the TOTAL balance for (coldkey, hotkey, netuid); without
+    # this delta, a retry after a failed transfer_stake would sweep all alpha.
+    try:
+        pre_stake = subtensor.get_stake(
+            coldkey_ss58=coldkey_addr, hotkey_ss58=burn_hotkey, netuid=netuid
+        )
+        pre_alpha_rao = pre_stake.rao if hasattr(pre_stake, "rao") else int(pre_stake)
+    except Exception:
+        pre_alpha_rao = 0
+
     try:
         amount = bt.Balance.from_rao(fee_rao)
         stake_ok = subtensor.add_stake(
@@ -213,16 +225,20 @@ def pay_submission_fee(
     except Exception as e:
         return False, f"add_stake error: {e}"
 
-    # Get alpha amount created
-    alpha_staked = subtensor.get_stake(
+    # Determine how much new alpha was created (post - pre)
+    post_stake = subtensor.get_stake(
         coldkey_ss58=coldkey_addr, hotkey_ss58=burn_hotkey, netuid=netuid
     )
-    alpha_rao = alpha_staked.rao if hasattr(alpha_staked, "rao") else int(alpha_staked)
-    if alpha_rao <= 0:
-        return False, "add_stake succeeded but no alpha balance found"
-    print(f"      Alpha created: {alpha_rao} ({alpha_staked})")
+    post_alpha_rao = post_stake.rao if hasattr(post_stake, "rao") else int(post_stake)
+    new_alpha_rao = post_alpha_rao - pre_alpha_rao
 
-    # Step 2: Transfer alpha ownership to the owner's coldkey
+    if new_alpha_rao <= 0:
+        return False, "add_stake succeeded but no new alpha balance detected"
+    print(f"      Alpha created: {new_alpha_rao} (total on hotkey: {post_alpha_rao})")
+
+    transfer_amount = bt.Balance.from_rao(new_alpha_rao)
+
+    # Step 2: Transfer only the new alpha to the owner's coldkey
     print("[2/2] Transferring alpha to subnet operator...")
     try:
         transfer_ok = subtensor.transfer_stake(
@@ -231,7 +247,7 @@ def pay_submission_fee(
             hotkey_ss58=burn_hotkey,
             origin_netuid=netuid,
             destination_netuid=netuid,
-            amount=alpha_staked,
+            amount=transfer_amount,
             wait_for_inclusion=True,
             wait_for_finalization=True,
         )
@@ -248,7 +264,7 @@ def pay_submission_fee(
 
     result = {
         "amount_rao": fee_rao,
-        "alpha_rao": alpha_rao,
+        "alpha_rao": new_alpha_rao,
         "block": current_block,
         "block_hash": block_hash,
         "burn_hotkey": burn_hotkey,
@@ -259,7 +275,7 @@ def pay_submission_fee(
     print("\n[OK] Submission fee paid!")
     print(f"   Block: {current_block}")
     print(f"   Block hash: {block_hash}")
-    print(f"   Alpha transferred: {alpha_rao}")
+    print(f"   Alpha transferred: {new_alpha_rao}")
     print("\n   SAVE THESE DETAILS - they are your proof of payment for disputes")
 
     return True, result
