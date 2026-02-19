@@ -673,7 +673,7 @@ asyncio.run(main())
             )
 
         try:
-            # Get or create Basilica deployment (cleaned up in finally block)
+            # Get or create Basilica deployment (cleaned up by validator.py after all runs)
             logger.info("[BASILICA] Acquiring deployment...")
             deployment = await self._get_basilica_deployment()
 
@@ -905,8 +905,9 @@ asyncio.run(main())
     async def delete_basilica_deployment(self) -> None:
         """Delete the current Basilica deployment to free resources.
 
-        Called in the finally block of every evaluation so deployments
-        don't leak on Basilica when evaluations fail or time out.
+        Called by validator.py in a finally block after all evaluation
+        runs for a submission complete (not between individual runs).
+        Also called internally when a cached deployment has expired.
         """
         if self._basilica_deployment is None:
             return
