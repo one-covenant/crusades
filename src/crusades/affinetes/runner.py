@@ -861,9 +861,10 @@ asyncio.run(main())
             deploy_start = time.time()
             client = BasilicaClient()
 
-            # Use create_deployment + wait_until_ready instead of deploy()
-            # so we always hold a reference to delete on failure.
-            response = client.create_deployment(
+            # Split into create + get + wait (instead of client.deploy()) so
+            # we always hold a Deployment reference for cleanup on failure.
+            # All calls use async variants to avoid blocking the event loop.
+            response = await client.create_deployment_async(
                 instance_name=deploy_name,
                 image=self.basilica_image,
                 port=8000,
@@ -874,11 +875,11 @@ asyncio.run(main())
                 cpu=self.basilica_cpu,
                 memory=self.basilica_memory,
             )
-            deployment = client.get(response.instance_name)
+            deployment = await client.get_async(response.instance_name)
             logger.info(f"   Basilica ID: {deployment.name}")
 
-            deployment.wait_until_ready(timeout=600)
-            deployment.refresh()
+            await deployment.wait_until_ready_async(timeout=600)
+            await deployment.refresh_async()
 
             deploy_time = time.time() - deploy_start
             logger.info(f"[BASILICA] Deployment ready in {deploy_time:.1f}s")
@@ -899,7 +900,7 @@ asyncio.run(main())
             logger.error(traceback.format_exc())
             if deployment is not None:
                 try:
-                    deployment.delete()
+                    await deployment.delete_async()
                     logger.info(f"[BASILICA] Cleaned up failed deployment '{deployment.name}'")
                 except Exception as del_err:
                     logger.warning(f"[BASILICA] Failed to clean up deployment: {del_err}")
@@ -917,7 +918,7 @@ asyncio.run(main())
 
         name = getattr(self._basilica_deployment, "name", "unknown")
         try:
-            self._basilica_deployment.delete()
+            await self._basilica_deployment.delete_async()
             logger.info(f"[BASILICA] Deployment '{name}' deleted")
         except Exception as e:
             logger.warning(f"[BASILICA] Failed to delete deployment '{name}': {e}")
