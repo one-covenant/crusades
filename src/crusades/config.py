@@ -5,7 +5,7 @@ from functools import cache
 from pathlib import Path
 from typing import Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -73,6 +73,26 @@ class PaymentConfig(BaseModel):
     enabled: bool = False
     fee_rao: int = 100_000_000  # 0.1 TAO in RAO (1 TAO = 1e9 RAO)
     payment_address: str = ""  # Explicit SS58 coldkey; empty = derive from burn_uid
+
+    @field_validator("payment_address")
+    @classmethod
+    def _validate_payment_address(cls, v: str) -> str:
+        if not v:
+            return v
+        try:
+            import ss58
+        except ImportError:
+            if not (v.startswith("5") and 46 <= len(v) <= 48):
+                raise ValueError(
+                    f"payment_address looks invalid (length {len(v)}, "
+                    f"expected 46-48 starting with '5'): {v[:20]}..."
+                )
+            return v
+        try:
+            ss58.decode(v)
+        except Exception as exc:
+            raise ValueError(f"payment_address is not a valid SS58 address: {exc}") from exc
+        return v
 
 
 class DockerConfig(BaseModel):
