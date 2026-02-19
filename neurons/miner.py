@@ -18,7 +18,7 @@ import urllib.request
 
 import bittensor as bt
 
-from crusades.chain.payment import resolve_payment_address
+from crusades.chain.payment import find_payment_extrinsic, resolve_payment_address
 from crusades.config import HParams
 
 
@@ -259,6 +259,24 @@ def pay_submission_fee(
     except Exception as e:
         return False, f"transfer_stake error: {e} (alpha still staked under your coldkey)"
 
+    # Locate the transfer_stake extrinsic so it can be embedded in the
+    # commitment for O(1) validator verification (instead of block scanning).
+    payment_ref = find_payment_extrinsic(
+        subtensor=subtensor,
+        miner_coldkey=coldkey_addr,
+        payment_address=payment_coldkey,
+        netuid=netuid,
+        lookback_blocks=5,
+    )
+
+    payment_block: int | None = None
+    payment_index: int | None = None
+    if payment_ref is not None:
+        payment_block, payment_index = payment_ref
+        print(f"\n   Payment extrinsic: block {payment_block}, index {payment_index}")
+    else:
+        print("\n   Warning: could not locate payment extrinsic (validator will scan)")
+
     current_block = subtensor.get_current_block()
     block_hash = subtensor.get_block_hash(current_block)
 
@@ -270,6 +288,8 @@ def pay_submission_fee(
         "burn_hotkey": burn_hotkey,
         "payment_coldkey": payment_coldkey,
         "netuid": netuid,
+        "payment_block": payment_block,
+        "payment_index": payment_index,
     }
 
     print("\n[OK] Submission fee paid!")
@@ -357,8 +377,10 @@ def commit_to_chain(
             return False, f"Payment failed: {pay_result}"
 
         print("\n   Payment successful. Proceeding to commit...")
+        pay_result_dict = pay_result  # type: dict
     else:
         print("\n   Payment disabled in hparams. Skipping fee.")
+        pay_result_dict = None
 
     print("\nCommitting to blockchain...")
     print(f"   Network: {network}")
@@ -367,9 +389,17 @@ def commit_to_chain(
     print(f"   Reveal blocks: {blocks_until_reveal} (from hparams.json)")
     print(f"   Block time: {block_time}s (from hparams.json)")
 
-    # Commitment data: packed format to fit 128-byte on-chain limit
-    # Format: <32 hex hash>:<url>  (33 bytes overhead, leaves 95 for URL)
-    commitment_data = f"{code_hash}:{code_url}"
+    # Commitment data: packed format to fit 128-byte on-chain limit.
+    # If payment extrinsic ref is available, embed it for O(1) validator lookup:
+    #   <32hex>:<block>:<index>:<url>   (~46 bytes overhead, ~82 for URL)
+    # Otherwise fall back to legacy format:
+    #   <32hex>:<url>                   (33 bytes overhead, 95 for URL)
+    pay_block = pay_result_dict.get("payment_block") if pay_result_dict else None
+    pay_index = pay_result_dict.get("payment_index") if pay_result_dict else None
+    if pay_block is not None and pay_index is not None:
+        commitment_data = f"{code_hash}:{pay_block}:{pay_index}:{code_url}"
+    else:
+        commitment_data = f"{code_hash}:{code_url}"
 
     print(f"   Commitment size: {len(commitment_data)} bytes")
     if len(commitment_data) > 128:

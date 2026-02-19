@@ -335,3 +335,185 @@ async def verify_payment_on_chain_async(
             min_amount=min_amount,
         ),
     )
+
+
+def verify_payment_direct(
+    subtensor: bt.subtensor,
+    block_number: int,
+    extrinsic_index: int,
+    miner_coldkey: str,
+    payment_address: str,
+    netuid: int,
+    min_amount: int = 0,
+) -> PaymentInfo | None:
+    """O(1) payment verification using a miner-provided extrinsic reference.
+
+    Instead of scanning a range of blocks, fetches a single block and validates
+    that the extrinsic at the given index is a valid transfer_stake from the
+    miner to the payment address.  This is secure because the blockchain data
+    itself is the source of truth — a miner cannot forge an extrinsic.
+
+    Args:
+        subtensor: Subtensor connection
+        block_number: Block containing the payment extrinsic
+        extrinsic_index: Index of the extrinsic within that block
+        miner_coldkey: Expected source coldkey
+        payment_address: Expected destination coldkey
+        netuid: Expected subnet ID
+        min_amount: Minimum alpha amount required
+
+    Returns:
+        PaymentInfo if the extrinsic is a valid payment, None otherwise
+    """
+    try:
+        block_hash = subtensor.get_block_hash(block_number)
+        if block_hash is None:
+            logger.warning(f"Could not get hash for block {block_number}")
+            return None
+    except Exception as e:
+        logger.warning(f"Failed to get block hash for {block_number}: {e}")
+        return None
+
+    try:
+        block = subtensor.substrate.get_block(block_hash=block_hash)
+    except Exception as e:
+        logger.warning(f"Could not fetch block {block_number}: {e}")
+        return None
+
+    extrinsics = block.get("extrinsics", [])
+    if extrinsic_index >= len(extrinsics):
+        logger.warning(
+            f"Extrinsic index {extrinsic_index} out of range "
+            f"(block {block_number} has {len(extrinsics)} extrinsics)"
+        )
+        return None
+
+    extrinsic = extrinsics[extrinsic_index]
+    try:
+        ext_value = extrinsic.value if hasattr(extrinsic, "value") else extrinsic
+        call = ext_value.get("call", {})
+
+        if (
+            call.get("call_module") != "SubtensorModule"
+            or call.get("call_function") != "transfer_stake"
+        ):
+            logger.warning(f"Extrinsic at {block_number}:{extrinsic_index} is not a transfer_stake")
+            return None
+
+        raw_address = ext_value.get("address", "")
+        sender = raw_address.get("Id", "") if isinstance(raw_address, dict) else raw_address
+        if sender != miner_coldkey:
+            logger.warning(f"Extrinsic sender {sender[:16]}... != expected {miner_coldkey[:16]}...")
+            return None
+
+        call_args = {arg["name"]: arg["value"] for arg in call.get("call_args", [])}
+
+        dest_coldkey = call_args.get("destination_coldkey")
+        if isinstance(dest_coldkey, dict):
+            dest_coldkey = dest_coldkey.get("Id", "")
+        if dest_coldkey != payment_address:
+            logger.warning(
+                f"Extrinsic destination {str(dest_coldkey)[:16]}... "
+                f"!= expected {payment_address[:16]}..."
+            )
+            return None
+
+        origin_netuid = call_args.get("origin_netuid")
+        if origin_netuid is None or int(origin_netuid) != int(netuid):
+            logger.warning(f"Extrinsic netuid {origin_netuid} != expected {netuid}")
+            return None
+
+        alpha_amount = call_args.get("alpha_amount", 0)
+        if alpha_amount <= 0:
+            return None
+
+        if alpha_amount < min_amount:
+            logger.warning(f"Extrinsic alpha_amount {alpha_amount} < min {min_amount}")
+            return None
+
+        if _check_extrinsic_failed(subtensor, block_hash, extrinsic_index):
+            logger.warning(f"Extrinsic at {block_number}:{extrinsic_index} failed on-chain")
+            return None
+
+        logger.info(
+            f"Direct verification OK: block {block_number} extrinsic {extrinsic_index} "
+            f"({alpha_amount} alpha)"
+        )
+        return PaymentInfo(
+            block_hash=block_hash,
+            extrinsic_index=extrinsic_index,
+            alpha_amount=alpha_amount,
+            coldkey=miner_coldkey,
+        )
+
+    except Exception as e:
+        logger.warning(f"Error validating extrinsic at {block_number}:{extrinsic_index}: {e}")
+        return None
+
+
+async def verify_payment_direct_async(
+    subtensor: bt.subtensor,
+    block_number: int,
+    extrinsic_index: int,
+    miner_coldkey: str,
+    payment_address: str,
+    netuid: int,
+    min_amount: int = 0,
+) -> PaymentInfo | None:
+    """Async wrapper for verify_payment_direct."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: verify_payment_direct(
+            subtensor=subtensor,
+            block_number=block_number,
+            extrinsic_index=extrinsic_index,
+            miner_coldkey=miner_coldkey,
+            payment_address=payment_address,
+            netuid=netuid,
+            min_amount=min_amount,
+        ),
+    )
+
+
+def find_payment_extrinsic(
+    subtensor: bt.subtensor,
+    miner_coldkey: str,
+    payment_address: str,
+    netuid: int,
+    lookback_blocks: int = 5,
+) -> tuple[int, int] | None:
+    """Locate the miner's own transfer_stake extrinsic in recent blocks.
+
+    Called by the miner immediately after a successful transfer_stake to
+    discover the block number and extrinsic index, which are then embedded
+    in the commitment for O(1) validator verification.
+
+    Args:
+        subtensor: Subtensor connection
+        miner_coldkey: The miner's coldkey that sent the transfer
+        payment_address: Destination coldkey
+        netuid: Subnet ID
+        lookback_blocks: How many recent blocks to search
+
+    Returns:
+        (block_number, extrinsic_index) if found, None otherwise
+    """
+    current_block = subtensor.get_current_block()
+    for block_num in range(current_block, max(0, current_block - lookback_blocks), -1):
+        try:
+            block_hash = subtensor.get_block_hash(block_num)
+            if block_hash is None:
+                continue
+            payment = _scan_block_for_transfer_stake(
+                subtensor=subtensor,
+                block_hash=block_hash,
+                miner_coldkey=miner_coldkey,
+                payment_address=payment_address,
+                netuid=netuid,
+            )
+            if payment is not None:
+                return (block_num, payment.extrinsic_index)
+        except Exception:
+            continue
+    return None

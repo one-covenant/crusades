@@ -34,6 +34,7 @@ from crusades.chain.commitments import (
 from crusades.chain.payment import (
     get_hotkey_owner,
     resolve_payment_address,
+    verify_payment_direct_async,
     verify_payment_on_chain_async,
 )
 from crusades.chain.weights import WeightSetter
@@ -308,9 +309,9 @@ class Validator(BaseNode):
     ) -> bool:
         """Verify that the miner has paid the submission fee via alpha transfer.
 
-        Scans recent blocks for a SubtensorModule.transfer_stake extrinsic from
-        the miner's coldkey to the burn_uid owner's coldkey, and records the
-        payment in the database to prevent double-spend.
+        When the commitment contains a payment extrinsic reference (block +
+        index), performs an O(1) direct lookup.  Falls back to scanning recent
+        blocks for legacy commitments without the reference.
 
         Returns:
             True if payment verified (or payments disabled), False otherwise
@@ -373,15 +374,39 @@ class Validator(BaseNode):
         except Exception as e:
             logger.warning(f"Could not query AMM rate, skipping amount check: {e}")
 
-        payment = await verify_payment_on_chain_async(
-            subtensor=self.chain.subtensor,
-            miner_coldkey=miner_coldkey,
-            commitment_block=commitment.reveal_block,
-            payment_address=payment_address,
-            netuid=netuid,
-            scan_blocks=scan_blocks,
-            min_amount=min_alpha,
-        )
+        # O(1) direct lookup when the miner embedded the extrinsic reference.
+        # Falls back to block scanning for legacy commitments without the ref.
+        payment = None
+        if commitment.has_payment_ref:
+            logger.info(
+                f"Direct payment lookup: block {commitment.payment_block} "
+                f"extrinsic {commitment.payment_extrinsic_index}"
+            )
+            payment = await verify_payment_direct_async(
+                subtensor=self.chain.subtensor,
+                block_number=commitment.payment_block,
+                extrinsic_index=commitment.payment_extrinsic_index,
+                miner_coldkey=miner_coldkey,
+                payment_address=payment_address,
+                netuid=netuid,
+                min_amount=min_alpha,
+            )
+            if payment is None:
+                logger.warning(
+                    f"Direct lookup failed for block {commitment.payment_block}:"
+                    f"{commitment.payment_extrinsic_index}, falling back to scan"
+                )
+
+        if payment is None:
+            payment = await verify_payment_on_chain_async(
+                subtensor=self.chain.subtensor,
+                miner_coldkey=miner_coldkey,
+                commitment_block=commitment.reveal_block,
+                payment_address=payment_address,
+                netuid=netuid,
+                scan_blocks=scan_blocks,
+                min_amount=min_alpha,
+            )
 
         if payment is None:
             logger.warning(

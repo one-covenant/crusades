@@ -7,12 +7,19 @@ URL-Based Architecture with Timelock Encryption:
 - After reveal_blocks, validators can read decrypted URL
 - Validator fetches code from URL and evaluates
 
-Commitment format (packed, fits 128-byte on-chain limit):
+Commitment formats (packed, fits 128-byte on-chain limit):
+
+  Legacy (no payment ref):
     <32 hex hash>:<url>
     Example: cf4817d9793e92a0...1354f9:https://example.com/train.py
 
+  With payment reference (enables O(1) validator lookup):
+    <32 hex hash>:<block_number>:<extrinsic_index>:<url>
+    Example: cf4817d9793e92a0...1354f9:12345678:3:https://example.com/train.py
+
   - 32 hex chars = 128-bit truncated SHA256
-  - 33 bytes overhead, leaves 95 bytes for URL
+  - Legacy: 33 bytes overhead, leaves 95 bytes for URL
+  - With payment ref: ~46 bytes overhead, leaves ~82 bytes for URL
 """
 
 import ipaddress
@@ -140,7 +147,8 @@ class CodeUrlInfo:
 class MinerCommitment:
     """A miner's commitment from the blockchain.
 
-    Contains code URL for validator to fetch miner's train.py.
+    Contains code URL for validator to fetch miner's train.py, and optionally
+    the payment extrinsic reference for O(1) verification.
     """
 
     uid: int
@@ -149,6 +157,8 @@ class MinerCommitment:
     reveal_block: int
     is_revealed: bool
     raw_data: str
+    payment_block: int | None = None
+    payment_extrinsic_index: int | None = None
 
     @classmethod
     def from_chain_data(
@@ -161,10 +171,9 @@ class MinerCommitment:
     ) -> "MinerCommitment | None":
         """Parse commitment from blockchain data.
 
-        Expects JSON format with code URL:
-        {
-            "code_url": "https://example.com/train.py"
-        }
+        Supports two packed formats:
+          - Legacy:       <32hex>:<url>
+          - With payment: <32hex>:<block>:<index>:<url>
 
         Args:
             uid: Miner UID
@@ -181,22 +190,31 @@ class MinerCommitment:
 
         data = data.strip()
 
-        # Limit commitment size to prevent DoS via huge JSON payloads
         if len(data) > MAX_COMMITMENT_SIZE:
             logger.warning(
                 f"Commitment from UID {uid} exceeds max size ({len(data)} > {MAX_COMMITMENT_SIZE}), skipping"
             )
             return None
 
-        # Parse packed format: <32 hex chars>:<url>
-        # Fits 128-byte on-chain limit (33 bytes overhead, 95 for URL)
-        packed_match = re.match(r"^([0-9a-f]{32}):(https?://.+)$", data)
-        if not packed_match:
-            logger.debug(f"Invalid commitment format from UID {uid}: {data[:50]}...")
-            return None
+        payment_block: int | None = None
+        payment_ext_idx: int | None = None
 
-        code_hash = packed_match.group(1)
-        code_url = packed_match.group(2)
+        # Try new format first: <32hex>:<block>:<index>:<url>
+        pay_match = re.match(r"^([0-9a-f]{32}):(\d{1,10}):(\d{1,5}):(https?://.+)$", data)
+        if pay_match:
+            code_hash = pay_match.group(1)
+            payment_block = int(pay_match.group(2))
+            payment_ext_idx = int(pay_match.group(3))
+            code_url = pay_match.group(4)
+        else:
+            # Legacy format: <32hex>:<url>
+            packed_match = re.match(r"^([0-9a-f]{32}):(https?://.+)$", data)
+            if not packed_match:
+                logger.debug(f"Invalid commitment format from UID {uid}: {data[:50]}...")
+                return None
+            code_hash = packed_match.group(1)
+            code_url = packed_match.group(2)
+
         code_url_info = CodeUrlInfo(url=code_url, code_hash=code_hash)
         logger.debug(f"Commitment from UID {uid}: {code_url[:50]}...")
 
@@ -207,7 +225,14 @@ class MinerCommitment:
             reveal_block=reveal_block,
             is_revealed=current_block >= reveal_block,
             raw_data=data,
+            payment_block=payment_block,
+            payment_extrinsic_index=payment_ext_idx,
         )
+
+    @property
+    def has_payment_ref(self) -> bool:
+        """Whether this commitment includes a payment extrinsic reference."""
+        return self.payment_block is not None and self.payment_extrinsic_index is not None
 
     def has_valid_code_url(self) -> bool:
         """Check if this commitment has a valid code URL."""
