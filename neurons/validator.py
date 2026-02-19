@@ -332,8 +332,21 @@ class Validator(BaseNode):
             f"(coldkey: {miner_coldkey[:16]}..., dest: {payment_address[:16]}...)"
         )
 
-        # Scan chain for matching transfer_stake extrinsic
-        # Allow 5% slippage: AMM conversion yields slightly less alpha than TAO input
+        # Convert fee_rao (TAO) to expected alpha using the subnet AMM rate.
+        min_alpha = 0
+        try:
+            subnet_info = self.chain.subtensor.subnet(netuid=netuid)
+            expected_alpha, _ = subnet_info.tao_to_alpha_with_slippage(
+                bt.Balance.from_rao(hparams.payment.fee_rao)
+            )
+            min_alpha = int(expected_alpha.rao * 0.90)
+            logger.debug(
+                f"Payment min_alpha: {min_alpha} "
+                f"(fee_rao={hparams.payment.fee_rao}, expected_alpha={expected_alpha.rao})"
+            )
+        except Exception as e:
+            logger.warning(f"Could not query AMM rate, skipping amount check: {e}")
+
         payment = await verify_payment_on_chain_async(
             subtensor=self.chain.subtensor,
             miner_coldkey=miner_coldkey,
@@ -341,7 +354,7 @@ class Validator(BaseNode):
             payment_address=payment_address,
             netuid=netuid,
             scan_blocks=scan_blocks,
-            min_amount=int(hparams.payment.fee_rao * 0.95),
+            min_amount=min_alpha,
         )
 
         if payment is None:
@@ -351,9 +364,19 @@ class Validator(BaseNode):
             )
             return False
 
-        # Check for double-spend
+        # Check for double-spend, but allow idempotent retries.
         already_used = await self.db.is_payment_used(payment.block_hash, payment.extrinsic_index)
         if already_used:
+            existing_payment = await self.db.get_payment_for_submission(submission_id)
+            if (
+                existing_payment
+                and existing_payment.block_hash == payment.block_hash
+                and existing_payment.extrinsic_index == payment.extrinsic_index
+            ):
+                logger.info(
+                    f"Payment for {submission_id} already recorded (idempotent retry) — reusing"
+                )
+                return True
             logger.warning(
                 f"Payment at block {payment.block_hash[:16]}... extrinsic {payment.extrinsic_index} "
                 f"already used for another submission"
@@ -371,6 +394,15 @@ class Validator(BaseNode):
                 amount_rao=payment.alpha_amount,
             )
         except ValueError:
+            # Concurrent insert won the race — check if it was for this same submission
+            existing_payment = await self.db.get_payment_for_submission(submission_id)
+            if (
+                existing_payment
+                and existing_payment.block_hash == payment.block_hash
+                and existing_payment.extrinsic_index == payment.extrinsic_index
+            ):
+                logger.info(f"Payment for {submission_id} recorded by concurrent task — reusing")
+                return True
             logger.warning(
                 f"Payment at block {payment.block_hash[:16]}... extrinsic {payment.extrinsic_index} "
                 f"was concurrently claimed by another submission"
