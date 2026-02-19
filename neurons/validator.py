@@ -179,14 +179,18 @@ class Validator(BaseNode):
         # Load persisted state
         await self._load_state()
 
-        # Record the block at which this validator session started.
-        # Only commitments with reveal_block >= start_block will be accepted,
-        # preventing miners from pre-submitting before the validator is live.
+        # Record the block at which this validator session started, minus a
+        # grace period so commitments submitted during brief downtime (crash,
+        # upgrade) are not permanently skipped.
+        grace_blocks = hparams.payment.scan_blocks if hparams.payment.enabled else 0
         try:
-            self.start_block = self.chain.subtensor.get_current_block()
+            current = self.chain.subtensor.get_current_block()
         except Exception:
-            self.start_block = self.last_processed_block
-        logger.info(f"   Start window block: {self.start_block}")
+            current = self.last_processed_block
+        self.start_block = max(0, current - grace_blocks)
+        logger.info(
+            f"   Start window block: {self.start_block} (current={current}, grace={grace_blocks})"
+        )
 
         logger.info(f"   Affinetes mode: {self.affinetes_mode}")
         logger.info(f"   Model: {hparams.benchmark_model_name}")
