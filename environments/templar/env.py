@@ -1051,7 +1051,7 @@ def _load_model(model_path: str, use_random_init: bool = False):
             config,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            attn_implementation="sdpa",
+            attn_implementation="flash_attention_2",
         )
         model = model.to(device)
         logger.info(f"Model loaded on {device}")
@@ -1063,7 +1063,7 @@ def _load_model(model_path: str, use_random_init: bool = False):
             torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
-            attn_implementation="sdpa",
+            attn_implementation="flash_attention_2",
             local_files_only=True,
         )
 
