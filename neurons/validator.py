@@ -35,7 +35,6 @@ from crusades.chain.payment import (
     get_hotkey_owner,
     resolve_payment_address,
     verify_payment_direct_async,
-    verify_payment_on_chain_async,
 )
 from crusades.chain.weights import WeightSetter
 from crusades.config import get_config, get_hparams
@@ -181,8 +180,8 @@ class Validator(BaseNode):
 
         # Record the block at which this validator session started, minus a
         # grace period so commitments submitted during brief downtime (crash,
-        # upgrade) are not permanently skipped.
-        grace_blocks = hparams.payment.scan_blocks if hparams.payment.enabled else 0
+        # upgrade) are not permanently skipped.  200 blocks ≈ 40 min at 12s.
+        grace_blocks = 200 if hparams.payment.enabled else 0
         try:
             current = self.chain.subtensor.get_current_block()
         except Exception:
@@ -330,7 +329,6 @@ class Validator(BaseNode):
             logger.error("No chain connection — cannot verify payment")
             return False
 
-        scan_blocks = hparams.payment.scan_blocks
         netuid = hparams.netuid
 
         # Use explicit payment_address if configured, otherwise derive from burn_uid
@@ -378,39 +376,29 @@ class Validator(BaseNode):
         except Exception as e:
             logger.warning(f"Could not query AMM rate, skipping amount check: {e}")
 
-        # O(1) direct lookup when the miner embedded the extrinsic reference.
-        # Falls back to block scanning for legacy commitments without the ref.
-        payment = None
-        if commitment.has_payment_ref:
-            logger.info(
-                f"Direct payment lookup: block {commitment.payment_block} "
-                f"extrinsic {commitment.payment_extrinsic_index}"
+        # O(1) direct lookup using the extrinsic reference embedded in the
+        # commitment.  Miners must include the payment ref; commitments
+        # without one are rejected.
+        if not commitment.has_payment_ref:
+            logger.warning(
+                f"Commitment from {commitment.hotkey[:16]}... has no payment "
+                f"extrinsic reference — rejecting"
             )
-            payment = await verify_payment_direct_async(
-                subtensor=self.chain.subtensor,
-                block_number=commitment.payment_block,
-                extrinsic_index=commitment.payment_extrinsic_index,
-                miner_coldkey=miner_coldkey,
-                payment_address=payment_address,
-                netuid=netuid,
-                min_amount=min_alpha,
-            )
-            if payment is None:
-                logger.warning(
-                    f"Direct lookup failed for block {commitment.payment_block}:"
-                    f"{commitment.payment_extrinsic_index}, falling back to scan"
-                )
+            return False
 
-        if payment is None:
-            payment = await verify_payment_on_chain_async(
-                subtensor=self.chain.subtensor,
-                miner_coldkey=miner_coldkey,
-                commitment_block=commitment.reveal_block,
-                payment_address=payment_address,
-                netuid=netuid,
-                scan_blocks=scan_blocks,
-                min_amount=min_alpha,
-            )
+        logger.info(
+            f"Direct payment lookup: block {commitment.payment_block} "
+            f"extrinsic {commitment.payment_extrinsic_index}"
+        )
+        payment = await verify_payment_direct_async(
+            subtensor=self.chain.subtensor,
+            block_number=commitment.payment_block,
+            extrinsic_index=commitment.payment_extrinsic_index,
+            miner_coldkey=miner_coldkey,
+            payment_address=payment_address,
+            netuid=netuid,
+            min_amount=min_alpha,
+        )
 
         if payment is None:
             logger.warning(

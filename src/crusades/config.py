@@ -61,9 +61,10 @@ class PaymentConfig(BaseModel):
 
     Miners stake TAO as alpha then transfer_stake it to the coldkey that
     owns burn_uid's hotkey. The destination is derived from the metagraph
-    at runtime. The validator scans for a SubtensorModule.transfer_stake
-    extrinsic on-chain before evaluating. Unlike plain add_stake, a
-    transfer_stake moves ownership to a different coldkey — irreversible.
+    at runtime. The miner embeds the payment extrinsic reference (block +
+    index) in the commitment so the validator performs an O(1) on-chain
+    lookup. Unlike plain add_stake, a transfer_stake moves ownership to a
+    different coldkey — irreversible.
 
     If payment_address is set, it overrides the burn_uid → coldkey resolution
     and payments go directly to the specified SS58 address.
@@ -71,7 +72,6 @@ class PaymentConfig(BaseModel):
 
     enabled: bool = False
     fee_rao: int = 100_000_000  # 0.1 TAO in RAO (1 TAO = 1e9 RAO)
-    scan_blocks: int = 200  # How many blocks around commitment to scan for payment
     payment_address: str = ""  # Explicit SS58 coldkey; empty = derive from burn_uid
 
 

@@ -6,9 +6,9 @@ alpha tokens to the coldkey that owns the burn_uid's hotkey on the subnet.
 The destination address is derived at runtime from the metagraph:
   burn_uid → metagraph.hotkeys[burn_uid] → get_hotkey_owner() → coldkey
 
-The verification scans a configurable window of blocks around the commitment
-for a SubtensorModule.transfer_stake extrinsic from the miner's coldkey to
-the owner's coldkey.
+The miner embeds the payment extrinsic reference (block number + index) in
+the commitment data. The validator performs an O(1) direct lookup to verify
+the specific SubtensorModule.transfer_stake extrinsic on-chain.
 """
 
 import asyncio
@@ -221,136 +221,6 @@ def _scan_block_for_transfer_stake(
             continue
 
     return None
-
-
-def _scan_block_range(
-    subtensor: bt.subtensor,
-    start_block: int,
-    end_block: int,
-    miner_coldkey: str,
-    payment_address: str,
-    netuid: int,
-    min_amount: int = 0,
-) -> PaymentInfo | None:
-    """Scan a range of blocks (end_block down to start_block) for a matching transfer_stake."""
-    for block_num in range(end_block, start_block - 1, -1):
-        try:
-            block_hash = subtensor.get_block_hash(block_num)
-            if block_hash is None:
-                continue
-
-            payment = _scan_block_for_transfer_stake(
-                subtensor=subtensor,
-                block_hash=block_hash,
-                miner_coldkey=miner_coldkey,
-                payment_address=payment_address,
-                netuid=netuid,
-                min_amount=min_amount,
-            )
-
-            if payment is not None:
-                logger.info(
-                    f"Found valid payment at block {block_num} "
-                    f"(extrinsic {payment.extrinsic_index}, "
-                    f"{payment.alpha_amount} alpha)"
-                )
-                return payment
-
-        except Exception as e:
-            logger.debug(f"Error scanning block {block_num}: {e}")
-            continue
-
-    return None
-
-
-def verify_payment_on_chain(
-    subtensor: bt.subtensor,
-    miner_coldkey: str,
-    commitment_block: int,
-    payment_address: str,
-    netuid: int,
-    scan_blocks: int = 200,
-    fast_scan_blocks: int = 15,
-    min_amount: int = 0,
-) -> PaymentInfo | None:
-    """Scan a range of blocks for a valid transfer_stake payment from the miner.
-
-    Uses a two-phase approach: first checks the most recent blocks (where
-    the payment is most likely to be), then falls back to a full scan.
-
-    Args:
-        subtensor: Subtensor connection
-        miner_coldkey: The miner's coldkey that should have sent the transfer
-        commitment_block: The block the commitment was revealed at
-        payment_address: Destination coldkey SS58 to check transfers against
-        netuid: Expected subnet ID
-        scan_blocks: How many blocks back to scan (full range)
-        fast_scan_blocks: How many recent blocks to check first
-        min_amount: Minimum alpha amount required (reject payments below this)
-
-    Returns:
-        PaymentInfo if valid payment found, None otherwise
-    """
-    start_block = max(0, commitment_block - scan_blocks)
-    end_block = commitment_block
-    fast_boundary = max(end_block - fast_scan_blocks + 1, start_block)
-
-    logger.info(
-        f"Scanning blocks {start_block}-{end_block} for transfer_stake payment "
-        f"from {miner_coldkey[:16]}... to {payment_address[:16]}... on netuid {netuid}"
-    )
-
-    # Fast pass: most miners pay shortly before committing
-    payment = _scan_block_range(
-        subtensor, fast_boundary, end_block, miner_coldkey, payment_address, netuid, min_amount
-    )
-    if payment is not None:
-        return payment
-
-    # Full scan: check remaining older blocks
-    if fast_boundary > start_block:
-        logger.debug(f"Fast scan miss, scanning remaining blocks {start_block}-{fast_boundary - 1}")
-        payment = _scan_block_range(
-            subtensor,
-            start_block,
-            fast_boundary - 1,
-            miner_coldkey,
-            payment_address,
-            netuid,
-            min_amount,
-        )
-        if payment is not None:
-            return payment
-
-    logger.warning(
-        f"No valid payment found in blocks {start_block}-{end_block} from {miner_coldkey[:16]}..."
-    )
-    return None
-
-
-async def verify_payment_on_chain_async(
-    subtensor: bt.subtensor,
-    miner_coldkey: str,
-    commitment_block: int,
-    payment_address: str,
-    netuid: int,
-    scan_blocks: int = 200,
-    min_amount: int = 0,
-) -> PaymentInfo | None:
-    """Async wrapper for verify_payment_on_chain."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
-        lambda: verify_payment_on_chain(
-            subtensor=subtensor,
-            miner_coldkey=miner_coldkey,
-            commitment_block=commitment_block,
-            payment_address=payment_address,
-            netuid=netuid,
-            scan_blocks=scan_blocks,
-            min_amount=min_amount,
-        ),
-    )
 
 
 def verify_payment_direct(

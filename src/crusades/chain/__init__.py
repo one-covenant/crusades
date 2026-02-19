@@ -6,7 +6,6 @@ from .payment import (
     find_payment_extrinsic,
     resolve_payment_address,
     verify_payment_direct_async,
-    verify_payment_on_chain_async,
 )
 from .weights import WeightSetter
 
@@ -17,5 +16,4 @@ __all__ = [
     "find_payment_extrinsic",
     "resolve_payment_address",
     "verify_payment_direct_async",
-    "verify_payment_on_chain_async",
 ]
