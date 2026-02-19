@@ -18,6 +18,7 @@ import urllib.request
 
 import bittensor as bt
 
+from crusades.chain.payment import resolve_payment_address
 from crusades.config import HParams
 
 
@@ -129,32 +130,37 @@ def _resolve_burn_hotkey(subtensor: bt.subtensor, netuid: int, burn_uid: int) ->
         return None
 
 
-def stake_submission_fee(
+def pay_submission_fee(
     wallet: bt.wallet,
     subtensor: bt.subtensor,
     netuid: int,
     fee_rao: int,
     burn_uid: int,
+    payment_coldkey: str,
 ) -> tuple[bool, dict | str]:
-    """Stake TAO into the subnet's burn address as a submission fee.
+    """Pay submission fee by staking TAO then transferring the alpha to the owner.
 
-    Creates alpha tokens by staking TAO to the burn_uid's hotkey.
-    The miner cannot recover this stake — it belongs to the burn address.
+    Two-step process:
+    1. add_stake: converts TAO to alpha on the burn_uid's hotkey
+    2. transfer_stake: moves alpha ownership to the subnet operator's coldkey
+
+    The transfer_stake makes the payment irreversible — the miner cannot
+    reclaim the alpha after it's transferred to a different coldkey.
 
     Args:
-        wallet: Bittensor wallet (coldkey signs the transfer)
+        wallet: Bittensor wallet (coldkey signs both transactions)
         subtensor: Subtensor connection
         netuid: Subnet to stake into
-        fee_rao: Amount to stake in RAO (1 TAO = 1e9 RAO)
+        fee_rao: Amount in RAO (1 TAO = 1e9 RAO)
         burn_uid: UID of the burn address on the subnet
+        payment_coldkey: Destination coldkey SS58 address (owner)
 
     Returns:
         Tuple of (success, result_dict_or_error_message)
     """
     fee_tao = fee_rao / 1e9
-    tx_fee_buffer_rao = 50_000_000  # 0.05 TAO reserve for transaction fees
+    tx_fee_buffer_rao = 100_000_000  # 0.1 TAO reserve for two tx fees
 
-    # Resolve burn hotkey from metagraph
     burn_hotkey = _resolve_burn_hotkey(subtensor, netuid, burn_uid)
     if burn_hotkey is None:
         return False, f"Could not resolve hotkey for burn_uid {burn_uid} on subnet {netuid}"
@@ -175,23 +181,26 @@ def stake_submission_fee(
         return False, f"Failed to check balance: {e}"
 
     print(f"\n{'=' * 60}")
-    print("SUBMISSION FEE (staked to burn address)")
+    print("SUBMISSION FEE (alpha transfer)")
     print(f"{'=' * 60}")
     print(f"   Amount: {fee_rao} RAO ({fee_tao} TAO)")
     print(f"   Subnet: {netuid}")
     print(f"   Burn UID: {burn_uid}")
     print(f"   Burn hotkey: {burn_hotkey[:16]}...")
+    print(f"   Owner coldkey: {payment_coldkey[:16]}...")
     print(f"   Balance: {balance_rao / 1e9:.4f} TAO")
-    print(f"\nThis stakes {fee_tao} TAO to the subnet burn address (irrecoverable).")
+    print(f"\nThis stakes {fee_tao} TAO as alpha, then transfers it to the")
+    print("subnet operator's coldkey (irreversible).")
 
     confirm = input("\nProceed with payment? [y/N]: ").strip().lower()
     if confirm != "y":
         return False, "Payment cancelled by user"
 
-    print("\nStaking submission fee to burn address...")
+    # Step 1: Stake TAO → alpha
+    print("\n[1/2] Staking TAO to create alpha...")
     try:
         amount = bt.Balance.from_rao(fee_rao)
-        success = subtensor.add_stake(
+        stake_ok = subtensor.add_stake(
             wallet=wallet,
             hotkey_ss58=burn_hotkey,
             netuid=netuid,
@@ -199,30 +208,61 @@ def stake_submission_fee(
             wait_for_inclusion=True,
             wait_for_finalization=True,
         )
-
-        if success:
-            current_block = subtensor.get_current_block()
-            block_hash = subtensor.get_block_hash(current_block)
-
-            result = {
-                "amount_rao": fee_rao,
-                "block": current_block,
-                "block_hash": block_hash,
-                "burn_hotkey": burn_hotkey,
-                "netuid": netuid,
-            }
-
-            print("\n[OK] Submission fee paid!")
-            print(f"   Block: {current_block}")
-            print(f"   Block hash: {block_hash}")
-            print("\n   SAVE THESE DETAILS - they are your proof of payment for disputes")
-
-            return True, result
-        else:
-            return False, "Staking transaction failed"
-
+        if not stake_ok:
+            return False, "add_stake transaction failed"
     except Exception as e:
-        return False, f"Staking error: {e}"
+        return False, f"add_stake error: {e}"
+
+    # Get alpha amount created
+    alpha_staked = subtensor.get_stake(
+        coldkey_ss58=coldkey_addr, hotkey_ss58=burn_hotkey, netuid=netuid
+    )
+    alpha_rao = alpha_staked.rao if hasattr(alpha_staked, "rao") else int(alpha_staked)
+    if alpha_rao <= 0:
+        return False, "add_stake succeeded but no alpha balance found"
+    print(f"      Alpha created: {alpha_rao} ({alpha_staked})")
+
+    # Step 2: Transfer alpha ownership to the owner's coldkey
+    print("[2/2] Transferring alpha to subnet operator...")
+    try:
+        transfer_ok = subtensor.transfer_stake(
+            wallet=wallet,
+            destination_coldkey_ss58=payment_coldkey,
+            hotkey_ss58=burn_hotkey,
+            origin_netuid=netuid,
+            destination_netuid=netuid,
+            amount=alpha_staked,
+            wait_for_inclusion=True,
+            wait_for_finalization=True,
+        )
+        if not transfer_ok:
+            return (
+                False,
+                "transfer_stake transaction failed (alpha still staked under your coldkey)",
+            )
+    except Exception as e:
+        return False, f"transfer_stake error: {e} (alpha still staked under your coldkey)"
+
+    current_block = subtensor.get_current_block()
+    block_hash = subtensor.get_block_hash(current_block)
+
+    result = {
+        "amount_rao": fee_rao,
+        "alpha_rao": alpha_rao,
+        "block": current_block,
+        "block_hash": block_hash,
+        "burn_hotkey": burn_hotkey,
+        "payment_coldkey": payment_coldkey,
+        "netuid": netuid,
+    }
+
+    print("\n[OK] Submission fee paid!")
+    print(f"   Block: {current_block}")
+    print(f"   Block hash: {block_hash}")
+    print(f"   Alpha transferred: {alpha_rao}")
+    print("\n   SAVE THESE DETAILS - they are your proof of payment for disputes")
+
+    return True, result
 
 
 def commit_to_chain(
@@ -272,14 +312,26 @@ def commit_to_chain(
     # --- Payment step ---
     if hparams.payment.enabled:
         fee_rao = hparams.payment.fee_rao
-        print(f"\n--- SUBMISSION FEE ({fee_rao / 1e9} TAO → burn address) ---")
 
-        pay_success, pay_result = stake_submission_fee(
+        # Derive payment destination: burn_uid → hotkey → coldkey owner
+        payment_coldkey = resolve_payment_address(subtensor, netuid, hparams.burn_uid)
+        if payment_coldkey is None:
+            return (
+                False,
+                f"Payment failed: could not resolve payment address from burn_uid {hparams.burn_uid}",
+            )
+
+        print(
+            f"\n--- SUBMISSION FEE ({fee_rao / 1e9} TAO as alpha → {payment_coldkey[:16]}...) ---"
+        )
+
+        pay_success, pay_result = pay_submission_fee(
             wallet=wallet,
             subtensor=subtensor,
             netuid=netuid,
             fee_rao=fee_rao,
             burn_uid=hparams.burn_uid,
+            payment_coldkey=payment_coldkey,
         )
 
         if not pay_success:

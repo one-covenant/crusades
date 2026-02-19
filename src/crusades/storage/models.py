@@ -80,7 +80,7 @@ class SubmissionModel(Base):
     code_content: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Rate limiting handled by checking commit_block in submission_id
-    payment_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    payment_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # Relationships
     evaluations: Mapped[list["EvaluationModel"]] = relationship(
@@ -141,10 +141,10 @@ class AdaptiveThresholdModel(Base):
 class VerifiedPaymentModel(Base):
     """Database model for tracking verified submission payments.
 
-    Records staking transactions from miners that serve as submission fees.
+    Records transfer_stake transactions from miners that serve as submission fees.
     Used to prevent double-spend (same payment claimed for multiple submissions).
 
-    Each record links a unique on-chain staking extrinsic to a submission.
+    Each record links a unique on-chain transfer_stake extrinsic to a submission.
     """
 
     __tablename__ = "verified_payments"

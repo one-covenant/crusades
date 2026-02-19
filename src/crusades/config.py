@@ -59,10 +59,11 @@ class AdaptiveThresholdConfig(BaseModel):
 class PaymentConfig(BaseModel):
     """Submission payment settings.
 
-    Miners must stake TAO into the subnet as a fee before each submission.
-    This creates alpha tokens which can be burned daily, benefiting the subnet.
-
-    The validator verifies the staking event on-chain before evaluating.
+    Miners stake TAO as alpha then transfer_stake it to the coldkey that
+    owns burn_uid's hotkey. The destination is derived from the metagraph
+    at runtime. The validator scans for a SubtensorModule.transfer_stake
+    extrinsic on-chain before evaluating. Unlike plain add_stake, a
+    transfer_stake moves ownership to a different coldkey — irreversible.
     """
 
     enabled: bool = True
@@ -178,7 +179,7 @@ class HParams(BaseModel):
     def _validate_scan_window(self) -> Self:
         """Ensure payment.scan_blocks >= reveal_blocks.
 
-        The miner stakes ~reveal_blocks before the reveal. If scan_blocks
+        The miner transfers ~reveal_blocks before the reveal. If scan_blocks
         is smaller, the payment will always fall outside the scan window
         and every verification will silently fail.
         """

@@ -19,6 +19,8 @@ from pathlib import Path
 
 import bittensor as bt
 
+from crusades.chain.payment import resolve_payment_address
+
 
 def load_hparams():
     hparams_path = Path(__file__).parent.parent / "hparams" / "hparams.json"
@@ -26,13 +28,6 @@ def load_hparams():
         with open(hparams_path) as f:
             return json.load(f)
     return {}
-
-
-def resolve_burn_hotkey(sub, netuid, burn_uid):
-    metagraph = sub.metagraph(netuid)
-    if burn_uid >= len(metagraph.hotkeys):
-        return None
-    return metagraph.hotkeys[burn_uid]
 
 
 def inspect_block(sub, block_hash=None, block_number=None):
@@ -48,8 +43,8 @@ def inspect_block(sub, block_hash=None, block_number=None):
     return block, block_hash
 
 
-def find_stake_payments(block, netuid, burn_hotkey):
-    """Find all add_stake extrinsics in a block targeting the burn hotkey."""
+def find_transfer_stake_payments(block, payment_address, netuid):
+    """Find all transfer_stake extrinsics in a block targeting the payment address."""
     payments = []
     extrinsics = block.get("extrinsics", [])
 
@@ -59,34 +54,39 @@ def find_stake_payments(block, netuid, burn_hotkey):
             call_module = call.get("call_module", "")
             call_function = call.get("call_function", "")
 
-            if call_module == "SubtensorModule" and call_function == "add_stake":
+            if call_module == "SubtensorModule" and call_function == "transfer_stake":
                 params = {p["name"]: p["value"] for p in call.get("call_args", [])}
 
-                hotkey_raw = params.get("hotkey", "")
-                if isinstance(hotkey_raw, dict):
-                    hotkey_raw = hotkey_raw.get("Id", hotkey_raw)
+                dest_coldkey = params.get("destination_coldkey", "")
+                if isinstance(dest_coldkey, dict):
+                    dest_coldkey = dest_coldkey.get("Id", dest_coldkey)
 
-                target_netuid = params.get("netuid", None)
-                amount_raw = params.get("amount_staked", 0)
+                hotkey = params.get("hotkey", "")
+                if isinstance(hotkey, dict):
+                    hotkey = hotkey.get("Id", hotkey)
+
+                origin_netuid = params.get("origin_netuid")
+                dest_netuid = params.get("destination_netuid")
+                alpha_amount = params.get("alpha_amount", 0)
 
                 sender = ext.value.get("address", "unknown")
                 if isinstance(sender, dict):
                     sender = sender.get("Id", sender)
 
-                is_match = str(hotkey_raw) == str(burn_hotkey) and (
-                    target_netuid is None or int(target_netuid) == int(netuid)
+                is_match = str(dest_coldkey) == str(payment_address) and (
+                    origin_netuid is None or int(origin_netuid) == int(netuid)
                 )
 
                 payments.append(
                     {
                         "extrinsic_index": idx,
                         "sender_coldkey": sender,
-                        "target_hotkey": hotkey_raw,
-                        "target_netuid": target_netuid,
-                        "amount_rao": amount_raw,
-                        "amount_tao": amount_raw / 1e9 if amount_raw else 0,
-                        "matches_burn": is_match,
-                        "call_function": call_function,
+                        "dest_coldkey": dest_coldkey,
+                        "hotkey": hotkey,
+                        "origin_netuid": origin_netuid,
+                        "dest_netuid": dest_netuid,
+                        "alpha_amount": alpha_amount,
+                        "matches_payment": is_match,
                     }
                 )
         except Exception as e:
@@ -109,6 +109,11 @@ def main():
     parser.add_argument(
         "--network", default="finney", help="Network: finney, local, test (default: finney)"
     )
+    parser.add_argument(
+        "--payment-address",
+        type=str,
+        help="Override payment dest address (default: derived from burn_uid)",
+    )
     parser.add_argument("--netuid", type=int, help="Subnet UID (default: from hparams.json)")
     parser.add_argument("--burn-uid", type=int, help="Burn UID (default: from hparams.json)")
     args = parser.parse_args()
@@ -119,24 +124,26 @@ def main():
     hparams = load_hparams()
     netuid = args.netuid or hparams.get("netuid", 2)
     burn_uid = args.burn_uid if args.burn_uid is not None else hparams.get("burn_uid", 0)
-    fee_rao = hparams.get("payment", {}).get("fee_rao", 100_000_000)
-
-    print("=" * 60)
-    print("PAYMENT VERIFICATION")
-    print("=" * 60)
-    print(f"  Network:      {args.network}")
-    print(f"  Netuid:       {netuid}")
-    print(f"  Burn UID:     {burn_uid}")
-    print(f"  Required fee: {fee_rao:,} RAO ({fee_rao / 1e9:.4f} TAO)")
 
     print(f"\nConnecting to {args.network}...")
     sub = bt.subtensor(network=args.network)
 
-    burn_hotkey = resolve_burn_hotkey(sub, netuid, burn_uid)
-    if not burn_hotkey:
-        print(f"  ERROR: Could not resolve burn UID {burn_uid} on subnet {netuid}")
-        sys.exit(1)
-    print(f"  Burn hotkey:  {burn_hotkey}")
+    # Resolve payment address: explicit override or derive from burn_uid
+    payment_address = args.payment_address
+    if not payment_address:
+        print(f"  Resolving payment address from burn_uid {burn_uid} on subnet {netuid}...")
+        payment_address = resolve_payment_address(sub, netuid, burn_uid)
+        if not payment_address:
+            print(f"  ERROR: Could not resolve payment address from burn_uid {burn_uid}")
+            sys.exit(1)
+
+    print("=" * 60)
+    print("PAYMENT VERIFICATION")
+    print("=" * 60)
+    print(f"  Network:         {args.network}")
+    print(f"  Netuid:          {netuid}")
+    print(f"  Burn UID:        {burn_uid}")
+    print(f"  Payment address: {payment_address}")
 
     print("\nFetching block...")
     try:
@@ -176,38 +183,34 @@ def main():
             print(f"  [{idx}] ERROR: {e}")
 
     print(f"\n{'=' * 60}")
-    print("STAKE PAYMENTS (add_stake to burn address)")
+    print("ALPHA TRANSFER PAYMENTS (transfer_stake to payment address)")
     print(f"{'=' * 60}")
-    payments = find_stake_payments(block, netuid, burn_hotkey)
-    stake_payments = [p for p in payments if "error" not in p]
+    payments = find_transfer_stake_payments(block, payment_address, netuid)
+    valid_payments = [p for p in payments if "error" not in p]
 
-    if not stake_payments:
-        print("  No add_stake extrinsics found in this block.")
+    if not valid_payments:
+        print("  No transfer_stake extrinsics found in this block.")
 
-    for p in stake_payments:
-        match_str = "YES" if p["matches_burn"] else "NO"
-        sufficient = p["amount_rao"] >= fee_rao if p["amount_rao"] else False
-        sufficient_str = "YES" if sufficient else "NO"
+    for p in valid_payments:
+        match_str = "YES" if p["matches_payment"] else "NO"
 
         print(f"\n  Extrinsic #{p['extrinsic_index']}:")
-        print(f"    Sender (coldkey): {p['sender_coldkey']}")
-        print(f"    Target hotkey:    {p['target_hotkey']}")
-        print(f"    Target netuid:    {p['target_netuid']}")
-        print(f"    Amount:           {p['amount_rao']:,} RAO ({p['amount_tao']:.4f} TAO)")
-        print(f"    Matches burn:     {match_str}")
-        print(f"    Sufficient:       {sufficient_str} (required: {fee_rao:,} RAO)")
+        print(f"    Sender (coldkey):  {p['sender_coldkey']}")
+        print(f"    Dest coldkey:      {p['dest_coldkey']}")
+        print(f"    Hotkey:            {p['hotkey']}")
+        print(f"    Origin netuid:     {p['origin_netuid']}")
+        print(f"    Dest netuid:       {p['dest_netuid']}")
+        print(f"    Alpha amount:      {p['alpha_amount']}")
+        print(f"    Matches payment:   {match_str}")
 
-        if p["matches_burn"] and sufficient:
+        if p["matches_payment"]:
             print("\n    >>> VALID PAYMENT <<<")
-        elif p["matches_burn"] and not sufficient:
-            print(f"\n    >>> UNDERPAYMENT (paid {p['amount_rao']:,}, need {fee_rao:,}) <<<")
         else:
-            print("\n    >>> NOT A BURN PAYMENT (different target) <<<")
+            print("\n    >>> NOT A PAYMENT (different destination or netuid) <<<")
 
-    valid = [p for p in stake_payments if p["matches_burn"] and p.get("amount_rao", 0) >= fee_rao]
+    valid = [p for p in valid_payments if p["matches_payment"]]
 
-    # If no payment found, scan nearby blocks (miner CLI often reports a
-    # slightly later block than where the extrinsic actually landed).
+    # If no payment found, scan nearby blocks
     scan_range = 5
     found_block_num = None
     found_block_hash = None
@@ -220,11 +223,11 @@ def main():
                 nearby_num = int(block_num) + offset
                 nearby_hash = sub.substrate.get_block_hash(nearby_num)
                 nearby_block = sub.substrate.get_block(block_hash=nearby_hash)
-                nearby_payments = find_stake_payments(nearby_block, netuid, burn_hotkey)
+                nearby_payments = find_transfer_stake_payments(
+                    nearby_block, payment_address, netuid
+                )
                 nearby_valid = [
-                    p
-                    for p in nearby_payments
-                    if "error" not in p and p["matches_burn"] and p.get("amount_rao", 0) >= fee_rao
+                    p for p in nearby_payments if "error" not in p and p["matches_payment"]
                 ]
                 if nearby_valid:
                     valid = nearby_valid
@@ -233,7 +236,7 @@ def main():
                     print(f"  >>> Found payment in block {nearby_num} (offset {offset:+d})")
                     for p in valid:
                         print(f"      Extrinsic #{p['extrinsic_index']}: {p['sender_coldkey']}")
-                        print(f"      Amount: {p['amount_rao']:,} RAO ({p['amount_tao']:.4f} TAO)")
+                        print(f"      Alpha: {p['alpha_amount']}")
                     break
             except Exception as e:
                 print(f"    (block {nearby_num}: fetch failed — {e})")
@@ -248,7 +251,7 @@ def main():
         actual_hash = found_block_hash or block_hash
         print("  PAYMENT VERIFIED")
         print(f"  Miner coldkey: {p['sender_coldkey']}")
-        print(f"  Amount:        {p['amount_rao']:,} RAO ({p['amount_tao']:.4f} TAO)")
+        print(f"  Alpha amount:  {p['alpha_amount']}")
         print(f"  Block:         {actual_block}")
         print(f"  Block hash:    {actual_hash}")
         print(f"  Extrinsic:     #{p['extrinsic_index']}")
@@ -256,8 +259,7 @@ def main():
             print(
                 f"\n  NOTE: Payment was in block {found_block_num}, not the reported {block_num}."
             )
-            print("  This is normal — add_stake() can report a slightly later block.")
-        print(f"\n  To refund, send {p['amount_tao']:.4f} TAO to coldkey:")
+        print("\n  To refund, transfer equivalent TAO to coldkey:")
         print(f"    {p['sender_coldkey']}")
     else:
         print("  NO VALID PAYMENT FOUND")

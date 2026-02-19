@@ -33,6 +33,7 @@ from crusades.chain.commitments import (
 )
 from crusades.chain.payment import (
     get_hotkey_owner,
+    resolve_payment_address,
     verify_payment_on_chain_async,
 )
 from crusades.chain.weights import WeightSetter
@@ -287,10 +288,11 @@ class Validator(BaseNode):
         commitment: MinerCommitment,
         submission_id: str,
     ) -> bool:
-        """Verify that the miner has paid the submission fee by staking into the subnet.
+        """Verify that the miner has paid the submission fee via alpha transfer.
 
-        Scans recent blocks for an add_stake extrinsic from the miner's coldkey
-        and records the payment in the database to prevent double-spend.
+        Scans recent blocks for a SubtensorModule.transfer_stake extrinsic from
+        the miner's coldkey to the burn_uid owner's coldkey, and records the
+        payment in the database to prevent double-spend.
 
         Returns:
             True if payment verified (or payments disabled), False otherwise
@@ -305,23 +307,13 @@ class Validator(BaseNode):
             logger.error("No chain connection — cannot verify payment")
             return False
 
-        fee_rao = hparams.payment.fee_rao
         scan_blocks = hparams.payment.scan_blocks
         netuid = hparams.netuid
-        burn_uid = hparams.burn_uid
 
-        # Resolve burn hotkey from metagraph so we can verify stake destination
-        burn_hotkey: str | None = None
-        try:
-            metagraph = self.chain.subtensor.metagraph(netuid)
-            if burn_uid < len(metagraph.hotkeys):
-                burn_hotkey = metagraph.hotkeys[burn_uid]
-                logger.debug(f"Burn hotkey for UID {burn_uid}: {burn_hotkey[:16]}...")
-        except Exception as e:
-            logger.warning(f"Could not resolve burn hotkey for UID {burn_uid}: {e}")
-
-        if burn_hotkey is None:
-            logger.error(f"Cannot resolve burn hotkey for UID {burn_uid} — cannot verify payment")
+        # Derive payment destination: burn_uid → hotkey → coldkey owner
+        payment_address = resolve_payment_address(self.chain.subtensor, netuid, hparams.burn_uid)
+        if payment_address is None:
+            logger.error("Could not resolve payment address from burn_uid — cannot verify payment")
             return False
 
         # Look up miner's coldkey from their hotkey
@@ -337,24 +329,24 @@ class Validator(BaseNode):
 
         logger.info(
             f"Verifying payment for {commitment.hotkey[:16]}... "
-            f"(coldkey: {miner_coldkey[:16]}..., burn: {burn_hotkey[:16]}...)"
+            f"(coldkey: {miner_coldkey[:16]}..., dest: {payment_address[:16]}...)"
         )
 
-        # Scan chain for matching staking extrinsic targeting the burn hotkey
+        # Scan chain for matching transfer_stake extrinsic
         payment = await verify_payment_on_chain_async(
             subtensor=self.chain.subtensor,
             miner_coldkey=miner_coldkey,
             commitment_block=commitment.reveal_block,
+            payment_address=payment_address,
             netuid=netuid,
-            min_amount_rao=fee_rao,
             scan_blocks=scan_blocks,
-            burn_hotkey=burn_hotkey,
+            min_amount=hparams.payment.fee_rao,
         )
 
         if payment is None:
             logger.warning(
                 f"No valid payment found for {commitment.hotkey[:16]}... "
-                f"(required {fee_rao} RAO stake on netuid {netuid})"
+                f"(required transfer_stake to {payment_address[:16]}... on netuid {netuid})"
             )
             return False
 
@@ -367,18 +359,25 @@ class Validator(BaseNode):
             )
             return False
 
-        # Record the payment
-        await self.db.record_verified_payment(
-            submission_id=submission_id,
-            miner_hotkey=commitment.hotkey,
-            miner_coldkey=miner_coldkey,
-            block_hash=payment.block_hash,
-            extrinsic_index=payment.extrinsic_index,
-            amount_rao=payment.amount_rao,
-        )
+        # Record the payment (unique constraint guards against concurrent claims)
+        try:
+            await self.db.record_verified_payment(
+                submission_id=submission_id,
+                miner_hotkey=commitment.hotkey,
+                miner_coldkey=miner_coldkey,
+                block_hash=payment.block_hash,
+                extrinsic_index=payment.extrinsic_index,
+                amount_rao=payment.alpha_amount,
+            )
+        except ValueError:
+            logger.warning(
+                f"Payment at block {payment.block_hash[:16]}... extrinsic {payment.extrinsic_index} "
+                f"was concurrently claimed by another submission"
+            )
+            return False
 
         logger.info(
-            f"Payment verified: {payment.amount_rao} RAO at block "
+            f"Payment verified: {payment.alpha_amount} alpha at block "
             f"{payment.block_hash[:16]}... extrinsic {payment.extrinsic_index}"
         )
         return True
@@ -444,7 +443,7 @@ class Validator(BaseNode):
                 status=SubmissionStatus.FAILED_EVALUATION,
                 payment_verified=False,
                 spec_version=crusades.COMPETITION_VERSION,
-                error_message="Payment not verified: no valid stake payment found on-chain",
+                error_message="Payment not verified: no valid transfer_stake payment found on-chain",
             )
             try:
                 await self.db.save_submission(failed_submission)

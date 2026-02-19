@@ -1,7 +1,13 @@
 """Bittensor chain integration."""
 
 from .manager import ChainManager
-from .payment import PaymentInfo, verify_payment_on_chain_async
+from .payment import PaymentInfo, resolve_payment_address, verify_payment_on_chain_async
 from .weights import WeightSetter
 
-__all__ = ["ChainManager", "PaymentInfo", "WeightSetter", "verify_payment_on_chain_async"]
+__all__ = [
+    "ChainManager",
+    "PaymentInfo",
+    "WeightSetter",
+    "resolve_payment_address",
+    "verify_payment_on_chain_async",
+]
