@@ -856,28 +856,33 @@ asyncio.run(main())
         deploy_name = f"templar-eval-{uuid.uuid4().hex[:8]}"
         logger.info(f"   Deployment name: {deploy_name}")
 
+        deployment = None
         try:
             deploy_start = time.time()
             client = BasilicaClient()
 
-            deployment = client.deploy(
-                name=deploy_name,
+            # Use create_deployment + wait_until_ready instead of deploy()
+            # so we always hold a reference to delete on failure.
+            response = client.create_deployment(
+                instance_name=deploy_name,
                 image=self.basilica_image,
                 port=8000,
                 ttl_seconds=self.basilica_ttl_seconds,
-                timeout=600,
                 gpu_count=self.basilica_gpu_count,
                 gpu_models=self.basilica_gpu_models,
                 min_gpu_memory_gb=self.basilica_min_gpu_memory_gb,
                 cpu=self.basilica_cpu,
                 memory=self.basilica_memory,
             )
+            deployment = client.get(response.instance_name)
+            logger.info(f"   Basilica ID: {deployment.name}")
+
+            deployment.wait_until_ready(timeout=600)
+            deployment.refresh()
 
             deploy_time = time.time() - deploy_start
-            logger.info(f"[BASILICA] Deployment created in {deploy_time:.1f}s")
+            logger.info(f"[BASILICA] Deployment ready in {deploy_time:.1f}s")
             logger.info(f"   Deployment URL: {deployment.url}")
-            if hasattr(deployment, "id"):
-                logger.info(f"   Deployment ID: {deployment.id}")
             logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
             logger.info(
                 f"   TTL: {self.basilica_ttl_seconds}s (expires in {self.basilica_ttl_seconds / 60:.0f} min)"
@@ -892,14 +897,12 @@ asyncio.run(main())
             logger.error("[BASILICA] Failed to deploy!")
             logger.error(f"   Error: {e}")
             logger.error(traceback.format_exc())
-            # deploy() may have created the deployment on Basilica before
-            # timing out — clean it up by name so it doesn't leak.
-            try:
-                client = BasilicaClient()
-                client.delete_deployment(deploy_name)
-                logger.info(f"[BASILICA] Cleaned up failed deployment '{deploy_name}'")
-            except Exception:
-                pass
+            if deployment is not None:
+                try:
+                    deployment.delete()
+                    logger.info(f"[BASILICA] Cleaned up failed deployment '{deployment.name}'")
+                except Exception as del_err:
+                    logger.warning(f"[BASILICA] Failed to clean up deployment: {del_err}")
             return None
 
     async def delete_basilica_deployment(self) -> None:
