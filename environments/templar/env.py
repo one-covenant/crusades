@@ -1283,9 +1283,14 @@ def _get_cached_model(model_path: str, use_random_init: bool = False):
 
 
 def _create_data_iterator(
-    data: torch.Tensor, batch_size: int, sequence_length: int
+    data: torch.Tensor, batch_size: int, sequence_length: int, *, offset: int = 0
 ) -> Iterator[torch.Tensor]:
-    """Create infinite data iterator."""
+    """Create infinite data iterator.
+
+    Args:
+        offset: Starting sample index. Used to give warmup a different data
+            slice than the timed run, preventing work-displacement attacks.
+    """
     if data.size(1) < sequence_length:
         raise ValueError(f"Data sequence length {data.size(1)} < required {sequence_length}")
 
@@ -1293,7 +1298,7 @@ def _create_data_iterator(
     num_samples = data.size(0)
 
     def _iter():
-        idx = 0
+        idx = offset % num_samples if num_samples > 0 else 0
         while True:
             end_idx = idx + batch_size
             if end_idx > num_samples:
@@ -2168,10 +2173,27 @@ class Actor:
                     "code": code,
                 }
 
-            # Reset model for miner's code
-            model.load_state_dict(initial_state)
+            # ── Anti-work-displacement: warmup uses different weights & data ──
+            # torch.compile / CUDA graphs are shape-dependent, not value-dependent,
+            # so warmup still compiles correctly.  But the miner cannot precompute
+            # timed-run results because the starting weights and data offset differ.
+            # No load_state_dict needed here — we randomize in-place on the model's
+            # existing tensors (preserving shapes/device).  The real initial_state
+            # is restored at the reset step after warmup completes.
+            with torch.no_grad():
+                for p in model.parameters():
+                    p.uniform_(-0.1, 0.1)
+
+            warmup_data_offset = int.from_bytes(os.urandom(4), "big") % max(data.size(0), 1)
+            logger.info(
+                "Warmup using perturbed weights and data offset=%d (anti-displacement)",
+                warmup_data_offset,
+            )
+
             warmup_steps = 2
-            data_iter_warmup = _create_data_iterator(data, batch_size, seq_len)
+            data_iter_warmup = _create_data_iterator(
+                data, batch_size, seq_len, offset=warmup_data_offset
+            )
             optimizer_warmup = _create_optimizer(model)
 
             logger.info(f"Running {warmup_steps} warmup step(s) to check for basic errors...")
