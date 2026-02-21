@@ -262,23 +262,36 @@ def pay_submission_fee(
 
     # Locate the transfer_stake extrinsic so it can be embedded in the
     # commitment for O(1) validator verification.
-    payment_ref = find_payment_extrinsic(
-        subtensor=subtensor,
-        miner_coldkey=coldkey_addr,
-        payment_address=payment_coldkey,
-        netuid=netuid,
-        lookback_blocks=5,
-    )
-
-    payment_block: int | None = None
-    payment_index: int | None = None
-    if payment_ref is not None:
-        payment_block, payment_index = payment_ref
-        print(f"\n   Payment extrinsic: block {payment_block}, index {payment_index}")
-    else:
-        print(
-            "\n   WARNING: could not locate payment extrinsic — validator will reject this submission"
+    # Retry with increasing lookback to handle RPC lag / finalization delay.
+    payment_ref = None
+    for attempt, lookback in enumerate((5, 10, 20), start=1):
+        payment_ref = find_payment_extrinsic(
+            subtensor=subtensor,
+            miner_coldkey=coldkey_addr,
+            payment_address=payment_coldkey,
+            netuid=netuid,
+            lookback_blocks=lookback,
         )
+        if payment_ref is not None:
+            break
+        if attempt < 3:
+            import time as _time
+
+            print(
+                f"\n   Retrying payment extrinsic lookup (attempt {attempt}/3, lookback={lookback})..."
+            )
+            _time.sleep(3)
+
+    if payment_ref is None:
+        return (
+            False,
+            "Could not locate payment extrinsic on-chain after retries. "
+            "The payment was sent but cannot be referenced — validator will reject. "
+            "Try again or contact support.",
+        )
+
+    payment_block, payment_index = payment_ref
+    print(f"\n   Payment extrinsic: block {payment_block}, index {payment_index}")
 
     current_block = subtensor.get_current_block()
     block_hash = subtensor.get_block_hash(current_block)

@@ -74,7 +74,6 @@ class Validator(BaseNode):
 
         # State
         self.last_processed_block: int = 0
-        self.start_block: int = 0  # Set at startup; reject commitments before this
         # Map URL -> (reveal_block, hotkey) to track first committer
         # Pruned to MAX_EVALUATED_URLS to prevent unbounded memory growth
         self.evaluated_code_urls: dict[str, tuple[int, str]] = {}
@@ -178,19 +177,6 @@ class Validator(BaseNode):
         # Load persisted state
         await self._load_state()
 
-        # Record the block at which this validator session started, minus a
-        # grace period so commitments submitted during brief downtime (crash,
-        # upgrade) are not permanently skipped.  200 blocks ≈ 40 min at 12s.
-        grace_blocks = 200 if hparams.payment.enabled else 0
-        try:
-            current = self.chain.subtensor.get_current_block()
-        except Exception:
-            current = self.last_processed_block
-        self.start_block = max(0, current - grace_blocks)
-        logger.info(
-            f"   Start window block: {self.start_block} (current={current}, grace={grace_blocks})"
-        )
-
         logger.info(f"   Affinetes mode: {self.affinetes_mode}")
         logger.info(f"   Model: {hparams.benchmark_model_name}")
         logger.info(f"   Dataset: {hparams.benchmark_dataset_name}")
@@ -262,14 +248,6 @@ class Validator(BaseNode):
                         )
                         continue
 
-                    # Reject commitments from before this validator session started
-                    if commitment.reveal_block < self.start_block:
-                        logger.info(
-                            f"Skipping commitment from UID {commitment.uid}: "
-                            f"reveal_block {commitment.reveal_block} < start_block {self.start_block}"
-                        )
-                        continue
-
                     # Use code URL as unique identifier - first committer wins
                     code_url = commitment.code_url_info.url
                     if code_url in self.evaluated_code_urls:
@@ -323,6 +301,12 @@ class Validator(BaseNode):
 
         if not hparams.payment.enabled:
             logger.debug("Payment verification disabled in hparams")
+            return True
+
+        if commitment.hotkey in hparams.payment.skip_payment_hotkeys:
+            logger.info(
+                f"Skipping payment for {commitment.hotkey[:16]}... (in skip_payment_hotkeys)"
+            )
             return True
 
         if self.chain is None:

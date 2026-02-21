@@ -92,19 +92,22 @@ def _check_extrinsic_failed(
     to prevent a hung node from blocking the validator indefinitely.
     """
     for attempt in range(1 + retries):
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(subtensor.substrate.get_events, block_hash=block_hash)
-                events = future.result(timeout=_RPC_TIMEOUT_SECONDS)
+            future = pool.submit(subtensor.substrate.get_events, block_hash=block_hash)
+            events = future.result(timeout=_RPC_TIMEOUT_SECONDS)
+            pool.shutdown(wait=False)
             for event in events:
                 if event.get("extrinsic_idx") != extrinsic_index:
                     continue
-                module = event["event"]["module_id"]
-                event_id = event["event"]["event_id"]
+                ev = event.get("event", {})
+                module = ev.get("module_id", "")
+                event_id = ev.get("event_id", "")
                 if module == "System" and event_id == "ExtrinsicFailed":
                     return True
             return False
         except concurrent.futures.TimeoutError:
+            pool.shutdown(wait=False, cancel_futures=True)
             logger.warning(
                 f"get_events timed out after {_RPC_TIMEOUT_SECONDS}s "
                 f"(attempt {attempt + 1}/{1 + retries})"
@@ -114,6 +117,7 @@ def _check_extrinsic_failed(
                 return True
             time.sleep(1)
         except Exception as e:
+            pool.shutdown(wait=False)
             if attempt < retries:
                 logger.warning(
                     f"Could not check extrinsic events (attempt {attempt + 1}/{1 + retries}): {e}"
@@ -175,6 +179,7 @@ def _scan_block_for_transfer_stake(
                 sender = raw_address.get("Id", "")
             else:
                 sender = raw_address
+            sender = sender or ""
             if sender != miner_coldkey:
                 continue
 
@@ -267,7 +272,7 @@ def verify_payment_direct(
         return None
 
     extrinsics = block.get("extrinsics", [])
-    if extrinsic_index >= len(extrinsics):
+    if extrinsic_index < 0 or extrinsic_index >= len(extrinsics):
         logger.warning(
             f"Extrinsic index {extrinsic_index} out of range "
             f"(block {block_number} has {len(extrinsics)} extrinsics)"
@@ -288,6 +293,7 @@ def verify_payment_direct(
 
         raw_address = ext_value.get("address", "")
         sender = raw_address.get("Id", "") if isinstance(raw_address, dict) else raw_address
+        sender = sender or ""
         if sender != miner_coldkey:
             logger.warning(f"Extrinsic sender {sender[:16]}... != expected {miner_coldkey[:16]}...")
             return None
@@ -400,6 +406,7 @@ def find_payment_extrinsic(
             )
             if payment is not None:
                 return (block_num, payment.extrinsic_index)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Error scanning block {block_num} for payment extrinsic: {e}")
             continue
     return None

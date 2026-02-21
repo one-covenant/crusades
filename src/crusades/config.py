@@ -53,7 +53,7 @@ class AdaptiveThresholdConfig(BaseModel):
 
     base_threshold: float = 0.02  # Minimum threshold (2%)
     decay_percent: float = 0.05  # Percent to lose per interval (5% = loses 5% of excess)
-    decay_interval_blocks: int = 10  # Blocks between decay steps (~2 min)
+    decay_interval_blocks: int = 100  # Blocks between decay steps (~20 min)
 
 
 class PaymentConfig(BaseModel):
@@ -73,24 +73,18 @@ class PaymentConfig(BaseModel):
     enabled: bool = False
     fee_rao: int = 100_000_000  # 0.1 TAO in RAO (1 TAO = 1e9 RAO)
     payment_address: str = ""  # Explicit SS58 coldkey; empty = derive from burn_uid
+    skip_payment_hotkeys: list[str] = []  # Hotkeys exempt from payment (e.g., validator's own)
 
     @field_validator("payment_address")
     @classmethod
     def _validate_payment_address(cls, v: str) -> str:
         if not v:
             return v
+        from substrateinterface.utils.ss58 import ss58_decode
+
         try:
-            import ss58
-        except ImportError:
-            if not (v.startswith("5") and 46 <= len(v) <= 48):
-                raise ValueError(
-                    f"payment_address looks invalid (length {len(v)}, "
-                    f"expected 46-48 starting with '5'): {v[:20]}..."
-                )
-            return v
-        try:
-            ss58.decode(v)
-        except Exception as exc:
+            ss58_decode(v)
+        except ValueError as exc:
             raise ValueError(f"payment_address is not a valid SS58 address: {exc}") from exc
         return v
 
