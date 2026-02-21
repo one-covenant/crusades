@@ -1288,8 +1288,7 @@ def _create_data_iterator(
     """Create infinite data iterator.
 
     Args:
-        offset: Starting sample index. Used to give warmup a different data
-            slice than the timed run, preventing work-displacement attacks.
+        offset: Starting sample index for the data iterator.
     """
     if data.size(1) < sequence_length:
         raise ValueError(f"Data sequence length {data.size(1)} < required {sequence_length}")
@@ -2173,20 +2172,15 @@ class Actor:
                     "code": code,
                 }
 
-            # ── Anti-work-displacement: warmup uses different weights & data ──
-            # torch.compile / CUDA graphs are shape-dependent, not value-dependent,
-            # so warmup still compiles correctly.  But the miner cannot precompute
-            # timed-run results because the starting weights and data offset differ.
-            # No load_state_dict needed here — we randomize in-place on the model's
-            # existing tensors (preserving shapes/device).  The real initial_state
-            # is restored at the reset step after warmup completes.
+            # Warmup uses randomized weights and a random data offset.
+            # The real initial_state is restored after warmup completes.
             with torch.no_grad():
                 for p in model.parameters():
                     p.uniform_(-0.1, 0.1)
 
             warmup_data_offset = int.from_bytes(os.urandom(4), "big") % max(data.size(0), 1)
             logger.info(
-                "Warmup using perturbed weights and data offset=%d (anti-displacement)",
+                "Warmup using perturbed weights and data offset=%d",
                 warmup_data_offset,
             )
 

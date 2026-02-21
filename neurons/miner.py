@@ -174,9 +174,9 @@ def pay_submission_fee(
 
         if balance_rao < required_rao:
             return False, (
-                f"Insufficient balance. Need {fee_rao} RAO ({fee_tao} TAO) "
+                f"Insufficient balance. Need {fee_tao:.4f} TAO "
                 f"+ ~{tx_fee_buffer_rao / 1e9:.2f} TAO tx fees, "
-                f"have {balance_rao} RAO ({balance_rao / 1e9:.4f} TAO)"
+                f"have {balance_rao / 1e9:.4f} TAO"
             )
     except Exception as e:
         return False, f"Failed to check balance: {e}"
@@ -184,13 +184,13 @@ def pay_submission_fee(
     print(f"\n{'=' * 60}")
     print("SUBMISSION FEE (alpha transfer)")
     print(f"{'=' * 60}")
-    print(f"   Amount: {fee_rao} RAO ({fee_tao} TAO)")
+    print(f"   Amount: {fee_tao:.4f} TAO")
     print(f"   Subnet: {netuid}")
     print(f"   Burn UID: {burn_uid}")
     print(f"   Burn hotkey: {burn_hotkey[:16]}...")
     print(f"   Owner coldkey: {payment_coldkey[:16]}...")
-    print(f"   Balance: {balance_rao / 1e9:.4f} TAO")
-    print(f"\nThis stakes {fee_tao} TAO as alpha, then transfers it to the")
+    print(f"   Your balance: {balance_rao / 1e9:.4f} TAO")
+    print(f"\nThis stakes {fee_tao:.4f} TAO as alpha, then transfers it to the")
     print("subnet operator's coldkey (irreversible).")
 
     confirm = input("\nProceed with payment? [y/N]: ").strip().lower()
@@ -235,7 +235,9 @@ def pay_submission_fee(
 
     if new_alpha_rao <= 0:
         return False, "add_stake succeeded but no new alpha balance detected"
-    print(f"      Alpha created: {new_alpha_rao} (total on hotkey: {post_alpha_rao})")
+    print(
+        f"      Alpha created: {new_alpha_rao / 1e9:.4f} (total on hotkey: {post_alpha_rao / 1e9:.4f})"
+    )
 
     transfer_amount = bt.Balance.from_rao(new_alpha_rao)
 
@@ -309,9 +311,10 @@ def pay_submission_fee(
     }
 
     print("\n[OK] Submission fee paid!")
+    print(f"   TAO spent: {fee_tao:.4f}")
+    print(f"   Alpha transferred: {new_alpha_rao / 1e9:.4f}")
     print(f"   Block: {current_block}")
     print(f"   Block hash: {block_hash}")
-    print(f"   Alpha transferred: {new_alpha_rao}")
     print("\n   SAVE THESE DETAILS - they are your proof of payment for disputes")
 
     return True, result
@@ -380,7 +383,7 @@ def commit_to_chain(
                 )
 
         print(
-            f"\n--- SUBMISSION FEE ({fee_rao / 1e9} TAO as alpha → {payment_coldkey[:16]}...) ---"
+            f"\n--- SUBMISSION FEE ({fee_rao / 1e9:.4f} TAO as alpha → {payment_coldkey[:16]}...) ---"
         )
 
         pay_success, pay_result = pay_submission_fee(
