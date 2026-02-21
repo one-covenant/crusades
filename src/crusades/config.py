@@ -74,6 +74,8 @@ class PaymentConfig(BaseModel):
     fee_rao: int = 100_000_000  # 0.1 TAO in RAO (1 TAO = 1e9 RAO)
     payment_address: str = ""  # Explicit SS58 coldkey; empty = derive from burn_uid
     skip_payment_hotkeys: list[str] = []  # Hotkeys exempt from payment (e.g., validator's own)
+    rpc_timeout: int = 30  # Seconds before an RPC call is considered hung
+    rpc_retries: int = 2  # Retry count for transient RPC failures
 
     @field_validator("payment_address")
     @classmethod
@@ -186,6 +188,10 @@ class HParams(BaseModel):
 
     # Adaptive threshold for leaderboard
     adaptive_threshold: AdaptiveThresholdConfig = Field(default_factory=AdaptiveThresholdConfig)
+
+    # Validator operational limits
+    code_fetch_timeout: int = 30  # Seconds to wait when downloading miner code
+    max_evaluated_urls: int = 10_000  # Cap on tracked URLs to prevent unbounded memory
 
     # Submission payment (alpha staking fee)
     payment: PaymentConfig = Field(default_factory=PaymentConfig)

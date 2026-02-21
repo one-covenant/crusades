@@ -79,23 +79,24 @@ def resolve_payment_address(subtensor: bt.subtensor, netuid: int, burn_uid: int)
         return None
 
 
-_RPC_TIMEOUT_SECONDS = 30
-
-
 def _check_extrinsic_failed(
-    subtensor: bt.subtensor, block_hash: str, extrinsic_index: int, retries: int = 2
+    subtensor: bt.subtensor,
+    block_hash: str,
+    extrinsic_index: int,
+    retries: int = 2,
+    rpc_timeout: int = 30,
 ) -> bool:
     """Check if an extrinsic in a block failed by examining events.
 
     Retries on transient RPC failures to avoid rejecting valid payments
-    due to network hiccups. Each RPC call is capped at _RPC_TIMEOUT_SECONDS
-    to prevent a hung node from blocking the validator indefinitely.
+    due to network hiccups. Each RPC call is capped at ``rpc_timeout``
+    seconds to prevent a hung node from blocking the validator indefinitely.
     """
     for attempt in range(1 + retries):
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
             future = pool.submit(subtensor.substrate.get_events, block_hash=block_hash)
-            events = future.result(timeout=_RPC_TIMEOUT_SECONDS)
+            events = future.result(timeout=rpc_timeout)
             pool.shutdown(wait=False)
             for event in events:
                 if event.get("extrinsic_idx") != extrinsic_index:
@@ -109,8 +110,7 @@ def _check_extrinsic_failed(
         except concurrent.futures.TimeoutError:
             pool.shutdown(wait=False, cancel_futures=True)
             logger.warning(
-                f"get_events timed out after {_RPC_TIMEOUT_SECONDS}s "
-                f"(attempt {attempt + 1}/{1 + retries})"
+                f"get_events timed out after {rpc_timeout}s (attempt {attempt + 1}/{1 + retries})"
             )
             if attempt >= retries:
                 logger.error("get_events timed out on all attempts. Assuming failed to be safe.")
@@ -138,6 +138,8 @@ def _scan_block_for_transfer_stake(
     payment_address: str,
     netuid: int,
     min_amount: int = 0,
+    rpc_timeout: int = 30,
+    rpc_retries: int = 2,
 ) -> PaymentInfo | None:
     """Scan a single block for a matching transfer_stake extrinsic.
 
@@ -151,6 +153,8 @@ def _scan_block_for_transfer_stake(
         payment_address: Expected destination coldkey (burn_uid owner)
         netuid: Expected subnet ID
         min_amount: Minimum alpha amount required (reject payments below this)
+        rpc_timeout: Seconds before an RPC call is considered hung
+        rpc_retries: Retry count for transient RPC failures
 
     Returns:
         PaymentInfo if a valid payment found, None otherwise
@@ -210,7 +214,9 @@ def _scan_block_for_transfer_stake(
                 )
                 continue
 
-            if _check_extrinsic_failed(subtensor, block_hash, idx):
+            if _check_extrinsic_failed(
+                subtensor, block_hash, idx, retries=rpc_retries, rpc_timeout=rpc_timeout
+            ):
                 logger.debug(f"Found matching transfer_stake at index {idx} but it failed")
                 continue
 
@@ -236,6 +242,8 @@ def verify_payment_direct(
     payment_address: str,
     netuid: int,
     min_amount: int = 0,
+    rpc_timeout: int = 30,
+    rpc_retries: int = 2,
 ) -> PaymentInfo | None:
     """O(1) payment verification using a miner-provided extrinsic reference.
 
@@ -252,6 +260,8 @@ def verify_payment_direct(
         payment_address: Expected destination coldkey
         netuid: Expected subnet ID
         min_amount: Minimum alpha amount required
+        rpc_timeout: Seconds before an RPC call is considered hung
+        rpc_retries: Retry count for transient RPC failures
 
     Returns:
         PaymentInfo if the extrinsic is a valid payment, None otherwise
@@ -323,7 +333,9 @@ def verify_payment_direct(
             logger.warning(f"Extrinsic alpha_amount {alpha_amount} < min {min_amount}")
             return None
 
-        if _check_extrinsic_failed(subtensor, block_hash, extrinsic_index):
+        if _check_extrinsic_failed(
+            subtensor, block_hash, extrinsic_index, retries=rpc_retries, rpc_timeout=rpc_timeout
+        ):
             logger.warning(f"Extrinsic at {block_number}:{extrinsic_index} failed on-chain")
             return None
 
@@ -351,6 +363,8 @@ async def verify_payment_direct_async(
     payment_address: str,
     netuid: int,
     min_amount: int = 0,
+    rpc_timeout: int = 30,
+    rpc_retries: int = 2,
 ) -> PaymentInfo | None:
     """Async wrapper for verify_payment_direct."""
     loop = asyncio.get_running_loop()
@@ -364,6 +378,8 @@ async def verify_payment_direct_async(
             payment_address=payment_address,
             netuid=netuid,
             min_amount=min_amount,
+            rpc_timeout=rpc_timeout,
+            rpc_retries=rpc_retries,
         ),
     )
 

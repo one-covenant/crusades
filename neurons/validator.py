@@ -75,9 +75,8 @@ class Validator(BaseNode):
         # State
         self.last_processed_block: int = 0
         # Map URL -> (reveal_block, hotkey) to track first committer
-        # Pruned to MAX_EVALUATED_URLS to prevent unbounded memory growth
+        # Pruned to max_evaluated_urls (from hparams) to prevent unbounded memory growth
         self.evaluated_code_urls: dict[str, tuple[int, str]] = {}
-        self.MAX_EVALUATED_URLS: int = 10_000
 
         # Timing
         self.last_weight_set_block: int = 0
@@ -382,6 +381,8 @@ class Validator(BaseNode):
             payment_address=payment_address,
             netuid=netuid,
             min_amount=min_alpha,
+            rpc_timeout=hparams.payment.rpc_timeout,
+            rpc_retries=hparams.payment.rpc_retries,
         )
 
         if payment is None:
@@ -591,8 +592,9 @@ class Validator(BaseNode):
             opener = urllib.request.build_opener(SSRFSafeRedirectHandler())
 
             max_size = 500_000
+            hparams = get_hparams()
             req = urllib.request.Request(code_url, headers={"User-Agent": "templar-crusades"})
-            with opener.open(req, timeout=30) as response:
+            with opener.open(req, timeout=hparams.code_fetch_timeout) as response:
                 # Read in chunks with size limit
                 chunks = []
                 total_bytes = 0
@@ -1134,11 +1136,13 @@ class Validator(BaseNode):
 
     def _prune_evaluated_urls(self) -> None:
         """Prune evaluated_code_urls to prevent unbounded memory growth."""
-        if len(self.evaluated_code_urls) > self.MAX_EVALUATED_URLS:
+        hparams = get_hparams()
+        limit = hparams.max_evaluated_urls
+        if len(self.evaluated_code_urls) > limit:
             sorted_urls = sorted(
                 self.evaluated_code_urls.items(), key=lambda x: x[1][0], reverse=True
             )
-            self.evaluated_code_urls = dict(sorted_urls[: self.MAX_EVALUATED_URLS])
+            self.evaluated_code_urls = dict(sorted_urls[:limit])
 
     async def _save_state(self) -> None:
         """Persist validator state to database."""
