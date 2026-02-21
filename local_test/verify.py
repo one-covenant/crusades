@@ -987,8 +987,8 @@ def main():
     verification = hparams.get("verification", {})
     max_loss_difference = verification.get("max_loss_difference", 0.3)
     min_changed_ratio = verification.get("min_params_changed_ratio", 0.8)
-    gradient_norm_ratio_max = verification.get("gradient_norm_ratio_max", 1.10)
-    weight_relative_error_max = verification.get("weight_relative_error_max", 0.008)
+    gradient_norm_ratio_max = verification.get("gradient_norm_ratio_max", 1.08)
+    weight_relative_error_max = verification.get("weight_relative_error_max", 0.006)
 
     expected_tokens = batch_size * seq_len * num_steps
     expected_seq_len = seq_len - 1

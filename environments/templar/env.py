@@ -1805,9 +1805,9 @@ def _verify_outputs(
     candidate_grad: GradientInfo | None = None,
     reference_final_state: dict | None = None,
     model: torch.nn.Module | None = None,
-    max_loss_difference: float = 0.5,
-    gradient_norm_ratio_max: float = 1.10,
-    weight_relative_error_max: float = 0.008,
+    max_loss_difference: float = 0.3,
+    gradient_norm_ratio_max: float = 1.08,
+    weight_relative_error_max: float = 0.006,
 ) -> tuple[bool, str | None, dict]:
     """Verify candidate outputs match reference.
 
@@ -1965,15 +1965,15 @@ class Actor:
         min_trainable_params_ratio: float = 1.0,
         min_params_changed_ratio: float = 0.75,
         # Gradient verification
-        gradient_norm_ratio_max: float = 1.06,
+        gradient_norm_ratio_max: float = 1.08,
         # Weight verification
-        weight_relative_error_max: float = 0.008,
+        weight_relative_error_max: float = 0.006,
         # Timer integrity
-        timer_divergence_threshold: float = 0.05,
+        timer_divergence_threshold: float = 0.005,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
         max_plausible_mfu: float = 75.0,
-        min_mfu: float = 45.0,
+        min_mfu: float = 50.0,
         require_cuda_timing: bool = True,
         model_params_override: int | None = None,
     ) -> dict:
@@ -1995,9 +1995,9 @@ class Actor:
             use_random_init: Use random weights
             min_trainable_params_ratio: Min % params that must be trainable
             min_params_changed_ratio: Min % params that must change
-            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.10 = 10%)
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.008 = 0.8%)
-            timer_divergence_threshold: Max divergence between timer sources (e.g., 0.05 = 5%)
+            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.08 = 8%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.006 = 0.6%)
+            timer_divergence_threshold: Max divergence between timer sources (e.g., 0.005 = 0.5%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             min_mfu: Minimum MFU threshold — submissions below this are rejected
             model_params_override: Override model param count (None = auto-detect)
@@ -2784,15 +2784,15 @@ class EvaluateRequest(BaseModel):
     min_trainable_params_ratio: float = 1.0
     min_params_changed_ratio: float = 0.75
     # Gradient verification
-    gradient_norm_ratio_max: float = 1.06
+    gradient_norm_ratio_max: float = 1.08
     # Weight verification
-    weight_relative_error_max: float = 0.008
+    weight_relative_error_max: float = 0.006
     # Timer integrity
-    timer_divergence_threshold: float = 0.05
+    timer_divergence_threshold: float = 0.005
     # MFU calculation
     gpu_peak_tflops: float = 312.0
     max_plausible_mfu: float = 75.0
-    min_mfu: float = 45.0
+    min_mfu: float = 50.0
 
 
 class EvaluateResponse(BaseModel):

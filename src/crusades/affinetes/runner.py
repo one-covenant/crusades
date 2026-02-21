@@ -161,18 +161,18 @@ class AffinetesRunner:
         model_url: str | None = None,
         data_url: str | None = None,
         # Verification settings
-        max_loss_difference: float = 0.5,
+        max_loss_difference: float = 0.3,
         min_params_changed_ratio: float = 0.8,
         # Gradient verification
-        gradient_norm_ratio_max: float = 1.10,
+        gradient_norm_ratio_max: float = 1.08,
         # Weight verification
-        weight_relative_error_max: float = 0.008,
+        weight_relative_error_max: float = 0.006,
         # Timer integrity
-        timer_divergence_threshold: float = 0.05,
+        timer_divergence_threshold: float = 0.005,
         # MFU calculation
         gpu_peak_tflops: float = 312.0,
         max_plausible_mfu: float = 75.0,
-        min_mfu: float = 45.0,
+        min_mfu: float = 50.0,
         validator_image: str | None = None,
         # Basilica-specific settings
         basilica_image: str | None = None,
@@ -196,9 +196,9 @@ class AffinetesRunner:
             data_url: Default data URL (HuggingFace dataset)
             max_loss_difference: Max allowed |candidate_loss - reference_loss|
             min_params_changed_ratio: Min % params that must change
-            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.10 = 10%)
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.008 = 0.8%)
-            timer_divergence_threshold: Max allowed divergence between timer sources (e.g., 0.05 = 5%)
+            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.08 = 8%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.006 = 0.6%)
+            timer_divergence_threshold: Max allowed divergence between timer sources (e.g., 0.005 = 0.5%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             max_plausible_mfu: Reject MFU above this threshold (anti-cheat)
             min_mfu: Reject submissions below this MFU floor
@@ -448,7 +448,7 @@ asyncio.run(main())
                 if self.docker_gpu_devices.lower() == "all":
                     docker_cmd.extend(["--gpus", "all"])
                 else:
-                    docker_cmd.extend(["--gpus", f'"device={self.docker_gpu_devices}"'])
+                    docker_cmd.extend(["--gpus", f"device={self.docker_gpu_devices}"])
 
             # Memory limits (from hparams.json docker config)
             docker_cmd.extend(
