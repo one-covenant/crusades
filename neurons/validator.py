@@ -34,7 +34,7 @@ from crusades.chain.commitments import (
 from crusades.chain.payment import (
     get_hotkey_owner,
     resolve_payment_address,
-    verify_payment_on_chain_async,
+    verify_payment_direct_async,
 )
 from crusades.chain.weights import WeightSetter
 from crusades.config import get_config, get_hparams
@@ -75,9 +75,8 @@ class Validator(BaseNode):
         # State
         self.last_processed_block: int = 0
         # Map URL -> (reveal_block, hotkey) to track first committer
-        # Pruned to MAX_EVALUATED_URLS to prevent unbounded memory growth
+        # Pruned to max_evaluated_urls (from hparams) to prevent unbounded memory growth
         self.evaluated_code_urls: dict[str, tuple[int, str]] = {}
-        self.MAX_EVALUATED_URLS: int = 10_000
 
         # Timing
         self.last_weight_set_block: int = 0
@@ -290,9 +289,9 @@ class Validator(BaseNode):
     ) -> bool:
         """Verify that the miner has paid the submission fee via alpha transfer.
 
-        Scans recent blocks for a SubtensorModule.transfer_stake extrinsic from
-        the miner's coldkey to the burn_uid owner's coldkey, and records the
-        payment in the database to prevent double-spend.
+        Requires the commitment to contain a payment extrinsic reference
+        (block + index) for O(1) direct on-chain lookup.  Commitments
+        without the reference are rejected.
 
         Returns:
             True if payment verified (or payments disabled), False otherwise
@@ -303,18 +302,31 @@ class Validator(BaseNode):
             logger.debug("Payment verification disabled in hparams")
             return True
 
+        if commitment.hotkey in hparams.payment.skip_payment_hotkeys:
+            logger.info(
+                f"Skipping payment for {commitment.hotkey[:16]}... (in skip_payment_hotkeys)"
+            )
+            return True
+
         if self.chain is None:
             logger.error("No chain connection — cannot verify payment")
             return False
 
-        scan_blocks = hparams.payment.scan_blocks
         netuid = hparams.netuid
 
-        # Derive payment destination: burn_uid → hotkey → coldkey owner
-        payment_address = resolve_payment_address(self.chain.subtensor, netuid, hparams.burn_uid)
-        if payment_address is None:
-            logger.error("Could not resolve payment address from burn_uid — cannot verify payment")
-            return False
+        # Use explicit payment_address if configured, otherwise derive from burn_uid
+        if hparams.payment.payment_address:
+            payment_address = hparams.payment.payment_address
+            logger.debug(f"Using explicit payment_address: {payment_address[:16]}...")
+        else:
+            payment_address = resolve_payment_address(
+                self.chain.subtensor, netuid, hparams.burn_uid
+            )
+            if payment_address is None:
+                logger.error(
+                    "Could not resolve payment address from burn_uid — cannot verify payment"
+                )
+                return False
 
         # Look up miner's coldkey from their hotkey
         miner_coldkey = get_hotkey_owner(
@@ -347,14 +359,30 @@ class Validator(BaseNode):
         except Exception as e:
             logger.warning(f"Could not query AMM rate, skipping amount check: {e}")
 
-        payment = await verify_payment_on_chain_async(
+        # O(1) direct lookup using the extrinsic reference embedded in the
+        # commitment.  Miners must include the payment ref; commitments
+        # without one are rejected.
+        if not commitment.has_payment_ref:
+            logger.warning(
+                f"Commitment from {commitment.hotkey[:16]}... has no payment "
+                f"extrinsic reference — rejecting"
+            )
+            return False
+
+        logger.info(
+            f"Direct payment lookup: block {commitment.payment_block} "
+            f"extrinsic {commitment.payment_extrinsic_index}"
+        )
+        payment = await verify_payment_direct_async(
             subtensor=self.chain.subtensor,
+            block_number=commitment.payment_block,
+            extrinsic_index=commitment.payment_extrinsic_index,
             miner_coldkey=miner_coldkey,
-            commitment_block=commitment.reveal_block,
             payment_address=payment_address,
             netuid=netuid,
-            scan_blocks=scan_blocks,
             min_amount=min_alpha,
+            rpc_timeout=hparams.payment.rpc_timeout,
+            rpc_retries=hparams.payment.rpc_retries,
         )
 
         if payment is None:
@@ -516,6 +544,12 @@ class Validator(BaseNode):
         2. Redirects don't lead to private IP addresses
         3. Response is a single Python file, not HTML/folder
 
+        Known limitation: DNS rebinding TOCTOU -- the hostname is resolved and
+        validated before the HTTP request, but a malicious DNS server could
+        return a different (private) IP for the second resolution during
+        ``opener.open()``. The risk is low because redirect destinations are
+        also validated, and the response body is size-limited and content-checked.
+
         Args:
             code_url: The URL containing train.py code
 
@@ -558,8 +592,9 @@ class Validator(BaseNode):
             opener = urllib.request.build_opener(SSRFSafeRedirectHandler())
 
             max_size = 500_000
+            hparams = get_hparams()
             req = urllib.request.Request(code_url, headers={"User-Agent": "templar-crusades"})
-            with opener.open(req, timeout=30) as response:
+            with opener.open(req, timeout=hparams.code_fetch_timeout) as response:
                 # Read in chunks with size limit
                 chunks = []
                 total_bytes = 0
@@ -1101,11 +1136,13 @@ class Validator(BaseNode):
 
     def _prune_evaluated_urls(self) -> None:
         """Prune evaluated_code_urls to prevent unbounded memory growth."""
-        if len(self.evaluated_code_urls) > self.MAX_EVALUATED_URLS:
+        hparams = get_hparams()
+        limit = hparams.max_evaluated_urls
+        if len(self.evaluated_code_urls) > limit:
             sorted_urls = sorted(
                 self.evaluated_code_urls.items(), key=lambda x: x[1][0], reverse=True
             )
-            self.evaluated_code_urls = dict(sorted_urls[: self.MAX_EVALUATED_URLS])
+            self.evaluated_code_urls = dict(sorted_urls[:limit])
 
     async def _save_state(self) -> None:
         """Persist validator state to database."""

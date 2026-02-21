@@ -57,9 +57,14 @@
         "decay_interval_blocks": 100
     },
 
+    "code_fetch_timeout": 30,
+    "max_evaluated_urls": 10000,
+
     "payment": {
         "enabled": true,
         "fee_rao": 100000000,
-        "scan_blocks": 200
+        "payment_address": "",
+        "rpc_timeout": 30,
+        "rpc_retries": 2
     }
 }
