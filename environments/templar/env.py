@@ -2431,10 +2431,10 @@ class Actor:
                 f"{f', cuda_events={cuda_wall_time:.2f}s' if cuda_wall_time else ''})"
             )
 
-            # Non-rank-0 processes: skip verification, return minimal result
+            # Non-rank-0 processes: skip verification, return minimal result.
+            # The matching barrier lives in the finally block so rank-0 early
+            # returns (verification failures, exceptions) cannot deadlock.
             if not _IS_RANK_0:
-                if num_gpus > 1 and _WORLD_SIZE > 1:
-                    dist.barrier()
                 return {
                     "task_id": task_id,
                     "mfu": 0.0,
@@ -2693,10 +2693,6 @@ class Actor:
                         elif check.get("check") == "weight_verification":
                             error_code = "weight_mismatch"
 
-            # Barrier before returning so all ranks exit together
-            if num_gpus > 1 and _WORLD_SIZE > 1:
-                dist.barrier()
-
             return {
                 "task_id": task_id,
                 "mfu": mfu if verified else 0.0,
@@ -2760,12 +2756,14 @@ class Actor:
                 torch.cuda.empty_cache()
             _log_vram("after-cleanup")
 
-            # Destroy distributed process group if initialized
+            # Sync all ranks before teardown so no process is left
+            # blocked at a barrier.  This single barrier in finally is
+            # the ONLY barrier after the timed eval — both rank-0 (any
+            # exit path) and non-rank-0 (early return) converge here.
             try:
-                import torch.distributed as _dist
-
-                if _dist.is_initialized():
-                    _dist.destroy_process_group()
+                if dist.is_initialized():
+                    dist.barrier()
+                    dist.destroy_process_group()
             except Exception:
                 pass
 
