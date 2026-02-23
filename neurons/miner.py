@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -277,12 +278,10 @@ def pay_submission_fee(
         if payment_ref is not None:
             break
         if attempt < 3:
-            import time as _time
-
             print(
                 f"\n   Retrying payment extrinsic lookup (attempt {attempt}/3, lookback={lookback})..."
             )
-            _time.sleep(3)
+            time.sleep(3)
 
     if payment_ref is None:
         return (
