@@ -88,7 +88,7 @@ _monotonic = time.monotonic
 _cuda_synchronize = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
 _cuda_elapsed_time = torch.cuda.Event.elapsed_time if torch.cuda.is_available() else None
 
-# Multi-GPU rank detection (set by torchrun when num_gpus > 1)
+# Multi-GPU rank detection (set by torchrun)
 _LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 _WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 _IS_RANK_0 = _LOCAL_RANK == 0
@@ -2024,7 +2024,6 @@ class Actor:
             )
             device = torch.device(f"cuda:{_LOCAL_RANK}" if torch.cuda.is_available() else "cpu")
 
-            # Initialize distributed process group for multi-GPU
             import torch.distributed as dist
 
             if num_gpus > 1 and _WORLD_SIZE > 1:
@@ -2035,7 +2034,7 @@ class Actor:
 
             seq_len = sequence_length or EVAL_SEQUENCE_LENGTH
 
-            # Run reference implementation on rank 0 only (single-GPU baseline)
+            # Reference baseline: rank 0 only
             if _IS_RANK_0:
                 data_iter_ref = _create_data_iterator(data, batch_size, seq_len)
                 optimizer_ref = _create_optimizer(model)
@@ -2065,7 +2064,7 @@ class Actor:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             else:
-                # Non-rank-0: cache initial state only, skip reference
+                # Non-rank-0: cache initial state, skip reference
                 initial_state = _CACHE.get("initial_state")
                 if initial_state is None:
                     initial_state = {
@@ -2076,7 +2075,6 @@ class Actor:
                 reference_grad = None
                 reference_final_state = None
 
-            # Barrier: all ranks wait until reference is done
             if num_gpus > 1 and _WORLD_SIZE > 1:
                 dist.barrier()
 
@@ -2431,9 +2429,7 @@ class Actor:
                 f"{f', cuda_events={cuda_wall_time:.2f}s' if cuda_wall_time else ''})"
             )
 
-            # Non-rank-0 processes: skip verification, return minimal result.
-            # The matching barrier lives in the finally block so rank-0 early
-            # returns (verification failures, exceptions) cannot deadlock.
+            # Non-rank-0: skip verification (barrier in finally block)
             if not _IS_RANK_0:
                 return {
                     "task_id": task_id,
@@ -2622,9 +2618,7 @@ class Actor:
 
             total_tokens_int = expected_tokens  # Use validator-computed token count
             tps = float(total_tokens_int) / max(wall_time, 1e-6)
-            # MFU is per-GPU utilization: in DDP each rank processes the same
-            # token count with the same wall time, so the N in numerator and
-            # denominator cancels out.  No scaling of gpu_peak_tflops needed.
+            # MFU is per-GPU: N cancels in numerator and denominator for DDP
             mfu = _calculate_mfu(total_tokens_int, wall_time, model_params, gpu_peak_tflops)
 
             # MFU sanity cap — no legitimate code can exceed this on current hardware.
@@ -2756,10 +2750,7 @@ class Actor:
                 torch.cuda.empty_cache()
             _log_vram("after-cleanup")
 
-            # Sync all ranks before teardown so no process is left
-            # blocked at a barrier.  This single barrier in finally is
-            # the ONLY barrier after the timed eval — both rank-0 (any
-            # exit path) and non-rank-0 (early return) converge here.
+            # All ranks converge here before teardown (prevents deadlocks)
             try:
                 if dist.is_initialized():
                     dist.barrier()

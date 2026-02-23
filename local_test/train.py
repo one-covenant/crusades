@@ -72,27 +72,20 @@ def _get_compiled_fn(model):
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     """Optimized training loop for maximum MFU on A100.
 
-    When num_gpus > 1 the caller (env.py) launches via torchrun and
-    each rank gets its own copy of this function.  The distributed
-    process group is already initialized by the eval environment.
-    Wrap the model with DDP/FSDP here to leverage multiple GPUs.
+    When num_gpus > 1, env.py launches via torchrun with the process
+    group already initialized.  Use ``device.index`` for the local rank
+    (``os`` is forbidden).
 
-    ``device`` is ``torch.device("cuda:N")`` where N is the local rank,
-    so ``device.index`` gives the integer GPU index.  ``os`` is forbidden
-    in miner code — use ``device.index`` instead of ``os.environ``.
-
-    Example DDP usage::
-
-        from torch.nn.parallel import DistributedDataParallel as DDP
+    DDP example::
 
         if num_gpus > 1:
+            from torch.nn.parallel import DistributedDataParallel as DDP
             model = DDP(model, device_ids=[device.index])
 
-    Example FSDP usage::
-
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    FSDP example::
 
         if num_gpus > 1:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             model = FSDP(model, device_id=device.index)
     """
 

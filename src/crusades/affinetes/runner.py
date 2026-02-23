@@ -150,7 +150,6 @@ class AffinetesRunner:
         "BASILICA_EVAL_IMAGE", "ghcr.io/one-covenant/templar-eval:latest"
     )
 
-    # Docker network for multi-GPU: --internal blocks all egress
     _INTERNAL_NETWORK = "crusades_nccl_internal"
     _internal_network_created = False
 
@@ -492,7 +491,7 @@ asyncio.run(main())
                     docker_cmd.extend(["--gpus", f"device={self.docker_gpu_devices}"])
 
             # Memory limits (from hparams.json docker config)
-            # Scale shm-size for NCCL inter-process communication (~2GB per GPU)
+            # Scale shm-size for NCCL (~2GB per GPU)
             shm_size = self.docker_shm_size
             if self.num_gpus > 1:
                 base_shm_gb = int(self.docker_shm_size.rstrip("gG"))
@@ -507,16 +506,12 @@ asyncio.run(main())
             )
 
             # Docker sandbox configuration
-            # Scale pids-limit for torchrun multi-process (1024 per process)
+            # Scale pids-limit for torchrun (1024 per process)
             pids_limit = 1024 * max(self.num_gpus, 1)
             if self.num_gpus <= 1:
-                # Single-GPU: no networking needed at all.
                 docker_cmd.extend(["--network", "none"])
             else:
-                # Multi-GPU: torchrun + NCCL need loopback for rendezvous
-                # and shared-memory coordination.  Use an internal network
-                # (blocks all egress) with --dns 0.0.0.0 (breaks DNS
-                # resolution) so miner code cannot reach the internet.
+                # Multi-GPU: internal network (no egress) + no DNS
                 self._ensure_internal_network()
                 docker_cmd.extend(
                     [
