@@ -150,6 +150,10 @@ class AffinetesRunner:
         "BASILICA_EVAL_IMAGE", "ghcr.io/one-covenant/templar-eval:latest"
     )
 
+    # Docker network for multi-GPU: --internal blocks all egress
+    _INTERNAL_NETWORK = "crusades_nccl_internal"
+    _internal_network_created = False
+
     def __init__(
         self,
         mode: Literal["docker", "basilica"] = "docker",
@@ -263,6 +267,29 @@ class AffinetesRunner:
             logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
             logger.info(f"   Min GPU Memory: {self.basilica_min_gpu_memory_gb}GB")
             logger.info(f"   CPU/Memory: {self.basilica_cpu} / {self.basilica_memory}")
+
+    @classmethod
+    def _ensure_internal_network(cls) -> None:
+        """Create a Docker internal network (no egress) for multi-GPU NCCL."""
+        if cls._internal_network_created:
+            return
+        import subprocess
+
+        try:
+            subprocess.run(
+                [
+                    "docker",
+                    "network",
+                    "create",
+                    "--internal",
+                    cls._INTERNAL_NETWORK,
+                ],
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception:
+            pass
+        cls._internal_network_created = True
 
     async def evaluate(
         self,
@@ -482,12 +509,23 @@ asyncio.run(main())
             # Docker sandbox configuration
             # Scale pids-limit for torchrun multi-process (1024 per process)
             pids_limit = 1024 * max(self.num_gpus, 1)
-            # --network none blocks all networking (including loopback).
-            # torchrun + NCCL need loopback for rendezvous and shared memory
-            # coordination, so multi-GPU uses the default bridge network.
-            # Security is maintained via --cap-drop ALL + --security-opt.
             if self.num_gpus <= 1:
+                # Single-GPU: no networking needed at all.
                 docker_cmd.extend(["--network", "none"])
+            else:
+                # Multi-GPU: torchrun + NCCL need loopback for rendezvous
+                # and shared-memory coordination.  Use an internal network
+                # (blocks all egress) with --dns 0.0.0.0 (breaks DNS
+                # resolution) so miner code cannot reach the internet.
+                self._ensure_internal_network()
+                docker_cmd.extend(
+                    [
+                        "--network",
+                        self._INTERNAL_NETWORK,
+                        "--dns",
+                        "0.0.0.0",
+                    ]
+                )
             docker_cmd.extend(
                 [
                     "--cap-drop",
