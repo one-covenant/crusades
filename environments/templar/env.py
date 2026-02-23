@@ -2622,9 +2622,10 @@ class Actor:
 
             total_tokens_int = expected_tokens  # Use validator-computed token count
             tps = float(total_tokens_int) / max(wall_time, 1e-6)
-            # Scale peak TFLOPS by num_gpus so MFU represents aggregate utilization
-            aggregate_tflops = gpu_peak_tflops * num_gpus
-            mfu = _calculate_mfu(total_tokens_int, wall_time, model_params, aggregate_tflops)
+            # MFU is per-GPU utilization: in DDP each rank processes the same
+            # token count with the same wall time, so the N in numerator and
+            # denominator cancels out.  No scaling of gpu_peak_tflops needed.
+            mfu = _calculate_mfu(total_tokens_int, wall_time, model_params, gpu_peak_tflops)
 
             # MFU sanity cap — no legitimate code can exceed this on current hardware.
             # Safety net: even if a novel timing attack evades all other checks,
