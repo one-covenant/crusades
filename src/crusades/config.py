@@ -5,7 +5,7 @@ from functools import cache
 from pathlib import Path
 from typing import Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,11 +28,11 @@ class StorageConfig(BaseModel):
 class VerificationConfig(BaseModel):
     """Verification settings using gradient and weight-based checks."""
 
-    max_loss_difference: float = 0.5
+    max_loss_difference: float = 0.3
     min_params_changed_ratio: float = 0.8
-    gradient_norm_ratio_max: float = 1.10
-    weight_relative_error_max: float = 0.008
-    timer_divergence_threshold: float = 0.05
+    gradient_norm_ratio_max: float = 1.08
+    weight_relative_error_max: float = 0.006
+    timer_divergence_threshold: float = 0.005
 
 
 class MFUConfig(BaseModel):
@@ -40,7 +40,7 @@ class MFUConfig(BaseModel):
 
     gpu_peak_tflops: float = 312.0  # A100 80GB peak TFLOPS (bfloat16)
     max_plausible_mfu: float = 75.0  # Reject MFU above this as likely cheating
-    min_mfu: float = 45.0  # Reject submissions below this floor
+    min_mfu: float = 50.0  # Reject submissions below this floor
 
 
 class AdaptiveThresholdConfig(BaseModel):
@@ -51,7 +51,7 @@ class AdaptiveThresholdConfig(BaseModel):
     - Decays over time towards base_threshold (loses decay_percent each interval)
     """
 
-    base_threshold: float = 0.01  # Minimum threshold (1%)
+    base_threshold: float = 0.02  # Minimum threshold (2%)
     decay_percent: float = 0.05  # Percent to lose per interval (5% = loses 5% of excess)
     decay_interval_blocks: int = 100  # Blocks between decay steps (~20 min)
 
@@ -61,14 +61,34 @@ class PaymentConfig(BaseModel):
 
     Miners stake TAO as alpha then transfer_stake it to the coldkey that
     owns burn_uid's hotkey. The destination is derived from the metagraph
-    at runtime. The validator scans for a SubtensorModule.transfer_stake
-    extrinsic on-chain before evaluating. Unlike plain add_stake, a
-    transfer_stake moves ownership to a different coldkey — irreversible.
+    at runtime. The miner embeds the payment extrinsic reference (block +
+    index) in the commitment so the validator performs an O(1) on-chain
+    lookup. Unlike plain add_stake, a transfer_stake moves ownership to a
+    different coldkey — irreversible.
+
+    If payment_address is set, it overrides the burn_uid → coldkey resolution
+    and payments go directly to the specified SS58 address.
     """
 
-    enabled: bool = True
+    enabled: bool = False
     fee_rao: int = 100_000_000  # 0.1 TAO in RAO (1 TAO = 1e9 RAO)
-    scan_blocks: int = 200  # How many blocks around commitment to scan for payment
+    payment_address: str = ""  # Explicit SS58 coldkey; empty = derive from burn_uid
+    skip_payment_hotkeys: list[str] = []  # Hotkeys exempt from payment (e.g., validator's own)
+    rpc_timeout: int = 30  # Seconds before an RPC call is considered hung
+    rpc_retries: int = 2  # Retry count for transient RPC failures
+
+    @field_validator("payment_address")
+    @classmethod
+    def _validate_payment_address(cls, v: str) -> str:
+        if not v:
+            return v
+        from substrateinterface.utils.ss58 import ss58_decode
+
+        try:
+            ss58_decode(v)
+        except ValueError as exc:
+            raise ValueError(f"payment_address is not a valid SS58 address: {exc}") from exc
+        return v
 
 
 class DockerConfig(BaseModel):
@@ -169,27 +189,15 @@ class HParams(BaseModel):
     # Adaptive threshold for leaderboard
     adaptive_threshold: AdaptiveThresholdConfig = Field(default_factory=AdaptiveThresholdConfig)
 
+    # Validator operational limits
+    code_fetch_timeout: int = 30  # Seconds to wait when downloading miner code
+    max_evaluated_urls: int = 10_000  # Cap on tracked URLs to prevent unbounded memory
+
     # Submission payment (alpha staking fee)
     payment: PaymentConfig = Field(default_factory=PaymentConfig)
 
     # Storage (for evaluation records - not in hparams.json)
     storage: StorageConfig = Field(default_factory=StorageConfig)
-
-    @model_validator(mode="after")
-    def _validate_scan_window(self) -> Self:
-        """Ensure payment.scan_blocks >= reveal_blocks.
-
-        The miner transfers ~reveal_blocks before the reveal. If scan_blocks
-        is smaller, the payment will always fall outside the scan window
-        and every verification will silently fail.
-        """
-        if self.payment.enabled and self.payment.scan_blocks < self.reveal_blocks:
-            raise ValueError(
-                f"payment.scan_blocks ({self.payment.scan_blocks}) must be >= "
-                f"reveal_blocks ({self.reveal_blocks}). Otherwise the validator "
-                f"will never find the miner's payment on-chain."
-            )
-        return self
 
     @classmethod
     def load(cls, path: Path | str | None = None) -> Self:

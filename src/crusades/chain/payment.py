@@ -6,12 +6,13 @@ alpha tokens to the coldkey that owns the burn_uid's hotkey on the subnet.
 The destination address is derived at runtime from the metagraph:
   burn_uid → metagraph.hotkeys[burn_uid] → get_hotkey_owner() → coldkey
 
-The verification scans a configurable window of blocks around the commitment
-for a SubtensorModule.transfer_stake extrinsic from the miner's coldkey to
-the owner's coldkey.
+The miner embeds the payment extrinsic reference (block number + index) in
+the commitment data. The validator performs an O(1) direct lookup to verify
+the specific SubtensorModule.transfer_stake extrinsic on-chain.
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import time
 from dataclasses import dataclass
@@ -79,24 +80,40 @@ def resolve_payment_address(subtensor: bt.subtensor, netuid: int, burn_uid: int)
 
 
 def _check_extrinsic_failed(
-    subtensor: bt.subtensor, block_hash: str, extrinsic_index: int, retries: int = 2
+    subtensor: bt.subtensor,
+    block_hash: str,
+    extrinsic_index: int,
+    retries: int = 2,
+    rpc_timeout: int = 30,
 ) -> bool:
     """Check if an extrinsic in a block failed by examining events.
 
     Retries on transient RPC failures to avoid rejecting valid payments
-    due to network hiccups.
+    due to network hiccups. Each RPC call is capped at ``rpc_timeout``
+    seconds to prevent a hung node from blocking the validator indefinitely.
     """
     for attempt in range(1 + retries):
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            events = subtensor.substrate.get_events(block_hash=block_hash)
+            future = pool.submit(subtensor.substrate.get_events, block_hash=block_hash)
+            events = future.result(timeout=rpc_timeout)
             for event in events:
                 if event.get("extrinsic_idx") != extrinsic_index:
                     continue
-                module = event["event"]["module_id"]
-                event_id = event["event"]["event_id"]
+                ev = event.get("event", {})
+                module = ev.get("module_id", "")
+                event_id = ev.get("event_id", "")
                 if module == "System" and event_id == "ExtrinsicFailed":
                     return True
             return False
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                f"get_events timed out after {rpc_timeout}s (attempt {attempt + 1}/{1 + retries})"
+            )
+            if attempt >= retries:
+                logger.error("get_events timed out on all attempts. Assuming failed to be safe.")
+                return True
+            time.sleep(1)
         except Exception as e:
             if attempt < retries:
                 logger.warning(
@@ -109,6 +126,8 @@ def _check_extrinsic_failed(
                 f"Assuming failed to be safe."
             )
             return True
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _scan_block_for_transfer_stake(
@@ -118,6 +137,8 @@ def _scan_block_for_transfer_stake(
     payment_address: str,
     netuid: int,
     min_amount: int = 0,
+    rpc_timeout: int = 30,
+    rpc_retries: int = 2,
 ) -> PaymentInfo | None:
     """Scan a single block for a matching transfer_stake extrinsic.
 
@@ -131,6 +152,8 @@ def _scan_block_for_transfer_stake(
         payment_address: Expected destination coldkey (burn_uid owner)
         netuid: Expected subnet ID
         min_amount: Minimum alpha amount required (reject payments below this)
+        rpc_timeout: Seconds before an RPC call is considered hung
+        rpc_retries: Retry count for transient RPC failures
 
     Returns:
         PaymentInfo if a valid payment found, None otherwise
@@ -159,6 +182,7 @@ def _scan_block_for_transfer_stake(
                 sender = raw_address.get("Id", "")
             else:
                 sender = raw_address
+            sender = sender or ""
             if sender != miner_coldkey:
                 continue
 
@@ -189,7 +213,9 @@ def _scan_block_for_transfer_stake(
                 )
                 continue
 
-            if _check_extrinsic_failed(subtensor, block_hash, idx):
+            if _check_extrinsic_failed(
+                subtensor, block_hash, idx, retries=rpc_retries, rpc_timeout=rpc_timeout
+            ):
                 logger.debug(f"Found matching transfer_stake at index {idx} but it failed")
                 continue
 
@@ -207,131 +233,195 @@ def _scan_block_for_transfer_stake(
     return None
 
 
-def _scan_block_range(
+def verify_payment_direct(
     subtensor: bt.subtensor,
-    start_block: int,
-    end_block: int,
+    block_number: int,
+    extrinsic_index: int,
     miner_coldkey: str,
     payment_address: str,
     netuid: int,
     min_amount: int = 0,
+    rpc_timeout: int = 30,
+    rpc_retries: int = 2,
 ) -> PaymentInfo | None:
-    """Scan a range of blocks (end_block down to start_block) for a matching transfer_stake."""
-    for block_num in range(end_block, start_block - 1, -1):
+    """O(1) payment verification using a miner-provided extrinsic reference.
+
+    Instead of scanning a range of blocks, fetches a single block and validates
+    that the extrinsic at the given index is a valid transfer_stake from the
+    miner to the payment address.  This is secure because the blockchain data
+    itself is the source of truth — a miner cannot forge an extrinsic.
+
+    Args:
+        subtensor: Subtensor connection
+        block_number: Block containing the payment extrinsic
+        extrinsic_index: Index of the extrinsic within that block
+        miner_coldkey: Expected source coldkey
+        payment_address: Expected destination coldkey
+        netuid: Expected subnet ID
+        min_amount: Minimum alpha amount required
+        rpc_timeout: Seconds before an RPC call is considered hung
+        rpc_retries: Retry count for transient RPC failures
+
+    Returns:
+        PaymentInfo if the extrinsic is a valid payment, None otherwise
+    """
+    try:
+        block_hash = subtensor.get_block_hash(block_number)
+        if block_hash is None:
+            logger.warning(f"Could not get hash for block {block_number}")
+            return None
+    except Exception as e:
+        logger.warning(f"Failed to get block hash for {block_number}: {e}")
+        return None
+
+    try:
+        block = subtensor.substrate.get_block(block_hash=block_hash)
+    except Exception as e:
+        logger.warning(f"Could not fetch block {block_number}: {e}")
+        return None
+
+    extrinsics = block.get("extrinsics", [])
+    if extrinsic_index < 0 or extrinsic_index >= len(extrinsics):
+        logger.warning(
+            f"Extrinsic index {extrinsic_index} out of range "
+            f"(block {block_number} has {len(extrinsics)} extrinsics)"
+        )
+        return None
+
+    extrinsic = extrinsics[extrinsic_index]
+    try:
+        ext_value = extrinsic.value if hasattr(extrinsic, "value") else extrinsic
+        call = ext_value.get("call", {})
+
+        if (
+            call.get("call_module") != "SubtensorModule"
+            or call.get("call_function") != "transfer_stake"
+        ):
+            logger.warning(f"Extrinsic at {block_number}:{extrinsic_index} is not a transfer_stake")
+            return None
+
+        raw_address = ext_value.get("address", "")
+        sender = raw_address.get("Id", "") if isinstance(raw_address, dict) else raw_address
+        sender = sender or ""
+        if sender != miner_coldkey:
+            logger.warning(f"Extrinsic sender {sender[:16]}... != expected {miner_coldkey[:16]}...")
+            return None
+
+        call_args = {arg["name"]: arg["value"] for arg in call.get("call_args", [])}
+
+        dest_coldkey = call_args.get("destination_coldkey")
+        if isinstance(dest_coldkey, dict):
+            dest_coldkey = dest_coldkey.get("Id", "")
+        if dest_coldkey != payment_address:
+            logger.warning(
+                f"Extrinsic destination {str(dest_coldkey)[:16]}... "
+                f"!= expected {payment_address[:16]}..."
+            )
+            return None
+
+        origin_netuid = call_args.get("origin_netuid")
+        if origin_netuid is None or int(origin_netuid) != int(netuid):
+            logger.warning(f"Extrinsic netuid {origin_netuid} != expected {netuid}")
+            return None
+
+        alpha_amount = call_args.get("alpha_amount", 0)
+        if alpha_amount <= 0:
+            return None
+
+        if alpha_amount < min_amount:
+            logger.warning(f"Extrinsic alpha_amount {alpha_amount} < min {min_amount}")
+            return None
+
+        if _check_extrinsic_failed(
+            subtensor, block_hash, extrinsic_index, retries=rpc_retries, rpc_timeout=rpc_timeout
+        ):
+            logger.warning(f"Extrinsic at {block_number}:{extrinsic_index} failed on-chain")
+            return None
+
+        logger.info(
+            f"Direct verification OK: block {block_number} extrinsic {extrinsic_index} "
+            f"({alpha_amount} alpha)"
+        )
+        return PaymentInfo(
+            block_hash=block_hash,
+            extrinsic_index=extrinsic_index,
+            alpha_amount=alpha_amount,
+            coldkey=miner_coldkey,
+        )
+
+    except Exception as e:
+        logger.warning(f"Error validating extrinsic at {block_number}:{extrinsic_index}: {e}")
+        return None
+
+
+async def verify_payment_direct_async(
+    subtensor: bt.subtensor,
+    block_number: int,
+    extrinsic_index: int,
+    miner_coldkey: str,
+    payment_address: str,
+    netuid: int,
+    min_amount: int = 0,
+    rpc_timeout: int = 30,
+    rpc_retries: int = 2,
+) -> PaymentInfo | None:
+    """Async wrapper for verify_payment_direct."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: verify_payment_direct(
+            subtensor=subtensor,
+            block_number=block_number,
+            extrinsic_index=extrinsic_index,
+            miner_coldkey=miner_coldkey,
+            payment_address=payment_address,
+            netuid=netuid,
+            min_amount=min_amount,
+            rpc_timeout=rpc_timeout,
+            rpc_retries=rpc_retries,
+        ),
+    )
+
+
+def find_payment_extrinsic(
+    subtensor: bt.subtensor,
+    miner_coldkey: str,
+    payment_address: str,
+    netuid: int,
+    lookback_blocks: int = 5,
+) -> tuple[int, int] | None:
+    """Locate the miner's own transfer_stake extrinsic in recent blocks.
+
+    Called by the miner immediately after a successful transfer_stake to
+    discover the block number and extrinsic index, which are then embedded
+    in the commitment for O(1) validator verification.
+
+    Args:
+        subtensor: Subtensor connection
+        miner_coldkey: The miner's coldkey that sent the transfer
+        payment_address: Destination coldkey
+        netuid: Subnet ID
+        lookback_blocks: How many recent blocks to search
+
+    Returns:
+        (block_number, extrinsic_index) if found, None otherwise
+    """
+    current_block = subtensor.get_current_block()
+    for block_num in range(current_block, max(0, current_block - lookback_blocks), -1):
         try:
             block_hash = subtensor.get_block_hash(block_num)
             if block_hash is None:
                 continue
-
             payment = _scan_block_for_transfer_stake(
                 subtensor=subtensor,
                 block_hash=block_hash,
                 miner_coldkey=miner_coldkey,
                 payment_address=payment_address,
                 netuid=netuid,
-                min_amount=min_amount,
             )
-
             if payment is not None:
-                logger.info(
-                    f"Found valid payment at block {block_num} "
-                    f"(extrinsic {payment.extrinsic_index}, "
-                    f"{payment.alpha_amount} alpha)"
-                )
-                return payment
-
+                return (block_num, payment.extrinsic_index)
         except Exception as e:
-            logger.debug(f"Error scanning block {block_num}: {e}")
+            logger.debug(f"Error scanning block {block_num} for payment extrinsic: {e}")
             continue
-
     return None
-
-
-def verify_payment_on_chain(
-    subtensor: bt.subtensor,
-    miner_coldkey: str,
-    commitment_block: int,
-    payment_address: str,
-    netuid: int,
-    scan_blocks: int = 200,
-    fast_scan_blocks: int = 15,
-    min_amount: int = 0,
-) -> PaymentInfo | None:
-    """Scan a range of blocks for a valid transfer_stake payment from the miner.
-
-    Uses a two-phase approach: first checks the most recent blocks (where
-    the payment is most likely to be), then falls back to a full scan.
-
-    Args:
-        subtensor: Subtensor connection
-        miner_coldkey: The miner's coldkey that should have sent the transfer
-        commitment_block: The block the commitment was revealed at
-        payment_address: Destination coldkey SS58 to check transfers against
-        netuid: Expected subnet ID
-        scan_blocks: How many blocks back to scan (full range)
-        fast_scan_blocks: How many recent blocks to check first
-        min_amount: Minimum alpha amount required (reject payments below this)
-
-    Returns:
-        PaymentInfo if valid payment found, None otherwise
-    """
-    start_block = max(0, commitment_block - scan_blocks)
-    end_block = commitment_block
-    fast_boundary = max(end_block - fast_scan_blocks + 1, start_block)
-
-    logger.info(
-        f"Scanning blocks {start_block}-{end_block} for transfer_stake payment "
-        f"from {miner_coldkey[:16]}... to {payment_address[:16]}... on netuid {netuid}"
-    )
-
-    # Fast pass: most miners pay shortly before committing
-    payment = _scan_block_range(
-        subtensor, fast_boundary, end_block, miner_coldkey, payment_address, netuid, min_amount
-    )
-    if payment is not None:
-        return payment
-
-    # Full scan: check remaining older blocks
-    if fast_boundary > start_block:
-        logger.debug(f"Fast scan miss, scanning remaining blocks {start_block}-{fast_boundary - 1}")
-        payment = _scan_block_range(
-            subtensor,
-            start_block,
-            fast_boundary - 1,
-            miner_coldkey,
-            payment_address,
-            netuid,
-            min_amount,
-        )
-        if payment is not None:
-            return payment
-
-    logger.warning(
-        f"No valid payment found in blocks {start_block}-{end_block} from {miner_coldkey[:16]}..."
-    )
-    return None
-
-
-async def verify_payment_on_chain_async(
-    subtensor: bt.subtensor,
-    miner_coldkey: str,
-    commitment_block: int,
-    payment_address: str,
-    netuid: int,
-    scan_blocks: int = 200,
-    min_amount: int = 0,
-) -> PaymentInfo | None:
-    """Async wrapper for verify_payment_on_chain."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
-        lambda: verify_payment_on_chain(
-            subtensor=subtensor,
-            miner_coldkey=miner_coldkey,
-            commitment_block=commitment_block,
-            payment_address=payment_address,
-            netuid=netuid,
-            scan_blocks=scan_blocks,
-            min_amount=min_amount,
-        ),
-    )

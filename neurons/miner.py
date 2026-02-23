@@ -12,13 +12,15 @@ Timelock encryption keeps it hidden until reveal_blocks pass.
 
 import argparse
 import hashlib
+import re
 import sys
+import time
 import urllib.error
 import urllib.request
 
 import bittensor as bt
 
-from crusades.chain.payment import resolve_payment_address
+from crusades.chain.payment import find_payment_extrinsic, resolve_payment_address
 from crusades.config import HParams
 
 
@@ -66,7 +68,7 @@ def validate_code_url(url: str) -> tuple[bool, str, str | None]:
     # For GitHub Gist URLs, convert to raw format
     final_url = url
     if "gist.github.com" in url.lower() and "/raw" not in url.lower():
-        final_url = url.replace("gist.github.com", "gist.githubusercontent.com")
+        final_url = re.sub(r"gist\.github\.com", "gist.githubusercontent.com", url, flags=re.I)
         if not final_url.endswith("/raw"):
             final_url = final_url.rstrip("/") + "/raw"
 
@@ -173,9 +175,9 @@ def pay_submission_fee(
 
         if balance_rao < required_rao:
             return False, (
-                f"Insufficient balance. Need {fee_rao} RAO ({fee_tao} TAO) "
+                f"Insufficient balance. Need {fee_tao:.4f} TAO "
                 f"+ ~{tx_fee_buffer_rao / 1e9:.2f} TAO tx fees, "
-                f"have {balance_rao} RAO ({balance_rao / 1e9:.4f} TAO)"
+                f"have {balance_rao / 1e9:.4f} TAO"
             )
     except Exception as e:
         return False, f"Failed to check balance: {e}"
@@ -183,13 +185,13 @@ def pay_submission_fee(
     print(f"\n{'=' * 60}")
     print("SUBMISSION FEE (alpha transfer)")
     print(f"{'=' * 60}")
-    print(f"   Amount: {fee_rao} RAO ({fee_tao} TAO)")
+    print(f"   Amount: {fee_tao:.4f} TAO")
     print(f"   Subnet: {netuid}")
     print(f"   Burn UID: {burn_uid}")
     print(f"   Burn hotkey: {burn_hotkey[:16]}...")
     print(f"   Owner coldkey: {payment_coldkey[:16]}...")
-    print(f"   Balance: {balance_rao / 1e9:.4f} TAO")
-    print(f"\nThis stakes {fee_tao} TAO as alpha, then transfers it to the")
+    print(f"   Your balance: {balance_rao / 1e9:.4f} TAO")
+    print(f"\nThis stakes {fee_tao:.4f} TAO as alpha, then transfers it to the")
     print("subnet operator's coldkey (irreversible).")
 
     confirm = input("\nProceed with payment? [y/N]: ").strip().lower()
@@ -234,7 +236,9 @@ def pay_submission_fee(
 
     if new_alpha_rao <= 0:
         return False, "add_stake succeeded but no new alpha balance detected"
-    print(f"      Alpha created: {new_alpha_rao} (total on hotkey: {post_alpha_rao})")
+    print(
+        f"      Alpha created: {new_alpha_rao / 1e9:.4f} (total on hotkey: {post_alpha_rao / 1e9:.4f})"
+    )
 
     transfer_amount = bt.Balance.from_rao(new_alpha_rao)
 
@@ -259,6 +263,37 @@ def pay_submission_fee(
     except Exception as e:
         return False, f"transfer_stake error: {e} (alpha still staked under your coldkey)"
 
+    # Locate the transfer_stake extrinsic so it can be embedded in the
+    # commitment for O(1) validator verification.
+    # Retry with increasing lookback to handle RPC lag / finalization delay.
+    payment_ref = None
+    for attempt, lookback in enumerate((5, 10, 20), start=1):
+        payment_ref = find_payment_extrinsic(
+            subtensor=subtensor,
+            miner_coldkey=coldkey_addr,
+            payment_address=payment_coldkey,
+            netuid=netuid,
+            lookback_blocks=lookback,
+        )
+        if payment_ref is not None:
+            break
+        if attempt < 3:
+            print(
+                f"\n   Retrying payment extrinsic lookup (attempt {attempt}/3, lookback={lookback})..."
+            )
+            time.sleep(3)
+
+    if payment_ref is None:
+        return (
+            False,
+            "Could not locate payment extrinsic on-chain after retries. "
+            "The payment was sent but cannot be referenced — validator will reject. "
+            "Try again or contact support.",
+        )
+
+    payment_block, payment_index = payment_ref
+    print(f"\n   Payment extrinsic: block {payment_block}, index {payment_index}")
+
     current_block = subtensor.get_current_block()
     block_hash = subtensor.get_block_hash(current_block)
 
@@ -270,12 +305,15 @@ def pay_submission_fee(
         "burn_hotkey": burn_hotkey,
         "payment_coldkey": payment_coldkey,
         "netuid": netuid,
+        "payment_block": payment_block,
+        "payment_index": payment_index,
     }
 
     print("\n[OK] Submission fee paid!")
+    print(f"   TAO spent: {fee_tao:.4f}")
+    print(f"   Alpha transferred: {new_alpha_rao / 1e9:.4f}")
     print(f"   Block: {current_block}")
     print(f"   Block hash: {block_hash}")
-    print(f"   Alpha transferred: {new_alpha_rao}")
     print("\n   SAVE THESE DETAILS - they are your proof of payment for disputes")
 
     return True, result
@@ -301,6 +339,9 @@ def commit_to_chain(
     Returns:
         Tuple of (success, result_dict or error_message)
     """
+    if not code_hash:
+        return False, "code_hash is required (run validate_code_url first)"
+
     # Load settings from hparams
     hparams = HParams.load()
     netuid = hparams.netuid
@@ -329,16 +370,19 @@ def commit_to_chain(
     if hparams.payment.enabled:
         fee_rao = hparams.payment.fee_rao
 
-        # Derive payment destination: burn_uid → hotkey → coldkey owner
-        payment_coldkey = resolve_payment_address(subtensor, netuid, hparams.burn_uid)
-        if payment_coldkey is None:
-            return (
-                False,
-                f"Payment failed: could not resolve payment address from burn_uid {hparams.burn_uid}",
-            )
+        # Use explicit payment_address if configured, otherwise derive from burn_uid
+        if hparams.payment.payment_address:
+            payment_coldkey = hparams.payment.payment_address
+        else:
+            payment_coldkey = resolve_payment_address(subtensor, netuid, hparams.burn_uid)
+            if payment_coldkey is None:
+                return (
+                    False,
+                    f"Payment failed: could not resolve payment address from burn_uid {hparams.burn_uid}",
+                )
 
         print(
-            f"\n--- SUBMISSION FEE ({fee_rao / 1e9} TAO as alpha → {payment_coldkey[:16]}...) ---"
+            f"\n--- SUBMISSION FEE ({fee_rao / 1e9:.4f} TAO as alpha → {payment_coldkey[:16]}...) ---"
         )
 
         pay_success, pay_result = pay_submission_fee(
@@ -354,8 +398,10 @@ def commit_to_chain(
             return False, f"Payment failed: {pay_result}"
 
         print("\n   Payment successful. Proceeding to commit...")
+        pay_result_dict = pay_result  # type: dict
     else:
         print("\n   Payment disabled in hparams. Skipping fee.")
+        pay_result_dict = None
 
     print("\nCommitting to blockchain...")
     print(f"   Network: {network}")
@@ -364,9 +410,16 @@ def commit_to_chain(
     print(f"   Reveal blocks: {blocks_until_reveal} (from hparams.json)")
     print(f"   Block time: {block_time}s (from hparams.json)")
 
-    # Commitment data: packed format to fit 128-byte on-chain limit
-    # Format: <32 hex hash>:<url>  (33 bytes overhead, leaves 95 for URL)
-    commitment_data = f"{code_hash}:{code_url}"
+    # Commitment data: packed format to fit 128-byte on-chain limit.
+    #   <32hex>:<block>:<index>:<url>   (~46 bytes overhead, ~82 for URL)
+    # Without payment ref (payment disabled):
+    #   <32hex>:<url>                   (33 bytes overhead, 95 for URL)
+    pay_block = pay_result_dict.get("payment_block") if pay_result_dict else None
+    pay_index = pay_result_dict.get("payment_index") if pay_result_dict else None
+    if pay_block is not None and pay_index is not None:
+        commitment_data = f"{code_hash}:{pay_block}:{pay_index}:{code_url}"
+    else:
+        commitment_data = f"{code_hash}:{code_url}"
 
     print(f"   Commitment size: {len(commitment_data)} bytes")
     if len(commitment_data) > 128:

@@ -2,7 +2,7 @@
 # Usage: docker build --network=host -f environments/templar/Dockerfile -t templar-eval:latest .
 # Run from repo root so hparams.json is accessible
 
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+FROM pytorch/pytorch:2.7.1-cuda12.6-cudnn9-devel
 
 RUN apt-get update && apt-get install -y \
     git curl ca-certificates build-essential ninja-build \
@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 # torch + CUDA version to match; if no wheel exists, the source build needs
 # the CUDA toolkit (switch base image to *-devel in that case).
 ENV MAX_JOBS=4
-RUN pip install --no-cache-dir --user --no-build-isolation "flash-attn>=2.5.0"
+RUN pip install --no-cache-dir --user --no-build-isolation "flash-attn==2.8.3"
 
 # Remove g++/make but keep gcc for torch.compile inductor backend
 USER root

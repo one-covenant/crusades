@@ -20,6 +20,7 @@ Fix any failures before submitting to avoid failed evaluations!
 """
 
 import ast
+import gc
 import importlib.util
 import json
 import math
@@ -987,8 +988,8 @@ def main():
     verification = hparams.get("verification", {})
     max_loss_difference = verification.get("max_loss_difference", 0.3)
     min_changed_ratio = verification.get("min_params_changed_ratio", 0.8)
-    gradient_norm_ratio_max = verification.get("gradient_norm_ratio_max", 1.10)
-    weight_relative_error_max = verification.get("weight_relative_error_max", 0.008)
+    gradient_norm_ratio_max = verification.get("gradient_norm_ratio_max", 1.08)
+    weight_relative_error_max = verification.get("weight_relative_error_max", 0.006)
 
     expected_tokens = batch_size * seq_len * num_steps
     expected_seq_len = seq_len - 1
@@ -1063,7 +1064,7 @@ def main():
     print("Loading model with RANDOM INITIALIZATION (same as validator)...")
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_config(
-        config, torch_dtype=torch.bfloat16, trust_remote_code=True, attn_implementation="sdpa"
+        config, dtype=torch.bfloat16, trust_remote_code=True, attn_implementation="sdpa"
     )
     model = model.to(device)
     model.gradient_checkpointing_enable()
@@ -1106,6 +1107,9 @@ def main():
 
     reference_final_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     print("  Captured reference final model state for weight verification")
+    del optimizer_ref
+    gc.collect()
+    torch.cuda.empty_cache()
     print()
 
     # === Reset model ===
@@ -1145,6 +1149,10 @@ def main():
         print("Cannot continue — warmup failed (code doesn't run).")
         _print_summary(results)
         sys.exit(1)
+
+    del warmup_optimizer
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # === Reset model again ===
     model.load_state_dict({k: v.to(device) for k, v in initial_state.items()})
