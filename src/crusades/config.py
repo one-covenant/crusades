@@ -73,7 +73,6 @@ class PaymentConfig(BaseModel):
     enabled: bool = False
     fee_rao: int = 100_000_000  # 0.1 TAO in RAO (1 TAO = 1e9 RAO)
     payment_address: str = ""  # Explicit SS58 coldkey; empty = derive from burn_uid
-    skip_payment_hotkeys: list[str] = []  # Hotkeys exempt from payment (e.g., validator's own)
     rpc_timeout: int = 30  # Seconds before an RPC call is considered hung
     rpc_retries: int = 2  # Retry count for transient RPC failures
     archive_endpoint: str = "wss://archive.chain.opentensor.ai:443"

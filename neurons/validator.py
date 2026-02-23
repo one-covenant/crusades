@@ -322,12 +322,6 @@ class Validator(BaseNode):
             logger.debug("Payment verification disabled in hparams")
             return True
 
-        if commitment.hotkey in hparams.payment.skip_payment_hotkeys:
-            logger.info(
-                f"Skipping payment for {commitment.hotkey[:16]}... (in skip_payment_hotkeys)"
-            )
-            return True
-
         if self.chain is None:
             logger.error("No chain connection — cannot verify payment")
             return False
