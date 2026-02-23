@@ -157,6 +157,7 @@ class AffinetesRunner:
         docker_gpu_devices: str = "all",
         docker_memory_limit: str = "32g",
         docker_shm_size: str = "8g",
+        num_gpus: int = 1,
         timeout: int = 600,
         model_url: str | None = None,
         data_url: str | None = None,
@@ -194,6 +195,7 @@ class AffinetesRunner:
             docker_gpu_devices: GPU devices for Docker ("all", "0", "0,1", "none")
             docker_memory_limit: Docker memory limit (e.g., "32g")
             docker_shm_size: Shared memory size for Docker (e.g., "8g")
+            num_gpus: Number of GPUs for evaluation (1 = single-GPU, >1 = multi-GPU via torchrun)
             timeout: Evaluation timeout in seconds
             model_url: Default model URL (HuggingFace model ID)
             data_url: Default data URL (HuggingFace dataset)
@@ -219,6 +221,7 @@ class AffinetesRunner:
         self.docker_gpu_devices = docker_gpu_devices
         self.docker_memory_limit = docker_memory_limit
         self.docker_shm_size = docker_shm_size
+        self.num_gpus = num_gpus
         self.timeout = timeout
         self.default_model_url = model_url
         self.default_data_url = data_url
@@ -381,12 +384,15 @@ class AffinetesRunner:
         eval_script = f'''
 import asyncio
 import json
+import os
 import sys
 sys.path.insert(0, '/app')
 
 from env import Actor
 
 async def main():
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
     # Read miner's code
     with open('/app/scripts/miner_train.py') as f:
         code = f.read()
@@ -418,8 +424,10 @@ async def main():
         max_plausible_mfu={self.max_plausible_mfu},
         min_mfu={self.min_mfu},
         require_cuda_timing=True,
+        num_gpus={self.num_gpus},
     )
-    print("EVAL_RESULT:" + json.dumps(result))
+    if local_rank == 0:
+        print("EVAL_RESULT:" + json.dumps(result))
 
 asyncio.run(main())
 '''
@@ -457,27 +465,38 @@ asyncio.run(main())
                     docker_cmd.extend(["--gpus", f"device={self.docker_gpu_devices}"])
 
             # Memory limits (from hparams.json docker config)
+            # Scale shm-size for NCCL inter-process communication (~2GB per GPU)
+            shm_size = self.docker_shm_size
+            if self.num_gpus > 1:
+                base_shm_gb = int(self.docker_shm_size.rstrip("gG"))
+                shm_size = f"{max(base_shm_gb, 2 * self.num_gpus)}g"
             docker_cmd.extend(
                 [
                     "--memory",
                     self.docker_memory_limit,
                     "--shm-size",
-                    self.docker_shm_size,
+                    shm_size,
                 ]
             )
 
             # Docker sandbox configuration
+            # Scale pids-limit for torchrun multi-process (1024 per process)
+            pids_limit = 1024 * max(self.num_gpus, 1)
+            # --network none blocks all networking (including loopback).
+            # torchrun + NCCL need loopback for rendezvous and shared memory
+            # coordination, so multi-GPU uses the default bridge network.
+            # Security is maintained via --cap-drop ALL + --security-opt.
+            if self.num_gpus <= 1:
+                docker_cmd.extend(["--network", "none"])
             docker_cmd.extend(
                 [
-                    "--network",
-                    "none",
                     "--cap-drop",
                     "ALL",
                     "--security-opt",
                     "no-new-privileges",
                     "--read-only",
                     "--pids-limit",
-                    "1024",
+                    str(pids_limit),
                     # Writable /tmp for temporary files (exec needed for torch.compile)
                     "--tmpfs",
                     "/tmp:rw,exec,nosuid,size=4g",
@@ -497,13 +516,24 @@ asyncio.run(main())
             )
 
             # Image and command
-            docker_cmd.extend(
-                [
-                    self.validator_image,
-                    "python",
-                    "/app/scripts/eval_script.py",
-                ]
-            )
+            if self.num_gpus > 1:
+                docker_cmd.extend(
+                    [
+                        self.validator_image,
+                        "torchrun",
+                        "--nproc_per_node",
+                        str(self.num_gpus),
+                        "/app/scripts/eval_script.py",
+                    ]
+                )
+            else:
+                docker_cmd.extend(
+                    [
+                        self.validator_image,
+                        "python",
+                        "/app/scripts/eval_script.py",
+                    ]
+                )
 
             logger.info(f"Running evaluation in {self.validator_image}...")
             logger.debug(f"   Full Docker command: {' '.join(docker_cmd)}")
@@ -733,6 +763,7 @@ asyncio.run(main())
                 "gpu_peak_tflops": self.gpu_peak_tflops,
                 "max_plausible_mfu": self.max_plausible_mfu,
                 "min_mfu": self.min_mfu,
+                "num_gpus": self.num_gpus,
             }
 
             logger.info("[BASILICA] Sending evaluation request...")

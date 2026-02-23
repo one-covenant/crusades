@@ -195,9 +195,7 @@ FORBIDDEN_MODULES: set[str] = {
 
 # Dotted module paths blocked even when the base module is allowed
 FORBIDDEN_DOTTED_MODULES: set[str] = {
-    "torch.multiprocessing",
     "torch.utils.dlpack",
-    "torch.distributed",
     "numpy.ctypeslib",
 }
 
@@ -337,9 +335,12 @@ FORBIDDEN_ASSIGNMENT_ATTRS: set[str] = {
 ALLOWED_TORCH_SUBMODULE_IMPORTS: set[str] = {
     "torch.nn",
     "torch.nn.functional",
+    "torch.nn.parallel",
     "torch.amp",
     "torch.cuda",
     "torch.cuda.amp",
+    "torch.distributed",
+    "torch.multiprocessing",
 }
 
 # Prefixes of ``torch.*`` dotted paths where attribute *assignment* is

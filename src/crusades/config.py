@@ -169,6 +169,7 @@ class HParams(BaseModel):
     benchmark_master_seed: int
     benchmark_sequence_length: int
     benchmark_batch_size: int
+    num_gpus: int = 1  # Number of GPUs for evaluation (1 = single-GPU, >1 = multi-GPU via torchrun)
 
     # Timing settings
     set_weights_interval_blocks: int  # Minimum blocks between weight updates

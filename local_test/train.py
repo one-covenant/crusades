@@ -1,33 +1,3 @@
-"""
-Reference training implementation for Templar Crusades.
-
-This is the baseline implementation. Miners should optimize it for maximum MFU
-(Model FLOPs Utilization) while passing all verification checks.
-
-=== SUBMISSION ===
-
-The validator only calls the inner_steps function.
-
-=== VERIFICATION RULES ===
-
-Your inner_steps function MUST:
-  - Use the provided optimizer (call optimizer.step() and optimizer.zero_grad())
-  - Process ALL tokens in each batch (no truncation)
-  - Return actual final_logits tensor (not None)
-  - Return logits with correct shape: (batch_size, seq_len - 1, vocab_size)
-  - Produce gradients that closely match the reference implementation
-  - Train all model parameters (don't freeze layers)
-  - Call optimizer.step() for each training step
-
-Your inner_steps function MUST NOT:
-  - Access optimizer internals (e.g., optimizer.optimizer)
-  - Truncate or skip parts of input sequences
-  - Return None for final_logits
-  - Report inflated token counts
-  - Modify the model's requires_grad settings
-  - Modify torch backend settings (deterministic, benchmark, SDP toggles, etc.)
-"""
-
 from dataclasses import dataclass
 
 import torch
@@ -36,68 +6,130 @@ import torch.nn.functional as F
 
 @dataclass
 class InnerStepsResult:
-    """Required return type from inner_steps function.
-
-    All fields are verified by the validator:
-    - final_logits: Must be a 3D tensor (batch, seq_len-1, vocab), NOT None
-    - total_tokens: Should equal batch_size * seq_len * num_steps
-    - final_loss: Must be a positive float, close to reference loss
-    """
-
     final_logits: torch.Tensor
     total_tokens: int
     final_loss: float
 
 
-def inner_steps(model, data_iterator, optimizer, num_steps, device):
-    """Run training steps and return results.
+_COMPILED_FN = {}
+_PREPARED_MODEL_IDS = set()
+_TORCH_CONFIGURED = False
 
-    This is the function the validator calls. It receives:
-    - model: Pre-loaded model (already on device, in train mode, with gradient checkpointing)
-    - data_iterator: Infinite iterator yielding batches of shape (batch_size, seq_len)
-    - optimizer: Pre-configured AdamW optimizer (wrapped by validator for gradient capture)
-    - num_steps: Number of training steps to run (must complete all of them)
-    - device: Target device (cuda or cpu)
 
-    The validator measures wall_time of this function and calculates:
-        MFU = (6 * model_params * batch_size * seq_len * num_steps) / (wall_time * gpu_peak_tflops)
+def _configure_torch():
+    global _TORCH_CONFIGURED
+    if _TORCH_CONFIGURED:
+        return
+    _TORCH_CONFIGURED = True
 
-    Higher MFU = you completed the same training faster = better score.
 
-    Returns:
-        InnerStepsResult with outputs for verification
+def _prepare_model(model):
+    model_id = id(model)
+    if model_id in _PREPARED_MODEL_IDS:
+        return
+    _PREPARED_MODEL_IDS.add(model_id)
+
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+        try:
+            model.config.output_hidden_states = False
+        except Exception:
+            pass
+        try:
+            model.config.output_attentions = False
+        except Exception:
+            pass
+
+
+def _get_compiled_fn(model):
+    key = id(model)
+    if key in _COMPILED_FN:
+        return _COMPILED_FN[key]
+
+    def fwd_bwd(input_ids, labels):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            logits = model(input_ids).logits
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
+        loss.backward()
+        return logits, loss
+
+    try:
+        compiled = torch.compile(fwd_bwd, mode="reduce-overhead", dynamic=False)
+    except Exception:
+        compiled = fwd_bwd
+
+    _COMPILED_FN[key] = compiled
+    return compiled
+
+
+def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
+    """Optimized training loop for maximum MFU on A100.
+
+    When num_gpus > 1 the caller (env.py) launches via torchrun and
+    each rank gets its own copy of this function.  The distributed
+    process group is already initialized by the eval environment.
+    Wrap the model with DDP/FSDP here to leverage multiple GPUs.
+
+    ``device`` is ``torch.device("cuda:N")`` where N is the local rank,
+    so ``device.index`` gives the integer GPU index.  ``os`` is forbidden
+    in miner code — use ``device.index`` instead of ``os.environ``.
+
+    Example DDP usage::
+
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        if num_gpus > 1:
+            model = DDP(model, device_ids=[device.index])
+
+    Example FSDP usage::
+
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        if num_gpus > 1:
+            model = FSDP(model, device_id=device.index)
     """
-    total_tokens = 0
+
+    _configure_torch()
+    _prepare_model(model)
+
+    step_fn = _get_compiled_fn(model)
+
+    # Prefetch and pre-split all batches (contiguous copies happen here,
+    # outside the tight training loop)
+    all_inputs = []
+    all_labels = []
+    tokens_per_batch = 0
+    for _ in range(num_steps):
+        batch = next(data_iterator).to(device, dtype=torch.long, non_blocking=True)
+        all_inputs.append(batch[:, :-1].contiguous())
+        all_labels.append(batch[:, 1:].contiguous())
+        tokens_per_batch = batch.numel()
+
+    opt_step = optimizer.step
+    opt_zero = optimizer.zero_grad
+    total_tokens = num_steps * tokens_per_batch
+    last_step = num_steps - 1
     final_logits = None
-    final_loss = 0.0
+    final_loss_val = 0.0
 
     for step in range(num_steps):
-        batch = next(data_iterator)
-        batch = batch.to(device, dtype=torch.long)
+        logits, loss = step_fn(all_inputs[step], all_labels[step])
+        opt_step()
+        opt_zero(set_to_none=True)
 
-        input_ids = batch[:, :-1]
-        labels = batch[:, 1:]
-
-        outputs = model(input_ids)
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs
-
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            ignore_index=-100,
-        )
-
-        loss.backward()
-
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
-        total_tokens += batch.numel()
-        final_logits = logits.detach().float()
-        final_loss = loss.item()
+        if step == last_step:
+            final_logits = logits.detach()
+            final_loss_val = loss.item()
 
     return InnerStepsResult(
         final_logits=final_logits,
         total_tokens=total_tokens,
-        final_loss=final_loss,
+        final_loss=final_loss_val,
     )

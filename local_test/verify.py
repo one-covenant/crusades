@@ -988,6 +988,7 @@ def main():
             optimizer=warmup_optimizer,
             num_steps=2,
             device=device,
+            num_gpus=1,
         )
         if warmup_result is None:
             print("  [FAILED] inner_steps returned None during warmup!")
@@ -1036,6 +1037,7 @@ def main():
             optimizer=capturing_optimizer,
             num_steps=num_steps,
             device=device,
+            num_gpus=1,
         )
     except AttributeError as e:
         if "read-only" in str(e) or "protected" in str(e):

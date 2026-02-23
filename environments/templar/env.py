@@ -88,6 +88,11 @@ _monotonic = time.monotonic
 _cuda_synchronize = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
 _cuda_elapsed_time = torch.cuda.Event.elapsed_time if torch.cuda.is_available() else None
 
+# Multi-GPU rank detection (set by torchrun when num_gpus > 1)
+_LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
+_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
+_IS_RANK_0 = _LOCAL_RANK == 0
+
 # Save the REAL torch.nn.functional functions at import time, before any miner
 # code can monkey-patch them.  The reference implementation uses these saved
 # copies exclusively so that ``F.cross_entropy = fake`` cannot poison the
@@ -169,9 +174,10 @@ def _log_vram(tag: str):
     """Log current VRAM usage for debugging memory leaks."""
     if not torch.cuda.is_available():
         return
-    allocated = torch.cuda.memory_allocated() / 1024**3
-    reserved = torch.cuda.memory_reserved() / 1024**3
-    logger.info(f"[VRAM {tag}] allocated={allocated:.2f}GB reserved={reserved:.2f}GB")
+    dev = _LOCAL_RANK
+    allocated = torch.cuda.memory_allocated(dev) / 1024**3
+    reserved = torch.cuda.memory_reserved(dev) / 1024**3
+    logger.info(f"[VRAM {tag}] rank={dev} allocated={allocated:.2f}GB reserved={reserved:.2f}GB")
 
 
 # Global cache for model (data is NOT cached for validators)
@@ -959,8 +965,7 @@ def _load_model(model_path: str, use_random_init: bool = False):
             local_files_only=True,
         )
 
-        # Simple model loading - Qwen2.5-3B (~6GB) fits easily on A100 80GB
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = f"cuda:{_LOCAL_RANK}" if torch.cuda.is_available() else "cpu"
         model = AutoModelForCausalLM.from_config(
             config,
             torch_dtype=torch.bfloat16,
@@ -968,7 +973,7 @@ def _load_model(model_path: str, use_random_init: bool = False):
             attn_implementation="flash_attention_2",
         )
         model = model.to(device)
-        logger.info(f"Model loaded on {device}")
+        logger.info(f"Model loaded on {device} (rank {_LOCAL_RANK})")
     else:
         logger.info(f"Loading pretrained model from {model_path}")
         # Use local cache only (Docker runs with --network=none)
@@ -1890,6 +1895,7 @@ class Actor:
         min_mfu: float = 50.0,
         require_cuda_timing: bool = True,
         model_params_override: int | None = None,
+        num_gpus: int = 1,
     ) -> dict:
         """
         Run MFU evaluation on miner's code.
@@ -2016,36 +2022,63 @@ class Actor:
                 sequence_length=sequence_length or EVAL_SEQUENCE_LENGTH,
                 validator_seed=seed,  # Unpredictable sampling
             )
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = torch.device(f"cuda:{_LOCAL_RANK}" if torch.cuda.is_available() else "cpu")
+
+            # Initialize distributed process group for multi-GPU
+            import torch.distributed as dist
+
+            if num_gpus > 1 and _WORLD_SIZE > 1:
+                if not dist.is_initialized():
+                    torch.cuda.set_device(_LOCAL_RANK)
+                    dist.init_process_group(backend="nccl")
+                    logger.info(f"Initialized process group: rank {_LOCAL_RANK}/{_WORLD_SIZE}")
 
             seq_len = sequence_length or EVAL_SEQUENCE_LENGTH
 
-            # Run reference implementation FIRST in a clean environment
-            data_iter_ref = _create_data_iterator(data, batch_size, seq_len)
-            optimizer_ref = _create_optimizer(model)
+            # Run reference implementation on rank 0 only (single-GPU baseline)
+            if _IS_RANK_0:
+                data_iter_ref = _create_data_iterator(data, batch_size, seq_len)
+                optimizer_ref = _create_optimizer(model)
 
-            initial_state = _CACHE.get("initial_state")
-            if initial_state is None:
-                initial_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                _CACHE["initial_state"] = initial_state
+                initial_state = _CACHE.get("initial_state")
+                if initial_state is None:
+                    initial_state = {
+                        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                    }
+                    _CACHE["initial_state"] = initial_state
 
-            reference, reference_grad = _run_reference(
-                model, data_iter_ref, optimizer_ref, steps, device, capture_final_gradients=True
-            )
+                reference, reference_grad = _run_reference(
+                    model, data_iter_ref, optimizer_ref, steps, device, capture_final_gradients=True
+                )
 
-            # Capture reference final weights for verification
-            reference_final_state = {
-                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-            }
-            logger.info("Captured reference final model state for weight verification")
-            _log_vram("after-reference-run")
+                # Capture reference final weights for verification
+                reference_final_state = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
+                logger.info("Captured reference final model state for weight verification")
+                _log_vram("after-reference-run")
 
-            # Free reference optimizer VRAM before running miner code
-            del optimizer_ref
-            del data_iter_ref
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                # Free reference optimizer VRAM before running miner code
+                del optimizer_ref
+                del data_iter_ref
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            else:
+                # Non-rank-0: cache initial state only, skip reference
+                initial_state = _CACHE.get("initial_state")
+                if initial_state is None:
+                    initial_state = {
+                        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                    }
+                    _CACHE["initial_state"] = initial_state
+                reference = None
+                reference_grad = None
+                reference_final_state = None
+
+            # Barrier: all ranks wait until reference is done
+            if num_gpus > 1 and _WORLD_SIZE > 1:
+                dist.barrier()
 
             # Capture vault timer refs into locals BEFORE loading miner code.
             # Closure variables inside the vault are immune to frame.f_globals
@@ -2120,6 +2153,7 @@ class Actor:
                         optimizer=optimizer_warmup,
                         num_steps=warmup_steps,
                         device=device,
+                        num_gpus=num_gpus,
                     )
 
                 # Quick validation of warmup result
@@ -2304,6 +2338,7 @@ class Actor:
                     optimizer=optimizer_miner,
                     num_steps=steps,
                     device=device,
+                    num_gpus=num_gpus,
                 )
 
             if _cuda_end_event is not None:
@@ -2395,6 +2430,22 @@ class Actor:
                 f"(perf_counter={wall_time_perf:.2f}s, monotonic={wall_time_mono:.2f}s"
                 f"{f', cuda_events={cuda_wall_time:.2f}s' if cuda_wall_time else ''})"
             )
+
+            # Non-rank-0 processes: skip verification, return minimal result
+            if not _IS_RANK_0:
+                if num_gpus > 1 and _WORLD_SIZE > 1:
+                    dist.barrier()
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": True,
+                    "error": None,
+                    "seed": seed,
+                    "code": code,
+                }
 
             # Convert GPU gradient snapshot to CPU (slow, but OUTSIDE the timer)
             optimizer_miner.finalize_gradients()
@@ -2571,7 +2622,9 @@ class Actor:
 
             total_tokens_int = expected_tokens  # Use validator-computed token count
             tps = float(total_tokens_int) / max(wall_time, 1e-6)
-            mfu = _calculate_mfu(total_tokens_int, wall_time, model_params, gpu_peak_tflops)
+            # Scale peak TFLOPS by num_gpus so MFU represents aggregate utilization
+            aggregate_tflops = gpu_peak_tflops * num_gpus
+            mfu = _calculate_mfu(total_tokens_int, wall_time, model_params, aggregate_tflops)
 
             # MFU sanity cap — no legitimate code can exceed this on current hardware.
             # Safety net: even if a novel timing attack evades all other checks,
@@ -2639,6 +2692,10 @@ class Actor:
                         elif check.get("check") == "weight_verification":
                             error_code = "weight_mismatch"
 
+            # Barrier before returning so all ranks exit together
+            if num_gpus > 1 and _WORLD_SIZE > 1:
+                dist.barrier()
+
             return {
                 "task_id": task_id,
                 "mfu": mfu if verified else 0.0,
@@ -2702,6 +2759,15 @@ class Actor:
                 torch.cuda.empty_cache()
             _log_vram("after-cleanup")
 
+            # Destroy distributed process group if initialized
+            try:
+                import torch.distributed as _dist
+
+                if _dist.is_initialized():
+                    _dist.destroy_process_group()
+            except Exception:
+                pass
+
 
 # =============================================================================
 # FastAPI HTTP Server (for Basilica custom Docker deployment)
@@ -2749,6 +2815,8 @@ class EvaluateRequest(BaseModel):
     gpu_peak_tflops: float = 312.0
     max_plausible_mfu: float = 75.0
     min_mfu: float = 50.0
+    # Multi-GPU
+    num_gpus: int = 1
 
 
 class EvaluateResponse(BaseModel):
@@ -2806,6 +2874,7 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         max_plausible_mfu=request.max_plausible_mfu,
         min_mfu=request.min_mfu,
         require_cuda_timing=True,
+        num_gpus=request.num_gpus,
     )
 
     return EvaluateResponse(
