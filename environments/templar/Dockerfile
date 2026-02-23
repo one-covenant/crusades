@@ -2,7 +2,7 @@
 # Usage: docker build --network=host -f environments/templar/Dockerfile -t templar-eval:latest .
 # Run from repo root so hparams.json is accessible
 
-FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-devel
+FROM pytorch/pytorch:2.7.1-cuda12.6-cudnn9-devel
 
 RUN apt-get update && apt-get install -y \
     git curl ca-certificates build-essential ninja-build \

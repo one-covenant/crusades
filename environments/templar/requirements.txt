@@ -16,4 +16,4 @@ pydantic==2.12.5
 boto3==1.42.54
 
 # Utilities
-numpy==2.2.5
+numpy==2.2.6

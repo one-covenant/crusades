@@ -93,42 +93,41 @@ def _check_extrinsic_failed(
     seconds to prevent a hung node from blocking the validator indefinitely.
     """
     for attempt in range(1 + retries):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            try:
-                future = pool.submit(subtensor.substrate.get_events, block_hash=block_hash)
-                events = future.result(timeout=rpc_timeout)
-                for event in events:
-                    if event.get("extrinsic_idx") != extrinsic_index:
-                        continue
-                    ev = event.get("event", {})
-                    module = ev.get("module_id", "")
-                    event_id = ev.get("event_id", "")
-                    if module == "System" and event_id == "ExtrinsicFailed":
-                        return True
-                return False
-            except concurrent.futures.TimeoutError:
-                pool.shutdown(wait=False, cancel_futures=True)
-                logger.warning(
-                    f"get_events timed out after {rpc_timeout}s (attempt {attempt + 1}/{1 + retries})"
-                )
-                if attempt >= retries:
-                    logger.error(
-                        "get_events timed out on all attempts. Assuming failed to be safe."
-                    )
-                    return True
-                time.sleep(1)
-            except Exception as e:
-                if attempt < retries:
-                    logger.warning(
-                        f"Could not check extrinsic events (attempt {attempt + 1}/{1 + retries}): {e}"
-                    )
-                    time.sleep(1)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = pool.submit(subtensor.substrate.get_events, block_hash=block_hash)
+            events = future.result(timeout=rpc_timeout)
+            for event in events:
+                if event.get("extrinsic_idx") != extrinsic_index:
                     continue
-                logger.error(
-                    f"Could not check extrinsic events after {1 + retries} attempts: {e}. "
-                    f"Assuming failed to be safe."
-                )
+                ev = event.get("event", {})
+                module = ev.get("module_id", "")
+                event_id = ev.get("event_id", "")
+                if module == "System" and event_id == "ExtrinsicFailed":
+                    return True
+            return False
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                f"get_events timed out after {rpc_timeout}s (attempt {attempt + 1}/{1 + retries})"
+            )
+            if attempt >= retries:
+                logger.error("get_events timed out on all attempts. Assuming failed to be safe.")
                 return True
+            time.sleep(1)
+        except Exception as e:
+            if attempt < retries:
+                logger.warning(
+                    f"Could not check extrinsic events (attempt {attempt + 1}/{1 + retries}): {e}"
+                )
+                time.sleep(1)
+                continue
+            logger.error(
+                f"Could not check extrinsic events after {1 + retries} attempts: {e}. "
+                f"Assuming failed to be safe."
+            )
+            return True
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _scan_block_for_transfer_stake(
