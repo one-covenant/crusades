@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: N817
 
 
 @dataclass
@@ -70,16 +71,21 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     """Optimized training loop for maximum MFU.
 
     When num_gpus > 1 the process group is already initialized by torchrun.
+    The data_iterator already provides rank-specific (non-overlapping) batches.
     Use ``device.index`` for local rank (``os`` is forbidden).
     """
 
     _configure_torch()
     _prepare_model(model)
 
+    if num_gpus > 1:
+        model = DDP(model, device_ids=[device.index])
+
+    if optimizer is None:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, fused=True)
+
     step_fn = _get_compiled_fn(model)
 
-    # Prefetch and pre-split all batches (contiguous copies happen here,
-    # outside the tight training loop)
     all_inputs = []
     all_labels = []
     tokens_per_batch = 0

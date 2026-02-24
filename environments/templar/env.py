@@ -1202,28 +1202,36 @@ def _get_cached_model(model_path: str, use_random_init: bool = False):
 
 
 def _create_data_iterator(
-    data: torch.Tensor, batch_size: int, sequence_length: int, *, offset: int = 0
+    data: torch.Tensor,
+    batch_size: int,
+    sequence_length: int,
+    *,
+    offset: int = 0,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Iterator[torch.Tensor]:
-    """Create infinite data iterator.
+    """Create infinite data iterator with optional DDP-aware sharding.
 
-    Args:
-        offset: Starting sample index for the data iterator.
+    When ``world_size > 1`` each rank receives non-overlapping batches:
+    rank *k* starts at ``offset + k * batch_size`` and advances by
+    ``world_size * batch_size`` per step.
     """
     if data.size(1) < sequence_length:
         raise ValueError(f"Data sequence length {data.size(1)} < required {sequence_length}")
 
     data = data[:, :sequence_length]
     num_samples = data.size(0)
+    stride = batch_size * world_size
 
     def _iter():
-        idx = offset % num_samples if num_samples > 0 else 0
+        idx = (offset + rank * batch_size) % num_samples if num_samples > 0 else 0
         while True:
             end_idx = idx + batch_size
             if end_idx > num_samples:
                 idx = 0
                 end_idx = batch_size
             yield data[idx:end_idx]
-            idx = end_idx
+            idx = (idx + stride) % num_samples
 
     return _iter()
 
@@ -1425,14 +1433,21 @@ def _run_reference(
     num_steps: int,
     device: torch.device,
     capture_final_gradients: bool = True,
+    ddp_model: torch.nn.Module | None = None,
 ) -> tuple[InnerStepsResult, GradientInfo | None]:
     """Run reference implementation for comparison.
+
+    When *ddp_model* is provided, the forward pass uses the DDP wrapper
+    (triggering gradient all-reduce) while gradient capture reads from the
+    unwrapped *model* whose ``.grad`` tensors contain the all-reduced values.
 
     Returns:
         Tuple of (InnerStepsResult, GradientInfo) where GradientInfo
         contains the gradients from the final step (before optimizer.step)
     """
     _enforce_backend_state()
+
+    eval_model = ddp_model if ddp_model is not None else model
 
     total_tokens = 0
     final_logits = None
@@ -1445,7 +1460,7 @@ def _run_reference(
 
         input_ids = batch[:, :-1]
         labels = batch[:, 1:]
-        outputs = model(input_ids)
+        outputs = eval_model(input_ids)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs
         loss = _real_cross_entropy(
             logits.reshape(-1, logits.size(-1)),
@@ -1455,7 +1470,7 @@ def _run_reference(
 
         loss.backward()
 
-        # Capture gradients on final step (before optimizer.step clears them)
+        # Capture from unwrapped model (DDP puts all-reduced grads there)
         if capture_final_gradients and step == num_steps - 1:
             final_gradients = _capture_gradients(model)
 
@@ -1821,18 +1836,22 @@ def _verify_outputs(
     logger.info("[PASSED] Loss is valid and similar to reference")
 
     # 3. Gradient-based verification (captures backward pass correctness)
-    logger.info("[CHECK 3/4] Gradient verification")
-    grad_ok, grad_error, grad_details = _verify_gradients(
-        reference_grad,
-        candidate_grad,
-        norm_ratio_max=gradient_norm_ratio_max,
-    )
-    details["gradient_verification"] = grad_details
+    if reference_grad is None or candidate_grad is None:
+        logger.info("[CHECK 3/4] Gradient verification SKIPPED (multi-GPU mode)")
+        details["checks_passed"].append("gradient_verification_skipped")
+    else:
+        logger.info("[CHECK 3/4] Gradient verification")
+        grad_ok, grad_error, grad_details = _verify_gradients(
+            reference_grad,
+            candidate_grad,
+            norm_ratio_max=gradient_norm_ratio_max,
+        )
+        details["gradient_verification"] = grad_details
 
-    if not grad_ok:
-        details["checks_failed"].append({"check": "gradient_verification", "error": grad_error})
-        return False, grad_error, details
-    details["checks_passed"].append("gradient_verification")
+        if not grad_ok:
+            details["checks_failed"].append({"check": "gradient_verification", "error": grad_error})
+            return False, grad_error, details
+        details["checks_passed"].append("gradient_verification")
 
     # 4. Final weight verification (verifies optimizer step correctness)
     if reference_final_state is not None and model is not None:
@@ -2002,6 +2021,7 @@ class Actor:
         from datetime import timedelta
 
         import torch.distributed as dist
+        from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: N817
 
         _multi_gpu = num_gpus > 1 and _WORLD_SIZE > 1
 
@@ -2037,47 +2057,56 @@ class Actor:
 
             seq_len = sequence_length or EVAL_SEQUENCE_LENGTH
 
-            # Reference baseline: rank 0 only
+            # Cache initial state on all ranks (needed to restore after reference)
+            initial_state = _CACHE.get("initial_state")
+            if initial_state is None:
+                initial_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                _CACHE["initial_state"] = initial_state
+
+            # Reference baseline: all ranks participate (DDP when multi-GPU)
+            data_iter_ref = _create_data_iterator(
+                data,
+                batch_size,
+                seq_len,
+                rank=_LOCAL_RANK,
+                world_size=_WORLD_SIZE,
+            )
+            optimizer_ref = _create_optimizer(model)
+
+            ref_ddp: torch.nn.Module | None = None
+            if _multi_gpu:
+                ref_ddp = DDP(model, device_ids=[_LOCAL_RANK])
+
+            reference, reference_grad = _run_reference(
+                model,
+                data_iter_ref,
+                optimizer_ref,
+                steps,
+                device,
+                capture_final_gradients=(_IS_RANK_0 and not _multi_gpu),
+                ddp_model=ref_ddp,
+            )
+
+            # Only rank 0 captures reference state for verification
+            reference_final_state = None
             if _IS_RANK_0:
-                data_iter_ref = _create_data_iterator(data, batch_size, seq_len)
-                optimizer_ref = _create_optimizer(model)
-
-                initial_state = _CACHE.get("initial_state")
-                if initial_state is None:
-                    initial_state = {
-                        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-                    }
-                    _CACHE["initial_state"] = initial_state
-
-                reference, reference_grad = _run_reference(
-                    model, data_iter_ref, optimizer_ref, steps, device, capture_final_gradients=True
-                )
-
-                # Capture reference final weights for verification
                 reference_final_state = {
                     k: v.detach().cpu().clone() for k, v in model.state_dict().items()
                 }
                 logger.info("Captured reference final model state for weight verification")
-                _log_vram("after-reference-run")
+            _log_vram("after-reference-run")
 
-                # Free reference optimizer VRAM before running miner code
-                del optimizer_ref
-                del data_iter_ref
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            else:
-                # Non-rank-0: cache initial state, skip reference
-                initial_state = _CACHE.get("initial_state")
-                if initial_state is None:
-                    initial_state = {
-                        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-                    }
-                    _CACHE["initial_state"] = initial_state
-                reference = None
-                reference_grad = None
-                reference_final_state = None
+            # Tear down DDP wrapper before restoring initial state
+            if ref_ddp is not None:
+                del ref_ddp
+            del optimizer_ref
+            del data_iter_ref
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
+            # Restore initial state on all ranks before miner code runs
+            model.load_state_dict(initial_state)
             if _multi_gpu:
                 dist.barrier()
 
@@ -2140,7 +2169,12 @@ class Actor:
 
             warmup_steps = 2
             data_iter_warmup = _create_data_iterator(
-                data, batch_size, seq_len, offset=warmup_data_offset
+                data,
+                batch_size,
+                seq_len,
+                offset=warmup_data_offset,
+                rank=_LOCAL_RANK,
+                world_size=_WORLD_SIZE,
             )
             optimizer_warmup = _create_optimizer(model)
 
@@ -2280,9 +2314,18 @@ class Actor:
 
             # Full timed evaluation with gradient capture
             _log_vram("before-timed-eval")
-            data_iter_miner = _create_data_iterator(data, batch_size, seq_len)
-            base_optimizer = _create_optimizer(model)
-            optimizer_miner = GradientCapturingOptimizer(base_optimizer, model, num_steps=steps)
+            data_iter_miner = _create_data_iterator(
+                data,
+                batch_size,
+                seq_len,
+                rank=_LOCAL_RANK,
+                world_size=_WORLD_SIZE,
+            )
+            if _multi_gpu:
+                optimizer_miner = None
+            else:
+                base_optimizer = _create_optimizer(model)
+                optimizer_miner = GradientCapturingOptimizer(base_optimizer, model, num_steps=steps)
 
             _reset_torch_state()
             _enforce_backend_state()
@@ -2450,9 +2493,6 @@ class Actor:
                     "code": code,
                 }
 
-            # Convert GPU gradient snapshot to CPU (slow, but OUTSIDE the timer)
-            optimizer_miner.finalize_gradients()
-
             # Verify backend settings were not tampered with during timed eval
             _backend_violations = _check_backend_state()
             if _backend_violations:
@@ -2470,37 +2510,43 @@ class Actor:
                     "code": code,
                 }
 
-            # Verify optimizer wrapper integrity
-            if type(optimizer_miner) is not GradientCapturingOptimizer:
-                return {
-                    "task_id": task_id,
-                    "mfu": 0.0,
-                    "tps": 0.0,
-                    "total_tokens": 0,
-                    "wall_time_seconds": wall_time,
-                    "success": False,
-                    "error": "Optimizer integrity check failed",
-                    "error_code": "execution_failed",
-                    "seed": seed,
-                    "code": code,
-                }
+            if not _multi_gpu:
+                # Convert GPU gradient snapshot to CPU (slow, but OUTSIDE the timer)
+                optimizer_miner.finalize_gradients()
 
-            # Get gradients captured from the final step (inside miner's code)
-            candidate_grad = optimizer_miner.captured_gradients
+                # Verify optimizer wrapper integrity
+                if type(optimizer_miner) is not GradientCapturingOptimizer:
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": wall_time,
+                        "success": False,
+                        "error": "Optimizer integrity check failed",
+                        "error_code": "execution_failed",
+                        "seed": seed,
+                        "code": code,
+                    }
 
-            if candidate_grad is None:
-                return {
-                    "task_id": task_id,
-                    "mfu": 0.0,
-                    "tps": 0.0,
-                    "total_tokens": 0,
-                    "wall_time_seconds": wall_time,
-                    "success": False,
-                    "error": "No gradients captured - miner may not be calling optimizer.step()",
-                    "error_code": "no_gradients_captured",
-                    "seed": seed,
-                    "code": code,
-                }
+                # Get gradients captured from the final step (inside miner's code)
+                candidate_grad = optimizer_miner.captured_gradients
+
+                if candidate_grad is None:
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": wall_time,
+                        "success": False,
+                        "error": "No gradients captured - miner may not be calling optimizer.step()",
+                        "error_code": "no_gradients_captured",
+                        "seed": seed,
+                        "code": code,
+                    }
+            else:
+                candidate_grad = None
 
             # Validate miner's returned result
             ok, error, parsed = _validate_return_type(miner_result)

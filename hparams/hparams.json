@@ -22,7 +22,7 @@
     "block_time": 12,
 
     "docker": {
-        "num_gpus": 1,
+        "num_gpus": 2,
         "memory_limit": "80g",
         "shm_size": "32g"
     },
@@ -30,7 +30,7 @@
     "basilica": {
         "image": "ghcr.io/one-covenant/templar-eval:latest",
         "ttl_seconds": 3600,
-        "gpu_count": 1,
+        "gpu_count": 2,
         "gpu_models": ["A100"],
         "min_gpu_memory_gb": 80,
         "interconnect": "SXM",
@@ -62,8 +62,8 @@
     "max_evaluated_urls": 10000,
 
     "payment": {
-        "enabled": true,
-        "fee_rao": 50000000,
+        "enabled": false,
+        "fee_rao": 100000000,
         "payment_address": "",
         "rpc_timeout": 30,
         "rpc_retries": 2

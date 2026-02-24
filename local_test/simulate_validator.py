@@ -94,6 +94,7 @@ async def simulate():
         max_plausible_mfu=hb["mfu"]["max_plausible_mfu"],
         min_mfu=hb["mfu"]["min_mfu"],
         require_cuda_timing=True,
+        num_gpus=hb.get("docker", {}).get("num_gpus", 1),
     )
 
     print()
