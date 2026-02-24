@@ -62,8 +62,8 @@
     "max_evaluated_urls": 10000,
 
     "payment": {
-        "enabled": false,
-        "fee_rao": 100000000,
+        "enabled": true,
+        "fee_rao": 50000000,
         "payment_address": "",
         "rpc_timeout": 30,
         "rpc_retries": 2
