@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import statistics
 import time
@@ -556,6 +557,15 @@ class Validator(BaseNode):
         Returns:
             Tuple of (success, code_or_error)
         """
+        # Expand short gist.github.com URLs to raw fetch form.
+        # Miners commit the short form to fit the 128-byte on-chain limit.
+        if "gist.github.com" in code_url.lower() and "/raw" not in code_url.lower():
+            code_url = re.sub(
+                r"gist\.github\.com", "gist.githubusercontent.com", code_url, flags=re.I
+            )
+            if not code_url.endswith("/raw"):
+                code_url = code_url.rstrip("/") + "/raw"
+
         # SSRF Protection: Validate URL before making request
         code_url_info = CodeUrlInfo(url=code_url)
         is_safe, validation_result = code_url_info.validate_url_security()
