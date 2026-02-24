@@ -52,7 +52,7 @@
     },
 
     "adaptive_threshold": {
-        "base_threshold": 0.02,
+        "base_threshold": 0.002,
         "decay_percent": 0.05,
         "decay_interval_blocks": 100
     },
@@ -62,7 +62,7 @@
 
     "payment": {
         "enabled": true,
-        "fee_rao": 100000000,
+        "fee_rao": 5000000,
         "payment_address": "",
         "rpc_timeout": 30,
         "rpc_retries": 2
