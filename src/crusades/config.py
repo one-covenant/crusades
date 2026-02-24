@@ -92,16 +92,9 @@ class PaymentConfig(BaseModel):
 
 
 class DockerConfig(BaseModel):
-    """Docker execution settings for validator evaluations.
+    """Docker execution settings for validator evaluations."""
 
-    GPU device options:
-    - "all": Use all available GPUs (default)
-    - "0": Use only GPU 0
-    - "0,1": Use GPUs 0 and 1
-    - "none": Disable GPU (CPU only)
-    """
-
-    gpu_devices: str = "all"  # "all", "0", "0,1", "none"
+    num_gpus: int = Field(default=1, ge=0)  # >1 uses torchrun for multi-GPU
     memory_limit: str = "32g"  # Docker memory limit
     shm_size: str = "8g"  # Shared memory size (important for PyTorch)
 
@@ -168,7 +161,6 @@ class HParams(BaseModel):
     benchmark_master_seed: int
     benchmark_sequence_length: int
     benchmark_batch_size: int
-    num_gpus: int = Field(default=1, ge=1)  # GPUs for evaluation (>1 uses torchrun)
 
     # Timing settings
     set_weights_interval_blocks: int  # Minimum blocks between weight updates

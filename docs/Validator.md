@@ -194,7 +194,7 @@ Edit `hparams/hparams.json`:
     "min_success_rate": 0.5,
     
     "docker": {
-        "gpu_devices": "0",
+        "num_gpus": 1,
         "memory_limit": "80g",
         "shm_size": "32g"
     },
@@ -227,7 +227,7 @@ Edit `hparams/hparams.json`:
 | `burn_rate` | % of emissions to burn_uid | `0.95` (95%) |
 | `evaluation_runs` | Number of evaluation runs per submission | `5` |
 | `min_success_rate` | Minimum passing runs to accept | `0.5` (50%) |
-| `gpu_devices` | Which GPUs to use | `"0"` |
+| `docker.num_gpus` | Number of GPUs for local Docker evaluation | `1` |
 | `memory_limit` | Container memory limit | `"80g"` |
 | `gradient_norm_ratio_max` | Max gradient relative error (1 + %) | `1.06` (6%) |
 | `timer_divergence_threshold` | Max divergence between timer sources | `0.01` (1%) |

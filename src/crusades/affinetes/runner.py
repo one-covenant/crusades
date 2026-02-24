@@ -157,7 +157,6 @@ class AffinetesRunner:
         self,
         mode: Literal["docker", "basilica"] = "docker",
         basilica_api_key: str | None = None,
-        docker_gpu_devices: str = "all",
         docker_memory_limit: str = "32g",
         docker_shm_size: str = "8g",
         num_gpus: int = 1,
@@ -195,10 +194,9 @@ class AffinetesRunner:
         Args:
             mode: Execution mode ("docker" for local, "basilica" for remote)
             basilica_api_key: Basilica API key (or BASILICA_API_TOKEN env var)
-            docker_gpu_devices: GPU devices for Docker ("all", "0", "0,1", "none")
             docker_memory_limit: Docker memory limit (e.g., "32g")
             docker_shm_size: Shared memory size for Docker (e.g., "8g")
-            num_gpus: Number of GPUs for evaluation (1 = single-GPU, >1 = multi-GPU via torchrun)
+            num_gpus: Number of GPUs to use (0=CPU-only, 1=single GPU, >1=multi-GPU)
             timeout: Evaluation timeout in seconds
             model_url: Default model URL (HuggingFace model ID)
             data_url: Default data URL (HuggingFace dataset)
@@ -221,7 +219,6 @@ class AffinetesRunner:
         """
         self.mode = mode
         self.basilica_api_key = basilica_api_key or os.getenv("BASILICA_API_TOKEN")
-        self.docker_gpu_devices = docker_gpu_devices
         self.docker_memory_limit = docker_memory_limit
         self.docker_shm_size = docker_shm_size
         self.num_gpus = num_gpus
@@ -269,13 +266,21 @@ class AffinetesRunner:
 
     @classmethod
     def _ensure_internal_network(cls) -> None:
-        """Create a Docker internal network (no egress) for multi-GPU NCCL."""
+        """Create an internal Docker network for multi-GPU NCCL."""
         if cls._internal_network_created:
             return
-        import subprocess
-
         try:
-            subprocess.run(
+            # Check if network already exists
+            result = subprocess.run(
+                ["docker", "network", "inspect", cls._INTERNAL_NETWORK],
+                capture_output=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                cls._internal_network_created = True
+                return
+
+            result = subprocess.run(
                 [
                     "docker",
                     "network",
@@ -286,9 +291,15 @@ class AffinetesRunner:
                 capture_output=True,
                 timeout=10,
             )
-        except Exception:
-            pass
-        cls._internal_network_created = True
+            if result.returncode != 0:
+                logger.error(
+                    f"Failed to create Docker network '{cls._INTERNAL_NETWORK}': "
+                    f"{result.stderr.decode().strip()}"
+                )
+                return
+            cls._internal_network_created = True
+        except Exception as e:
+            logger.error(f"Error creating Docker network '{cls._INTERNAL_NETWORK}': {e}")
 
     async def evaluate(
         self,
@@ -483,15 +494,10 @@ asyncio.run(main())
                 f"{train_path}:/app/scripts/miner_train.py:ro",
             ]
 
-            # Add GPU if configured
-            if self.docker_gpu_devices and self.docker_gpu_devices.lower() != "none":
-                if self.docker_gpu_devices.lower() == "all":
-                    docker_cmd.extend(["--gpus", "all"])
-                else:
-                    docker_cmd.extend(["--gpus", f"device={self.docker_gpu_devices}"])
+            if self.num_gpus > 0:
+                docker_cmd.extend(["--gpus", str(self.num_gpus)])
 
-            # Memory limits (from hparams.json docker config)
-            # Scale shm-size for NCCL (~2GB per GPU)
+            # Memory limits; scale shm for multi-GPU NCCL
             shm_size = self.docker_shm_size
             if self.num_gpus > 1:
                 base_shm_gb = int(self.docker_shm_size.rstrip("gG"))
@@ -505,13 +511,12 @@ asyncio.run(main())
                 ]
             )
 
-            # Docker sandbox configuration
-            # Scale pids-limit for torchrun (1024 per process)
+            # Sandbox: scale pids-limit for torchrun
             pids_limit = 1024 * max(self.num_gpus, 1)
             if self.num_gpus <= 1:
                 docker_cmd.extend(["--network", "none"])
             else:
-                # Multi-GPU: internal network (no egress) + no DNS
+                # Multi-GPU: internal network (no egress), no DNS
                 self._ensure_internal_network()
                 docker_cmd.extend(
                     [
@@ -796,7 +801,7 @@ asyncio.run(main())
                 "gpu_peak_tflops": self.gpu_peak_tflops,
                 "max_plausible_mfu": self.max_plausible_mfu,
                 "min_mfu": self.min_mfu,
-                "num_gpus": self.num_gpus,
+                "num_gpus": self.basilica_gpu_count,
             }
 
             logger.info("[BASILICA] Sending evaluation request...")

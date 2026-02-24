@@ -1,7 +1,7 @@
 {
     "netuid": 2,
     "burn_rate": 0.95,
-    "burn_uid": 0,
+    "burn_uid": 3,
 
     "evaluation_runs": 1,
     "eval_steps": 5,
@@ -15,7 +15,6 @@
     "benchmark_master_seed": 42,
     "benchmark_sequence_length": 1024,
     "benchmark_batch_size": 8,
-    "num_gpus": 1,
 
     "set_weights_interval_blocks": 5,
     "reveal_blocks": 5,
@@ -23,7 +22,7 @@
     "block_time": 12,
 
     "docker": {
-        "gpu_devices": "0",
+        "num_gpus": 1,
         "memory_limit": "80g",
         "shm_size": "32g"
     },

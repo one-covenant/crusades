@@ -1999,6 +1999,12 @@ class Actor:
                 "seed": seed,
             }
 
+        from datetime import timedelta
+
+        import torch.distributed as dist
+
+        _multi_gpu = num_gpus > 1 and _WORLD_SIZE > 1
+
         try:
             # ---------------------------------------------------------------
             # CRITICAL: Run reference BEFORE loading miner module.
@@ -2023,10 +2029,7 @@ class Actor:
                 validator_seed=seed,  # Unpredictable sampling
             )
             device = torch.device(f"cuda:{_LOCAL_RANK}" if torch.cuda.is_available() else "cpu")
-
-            import torch.distributed as dist
-
-            if num_gpus > 1 and _WORLD_SIZE > 1:
+            if _multi_gpu:
                 if not dist.is_initialized():
                     torch.cuda.set_device(_LOCAL_RANK)
                     dist.init_process_group(backend="nccl")
@@ -2075,7 +2078,7 @@ class Actor:
                 reference_grad = None
                 reference_final_state = None
 
-            if num_gpus > 1 and _WORLD_SIZE > 1:
+            if _multi_gpu:
                 dist.barrier()
 
             # Capture vault timer refs into locals BEFORE loading miner code.
@@ -2142,6 +2145,7 @@ class Actor:
             optimizer_warmup = _create_optimizer(model)
 
             logger.info(f"Running {warmup_steps} warmup step(s) to check for basic errors...")
+            warmup_failure: dict | None = None
             try:
                 # Hide env modules during miner execution to prevent timer tampering.
                 with _hide_sensitive_env_modules():
@@ -2154,104 +2158,85 @@ class Actor:
                         num_gpus=num_gpus,
                     )
 
-                # Quick validation of warmup result
-                if warmup_result is None:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": "inner_steps returned None (warmup check)",
-                        "seed": seed,
-                        "code": code,
-                    }
+                # Quick validation of warmup result (only rank 0 validates)
+                if _IS_RANK_0:
+                    if warmup_result is None:
+                        warmup_failure = {
+                            "task_id": task_id,
+                            "mfu": 0.0,
+                            "tps": 0.0,
+                            "total_tokens": 0,
+                            "wall_time_seconds": 0.0,
+                            "success": False,
+                            "error": "inner_steps returned None (warmup check)",
+                            "seed": seed,
+                            "code": code,
+                        }
+                    elif not hasattr(warmup_result, "final_logits"):
+                        warmup_failure = {
+                            "task_id": task_id,
+                            "mfu": 0.0,
+                            "tps": 0.0,
+                            "total_tokens": 0,
+                            "wall_time_seconds": 0.0,
+                            "success": False,
+                            "error": "inner_steps result missing 'final_logits' attribute",
+                            "seed": seed,
+                            "code": code,
+                        }
+                    else:
+                        logits = warmup_result.final_logits
+                        if logits is None:
+                            warmup_failure = {
+                                "task_id": task_id,
+                                "mfu": 0.0,
+                                "tps": 0.0,
+                                "total_tokens": 0,
+                                "wall_time_seconds": 0.0,
+                                "success": False,
+                                "error": "final_logits is None - must return actual logits for verification",
+                                "error_code": "missing_logits",
+                                "seed": seed,
+                                "code": code,
+                            }
+                        elif len(logits.shape) != 3:
+                            warmup_failure = {
+                                "task_id": task_id,
+                                "mfu": 0.0,
+                                "tps": 0.0,
+                                "total_tokens": 0,
+                                "wall_time_seconds": 0.0,
+                                "success": False,
+                                "error": f"Logits shape mismatch: expected 3D (batch, seq, vocab), got {logits.shape}",
+                                "error_code": "invalid_logits_shape",
+                                "seed": seed,
+                                "code": code,
+                            }
 
-                # Check required attributes exist
-                if not hasattr(warmup_result, "final_logits"):
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": "inner_steps result missing 'final_logits' attribute",
-                        "seed": seed,
-                        "code": code,
-                    }
-
-                # Check logits are present and valid shape
-                logits = warmup_result.final_logits
-                if logits is None:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": "final_logits is None - must return actual logits for verification",
-                        "error_code": "missing_logits",
-                        "seed": seed,
-                        "code": code,
-                    }
-                if len(logits.shape) != 3:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": f"Logits shape mismatch: expected 3D (batch, seq, vocab), got {logits.shape}",
-                        "error_code": "invalid_logits_shape",
-                        "seed": seed,
-                        "code": code,
-                    }
-
-                expected_vocab = reference.final_logits.shape[2]
-                if logits.shape[2] != expected_vocab:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": f"Logits vocab dimension mismatch: expected {expected_vocab}, got {logits.shape[2]}",
-                        "error_code": "invalid_logits_shape",
-                        "seed": seed,
-                        "code": code,
-                    }
-
-                logger.info("Warmup passed - proceeding with verification checks")
-
-                # Check trainable params AFTER warmup (miner code may modify requires_grad)
-                trainable_ok, trainable_error, trainable_details = _verify_trainable_params(
-                    model, min_trainable_params_ratio
-                )
-                if not trainable_ok:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": trainable_error,
-                        "error_code": "insufficient_trainable_params",
-                        "seed": seed,
-                        "code": code,
-                        "diagnostics": {"trainable_params": trainable_details},
-                    }
+                    if warmup_failure is None:
+                        logger.info("Warmup passed - proceeding with verification checks")
+                        trainable_ok, trainable_error, trainable_details = _verify_trainable_params(
+                            model, min_trainable_params_ratio
+                        )
+                        if not trainable_ok:
+                            warmup_failure = {
+                                "task_id": task_id,
+                                "mfu": 0.0,
+                                "tps": 0.0,
+                                "total_tokens": 0,
+                                "wall_time_seconds": 0.0,
+                                "success": False,
+                                "error": trainable_error,
+                                "error_code": "insufficient_trainable_params",
+                                "seed": seed,
+                                "code": code,
+                                "diagnostics": {"trainable_params": trainable_details},
+                            }
 
             except Exception as e:
-                # Early termination - don't waste time on broken code
                 error_msg = f"Early termination (warmup failed): {type(e).__name__}: {str(e)}"
                 logger.error(error_msg)
-                return {
+                warmup_failure = {
                     "task_id": task_id,
                     "mfu": 0.0,
                     "tps": 0.0,
@@ -2262,6 +2247,28 @@ class Actor:
                     "seed": seed,
                     "code": code,
                 }
+
+            # Synchronize warmup result across all ranks to prevent deadlock.
+            if _multi_gpu:
+                local_fail = 1 if warmup_failure is not None else 0
+                fail_tensor = torch.tensor([local_fail], dtype=torch.int32, device=device)
+                dist.all_reduce(fail_tensor, op=dist.ReduceOp.MAX)
+                if fail_tensor.item() > 0:
+                    if warmup_failure is not None:
+                        return warmup_failure
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": "Warmup failed on another rank",
+                        "seed": seed,
+                        "code": code,
+                    }
+            elif warmup_failure is not None:
+                return warmup_failure
 
             # Reset model state after warmup and free warmup optimizer VRAM
             model.load_state_dict(initial_state)
@@ -2618,7 +2625,7 @@ class Actor:
 
             total_tokens_int = expected_tokens  # Use validator-computed token count
             tps = float(total_tokens_int) / max(wall_time, 1e-6)
-            # MFU is per-GPU: N cancels in numerator and denominator for DDP
+            # MFU is per-GPU (DDP: N cancels in numerator and denominator)
             mfu = _calculate_mfu(total_tokens_int, wall_time, model_params, gpu_peak_tflops)
 
             # MFU sanity cap — no legitimate code can exceed this on current hardware.
@@ -2750,13 +2757,17 @@ class Actor:
                 torch.cuda.empty_cache()
             _log_vram("after-cleanup")
 
-            # All ranks converge here before teardown (prevents deadlocks)
+            # All ranks converge before teardown (60s timeout prevents hangs).
             try:
                 if dist.is_initialized():
-                    dist.barrier()
+                    dist.barrier(timeout=timedelta(seconds=60))
                     dist.destroy_process_group()
             except Exception:
-                pass
+                try:
+                    if dist.is_initialized():
+                        dist.destroy_process_group()
+                except Exception:
+                    pass
 
 
 # =============================================================================
@@ -2834,38 +2845,144 @@ async def health():
     }
 
 
+async def _evaluate_via_torchrun(request: EvaluateRequest) -> dict:
+    """Spawn torchrun for multi-GPU Basilica evaluation (uvicorn is single-process)."""
+    import asyncio as _aio
+    import json as _json
+    import tempfile
+
+    params_path = None
+    script_path = None
+    try:
+        params_path = tempfile.mktemp(suffix=".json", dir="/tmp")
+        with open(params_path, "w") as f:
+            _json.dump(request.model_dump(), f)
+
+        eval_script = f'''
+import asyncio, json, os, sys
+sys.path.insert(0, '/app')
+from env import Actor
+
+async def main():
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    with open("{params_path}") as f:
+        p = json.load(f)
+    actor = Actor()
+    result = await actor.evaluate(
+        task_id=p["task_id"], seed=p["seed"],
+        model_url=p["model_url"], data_url=p["data_url"],
+        steps=p["steps"], batch_size=p["batch_size"],
+        timeout=p["timeout"], sequence_length=p.get("sequence_length"),
+        data_samples=p["data_samples"], code=p["code"],
+        max_loss_difference=p["max_loss_difference"],
+        use_random_init=p["use_random_init"],
+        min_trainable_params_ratio=p["min_trainable_params_ratio"],
+        min_params_changed_ratio=p["min_params_changed_ratio"],
+        gradient_norm_ratio_max=p["gradient_norm_ratio_max"],
+        weight_relative_error_max=p["weight_relative_error_max"],
+        timer_divergence_threshold=p["timer_divergence_threshold"],
+        gpu_peak_tflops=p["gpu_peak_tflops"],
+        max_plausible_mfu=p["max_plausible_mfu"],
+        min_mfu=p["min_mfu"],
+        require_cuda_timing=True,
+        num_gpus=p["num_gpus"],
+    )
+    if local_rank == 0:
+        print("EVAL_RESULT:" + json.dumps(result))
+
+asyncio.run(main())
+'''
+        script_path = tempfile.mktemp(suffix=".py", dir="/tmp")
+        with open(script_path, "w") as f:
+            f.write(eval_script)
+
+        proc = await _aio.create_subprocess_exec(
+            "torchrun",
+            "--nproc_per_node",
+            str(request.num_gpus),
+            script_path,
+            stdout=_aio.subprocess.PIPE,
+            stderr=_aio.subprocess.STDOUT,
+        )
+        stdout_bytes, _ = await _aio.wait_for(proc.communicate(), timeout=request.timeout + 120)
+        stdout_text = stdout_bytes.decode(errors="replace")
+
+        for line in stdout_text.split("\n"):
+            if line.startswith("EVAL_RESULT:"):
+                return _json.loads(line[len("EVAL_RESULT:") :])
+
+        return {
+            "task_id": request.task_id,
+            "success": False,
+            "error": f"No EVAL_RESULT in torchrun output (exit {proc.returncode}): {stdout_text[:300]}",
+            "seed": request.seed,
+            "mfu": 0.0,
+            "tps": 0.0,
+            "total_tokens": 0,
+            "wall_time_seconds": 0.0,
+        }
+    except TimeoutError:
+        return {
+            "task_id": request.task_id,
+            "success": False,
+            "error": f"torchrun evaluation timed out after {request.timeout}s",
+            "seed": request.seed,
+            "mfu": 0.0,
+            "tps": 0.0,
+            "total_tokens": 0,
+            "wall_time_seconds": 0.0,
+        }
+    except Exception as e:
+        return {
+            "task_id": request.task_id,
+            "success": False,
+            "error": f"torchrun evaluation failed: {e}",
+            "seed": request.seed,
+            "mfu": 0.0,
+            "tps": 0.0,
+            "total_tokens": 0,
+            "wall_time_seconds": 0.0,
+        }
+    finally:
+        for p in (params_path, script_path):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
-    """Evaluate miner's train.py code and return MFU score.
-
-    This endpoint is called by the validator via Basilica.
-    """
-    actor = get_actor()
-
-    result = await actor.evaluate(
-        task_id=request.task_id,
-        seed=request.seed,
-        model_url=request.model_url,
-        data_url=request.data_url,
-        steps=request.steps,
-        batch_size=request.batch_size,
-        timeout=request.timeout,
-        sequence_length=request.sequence_length,
-        data_samples=request.data_samples,
-        code=request.code,
-        max_loss_difference=request.max_loss_difference,
-        use_random_init=request.use_random_init,
-        min_trainable_params_ratio=request.min_trainable_params_ratio,
-        min_params_changed_ratio=request.min_params_changed_ratio,
-        gradient_norm_ratio_max=request.gradient_norm_ratio_max,
-        weight_relative_error_max=request.weight_relative_error_max,
-        timer_divergence_threshold=request.timer_divergence_threshold,
-        gpu_peak_tflops=request.gpu_peak_tflops,
-        max_plausible_mfu=request.max_plausible_mfu,
-        min_mfu=request.min_mfu,
-        require_cuda_timing=True,
-        num_gpus=request.num_gpus,
-    )
+    """Evaluate miner's code. Spawns torchrun when num_gpus > 1."""
+    if request.num_gpus > 1:
+        result = await _evaluate_via_torchrun(request)
+    else:
+        actor = get_actor()
+        result = await actor.evaluate(
+            task_id=request.task_id,
+            seed=request.seed,
+            model_url=request.model_url,
+            data_url=request.data_url,
+            steps=request.steps,
+            batch_size=request.batch_size,
+            timeout=request.timeout,
+            sequence_length=request.sequence_length,
+            data_samples=request.data_samples,
+            code=request.code,
+            max_loss_difference=request.max_loss_difference,
+            use_random_init=request.use_random_init,
+            min_trainable_params_ratio=request.min_trainable_params_ratio,
+            min_params_changed_ratio=request.min_params_changed_ratio,
+            gradient_norm_ratio_max=request.gradient_norm_ratio_max,
+            weight_relative_error_max=request.weight_relative_error_max,
+            timer_divergence_threshold=request.timer_divergence_threshold,
+            gpu_peak_tflops=request.gpu_peak_tflops,
+            max_plausible_mfu=request.max_plausible_mfu,
+            min_mfu=request.min_mfu,
+            require_cuda_timing=True,
+            num_gpus=request.num_gpus,
+        )
 
     return EvaluateResponse(
         task_id=result.get("task_id", request.task_id),

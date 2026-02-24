@@ -29,9 +29,6 @@ def _prepare_model(model):
         return
     _PREPARED_MODEL_IDS.add(model_id)
 
-    if hasattr(model, "gradient_checkpointing_disable"):
-        model.gradient_checkpointing_disable()
-
     if hasattr(model, "config"):
         model.config.use_cache = False
         try:
@@ -70,23 +67,10 @@ def _get_compiled_fn(model):
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
-    """Optimized training loop for maximum MFU on A100.
+    """Optimized training loop for maximum MFU.
 
-    When num_gpus > 1, env.py launches via torchrun with the process
-    group already initialized.  Use ``device.index`` for the local rank
-    (``os`` is forbidden).
-
-    DDP example::
-
-        if num_gpus > 1:
-            from torch.nn.parallel import DistributedDataParallel as DDP
-            model = DDP(model, device_ids=[device.index])
-
-    FSDP example::
-
-        if num_gpus > 1:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            model = FSDP(model, device_id=device.index)
+    When num_gpus > 1 the process group is already initialized by torchrun.
+    Use ``device.index`` for local rank (``os`` is forbidden).
     """
 
     _configure_torch()
