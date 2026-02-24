@@ -65,15 +65,16 @@ def validate_code_url(url: str) -> tuple[bool, str, str | None]:
                 None,
             )
 
-    # Normalize gist URLs to the short gist.github.com form for commitment
-    # (saves ~15 chars vs gist.githubusercontent.com/.../raw).
+    # Normalize gist URLs to the short gist.github.com/{user}/{id} form for
+    # commitment (saves ~15-30 chars vs gist.githubusercontent.com/.../raw/...).
     # The validator expands to the raw form before fetching.
+    # Handles all variants: .../raw, .../raw/revision, .../raw/revision/filename
     commit_url = url.rstrip("/")
-    if "gist.githubusercontent.com" in commit_url.lower():
-        commit_url = re.sub(
-            r"gist\.githubusercontent\.com", "gist.github.com", commit_url, flags=re.I
-        )
-        commit_url = re.sub(r"/raw$", "", commit_url)
+    gist_match = re.match(
+        r"https?://gist\.githubusercontent\.com/([^/]+/[0-9a-f]+)", commit_url, re.I
+    )
+    if gist_match:
+        commit_url = f"https://gist.github.com/{gist_match.group(1)}"
 
     # Build raw fetch URL for validation
     fetch_url = commit_url
@@ -383,7 +384,7 @@ def commit_to_chain(
     # Use actual current_block to estimate block digits; add 1 digit of headroom for index.
     max_commitment = 128
     if hparams.payment.enabled:
-        block_digits = len(str(current_block))
+        block_digits = len(str(current_block)) + 1  # +1 for power-of-10 rollover
         index_digits = 3  # extrinsic index rarely exceeds 999
         overhead = len(code_hash) + 1 + block_digits + 1 + index_digits + 1
     else:
