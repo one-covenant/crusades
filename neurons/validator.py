@@ -329,10 +329,9 @@ class Validator(BaseNode):
                 )
                 return False
 
-        # Look up miner's coldkey from their hotkey
-        miner_coldkey = get_hotkey_owner(
-            self.chain.subtensor, commitment.hotkey, block=commitment.reveal_block
-        )
+        # Look up miner's coldkey from their hotkey (at current block, not
+        # historical, to avoid "state discarded" errors on non-archive nodes)
+        miner_coldkey = get_hotkey_owner(self.chain.subtensor, commitment.hotkey)
         if miner_coldkey is None:
             logger.error(
                 f"Could not look up coldkey for hotkey {commitment.hotkey[:16]}... "

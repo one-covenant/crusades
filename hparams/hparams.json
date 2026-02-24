@@ -1,6 +1,6 @@
 {
     "netuid": 3,
-    "burn_rate": 1.0,
+    "burn_rate": 0.95,
     "burn_uid": 1,
 
     "evaluation_runs": 5,
@@ -33,6 +33,7 @@
         "gpu_count": 1,
         "gpu_models": ["A100"],
         "min_gpu_memory_gb": 80,
+        "interconnect": "SXM",
         "cpu": "8",
         "memory": "80Gi"
     },
