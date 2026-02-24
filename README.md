@@ -71,11 +71,14 @@ uv run local_test/verify.py
 Test your `train.py` inside the **exact same Docker container** the production validator uses. This gives MFU numbers that closely match the tournament leaderboard and avoids environment dependency mismatches.
 
 ```bash
-# Build the eval image (from repo root, requires A100 GPU)
+# Build the eval image (from repo root)
 docker build --network=host -f environments/templar/Dockerfile \
     --no-cache -t templar-eval:latest .
 
-# Run the simulation
+# Run the simulation (requires an A100 GPU or equivalent)
+# Note: MFU/benchmark results will only closely match leaderboard numbers
+# when executed on the same GPU model (A100). Runs on other hardware may
+# produce divergent MFU results.
 docker run --gpus all -it --rm \
     -v $(pwd)/local_test/train.py:/test/train.py \
     -v $(pwd)/local_test/simulate_validator.py:/test/simulate.py \
