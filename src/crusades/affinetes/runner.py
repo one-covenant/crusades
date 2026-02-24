@@ -876,7 +876,7 @@ asyncio.run(main())
             deployment = await client.get_async(response.instance_name)
             logger.info(f"   Basilica ID: {deployment.name}")
 
-            await deployment.wait_until_ready_async(timeout=600)
+            await deployment.wait_until_ready_async(timeout=self.timeout)
             await deployment.refresh_async()
 
             deploy_time = time.time() - deploy_start
