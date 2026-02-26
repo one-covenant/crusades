@@ -2,7 +2,7 @@
 # Usage: docker build --network=host -f environments/templar/Dockerfile -t templar-eval:latest .
 # Run from repo root so hparams.json is accessible
 
-FROM pytorch/pytorch:2.7.1-cuda12.6-cudnn9-devel
+FROM pytorch/pytorch:2.9.0-cuda12.6-cudnn9-devel
 
 RUN apt-get update && apt-get install -y \
     git curl ca-certificates build-essential ninja-build \
@@ -15,12 +15,10 @@ COPY --chown=appuser:appuser environments/templar/requirements.txt /app/
 USER appuser
 RUN pip install --no-cache-dir --user -r requirements.txt
 
-# flash-attn uses Dao-AI Lab's optimised attention kernels (15% faster than
-# PyTorch built-in SDPA).  Install separately: pre-built wheels need the
-# torch + CUDA version to match; if no wheel exists, the source build needs
-# the CUDA toolkit (switch base image to *-devel in that case).
-ENV MAX_JOBS=4
-RUN pip install --no-cache-dir --user --no-build-isolation "flash-attn==2.8.3"
+# flash-attn: use pre-built wheel (matches torch 2.9 + CUDA 12.6 + Python 3.11)
+# to avoid the ~1hr source compilation.
+RUN pip install --no-cache-dir --user \
+    "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu126torch2.9-cp311-cp311-linux_x86_64.whl"
 
 # Remove g++/make but keep gcc for torch.compile inductor backend
 USER root

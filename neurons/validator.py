@@ -350,8 +350,10 @@ class Validator(BaseNode):
                 miner_coldkey = get_hotkey_owner(
                     archive_sub, commitment.hotkey, block=commitment.payment_block
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    f"Historical hotkey lookup failed at block {commitment.payment_block}: {e}"
+                )
         if miner_coldkey is None:
             miner_coldkey = get_hotkey_owner(archive_sub, commitment.hotkey)
         if miner_coldkey is None:

@@ -2176,7 +2176,10 @@ class Actor:
                 rank=_LOCAL_RANK,
                 world_size=_WORLD_SIZE,
             )
-            optimizer_warmup = _create_optimizer(model)
+            if _multi_gpu:
+                optimizer_warmup = None
+            else:
+                optimizer_warmup = _create_optimizer(model)
 
             logger.info(f"Running {warmup_steps} warmup step(s) to check for basic errors...")
             warmup_failure: dict | None = None
@@ -2633,6 +2636,29 @@ class Actor:
                 }
             logger.info(f"[PASSED] Vocab dimension check: {actual_vocab} == {expected_vocab}")
 
+            # Sanity check: if multi-GPU, verify params are full (not sharded).
+            # DDP keeps full params automatically; FSDP/TP miners must gather
+            # params before returning from inner_steps.
+            if _multi_gpu:
+                for _pname, _pval in model.named_parameters():
+                    if _pname in initial_state and _pval.shape != initial_state[_pname].shape:
+                        return {
+                            "task_id": task_id,
+                            "mfu": 0.0,
+                            "tps": 0.0,
+                            "total_tokens": 0,
+                            "wall_time_seconds": wall_time,
+                            "success": False,
+                            "error": (
+                                f"Parameter '{_pname}' is sharded "
+                                f"(shape {list(_pval.shape)} vs expected {list(initial_state[_pname].shape)}). "
+                                f"FSDP/TP miners must gather full params before returning from inner_steps."
+                            ),
+                            "error_code": "sharded_params_detected",
+                            "seed": seed,
+                            "code": code,
+                        }
+
             # Verify sufficient parameters changed during training
             params_ok, params_error, params_details = _verify_params_changed(
                 model, initial_state, min_params_changed_ratio
@@ -2950,7 +2976,7 @@ asyncio.run(main())
             stdout=_aio.subprocess.PIPE,
             stderr=_aio.subprocess.STDOUT,
         )
-        stdout_bytes, _ = await _aio.wait_for(proc.communicate(), timeout=request.timeout + 120)
+        stdout_bytes, _ = await _aio.wait_for(proc.communicate(), timeout=request.timeout + 600)
         stdout_text = stdout_bytes.decode(errors="replace")
 
         for line in stdout_text.split("\n"):
