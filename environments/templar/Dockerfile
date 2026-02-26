@@ -61,7 +61,7 @@ USER appuser
 COPY --chown=appuser:appuser src/crusades/core/security_defs.py /app/crusades/core/security_defs.py
 
 ENV PYTHONUNBUFFERED=1
-ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ENV PYTORCH_ALLOC_CONF=expandable_segments:True
 ENV PATH="/home/appuser/.local/bin:${PATH}"
 ENV CACHED_DATASET_PATH="/home/appuser/.cache/templar/dataset.json"
 ENV HF_HUB_OFFLINE=1

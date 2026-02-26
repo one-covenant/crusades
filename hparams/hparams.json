@@ -14,7 +14,7 @@
     "benchmark_data_samples": 10000,
     "benchmark_master_seed": 42,
     "benchmark_sequence_length": 1024,
-    "benchmark_batch_size": 8,
+    "benchmark_batch_size": 16,
 
     "set_weights_interval_blocks": 5,
     "reveal_blocks": 5,
@@ -49,7 +49,7 @@
     "mfu": {
         "gpu_peak_tflops": 312.0,
         "max_plausible_mfu": 75.0,
-        "min_mfu": 50.0
+        "min_mfu": 35.0
     },
 
     "adaptive_threshold": {

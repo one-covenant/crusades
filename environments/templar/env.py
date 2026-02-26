@@ -202,6 +202,29 @@ def _hide_sensitive_env_modules():
         sys.modules.update(hidden_modules)
 
 
+_VALID_STRATEGIES = ("ddp", "fsdp", "tp")
+
+
+def _detect_strategy_from_source(source: str) -> str:
+    """Extract parallelism strategy from miner source via AST (no code execution).
+
+    Looks for a ``get_strategy()`` function that returns a string literal.
+    Falls back to ``"ddp"`` when the function is absent or unparseable.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return "ddp"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "get_strategy":
+            for stmt in node.body:
+                if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Constant):
+                    val = str(stmt.value.value).lower()
+                    if val in _VALID_STRATEGIES:
+                        return val
+    return "ddp"
+
+
 def _load_miner_module(train_path: Path):
     """Load miner's train.py as a module in an isolated context."""
     spec = importlib.util.spec_from_file_location("miner_train", train_path)
@@ -1003,44 +1026,44 @@ def _count_model_params(model: torch.nn.Module) -> int:
 
 
 def _calculate_mfu(
-    total_tokens: int,
+    total_unique_tokens: int,
     wall_time: float,
     model_params: int,
     gpu_peak_tflops: float = 312.0,
+    num_gpus: int = 1,
 ) -> float:
-    """Calculate Model FLOPs Utilization (MFU).
+    """Calculate system-level Model FLOPs Utilization (MFU).
 
-    MFU = actual_flops / theoretical_peak_flops
+    MFU = total_system_flops / total_system_peak_flops
 
-    For transformer training (forward + backward):
-    - Forward: 2 * params * tokens (multiply-accumulate)
-    - Backward: 4 * params * tokens (gradients are 2x forward)
-    - Total: 6 * params * tokens
+    The caller provides *total_unique_tokens* — the number of distinct tokens
+    processed across the entire system during training:
+
+    - DDP/FSDP: tokens_per_rank * num_gpus (each rank sees different data)
+    - TP:       tokens_per_rank            (all ranks see the same data)
+
+    Total useful FLOPs = 6 * params * total_unique_tokens (forward + backward).
+    Total system peak  = peak_per_gpu * num_gpus * wall_time.
 
     Args:
-        total_tokens: Total tokens processed
+        total_unique_tokens: Distinct tokens processed by the system
         wall_time: Wall clock time in seconds
         model_params: Number of model parameters
-        gpu_peak_tflops: GPU theoretical peak TFLOPS (A100 80GB = 312 TFLOPS bfloat16)
+        gpu_peak_tflops: Per-GPU theoretical peak TFLOPS (A100 80GB = 312 bfloat16)
+        num_gpus: Number of GPUs used in evaluation
 
     Returns:
         MFU as a percentage (0-100)
     """
-    # Guard against division by zero / invalid inputs
-    if wall_time <= 0 or gpu_peak_tflops <= 0:
+    if wall_time <= 0 or gpu_peak_tflops <= 0 or num_gpus <= 0:
         return 0.0
 
-    # FLOPs for forward + backward pass
-    flops_per_token = 6 * model_params
-    total_flops = flops_per_token * total_tokens
+    total_system_flops = 6 * model_params * total_unique_tokens
+    total_system_peak = gpu_peak_tflops * num_gpus * 1e12 * wall_time
 
-    # Actual TFLOPS achieved
-    actual_tflops = total_flops / wall_time / 1e12
+    mfu = (total_system_flops / total_system_peak) * 100
 
-    # MFU as percentage
-    mfu = (actual_tflops / gpu_peak_tflops) * 100
-
-    return min(mfu, 100.0)  # Cap at 100%
+    return min(mfu, 100.0)
 
 
 def _capture_gradients(model: torch.nn.Module) -> GradientInfo:
@@ -2025,6 +2048,16 @@ class Actor:
 
         _multi_gpu = num_gpus > 1 and _WORLD_SIZE > 1
 
+        # Detect parallelism strategy from source (AST only, no execution).
+        strategy = _detect_strategy_from_source(code)
+        is_data_parallel = strategy in ("ddp", "fsdp")
+        logger.info(f"Miner parallelism strategy: {strategy} (data_parallel={is_data_parallel})")
+
+        if is_data_parallel and _multi_gpu:
+            data_rank, data_world = _LOCAL_RANK, _WORLD_SIZE
+        else:
+            data_rank, data_world = 0, 1
+
         try:
             # ---------------------------------------------------------------
             # CRITICAL: Run reference BEFORE loading miner module.
@@ -2063,52 +2096,123 @@ class Actor:
                 initial_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 _CACHE["initial_state"] = initial_state
 
-            # Reference baseline: all ranks participate (DDP when multi-GPU)
-            data_iter_ref = _create_data_iterator(
-                data,
-                batch_size,
-                seq_len,
-                rank=_LOCAL_RANK,
-                world_size=_WORLD_SIZE,
-            )
-            optimizer_ref = _create_optimizer(model)
-
+            # Reference baseline: adapts to miner's parallelism strategy.
+            # DDP/FSDP: all ranks participate with DDP wrapper + sharded data.
+            # TP: only rank 0 runs (equivalent to single-GPU on replicated data).
+            reference: InnerStepsResult | None = None
+            reference_grad: GradientInfo | None = None
+            reference_final_state: dict | None = None
             ref_ddp: torch.nn.Module | None = None
-            if _multi_gpu:
+
+            if is_data_parallel and _multi_gpu:
+                data_iter_ref = _create_data_iterator(
+                    data,
+                    batch_size,
+                    seq_len,
+                    rank=data_rank,
+                    world_size=data_world,
+                )
+                optimizer_ref = _create_optimizer(model)
                 ref_ddp = DDP(model, device_ids=[_LOCAL_RANK])
 
-            reference, reference_grad = _run_reference(
-                model,
-                data_iter_ref,
-                optimizer_ref,
-                steps,
-                device,
-                capture_final_gradients=(_IS_RANK_0 and not _multi_gpu),
-                ddp_model=ref_ddp,
-            )
+                reference, reference_grad = _run_reference(
+                    model,
+                    data_iter_ref,
+                    optimizer_ref,
+                    steps,
+                    device,
+                    capture_final_gradients=False,
+                    ddp_model=ref_ddp,
+                )
 
-            # Only rank 0 captures reference state for verification
-            reference_final_state = None
-            if _IS_RANK_0:
+                if _IS_RANK_0:
+                    reference_final_state = {
+                        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                    }
+                    logger.info("Captured DDP reference final state for weight verification")
+                _log_vram("after-reference-run")
+
+                del ref_ddp
+                ref_ddp = None
+                del optimizer_ref
+                del data_iter_ref
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                model.load_state_dict(initial_state)
+                dist.barrier()
+            elif _multi_gpu:
+                # TP strategy: rank 0 runs single-GPU reference, others wait.
+                if _IS_RANK_0:
+                    data_iter_ref = _create_data_iterator(
+                        data,
+                        batch_size,
+                        seq_len,
+                        rank=0,
+                        world_size=1,
+                    )
+                    optimizer_ref = _create_optimizer(model)
+
+                    reference, reference_grad = _run_reference(
+                        model,
+                        data_iter_ref,
+                        optimizer_ref,
+                        steps,
+                        device,
+                        capture_final_gradients=True,
+                        ddp_model=None,
+                    )
+
+                    reference_final_state = {
+                        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                    }
+                    logger.info("Captured single-GPU reference final state (TP mode)")
+                    _log_vram("after-reference-run")
+
+                    del optimizer_ref
+                    del data_iter_ref
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    model.load_state_dict(initial_state)
+
+                dist.barrier()
+            else:
+                # Single-GPU path (no multi-GPU)
+                data_iter_ref = _create_data_iterator(
+                    data,
+                    batch_size,
+                    seq_len,
+                    rank=0,
+                    world_size=1,
+                )
+                optimizer_ref = _create_optimizer(model)
+
+                reference, reference_grad = _run_reference(
+                    model,
+                    data_iter_ref,
+                    optimizer_ref,
+                    steps,
+                    device,
+                    capture_final_gradients=_IS_RANK_0,
+                    ddp_model=None,
+                )
+
                 reference_final_state = {
                     k: v.detach().cpu().clone() for k, v in model.state_dict().items()
                 }
-                logger.info("Captured reference final model state for weight verification")
-            _log_vram("after-reference-run")
+                logger.info("Captured reference final state for weight verification")
+                _log_vram("after-reference-run")
 
-            # Tear down DDP wrapper before restoring initial state
-            if ref_ddp is not None:
-                del ref_ddp
-            del optimizer_ref
-            del data_iter_ref
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                del optimizer_ref
+                del data_iter_ref
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            # Restore initial state on all ranks before miner code runs
-            model.load_state_dict(initial_state)
-            if _multi_gpu:
-                dist.barrier()
+                model.load_state_dict(initial_state)
 
             # Capture vault timer refs into locals BEFORE loading miner code.
             # Closure variables inside the vault are immune to frame.f_globals
@@ -2173,8 +2277,8 @@ class Actor:
                 batch_size,
                 seq_len,
                 offset=warmup_data_offset,
-                rank=_LOCAL_RANK,
-                world_size=_WORLD_SIZE,
+                rank=data_rank,
+                world_size=data_world,
             )
             if _multi_gpu:
                 optimizer_warmup = None
@@ -2321,8 +2425,8 @@ class Actor:
                 data,
                 batch_size,
                 seq_len,
-                rank=_LOCAL_RANK,
-                world_size=_WORLD_SIZE,
+                rank=data_rank,
+                world_size=data_world,
             )
             if _multi_gpu:
                 optimizer_miner = None
@@ -2695,10 +2799,15 @@ class Actor:
                 weight_relative_error_max=weight_relative_error_max,
             )
 
-            total_tokens_int = expected_tokens  # Use validator-computed token count
-            tps = float(total_tokens_int) / max(wall_time, 1e-6)
-            # MFU is per-GPU (DDP: N cancels in numerator and denominator)
-            mfu = _calculate_mfu(total_tokens_int, wall_time, model_params, gpu_peak_tflops)
+            tokens_per_rank = expected_tokens
+            if is_data_parallel:
+                total_unique_tokens = tokens_per_rank * num_gpus
+            else:
+                total_unique_tokens = tokens_per_rank
+            tps = float(total_unique_tokens) / max(wall_time, 1e-6)
+            mfu = _calculate_mfu(
+                total_unique_tokens, wall_time, model_params, gpu_peak_tflops, num_gpus
+            )
 
             # MFU sanity cap — no legitimate code can exceed this on current hardware.
             # Safety net: even if a novel timing attack evades all other checks,
@@ -2724,7 +2833,7 @@ class Actor:
                     "task_id": task_id,
                     "mfu": mfu,
                     "tps": tps,
-                    "total_tokens": total_tokens_int,
+                    "total_tokens": total_unique_tokens,
                     "wall_time_seconds": wall_time,
                     "success": False,
                     "error": f"MFU {mfu:.1f}% below minimum threshold {min_mfu}%",
@@ -2736,10 +2845,12 @@ class Actor:
             # Diagnostics
             diagnostics = {
                 "verification": verify_details,
+                "strategy": strategy,
                 "reference_loss": reference.final_loss,
                 "candidate_loss": parsed.final_loss,
                 "expected_tokens": expected_tokens,
                 "actual_tokens": parsed.total_tokens,
+                "total_unique_tokens": total_unique_tokens,
                 "model_params": model_params,
                 "gpu_peak_tflops": gpu_peak_tflops,
                 "trainable_params": trainable_details,
@@ -2770,7 +2881,7 @@ class Actor:
                 "task_id": task_id,
                 "mfu": mfu if verified else 0.0,
                 "tps": tps if verified else 0.0,
-                "total_tokens": total_tokens_int if verified else 0,
+                "total_tokens": total_unique_tokens if verified else 0,
                 "wall_time_seconds": wall_time,
                 "success": verified,
                 "error": verify_error,
