@@ -171,6 +171,9 @@ class Validator(BaseNode):
             basilica_min_gpu_memory_gb=hparams.basilica.min_gpu_memory_gb,
             basilica_cpu=hparams.basilica.cpu,
             basilica_memory=hparams.basilica.memory,
+            basilica_interconnect=hparams.basilica.interconnect,
+            basilica_geo=hparams.basilica.geo,
+            basilica_spot=hparams.basilica.spot,
         )
 
         # Load persisted state
@@ -328,10 +331,19 @@ class Validator(BaseNode):
                 )
                 return False
 
-        # Look up miner's coldkey from their hotkey
-        miner_coldkey = get_hotkey_owner(
-            self.chain.subtensor, commitment.hotkey, block=commitment.reveal_block
-        )
+        # Try historical lookup at payment block for accuracy (handles hotkey
+        # ownership transfers); fall back to current block on non-archive nodes
+        # where old state may be pruned.
+        miner_coldkey = None
+        if commitment.payment_block:
+            try:
+                miner_coldkey = get_hotkey_owner(
+                    self.chain.subtensor, commitment.hotkey, block=commitment.payment_block
+                )
+            except Exception:
+                pass
+        if miner_coldkey is None:
+            miner_coldkey = get_hotkey_owner(self.chain.subtensor, commitment.hotkey)
         if miner_coldkey is None:
             logger.error(
                 f"Could not look up coldkey for hotkey {commitment.hotkey[:16]}... "
@@ -556,6 +568,18 @@ class Validator(BaseNode):
         Returns:
             Tuple of (success, code_or_error)
         """
+        # Expand short gist.github.com URLs to raw fetch form.
+        # Miners commit the short form to fit the 128-byte on-chain limit.
+        from urllib.parse import urlparse, urlunparse
+
+        parsed = urlparse(code_url)
+        if parsed.hostname and "gist.github.com" in parsed.hostname.lower():
+            new_host = parsed.hostname.replace("gist.github.com", "gist.githubusercontent.com")
+            path = parsed.path.rstrip("/")
+            if not path.endswith("/raw"):
+                path += "/raw"
+            code_url = urlunparse(parsed._replace(netloc=new_host, path=path))
+
         # SSRF Protection: Validate URL before making request
         code_url_info = CodeUrlInfo(url=code_url)
         is_safe, validation_result = code_url_info.validate_url_security()

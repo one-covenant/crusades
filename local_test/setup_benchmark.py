@@ -169,11 +169,17 @@ def main():
     print("SETUP COMPLETE")
     print("=" * 60)
     print()
-    print("You can now run local tests:")
-    print("uv run local_test/train.py")
+    print("Running verification (local_test/verify.py)...")
     print()
+
+    import subprocess
+
+    result = subprocess.run(
+        [sys.executable, str(project_root / "local_test" / "verify.py")],
+        cwd=str(project_root),
+    )
+    sys.exit(result.returncode)
 
 
 if __name__ == "__main__":
     main()
-    sys.exit(0)

@@ -65,16 +65,29 @@ def validate_code_url(url: str) -> tuple[bool, str, str | None]:
                 None,
             )
 
-    # For GitHub Gist URLs, convert to raw format
-    final_url = url
-    if "gist.github.com" in url.lower() and "/raw" not in url.lower():
-        final_url = re.sub(r"gist\.github\.com", "gist.githubusercontent.com", url, flags=re.I)
-        if not final_url.endswith("/raw"):
-            final_url = final_url.rstrip("/") + "/raw"
+    # Normalize gist URLs to the short gist.github.com/{user}/{id} form for
+    # commitment (saves ~15-30 chars vs gist.githubusercontent.com/.../raw/...).
+    # The validator expands to the raw form before fetching.
+    # Handles all variants: .../raw, .../raw/revision, .../raw/revision/filename
+    commit_url = url.rstrip("/")
+    gist_match = re.match(
+        r"https?://gist\.githubusercontent\.com/([^/]+/[0-9a-f]+)", commit_url, re.I
+    )
+    if gist_match:
+        commit_url = f"https://gist.github.com/{gist_match.group(1)}"
+
+    # Build raw fetch URL for validation
+    fetch_url = commit_url
+    if "gist.github.com" in fetch_url.lower() and "/raw" not in fetch_url.lower():
+        fetch_url = re.sub(
+            r"gist\.github\.com", "gist.githubusercontent.com", fetch_url, flags=re.I
+        )
+        if not fetch_url.endswith("/raw"):
+            fetch_url = fetch_url.rstrip("/") + "/raw"
 
     # Verify the URL is accessible and contains valid code
     try:
-        req = urllib.request.Request(final_url, headers={"User-Agent": "templar-crusades"})
+        req = urllib.request.Request(fetch_url, headers={"User-Agent": "templar-crusades"})
         with urllib.request.urlopen(req, timeout=10) as response:
             code = response.read().decode("utf-8")
 
@@ -118,7 +131,7 @@ def validate_code_url(url: str) -> tuple[bool, str, str | None]:
     except Exception as e:
         return False, f"Error validating URL: {e}", None
 
-    return True, final_url, code_hash
+    return True, commit_url, code_hash
 
 
 def _resolve_burn_hotkey(subtensor: bt.subtensor, netuid: int, burn_uid: int) -> str | None:
@@ -365,6 +378,24 @@ def commit_to_chain(
     # Get miner UID
     uid = subtensor.get_uid_for_hotkey_on_subnet(hotkey_ss58=hotkey, netuid=netuid)
     print(f"   Miner UID: {uid}")
+
+    # Pre-flight: check commitment size before taking payment.
+    # Format: "<32hex>:<block>:<index>:<url>" (payment) or "<32hex>:<url>" (no payment)
+    # Use actual current_block to estimate block digits; add 1 digit of headroom for index.
+    max_commitment = 128
+    if hparams.payment.enabled:
+        block_digits = len(str(current_block)) + 1  # +1 for power-of-10 rollover
+        index_digits = 3  # extrinsic index rarely exceeds 999
+        overhead = len(code_hash) + 1 + block_digits + 1 + index_digits + 1
+    else:
+        overhead = len(code_hash) + 1
+    if len(code_url) + overhead > max_commitment:
+        max_url = max_commitment - overhead
+        return False, (
+            f"URL too long ({len(code_url)} chars, max ~{max_url}). "
+            f"Commitment would exceed {max_commitment}-byte on-chain limit. "
+            f"Use a shorter URL."
+        )
 
     # --- Payment step ---
     if hparams.payment.enabled:
