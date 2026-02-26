@@ -171,6 +171,9 @@ class Validator(BaseNode):
             basilica_min_gpu_memory_gb=hparams.basilica.min_gpu_memory_gb,
             basilica_cpu=hparams.basilica.cpu,
             basilica_memory=hparams.basilica.memory,
+            basilica_interconnect=hparams.basilica.interconnect,
+            basilica_geo=hparams.basilica.geo,
+            basilica_spot=hparams.basilica.spot,
         )
 
         # Load persisted state

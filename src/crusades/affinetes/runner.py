@@ -182,6 +182,9 @@ class AffinetesRunner:
         basilica_min_gpu_memory_gb: int = 40,
         basilica_cpu: str = "4",
         basilica_memory: str = "32Gi",
+        basilica_interconnect: str | None = None,
+        basilica_geo: str | None = None,
+        basilica_spot: bool = False,
     ):
         """Initialize the runner.
 
@@ -240,6 +243,9 @@ class AffinetesRunner:
         self.basilica_min_gpu_memory_gb = basilica_min_gpu_memory_gb
         self.basilica_cpu = basilica_cpu
         self.basilica_memory = basilica_memory
+        self.basilica_interconnect = basilica_interconnect
+        self.basilica_geo = basilica_geo
+        self.basilica_spot = basilica_spot
 
         # Basilica deployment cache (per-instance, not global)
         self._basilica_deployment = None
@@ -731,11 +737,11 @@ asyncio.run(main())
 
             logger.info("[BASILICA] Sending evaluation request...")
             logger.info(f"   POST {deployment.url}/evaluate")
-            logger.info(f"   Timeout: {self.timeout + 120}s")
+            logger.info(f"   Timeout: {self.timeout + 600}s")
 
             start_time = time.time()
 
-            async with httpx.AsyncClient(timeout=self.timeout + 120) as client:
+            async with httpx.AsyncClient(timeout=self.timeout + 600) as client:
                 response = await client.post(
                     f"{deployment.url}/evaluate",
                     json=payload,
@@ -845,7 +851,13 @@ asyncio.run(main())
         logger.info(f"   Image: {self.basilica_image}")
         logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
         logger.info(f"   Min GPU memory: {self.basilica_min_gpu_memory_gb}GB")
+        if self.basilica_interconnect:
+            logger.info(f"   Interconnect: {self.basilica_interconnect}")
         logger.info(f"   CPU: {self.basilica_cpu}, Memory: {self.basilica_memory}")
+        if self.basilica_geo:
+            logger.info(f"   Geo: {self.basilica_geo}")
+        if self.basilica_spot:
+            logger.info("   Spot: enabled")
         logger.info(
             f"   TTL: {self.basilica_ttl_seconds}s ({self.basilica_ttl_seconds / 60:.0f} min)"
         )
@@ -862,17 +874,24 @@ asyncio.run(main())
             # Split into create + get + wait (instead of client.deploy()) so
             # we always hold a Deployment reference for cleanup on failure.
             # All calls use async variants to avoid blocking the event loop.
-            response = await client.create_deployment_async(
-                instance_name=deploy_name,
-                image=self.basilica_image,
-                port=8000,
-                ttl_seconds=self.basilica_ttl_seconds,
-                gpu_count=self.basilica_gpu_count,
-                gpu_models=self.basilica_gpu_models,
-                min_gpu_memory_gb=self.basilica_min_gpu_memory_gb,
-                cpu=self.basilica_cpu,
-                memory=self.basilica_memory,
-            )
+            deploy_kwargs = {
+                "instance_name": deploy_name,
+                "image": self.basilica_image,
+                "port": 8000,
+                "ttl_seconds": self.basilica_ttl_seconds,
+                "gpu_count": self.basilica_gpu_count,
+                "gpu_models": self.basilica_gpu_models,
+                "min_gpu_memory_gb": self.basilica_min_gpu_memory_gb,
+                "cpu": self.basilica_cpu,
+                "memory": self.basilica_memory,
+            }
+            if self.basilica_interconnect:
+                deploy_kwargs["interconnect"] = self.basilica_interconnect
+            if self.basilica_geo:
+                deploy_kwargs["geo"] = self.basilica_geo
+            if self.basilica_spot:
+                deploy_kwargs["spot"] = self.basilica_spot
+            response = await client.create_deployment_async(**deploy_kwargs)
             deployment = await client.get_async(response.instance_name)
             logger.info(f"   Basilica ID: {deployment.name}")
 

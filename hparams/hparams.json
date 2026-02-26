@@ -35,7 +35,9 @@
         "min_gpu_memory_gb": 80,
         "interconnect": "SXM",
         "cpu": "8",
-        "memory": "80Gi"
+        "memory": "80Gi",
+        "geo": "US",
+        "spot": true
     },
 
     "verification": {

@@ -127,8 +127,11 @@ class BasilicaConfig(BaseModel):
     gpu_count: int = 1  # Number of GPUs (1-8)
     gpu_models: list[str] = ["A100"]  # GPU types
     min_gpu_memory_gb: int = 40  # Minimum GPU memory in GB
+    interconnect: str | None = None  # GPU interconnect: "SXM" or "PCIe"
     cpu: str = "4"  # CPU cores
     memory: str = "32Gi"  # Memory limit
+    geo: str | None = None  # Geographic region (e.g., "US", "EU")
+    spot: bool = False  # Use spot/preemptible instances
 
 
 class HParams(BaseModel):
