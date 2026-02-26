@@ -1,16 +1,19 @@
 """TP train.py -- tensor-parallel strategy.
 
-Declares get_strategy() -> "tp". All ranks receive the same data
-(replicated batches). The model's linear layers are sharded column/row-wise
-across ranks. Must gather full params before returning.
+Declares get_strategy() -> "tp".  All ranks receive the same data
+(replicated batches).  The model's linear layers are sharded
+column/row-wise across ranks via PyTorch's native DTensor APIs.
 
-Uses PyTorch's native tensor_parallel APIs (torch.distributed.tensor_parallel).
+Key details for weight verification:
+  - TP replaces parameter tensors with DTensors (distributed shards).
+  - We use DTensor.full_tensor() to gather shards back to full tensors
+    and return them as ``final_state`` so the validator can run weight
+    verification normally.
 """
 
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor.parallel import (
@@ -25,6 +28,7 @@ class InnerStepsResult:
     final_logits: torch.Tensor
     total_tokens: int
     final_loss: float
+    final_state: dict | None = None
 
 
 def get_strategy():
@@ -58,19 +62,14 @@ def _apply_tp(model, device_mesh):
     return model
 
 
-def _gather_full_params(model, world_size):
-    """Gather sharded TP parameters back to full tensors on all ranks."""
+def _gather_full_state(model):
+    """Gather TP-sharded parameters back to full tensors (CPU) for verification."""
     state = {}
     for name, param in model.named_parameters():
         p = param.data
         if hasattr(p, "full_tensor"):
             p = p.full_tensor()
-        elif hasattr(p, "to_local"):
-            local = p.to_local()
-            gathered = [torch.zeros_like(local) for _ in range(world_size)]
-            dist.all_gather(gathered, local)
-            p = torch.cat(gathered, dim=0)
-        state[name] = p
+        state[name] = p.detach().cpu().clone()
     return state
 
 
@@ -116,16 +115,14 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         final_logits = logits.detach()
         final_loss = loss.item()
 
+    # Gather full params from DTensor shards for weight verification.
+    full_state = None
     if num_gpus > 1:
-        full_state = _gather_full_params(model, num_gpus)
-        current_state = model.state_dict()
-        for k in current_state:
-            if k in full_state:
-                current_state[k] = full_state[k]
-        model.load_state_dict(current_state, strict=False)
+        full_state = _gather_full_state(model)
 
     return InnerStepsResult(
         final_logits=final_logits,
         total_tokens=total_tokens,
         final_loss=final_loss,
+        final_state=full_state,
     )

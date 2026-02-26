@@ -2409,13 +2409,24 @@ class Actor:
             elif warmup_failure is not None:
                 return warmup_failure
 
-            # Reset model state after warmup and free warmup optimizer VRAM
-            model.load_state_dict(initial_state)
+            # Reset model state after warmup and free warmup optimizer VRAM.
+            # FSDP/TP modify parameter storage in-place (flat buffers / DTensors),
+            # so load_state_dict with original shapes will fail.
+            # Re-create the model from scratch for these strategies.
             del optimizer_warmup
             del data_iter_warmup
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if strategy in ("fsdp", "tp"):
+                del model
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                model = _load_model(model_url, use_random_init=use_random_init)
+                model.load_state_dict(initial_state)
+            else:
+                model.load_state_dict(initial_state)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             # Full timed evaluation with gradient capture
             _log_vram("before-timed-eval")
@@ -2738,11 +2749,19 @@ class Actor:
                 }
             logger.info(f"[PASSED] Vocab dimension check: {actual_vocab} == {expected_vocab}")
 
+            # If the miner returned a full state_dict (required for FSDP/TP
+            # where params are sharded in-place), build a verification model
+            # from it so shape-based and weight checks work normally.
+            miner_final_state = getattr(miner_result, "final_state", None)
+            verify_model = model
+            if miner_final_state is not None:
+                logger.info("Using miner-provided final_state for weight verification")
+                verify_model = _load_model(model_url, use_random_init=use_random_init)
+                verify_model.load_state_dict(miner_final_state)
+
             # Sanity check: if multi-GPU, verify params are full (not sharded).
-            # DDP keeps full params automatically; FSDP/TP miners must gather
-            # params before returning from inner_steps.
             if _multi_gpu:
-                for _pname, _pval in model.named_parameters():
+                for _pname, _pval in verify_model.named_parameters():
                     if _pname in initial_state and _pval.shape != initial_state[_pname].shape:
                         return {
                             "task_id": task_id,
@@ -2753,8 +2772,10 @@ class Actor:
                             "success": False,
                             "error": (
                                 f"Parameter '{_pname}' is sharded "
-                                f"(shape {list(_pval.shape)} vs expected {list(initial_state[_pname].shape)}). "
-                                f"FSDP/TP miners must gather full params before returning from inner_steps."
+                                f"(shape {list(_pval.shape)} vs expected "
+                                f"{list(initial_state[_pname].shape)}). "
+                                f"FSDP/TP miners must return final_state "
+                                f"with full params in InnerStepsResult."
                             ),
                             "error_code": "sharded_params_detected",
                             "seed": seed,
@@ -2763,7 +2784,7 @@ class Actor:
 
             # Verify sufficient parameters changed during training
             params_ok, params_error, params_details = _verify_params_changed(
-                model, initial_state, min_params_changed_ratio
+                verify_model, initial_state, min_params_changed_ratio
             )
             if not params_ok:
                 return {
@@ -2791,7 +2812,7 @@ class Actor:
                 reference_grad=reference_grad,
                 candidate_grad=candidate_grad,
                 reference_final_state=reference_final_state,
-                model=model,
+                model=verify_model,
                 max_loss_difference=max_loss_difference,
                 gradient_norm_ratio_max=gradient_norm_ratio_max,
                 weight_relative_error_max=weight_relative_error_max,
@@ -2919,6 +2940,11 @@ class Actor:
             reference_final_state = candidate_grad = None  # type: ignore[assignment]
             miner_result = parsed = miner_module = None  # type: ignore[assignment]
             reference = reference_grad = None  # type: ignore[assignment]
+
+            # FSDP/TP corrupt the model's parameter storage; invalidate cache
+            # so the next evaluation creates a fresh model.
+            if strategy in ("fsdp", "tp"):
+                _CACHE.pop("model", None)
 
             # Reset torch state (removes miner module, restores timing functions)
             _reset_torch_state()

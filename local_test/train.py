@@ -1,8 +1,7 @@
-"""Basic DDP train.py for testing multi-GPU parallelism.
+"""Default train.py -- basic DDP (same as train_ddp.py).
 
-Single-GPU: uses the validator-provided optimizer directly.
-Multi-GPU: wraps model with DDP and creates own optimizer.
-No torch.compile — kept simple for debugging.
+This is the default miner training script.  Works with single-GPU and
+multi-GPU (DDP).  No get_strategy() means the validator defaults to "ddp".
 """
 
 from dataclasses import dataclass
@@ -17,6 +16,7 @@ class InnerStepsResult:
     final_logits: torch.Tensor
     total_tokens: int
     final_loss: float
+    final_state: dict | None = None
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):

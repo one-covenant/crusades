@@ -1,7 +1,10 @@
-"""DDP train.py — data-parallel, default strategy.
+"""DDP train.py -- data-parallel strategy (default).
 
-No get_strategy() needed (defaults to "ddp").
-Each rank gets different data batches, gradients are all-reduced.
+No get_strategy() needed (defaults to "ddp").  Each rank gets different
+data batches, gradients are all-reduced automatically.
+
+DDP preserves original parameter shapes, so no ``final_state`` gathering
+is needed -- the validator can read weights directly from the model.
 """
 
 from dataclasses import dataclass
@@ -16,6 +19,7 @@ class InnerStepsResult:
     final_logits: torch.Tensor
     total_tokens: int
     final_loss: float
+    final_state: dict | None = None
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
