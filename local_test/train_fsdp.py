@@ -7,15 +7,17 @@ equivalent results to DDP.
 Key details for weight verification:
   - FSDP flattens parameter storage in-place, so after training the
     validator cannot read original-shape weights from the model object.
-  - We use FSDP.state_dict_type(FULL_STATE_DICT) to gather full params
-    with original shapes and return them as ``final_state`` so the
-    validator can run weight verification normally.
+  - We gather full params via FULL_STATE_DICT (rank0_only=True) and
+    return them as ``final_state``.  The validator compares CPU dicts
+    directly -- no extra model load needed.
 """
 
 import functools
+import warnings
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.fsdp import (
     FullStateDictConfig,
@@ -115,12 +117,17 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         final_loss = loss.item()
 
     # Gather full state dict with original shapes for weight verification.
-    # FSDP.state_dict_type + FULL_STATE_DICT is the official API for this.
+    # rank0_only=True avoids redundant CPU copies on non-rank-0 workers.
     full_state = None
     if num_gpus > 1:
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-            full_state = {k: v.clone() for k, v in model.state_dict().items()}
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                sd = model.state_dict()
+                if rank == 0:
+                    full_state = {k: v.clone() for k, v in sd.items()}
 
     return InnerStepsResult(
         final_logits=final_logits,

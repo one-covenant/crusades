@@ -1152,31 +1152,35 @@ def _verify_trainable_params(
 
 
 def _verify_params_changed(
-    model: torch.nn.Module,
+    trained_state: dict,
     initial_state: dict,
     min_changed_ratio: float = 0.5,
     element_threshold: float = 1e-6,
 ) -> tuple[bool, str | None, dict]:
     """Verify that minimum % of individual parameter elements changed during training.
 
+    Operates purely on CPU state dicts -- no model object or GPU memory needed.
+
     Args:
-        model: Model after training
-        initial_state: Model state before training
+        trained_state: State dict after training (CPU tensors)
+        initial_state: State dict before training (CPU tensors)
         min_changed_ratio: Minimum fraction of elements that must change
         element_threshold: Minimum absolute change for an element to count as "changed"
     """
     total_elements = 0
     changed_elements = 0
 
-    for name, param in model.named_parameters():
-        if name in initial_state:
-            initial = initial_state[name].to(param.device)
-            # Count individual elements that changed (not whole tensors)
-            element_diffs = (param.data - initial).abs()
-            changed_mask = element_diffs > element_threshold
+    for name, trained_val in trained_state.items():
+        if name not in initial_state:
+            continue
+        initial_val = initial_state[name]
+        if trained_val.shape != initial_val.shape:
+            continue
+        element_diffs = (trained_val.float() - initial_val.float()).abs()
+        changed_mask = element_diffs > element_threshold
 
-            total_elements += param.numel()
-            changed_elements += changed_mask.sum().item()
+        total_elements += trained_val.numel()
+        changed_elements += changed_mask.sum().item()
 
     changed_ratio = changed_elements / total_elements if total_elements > 0 else 0.0
 
@@ -1645,19 +1649,18 @@ def _verify_gradients(
 
 
 def _verify_final_weights(
-    model: torch.nn.Module,
+    candidate_state: dict,
     reference_final_state: dict,
     max_relative_error: float = 0.05,
 ) -> tuple[bool, str | None, dict]:
-    """Verify miner's final model weights match reference after full training.
+    """Verify miner's final weights match reference after full training.
 
-    Compares miner final weights against reference to verify the entire
-    training pipeline end-to-end. Computed layer-by-layer on CPU to avoid
-    GPU memory pressure.
+    Operates purely on CPU state dicts -- no model object or GPU memory needed.
+    Compares layer-by-layer to stay memory efficient.
 
     Args:
-        model: Model after miner's training (post optimizer steps)
-        reference_final_state: Model state dict after reference training
+        candidate_state: Miner's state dict after training (CPU tensors)
+        reference_final_state: Reference state dict after training (CPU tensors)
         max_relative_error: Maximum allowed |w_miner - w_ref| / |w_ref|
 
     Returns:
@@ -1673,26 +1676,27 @@ def _verify_final_weights(
     logger.info("VERIFICATION: Final model weight comparison")
     logger.info("=" * 60)
 
-    # Compute relative error layer-by-layer (memory efficient)
     diff_norm_sq = 0.0
     ref_norm_sq = 0.0
     total_elements = 0
     mismatched_layers = 0
 
-    for name, param in model.named_parameters():
+    for name, cand_val in candidate_state.items():
         if name not in reference_final_state:
             continue
 
-        # Move reference to same device for comparison, then back to CPU
-        ref_param = reference_final_state[name].to(param.device)
-        diff = param.data.float() - ref_param.float()
+        ref_param = reference_final_state[name]
+        if cand_val.shape != ref_param.shape:
+            mismatched_layers += 1
+            continue
+        diff = cand_val.float() - ref_param.float()
 
         layer_diff_sq = (diff * diff).sum().item()
         layer_ref_sq = (ref_param.float() * ref_param.float()).sum().item()
 
         diff_norm_sq += layer_diff_sq
         ref_norm_sq += layer_ref_sq
-        total_elements += param.numel()
+        total_elements += cand_val.numel()
 
         # Track layers with significant differences (NaN-safe)
         if layer_ref_sq > 0:
@@ -1759,7 +1763,7 @@ def _verify_outputs(
     reference_grad: GradientInfo | None = None,
     candidate_grad: GradientInfo | None = None,
     reference_final_state: dict | None = None,
-    model: torch.nn.Module | None = None,
+    candidate_final_state: dict | None = None,
     max_loss_difference: float = 0.3,
     gradient_norm_ratio_max: float = 1.08,
     weight_relative_error_max: float = 0.006,
@@ -1778,8 +1782,8 @@ def _verify_outputs(
         expected_tokens: Expected token count
         reference_grad: Reference gradients for comparison
         candidate_grad: Candidate gradients for comparison
-        reference_final_state: Reference model state after full training
-        model: Model after miner's training (for weight comparison)
+        reference_final_state: Reference state dict after full training (CPU)
+        candidate_final_state: Miner's state dict after training (CPU)
         max_loss_difference: Maximum allowed |candidate_loss - reference_loss|
         gradient_norm_ratio_max: Encoded as 1 + max_relative_error for gradient check
         weight_relative_error_max: Max relative error for final weight comparison
@@ -1875,10 +1879,10 @@ def _verify_outputs(
         details["checks_passed"].append("gradient_verification")
 
     # 4. Final weight verification (verifies optimizer step correctness)
-    if reference_final_state is not None and model is not None:
+    if reference_final_state is not None and candidate_final_state is not None:
         logger.info("[CHECK 4/4] Final weight verification")
         weight_ok, weight_error, weight_details = _verify_final_weights(
-            model,
+            candidate_final_state,
             reference_final_state,
             max_relative_error=weight_relative_error_max,
         )
@@ -2749,19 +2753,22 @@ class Actor:
                 }
             logger.info(f"[PASSED] Vocab dimension check: {actual_vocab} == {expected_vocab}")
 
-            # If the miner returned a full state_dict (required for FSDP/TP
-            # where params are sharded in-place), build a verification model
-            # from it so shape-based and weight checks work normally.
+            # Build a CPU state dict of the miner's trained model for
+            # verification.  FSDP/TP miners return a pre-gathered dict in
+            # final_state; DDP/single-GPU just use model.state_dict().
+            # All comparisons happen on CPU -- zero extra GPU memory.
             miner_final_state = getattr(miner_result, "final_state", None)
-            verify_model = model
             if miner_final_state is not None:
                 logger.info("Using miner-provided final_state for weight verification")
-                verify_model = _load_model(model_url, use_random_init=use_random_init)
-                verify_model.load_state_dict(miner_final_state)
+                candidate_state = miner_final_state
+            else:
+                candidate_state = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
 
             # Sanity check: if multi-GPU, verify params are full (not sharded).
             if _multi_gpu:
-                for _pname, _pval in verify_model.named_parameters():
+                for _pname, _pval in candidate_state.items():
                     if _pname in initial_state and _pval.shape != initial_state[_pname].shape:
                         return {
                             "task_id": task_id,
@@ -2784,7 +2791,7 @@ class Actor:
 
             # Verify sufficient parameters changed during training
             params_ok, params_error, params_details = _verify_params_changed(
-                verify_model, initial_state, min_params_changed_ratio
+                candidate_state, initial_state, min_params_changed_ratio
             )
             if not params_ok:
                 return {
@@ -2812,7 +2819,7 @@ class Actor:
                 reference_grad=reference_grad,
                 candidate_grad=candidate_grad,
                 reference_final_state=reference_final_state,
-                model=verify_model,
+                candidate_final_state=candidate_state,
                 max_loss_difference=max_loss_difference,
                 gradient_norm_ratio_max=gradient_norm_ratio_max,
                 weight_relative_error_max=weight_relative_error_max,
@@ -2937,7 +2944,7 @@ class Actor:
             # preventing gc.collect() + empty_cache() from reclaiming memory.
             optimizer_miner = base_optimizer = None  # type: ignore[assignment]  # noqa
             data_iter_miner = data = None  # type: ignore[assignment]
-            reference_final_state = candidate_grad = None  # type: ignore[assignment]
+            reference_final_state = candidate_grad = candidate_state = None  # type: ignore[assignment]
             miner_result = parsed = miner_module = None  # type: ignore[assignment]
             reference = reference_grad = None  # type: ignore[assignment]
 
