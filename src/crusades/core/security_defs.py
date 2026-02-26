@@ -38,7 +38,7 @@ FORBIDDEN_STRINGS: list[str] = [
     # Dunder escape hatches
     "__setattr__",
     "__delattr__",
-    "__class__",
+    # "__class__" — allowed: miners need obj.__class__ for FSDP layer detection
     "__subclasses__",
     "__bases__",
     "__mro__",
@@ -187,8 +187,9 @@ FORBIDDEN_MODULES: set[str] = {
     # unittest.mock.patch can replace any attribute on any object
     "unittest",
     "mock",
-    # functools.partial can wrap forbidden functions
-    "functools",
+    # functools.partial can wrap forbidden functions — ALLOWED: miners need
+    # functools.partial for FSDP auto_wrap_policy and similar optimisations.
+    # "functools",
     # weakref can observe GC behavior and hold references
     "weakref",
 }
@@ -255,7 +256,7 @@ FORBIDDEN_NAMES: set[str] = {
     "dir",
     "globals",
     "locals",
-    "type",
+    # "type" — allowed: miners need type() for FSDP auto_wrap_policy layer detection
     "memoryview",
     "open",
     "chr",
@@ -277,7 +278,7 @@ FORBIDDEN_BUILTINS: set[str] = {
     "dir",
     "globals",
     "locals",
-    "type",
+    # "type" — allowed: miners need type() for FSDP auto_wrap_policy layer detection
     "memoryview",
     "open",
     "chr",
@@ -340,6 +341,13 @@ ALLOWED_TORCH_SUBMODULE_IMPORTS: set[str] = {
     "torch.cuda",
     "torch.cuda.amp",
     "torch.distributed",
+    "torch.distributed.fsdp",
+    "torch.distributed.fsdp.wrap",
+    "torch.distributed.tensor",
+    "torch.distributed.tensor.parallel",
+    "torch.distributed.device_mesh",
+    "torch.distributed.optim",
+    "torch.utils.checkpoint",
     "torch.multiprocessing",
 }
 

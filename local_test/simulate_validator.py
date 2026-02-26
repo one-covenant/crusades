@@ -15,6 +15,7 @@ same Docker container.
         -v "$(pwd)/local_test/train.py":/test/train.py \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py \
         -v "$(pwd)/hparams/hparams.json":/app/hparams.json \
+        -v "$(pwd)/environments/templar/env.py":/app/env.py \
         -e PYTHONPATH=/app \
         templar-eval:latest \
         python3 /test/simulate.py

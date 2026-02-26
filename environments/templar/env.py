@@ -656,10 +656,8 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                     line = getattr(node, "lineno", "?")
                     return False, f"Line {line}: forbidden pattern detected"
 
-        if isinstance(node, ast.Attribute) and node.attr == "__class__":
-            if not isinstance(getattr(node, "_parent", None), ast.AnnAssign):
-                line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: forbidden pattern detected"
+        # Reading __class__ is allowed (needed for FSDP layer detection);
+        # only *writing* to __class__ is blocked above.
 
         # Block timer-related attribute access on ANY object.
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_TIMER_ATTRS:
