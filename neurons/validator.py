@@ -347,10 +347,20 @@ class Validator(BaseNode):
                 )
                 return False
 
-        # Look up miner's coldkey. Use archive node so historical lookups
-        # don't fail with "State discarded" on pruned blocks.
+        # Look up miner's coldkey. Prefer historical lookup at payment block
+        # for accuracy (handles hotkey ownership transfers), fall back to
+        # current block if the archive node is unreachable or block is missing.
         archive_sub = self.archive_subtensor
-        miner_coldkey = get_hotkey_owner(archive_sub, commitment.hotkey)
+        miner_coldkey = None
+        if commitment.payment_block:
+            try:
+                miner_coldkey = get_hotkey_owner(
+                    archive_sub, commitment.hotkey, block=commitment.payment_block
+                )
+            except Exception:
+                pass
+        if miner_coldkey is None:
+            miner_coldkey = get_hotkey_owner(archive_sub, commitment.hotkey)
         if miner_coldkey is None:
             logger.error(
                 f"Could not look up coldkey for hotkey {commitment.hotkey[:16]}... "
