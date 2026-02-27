@@ -347,9 +347,8 @@ class Validator(BaseNode):
                 )
                 return False
 
-        # Look up miner's coldkey. Prefer historical lookup at payment block
-        # for accuracy (handles hotkey ownership transfers), fall back to
-        # current block if the archive node is unreachable or block is missing.
+        # Look up miner's coldkey. Try archive node for historical accuracy
+        # first, fall back to regular subtensor if archive is unavailable.
         archive_sub = self.archive_subtensor
         miner_coldkey = None
         if commitment.payment_block:
@@ -361,6 +360,8 @@ class Validator(BaseNode):
                 pass
         if miner_coldkey is None:
             miner_coldkey = get_hotkey_owner(archive_sub, commitment.hotkey)
+        if miner_coldkey is None:
+            miner_coldkey = get_hotkey_owner(self.chain.subtensor, commitment.hotkey)
         if miner_coldkey is None:
             logger.error(
                 f"Could not look up coldkey for hotkey {commitment.hotkey[:16]}... "
@@ -413,6 +414,22 @@ class Validator(BaseNode):
             rpc_timeout=hparams.payment.rpc_timeout,
             rpc_retries=hparams.payment.rpc_retries,
         )
+
+        # Fall back to regular subtensor if archive node failed (the block
+        # may still be within the pruning window on the standard node).
+        if payment is None:
+            logger.info("Archive verification failed, retrying with standard subtensor")
+            payment = await verify_payment_direct_async(
+                subtensor=self.chain.subtensor,
+                block_number=commitment.payment_block,
+                extrinsic_index=commitment.payment_extrinsic_index,
+                miner_coldkey=miner_coldkey,
+                payment_address=payment_address,
+                netuid=netuid,
+                min_amount=min_alpha,
+                rpc_timeout=hparams.payment.rpc_timeout,
+                rpc_retries=hparams.payment.rpc_retries,
+            )
 
         if payment is None:
             logger.warning(
