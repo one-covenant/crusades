@@ -11,6 +11,20 @@ from __future__ import annotations
 
 import ast
 
+# Upper bound on the number of elements in a bytes([...]) / bytearray([...])
+# literal the scanner will attempt to decode.  Anything larger is rejected
+# outright as a potential resource-exhaustion / DoS vector.
+_MAX_BYTES_LITERAL_ELTS = 4096
+
+
+class SuspiciousConstructionError(Exception):
+    """Raised by decode resolvers when the construction looks intentionally
+    obfuscated but cannot be statically resolved (e.g. dynamic encoding).
+
+    Callers should treat this as fail-closed: reject the code.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Forbidden string patterns
 # ---------------------------------------------------------------------------
@@ -490,10 +504,22 @@ def _decode_with_encoding(raw: bytes, enc_node: ast.Call) -> str | None:
     """Decode *raw* bytes using encoding extracted from *enc_node* (.decode() call).
 
     Honors both positional and keyword ``encoding`` / ``errors`` arguments.
-    Falls back to UTF-8 when no encoding is specified.
+    Falls back to UTF-8 when no encoding is specified.  Raises
+    :class:`SuspiciousConstructionError` if an encoding/errors argument is present
+    but not a constant string (fail-closed).
     """
-    encoding = _literal_str_arg(enc_node, pos=0, name="encoding") or "utf-8"
-    errors = _literal_str_arg(enc_node, pos=1, name="errors") or "strict"
+    has_encoding_arg = bool(enc_node.args) or any(kw.arg == "encoding" for kw in enc_node.keywords)
+    encoding = _literal_str_arg(enc_node, pos=0, name="encoding")
+    if has_encoding_arg and encoding is None:
+        raise SuspiciousConstructionError("dynamic .decode(encoding) construction")
+    encoding = encoding or "utf-8"
+
+    has_errors_arg = len(enc_node.args) >= 2 or any(kw.arg == "errors" for kw in enc_node.keywords)
+    errors = _literal_str_arg(enc_node, pos=1, name="errors")
+    if has_errors_arg and errors is None:
+        raise SuspiciousConstructionError("dynamic .decode(..., errors) construction")
+    errors = errors or "strict"
+
     try:
         return raw.decode(encoding, errors)
     except (ValueError, UnicodeDecodeError, LookupError):
@@ -526,6 +552,8 @@ def try_decode_bytes_node(node: ast.AST) -> str | None:
         and len(inner.args) == 1
         and isinstance(inner.args[0], ast.List)
     ):
+        if len(inner.args[0].elts) > _MAX_BYTES_LITERAL_ELTS:
+            raise SuspiciousConstructionError("bytes literal too large")
         int_values = []
         for elt in inner.args[0].elts:
             if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
@@ -595,12 +623,25 @@ def try_decode_str_bytes_constructor(node: ast.AST) -> str | None:
     if inner.func.id not in ("bytes", "bytearray"):
         return None
 
-    # Extract encoding: str(bytes_obj, "utf-16le") or str(bytes_obj, encoding="utf-16le")
-    encoding = _literal_str_arg(node, pos=1, name="encoding") or "utf-8"
-    errors = _literal_str_arg(node, pos=2, name="errors") or "strict"
+    # Fail-closed: if there's an encoding arg but it's not a constant string,
+    # the miner is hiding the encoding dynamically — reject outright.
+    has_encoding_arg = len(node.args) >= 2 or any(kw.arg == "encoding" for kw in node.keywords)
+    encoding = _literal_str_arg(node, pos=1, name="encoding")
+    if has_encoding_arg and encoding is None:
+        raise SuspiciousConstructionError("dynamic str(bytes/bytearray, encoding) construction")
+    encoding = encoding or "utf-8"
+
+    has_errors_arg = len(node.args) >= 3 or any(kw.arg == "errors" for kw in node.keywords)
+    errors = _literal_str_arg(node, pos=2, name="errors")
+    if has_errors_arg and errors is None:
+        raise SuspiciousConstructionError("dynamic str(bytes/bytearray, ..., errors) construction")
+    errors = errors or "strict"
 
     if not (inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List)):
         return None
+
+    if len(inner.args[0].elts) > _MAX_BYTES_LITERAL_ELTS:
+        raise SuspiciousConstructionError("bytes literal too large")
 
     int_values = []
     for elt in inner.args[0].elts:

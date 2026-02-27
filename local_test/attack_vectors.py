@@ -251,6 +251,26 @@ def _bypass_cases() -> list[tuple[str, str]]:
         "x = b'f_back'.decode('ascii')\n",
     )
 
+    # Dynamic encoding (fail-closed)
+    add(
+        "str(bytes([...]), dynamic_encoding)",
+        'enc = "utf-8"\nx = str(bytes([102, 95, 98, 97, 99, 107]), enc)\n',
+    )
+    add(
+        "bytes([...]).decode(dynamic_encoding)",
+        'enc = "utf-8"\nx = bytes([102, 95, 98, 97, 99, 107]).decode(enc)\n',
+    )
+    add(
+        "str(bytearray([...]), encoding=var)",
+        'enc = "ascii"\nx = str(bytearray([102, 95, 98, 97, 99, 107]), encoding=enc)\n',
+    )
+
+    # Oversized bytes literal (DoS guard)
+    add(
+        "bytes([0]*5000).decode() DoS",
+        "x = bytes([" + ",".join(["0"] * 5000) + "]).decode()\n",
+    )
+
     # === FORBIDDEN MODULE IMPORTS ===
     add("import os", "import os\n")
     add("import sys", "import sys\n")

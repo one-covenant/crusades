@@ -56,6 +56,7 @@ from crusades.core.security_defs import (
     FORBIDDEN_TORCH_BACKEND_SYMBOL_IMPORTS,
     FORBIDDEN_TORCH_CONFIG_MODULES,
     FORBIDDEN_TORCH_SYMBOL_IMPORTS,
+    SuspiciousConstructionError,
     forbidden_name_binding_reason,
     try_decode_bytes_node,
     try_decode_str_bytes_constructor,
@@ -500,7 +501,12 @@ def validate_code_structure(code: str) -> list[str]:
     ]
     for node in ast.walk(tree):
         for label, resolver in _obfuscation_resolvers:
-            resolved = resolver(node)
+            try:
+                resolved = resolver(node)
+            except SuspiciousConstructionError as exc:
+                line = getattr(node, "lineno", "?")
+                violations.append(f"Line {line}: {exc}")
+                continue
             if resolved is not None:
                 for pattern in _FORBIDDEN_STRINGS:
                     if pattern in resolved:
