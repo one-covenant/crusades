@@ -82,6 +82,13 @@ FORBIDDEN_STRINGS: list[str] = [
     "f_back",
     "co_consts",
     "co_names",
+    # Generator / coroutine / async-generator frame access
+    "gi_frame",
+    "gi_code",
+    "cr_frame",
+    "cr_code",
+    "ag_frame",
+    "ag_code",
     # Operator helpers that can bypass attribute guards
     "operator.attrgetter",
     "operator.methodcaller",
@@ -388,4 +395,11 @@ FORBIDDEN_INTROSPECTION_ATTRS: set[str] = {
     "co_consts",
     "co_names",
     "__getattribute__",
+    # Generator / coroutine / async-generator frame access
+    "gi_frame",
+    "gi_code",
+    "cr_frame",
+    "cr_code",
+    "ag_frame",
+    "ag_code",
 }
