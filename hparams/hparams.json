@@ -17,7 +17,7 @@
     "benchmark_batch_size": 8,
 
     "set_weights_interval_blocks": 100,
-    "reveal_blocks": 100,
+    "reveal_blocks": 50,
     "min_blocks_between_commits": 360,
     "block_time": 12,
 
