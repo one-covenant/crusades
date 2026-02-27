@@ -3,7 +3,7 @@
     "burn_rate": 0.95,
     "burn_uid": 1,
 
-    "evaluation_runs": 5,
+    "evaluation_runs": 3,
     "eval_steps": 5,
     "eval_timeout": 1200,
     "min_success_rate": 0.5,
