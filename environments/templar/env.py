@@ -59,6 +59,14 @@ from crusades.core.security_defs import (
     FORBIDDEN_TORCH_BACKEND_SYMBOL_IMPORTS,
     FORBIDDEN_TORCH_CONFIG_MODULES,
     FORBIDDEN_TORCH_SYMBOL_IMPORTS,
+    SuspiciousConstructionError,
+    forbidden_name_binding_reason,
+    try_decode_bytes_node,
+    try_decode_str_bytes_constructor,
+    try_resolve_concat,
+    try_resolve_format,
+    try_resolve_fstring,
+    try_resolve_join,
 )
 
 # Setup logging - only for this module, don't configure root logger
@@ -93,6 +101,35 @@ _REAL_PC_ID = id(time.perf_counter)
 _REAL_MONO_ID = id(time.monotonic)
 _REAL_SYNC_ID = id(_cuda_synchronize)
 _REAL_ET_ID = id(_cuda_elapsed_time) if _cuda_elapsed_time is not None else None
+
+
+def _make_timer_vault():
+    """Immutable timer references stored in closure variables.
+
+    Stack-walking attacks (inspect.currentframe / frame.f_back) can find and
+    patch module-level globals like _perf_counter and _REAL_PC_ID.  Closure
+    variables are NOT accessible via frame.f_globals, making them immune to
+    this class of attack.
+    """
+    pc = time.perf_counter
+    mo = time.monotonic
+    sy = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
+    et = torch.cuda.Event.elapsed_time if torch.cuda.is_available() else None
+    ce = F.cross_entropy
+    pc_id, mo_id, sy_id = id(pc), id(mo), id(sy)
+    et_id = id(et) if et is not None else None
+    ce_id = id(ce)
+
+    def get_timers():
+        return pc, mo, sy, et, ce
+
+    def get_real_ids():
+        return pc_id, mo_id, sy_id, et_id, ce_id
+
+    return get_timers, get_real_ids
+
+
+_vault_get_timers, _vault_get_real_ids = _make_timer_vault()
 
 # Configuration from environment variables
 DETERMINISTIC_MODE = os.getenv("DETERMINISTIC_MODE", "1") == "1"
@@ -174,7 +211,17 @@ def _load_miner_module(train_path: Path):
 
 
 def _reset_torch_state():
-    """Reset torch global state between evaluations."""
+    """Reset torch global state between evaluations.
+
+    Restores timer/function references from the closure vault rather than from
+    module globals.  This makes the reset self-healing: even if a miner managed
+    to mutate the module-level ``_perf_counter`` etc. via ``frame.f_globals``,
+    the vault values are immune (closure variables are not reachable through
+    frame introspection) and will restore the worker to a clean state.
+    """
+    global _perf_counter, _monotonic, _cuda_synchronize, _cuda_elapsed_time, _real_cross_entropy
+    global _REAL_PC_ID, _REAL_MONO_ID, _REAL_SYNC_ID, _REAL_ET_ID, _REAL_CE_ID
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -186,15 +233,34 @@ def _reset_torch_state():
     if "miner_train" in sys.modules:
         del sys.modules["miner_train"]
 
-    time.perf_counter = _perf_counter
-    time.monotonic = _monotonic
-    F.cross_entropy = _real_cross_entropy
-    if torch.cuda.is_available():
-        torch.cuda.synchronize = _cuda_synchronize
-        if _cuda_elapsed_time is not None:
-            torch.cuda.Event.elapsed_time = _cuda_elapsed_time
+    vpc, vmo, vsy, vet, vce = _vault_get_timers()
 
-    logger.debug("Torch state reset complete")
+    # Restore the actual library-level entry points from vault
+    time.perf_counter = vpc
+    time.monotonic = vmo
+    F.cross_entropy = vce
+    if torch.cuda.is_available():
+        torch.cuda.synchronize = vsy
+        if vet is not None:
+            torch.cuda.Event.elapsed_time = vet
+
+    # Refresh module globals so they stay in sync with the vault.
+    # Without this, a poisoned global would persist and diverge from
+    # the (clean) library-level function, causing the next runtime
+    # integrity check to flag a mismatch.
+    _perf_counter = vpc
+    _monotonic = vmo
+    _real_cross_entropy = vce
+    _cuda_synchronize = vsy
+    _cuda_elapsed_time = vet
+
+    _REAL_PC_ID = id(vpc)
+    _REAL_MONO_ID = id(vmo)
+    _REAL_SYNC_ID = id(vsy)
+    _REAL_ET_ID = id(vet) if vet is not None else None
+    _REAL_CE_ID = id(vce)
+
+    logger.debug("Torch state reset complete (vault-sourced)")
 
 
 def _enforce_backend_state():
@@ -425,11 +491,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
     # module attributes (e.g. ``F.cross_entropy = fake``).
     torch_submodule_aliases: set[str] = set()
 
-    main_guard_nodes = _collect_main_guard_nodes(tree)
     for node in ast.walk(tree):
-        if id(node) in main_guard_nodes:
-            continue
-
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name == "torch":
@@ -528,11 +590,10 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             line = getattr(node, "lineno", "?")
             return False, f"Line {line}: reference to '{node.id}' is forbidden"
 
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "__name__":
-                    line = getattr(node, "lineno", "?")
-                    return False, f"Line {line}: reassignment of __name__ is forbidden"
+        name_binding_violation = forbidden_name_binding_reason(node)
+        if name_binding_violation:
+            line = getattr(node, "lineno", "?")
+            return False, f"Line {line}: {name_binding_violation}"
 
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_OBJECT_DUNDER_ATTRS:
             if isinstance(node.value, ast.Name) and node.value.id == "object":
@@ -747,12 +808,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                     line = getattr(deco, "lineno", "?")
                     return False, f"Line {line}: decorator @{deco.id} is forbidden"
 
-        # Block AugAssign on __name__ (e.g. __name__ += "...")
-        if isinstance(node, ast.AugAssign):
-            if isinstance(node.target, ast.Name) and node.target.id == "__name__":
-                line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: modification of __name__ is forbidden"
-
     return True, None
 
 
@@ -794,16 +849,14 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
     except SyntaxError as exc:
         return False, f"Syntax error at line {exc.lineno}: {exc.msg}"
 
-    scan_tree = ast.Module(
-        body=[node for node in tree.body if not _is_main_guard(node)],
-        type_ignores=tree.type_ignores,
-    )
-
-    safe, danger_error = _scan_for_dangerous_patterns(scan_tree)
+    # Scan the FULL tree — do NOT strip `if __name__ == "__main__":` blocks.
+    # Attackers can force them to execute via `__name__: str = "__main__"`
+    # (AnnAssign) or other reassignment tricks, so they must be scanned.
+    safe, danger_error = _scan_for_dangerous_patterns(tree)
     if not safe:
         return False, f"Security violation: {danger_error}"
 
-    for node in ast.walk(scan_tree):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             for pattern in _FORBIDDEN_STRINGS:
                 if pattern in node.value:
@@ -812,58 +865,33 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                         f"Security violation: Line {line}: forbidden string pattern detected"
                     )
 
-    for node in ast.walk(scan_tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "decode"
-        ):
-            inner = node.func.value
-            if (
-                isinstance(inner, ast.Call)
-                and isinstance(inner.func, ast.Name)
-                and inner.func.id in ("bytes", "bytearray")
-            ):
-                try:
-                    if inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List):
-                        int_values = []
-                        for elt in inner.args[0].elts:
-                            if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
-                                int_values.append(elt.value)
-                            else:
-                                raise ValueError("non-constant element")
-                        decoded_str = bytes(int_values).decode()
-                        for pattern in _FORBIDDEN_STRINGS:
-                            if pattern in decoded_str:
-                                line = getattr(node, "lineno", "?")
-                                return False, (
-                                    f"Security violation: Line {line}: forbidden string constructed via bytes"
-                                )
-                    else:
-                        raise ValueError("not a simple bytes([int, ...]) pattern")
-                except (ValueError, UnicodeDecodeError):
-                    line = getattr(node, "lineno", "?")
-                    return False, (
-                        f"Security violation: Line {line}: dynamic bytes().decode() construction is forbidden"
-                    )
-            elif isinstance(inner, ast.Constant) and isinstance(inner.value, bytes):
-                try:
-                    decoded_str = inner.value.decode()
-                except UnicodeDecodeError:
-                    line = getattr(node, "lineno", "?")
-                    return False, (
-                        f"Security violation: Line {line}: undecodable byte literal in .decode() call"
-                    )
+    # String obfuscation detection — uses shared helpers from security_defs
+    _obfuscation_resolvers = [
+        ("bytes decode", try_decode_bytes_node),
+        ("str(bytes(...))", try_decode_str_bytes_constructor),
+        ("str.join()", try_resolve_join),
+        ("concatenation", try_resolve_concat),
+        ("%-format", try_resolve_format),
+        ("f-string", try_resolve_fstring),
+    ]
+    for node in ast.walk(tree):
+        for label, resolver in _obfuscation_resolvers:
+            try:
+                resolved = resolver(node)
+            except SuspiciousConstructionError as exc:
+                line = getattr(node, "lineno", "?")
+                return False, (f"Security violation: Line {line}: {exc}")
+            if resolved is not None:
                 for pattern in _FORBIDDEN_STRINGS:
-                    if pattern in decoded_str:
+                    if pattern in resolved:
                         line = getattr(node, "lineno", "?")
                         return False, (
-                            f"Security violation: Line {line}: forbidden string constructed via bytes literal"
+                            f"Security violation: Line {line}: forbidden string constructed via {label}"
                         )
 
     # Scan attribute names (e.g. _e._perf_counter) — AST string scan only
     # catches ast.Constant values, not ast.Attribute.attr names
-    for node in ast.walk(scan_tree):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
             for pattern in _FORBIDDEN_STRINGS:
                 if node.attr == pattern:
@@ -871,120 +899,6 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
                     return False, (
                         f"Security violation: Line {line}: forbidden attribute name '{node.attr}'"
                     )
-
-    # Scan for str.join() obfuscation: "".join(["s","e","t","a","t","t","r"])
-    # Reconstructs the joined string and checks against forbidden patterns
-    for node in ast.walk(scan_tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "join"
-            and isinstance(node.func.value, ast.Constant)
-            and isinstance(node.func.value.value, str)
-            and node.args
-            and len(node.args) == 1
-        ):
-            arg = node.args[0]
-            # Handle list/tuple of string constants
-            if isinstance(arg, (ast.List, ast.Tuple)):
-                chars = []
-                all_const = True
-                for elt in arg.elts:
-                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                        chars.append(elt.value)
-                    else:
-                        all_const = False
-                        break
-                if all_const and chars:
-                    joined = node.func.value.value.join(chars)
-                    for pattern in _FORBIDDEN_STRINGS:
-                        if pattern in joined:
-                            line = getattr(node, "lineno", "?")
-                            return False, (
-                                f"Security violation: Line {line}: forbidden string constructed via str.join()"
-                            )
-
-    # Scan for string concatenation obfuscation: "__set" + "attr__"
-    # Walk full BinOp tree recursively to catch multi-level concat like "a" + "b" + "c"
-    def _collect_concat_parts(node: ast.AST) -> list[str] | None:
-        """Recursively collect all string constants from chained Add BinOps."""
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return [node.value]
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            left_parts = _collect_concat_parts(node.left)
-            right_parts = _collect_concat_parts(node.right)
-            if left_parts is not None and right_parts is not None:
-                return left_parts + right_parts
-        return None
-
-    for node in ast.walk(scan_tree):
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            parts = _collect_concat_parts(node)
-            if parts and len(parts) >= 2:
-                combined = "".join(parts)
-                for pattern in _FORBIDDEN_STRINGS:
-                    if pattern in combined:
-                        line = getattr(node, "lineno", "?")
-                        return False, (
-                            f"Security violation: Line {line}: forbidden string constructed via concatenation"
-                        )
-
-    # Scan for %-format obfuscation: "%s%s" % ("__set", "attr__")
-    for node in ast.walk(scan_tree):
-        if (
-            isinstance(node, ast.BinOp)
-            and isinstance(node.op, ast.Mod)
-            and isinstance(node.left, ast.Constant)
-            and isinstance(node.left.value, str)
-            and isinstance(node.right, ast.Tuple)
-        ):
-            parts = []
-            all_const = True
-            for elt in node.right.elts:
-                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                    parts.append(elt.value)
-                else:
-                    all_const = False
-                    break
-            if all_const and parts:
-                try:
-                    formatted = node.left.value % tuple(parts)
-                    for pattern in _FORBIDDEN_STRINGS:
-                        if pattern in formatted:
-                            line = getattr(node, "lineno", "?")
-                            return False, (
-                                f"Security violation: Line {line}: forbidden string constructed via %-format"
-                            )
-                except (TypeError, ValueError):
-                    pass
-
-    # Scan for f-string obfuscation: f"{'__set'}{'attr__'}"
-    for node in ast.walk(scan_tree):
-        if isinstance(node, ast.JoinedStr):
-            parts = []
-            all_const = True
-            for val in node.values:
-                if isinstance(val, ast.Constant) and isinstance(val.value, str):
-                    parts.append(val.value)
-                elif (
-                    isinstance(val, ast.FormattedValue)
-                    and isinstance(val.value, ast.Constant)
-                    and isinstance(val.value.value, str)
-                    and val.format_spec is None
-                    and val.conversion == -1
-                ):
-                    parts.append(val.value.value)
-                else:
-                    all_const = False
-                    break
-            if all_const and parts:
-                combined = "".join(parts)
-                for pattern in _FORBIDDEN_STRINGS:
-                    if pattern in combined:
-                        line = getattr(node, "lineno", "?")
-                        return False, (
-                            f"Security violation: Line {line}: forbidden string constructed via f-string"
-                        )
 
     inner_steps_found = False
     for node in ast.walk(tree):
@@ -2133,6 +2047,12 @@ class Actor:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            # Capture vault timer refs into locals BEFORE loading miner code.
+            # Closure variables inside the vault are immune to frame.f_globals
+            # patching, and these locals can't be reached by the miner either.
+            _vpc, _vmo, _vsy, _vet, _vce = _vault_get_timers()
+            _vpc_id, _vmo_id, _vsy_id, _vet_id, _vce_id = _vault_get_real_ids()
+
             # NOW load the miner module — after the reference is safely captured.
             # Module-level side-effects (monkey-patches etc.) can no longer affect
             # the reference results.
@@ -2259,6 +2179,21 @@ class Actor:
                         "code": code,
                     }
 
+                expected_vocab = reference.final_logits.shape[2]
+                if logits.shape[2] != expected_vocab:
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": f"Logits vocab dimension mismatch: expected {expected_vocab}, got {logits.shape[2]}",
+                        "error_code": "invalid_logits_shape",
+                        "seed": seed,
+                        "code": code,
+                    }
+
                 logger.info("Warmup passed - proceeding with verification checks")
 
                 # Check trainable params AFTER warmup (miner code may modify requires_grad)
@@ -2314,16 +2249,17 @@ class Actor:
             _enforce_backend_state()
 
             # ── Runtime timer integrity check ────────────────────────────
-            # Verify timer references are unchanged before and after execution.
+            # Verify module globals against vault-stored IDs (closure-protected,
+            # immune to frame.f_globals patching).
             def _runtime_ids_ok() -> bool:
                 ok = (
-                    id(_perf_counter) == _REAL_PC_ID
-                    and id(_monotonic) == _REAL_MONO_ID
-                    and id(_cuda_synchronize) == _REAL_SYNC_ID
-                    and id(F.cross_entropy) == _REAL_CE_ID
+                    id(_perf_counter) == _vpc_id
+                    and id(_monotonic) == _vmo_id
+                    and id(_cuda_synchronize) == _vsy_id
+                    and id(F.cross_entropy) == _vce_id
                 )
-                if _REAL_ET_ID is not None:
-                    ok = ok and id(torch.cuda.Event.elapsed_time) == _REAL_ET_ID
+                if _vet_id is not None:
+                    ok = ok and id(torch.cuda.Event.elapsed_time) == _vet_id
                 return ok
 
             if not _runtime_ids_ok():
@@ -2348,11 +2284,11 @@ class Actor:
                 _cuda_start_event = torch.cuda.Event(enable_timing=True)
                 _cuda_end_event = torch.cuda.Event(enable_timing=True)
 
-            # Use verified local refs so even if module globals are swapped
-            # mid-flight the locals cannot be reached by miner code.
-            _pc = _perf_counter
-            _mo = _monotonic
-            _sy = _cuda_synchronize
+            # Use vault-sourced local refs — captured before miner module load,
+            # immune to frame.f_globals patching.
+            _pc = _vpc
+            _mo = _vmo
+            _sy = _vsy
 
             _sy()
             start_perf = _pc()
@@ -2395,12 +2331,12 @@ class Actor:
             wall_time_perf = end_perf - start_perf
             wall_time_mono = end_mono - start_mono
 
-            # CUDA event wall time — call via saved unbound method reference
-            # so a monkey-patched Event.elapsed_time cannot affect the result.
+            # CUDA event wall time — call via vault-sourced ref so a
+            # monkey-patched Event.elapsed_time cannot affect the result.
             cuda_wall_time = None
             if _cuda_start_event is not None and _cuda_end_event is not None:
                 _cuda_end_event.synchronize()
-                cuda_wall_time = _cuda_elapsed_time(_cuda_start_event, _cuda_end_event) / 1000.0
+                cuda_wall_time = _vet(_cuda_start_event, _cuda_end_event) / 1000.0
 
             # Three-way timer cross-check: perf_counter vs monotonic vs CUDA events
             def _timer_divergence(a: float, b: float) -> float:
@@ -2576,6 +2512,26 @@ class Actor:
                     "code": code,
                 }
             logger.info(f"[PASSED] Sequence length check: {logits_seq_len} == {expected_seq_len}")
+
+            # Verify vocab dimension matches reference (catches fake logits
+            # that return e.g. input IDs reshaped to (batch, seq, 1) to avoid
+            # materializing the full vocab-sized tensor).
+            expected_vocab = reference.final_logits.shape[2]
+            actual_vocab = parsed.final_logits.shape[2]
+            if actual_vocab != expected_vocab:
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": f"Logits vocab dimension mismatch: expected {expected_vocab}, got {actual_vocab}",
+                    "error_code": "invalid_logits_shape",
+                    "seed": seed,
+                    "code": code,
+                }
+            logger.info(f"[PASSED] Vocab dimension check: {actual_vocab} == {expected_vocab}")
 
             # Verify sufficient parameters changed during training
             params_ok, params_error, params_details = _verify_params_changed(

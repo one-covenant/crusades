@@ -56,6 +56,14 @@ from crusades.core.security_defs import (
     FORBIDDEN_TORCH_BACKEND_SYMBOL_IMPORTS,
     FORBIDDEN_TORCH_CONFIG_MODULES,
     FORBIDDEN_TORCH_SYMBOL_IMPORTS,
+    SuspiciousConstructionError,
+    forbidden_name_binding_reason,
+    try_decode_bytes_node,
+    try_decode_str_bytes_constructor,
+    try_resolve_concat,
+    try_resolve_format,
+    try_resolve_fstring,
+    try_resolve_join,
 )
 
 # =========================================================================
@@ -141,12 +149,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
     # of these is forbidden — legitimate code never monkey-patches torch.
     torch_submodule_aliases: set[str] = set()
 
-    main_guard_nodes = _collect_main_guard_nodes(tree)
-
     for node in ast.walk(tree):
-        if id(node) in main_guard_nodes:
-            continue
-
         # --- Torch alias tracking ---
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -238,12 +241,10 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
             line = getattr(node, "lineno", "?")
             violations.append(f"Line {line}: reference to '{node.id}' is forbidden")
 
-        # Block __name__ reassignment
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "__name__":
-                    line = getattr(node, "lineno", "?")
-                    violations.append(f"Line {line}: reassignment of __name__ is forbidden")
+        name_binding_violation = forbidden_name_binding_reason(node)
+        if name_binding_violation:
+            line = getattr(node, "lineno", "?")
+            violations.append(f"Line {line}: {name_binding_violation}")
 
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_OBJECT_DUNDER_ATTRS:
             if isinstance(node.value, ast.Name) and node.value.id == "object":
@@ -464,12 +465,6 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                     line = getattr(deco, "lineno", "?")
                     violations.append(f"Line {line}: decorator @{deco.id} is forbidden")
 
-        # Block AugAssign on __name__
-        if isinstance(node, ast.AugAssign):
-            if isinstance(node.target, ast.Name) and node.target.id == "__name__":
-                line = getattr(node, "lineno", "?")
-                violations.append(f"Line {line}: modification of __name__ is forbidden")
-
     return violations
 
 
@@ -482,186 +477,50 @@ def validate_code_structure(code: str) -> list[str]:
     except SyntaxError as exc:
         return [f"Syntax error at line {exc.lineno}: {exc.msg}"]
 
-    scan_tree = ast.Module(
-        body=[node for node in tree.body if not _is_main_guard(node)],
-        type_ignores=tree.type_ignores,
-    )
-
-    violations.extend(_scan_for_dangerous_patterns(scan_tree))
+    # Scan the FULL tree — do NOT strip `if __name__ == "__main__":` blocks.
+    # Attackers can force them to execute via `__name__: str = "__main__"`
+    # (AnnAssign) or other reassignment tricks, so they must be scanned.
+    violations.extend(_scan_for_dangerous_patterns(tree))
 
     # Scan string literals for forbidden patterns
-    for node in ast.walk(scan_tree):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             for pattern in _FORBIDDEN_STRINGS:
                 if pattern in node.value:
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: forbidden string pattern '{pattern}' detected")
 
-    # Scan bytes().decode() and b"...".decode() for forbidden patterns
-    for node in ast.walk(scan_tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "decode"
-        ):
-            inner = node.func.value
-            if (
-                isinstance(inner, ast.Call)
-                and isinstance(inner.func, ast.Name)
-                and inner.func.id in ("bytes", "bytearray")
-            ):
-                try:
-                    if inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List):
-                        int_values = []
-                        for elt in inner.args[0].elts:
-                            if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
-                                int_values.append(elt.value)
-                            else:
-                                raise ValueError("non-constant")
-                        decoded_str = bytes(int_values).decode()
-                        for pattern in _FORBIDDEN_STRINGS:
-                            if pattern in decoded_str:
-                                line = getattr(node, "lineno", "?")
-                                violations.append(
-                                    f"Line {line}: forbidden string via bytes().decode()"
-                                )
-                    else:
-                        raise ValueError("not simple")
-                except (ValueError, UnicodeDecodeError):
-                    line = getattr(node, "lineno", "?")
-                    violations.append(
-                        f"Line {line}: dynamic bytes().decode() construction is forbidden"
-                    )
-            elif isinstance(inner, ast.Constant) and isinstance(inner.value, bytes):
-                try:
-                    decoded_str = inner.value.decode()
-                except UnicodeDecodeError:
-                    line = getattr(node, "lineno", "?")
-                    violations.append(f"Line {line}: undecodable byte literal in .decode() call")
-                    continue
+    # String obfuscation detection — uses shared helpers from security_defs
+    _obfuscation_resolvers = [
+        ("bytes decode", try_decode_bytes_node),
+        ("str(bytes(...))", try_decode_str_bytes_constructor),
+        ("str.join()", try_resolve_join),
+        ("concatenation", try_resolve_concat),
+        ("%-format", try_resolve_format),
+        ("f-string", try_resolve_fstring),
+    ]
+    for node in ast.walk(tree):
+        for label, resolver in _obfuscation_resolvers:
+            try:
+                resolved = resolver(node)
+            except SuspiciousConstructionError as exc:
+                line = getattr(node, "lineno", "?")
+                violations.append(f"Line {line}: {exc}")
+                continue
+            if resolved is not None:
                 for pattern in _FORBIDDEN_STRINGS:
-                    if pattern in decoded_str:
+                    if pattern in resolved:
                         line = getattr(node, "lineno", "?")
-                        violations.append(f"Line {line}: forbidden string via b'...'.decode()")
+                        violations.append(f"Line {line}: forbidden string constructed via {label}")
 
     # Scan attribute names (e.g. _e._perf_counter) — AST string scan only
     # catches ast.Constant values, not ast.Attribute.attr names
-    for node in ast.walk(scan_tree):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
             for pattern in _FORBIDDEN_STRINGS:
                 if node.attr == pattern:
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: forbidden attribute name '{node.attr}'")
-
-    # Scan for str.join() obfuscation: "".join(["s","e","t","a","t","t","r"])
-    for node in ast.walk(scan_tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "join"
-            and isinstance(node.func.value, ast.Constant)
-            and isinstance(node.func.value.value, str)
-            and node.args
-            and len(node.args) == 1
-        ):
-            arg = node.args[0]
-            if isinstance(arg, (ast.List, ast.Tuple)):
-                chars = []
-                all_const = True
-                for elt in arg.elts:
-                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                        chars.append(elt.value)
-                    else:
-                        all_const = False
-                        break
-                if all_const and chars:
-                    joined = node.func.value.value.join(chars)
-                    for pattern in _FORBIDDEN_STRINGS:
-                        if pattern in joined:
-                            line = getattr(node, "lineno", "?")
-                            violations.append(
-                                f"Line {line}: forbidden string constructed via str.join()"
-                            )
-
-    # Scan for string concatenation obfuscation: "__set" + "attr__"
-    # Walk full BinOp tree recursively to catch multi-level concat like "a" + "b" + "c"
-    def _collect_concat_parts(node: ast.AST) -> list[str] | None:
-        """Recursively collect all string constants from chained Add BinOps."""
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return [node.value]
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            left_parts = _collect_concat_parts(node.left)
-            right_parts = _collect_concat_parts(node.right)
-            if left_parts is not None and right_parts is not None:
-                return left_parts + right_parts
-        return None
-
-    for node in ast.walk(scan_tree):
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            parts = _collect_concat_parts(node)
-            if parts and len(parts) >= 2:
-                combined = "".join(parts)
-                for pattern in _FORBIDDEN_STRINGS:
-                    if pattern in combined:
-                        line = getattr(node, "lineno", "?")
-                        violations.append(
-                            f"Line {line}: forbidden string constructed via concatenation"
-                        )
-
-    # Scan for %-format obfuscation: "%s%s" % ("__set", "attr__")
-    for node in ast.walk(scan_tree):
-        if (
-            isinstance(node, ast.BinOp)
-            and isinstance(node.op, ast.Mod)
-            and isinstance(node.left, ast.Constant)
-            and isinstance(node.left.value, str)
-            and isinstance(node.right, ast.Tuple)
-        ):
-            parts = []
-            all_const = True
-            for elt in node.right.elts:
-                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                    parts.append(elt.value)
-                else:
-                    all_const = False
-                    break
-            if all_const and parts:
-                try:
-                    formatted = node.left.value % tuple(parts)
-                    for pattern in _FORBIDDEN_STRINGS:
-                        if pattern in formatted:
-                            line = getattr(node, "lineno", "?")
-                            violations.append(
-                                f"Line {line}: forbidden string constructed via %-format"
-                            )
-                except (TypeError, ValueError):
-                    pass
-
-    # Scan for f-string obfuscation: f"{'__set'}{'attr__'}"
-    for node in ast.walk(scan_tree):
-        if isinstance(node, ast.JoinedStr):
-            parts = []
-            all_const = True
-            for val in node.values:
-                if isinstance(val, ast.Constant) and isinstance(val.value, str):
-                    parts.append(val.value)
-                elif (
-                    isinstance(val, ast.FormattedValue)
-                    and isinstance(val.value, ast.Constant)
-                    and isinstance(val.value.value, str)
-                    and val.format_spec is None
-                    and val.conversion == -1
-                ):
-                    parts.append(val.value.value)
-                else:
-                    all_const = False
-                    break
-            if all_const and parts:
-                combined = "".join(parts)
-                for pattern in _FORBIDDEN_STRINGS:
-                    if pattern in combined:
-                        line = getattr(node, "lineno", "?")
-                        violations.append(f"Line {line}: forbidden string constructed via f-string")
 
     inner_steps_found = False
     for node in ast.walk(tree):
