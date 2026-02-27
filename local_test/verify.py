@@ -566,6 +566,48 @@ def validate_code_structure(code: str) -> list[str]:
                     violations.append(
                         f"Line {line}: dynamic bytes().decode() construction is forbidden"
                     )
+            elif (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "fromhex"
+                and isinstance(inner.func.value, ast.Name)
+                and inner.func.value.id in ("bytes", "bytearray")
+                and inner.args
+                and len(inner.args) == 1
+                and isinstance(inner.args[0], ast.Constant)
+                and isinstance(inner.args[0].value, str)
+            ):
+                try:
+                    decoded_str = bytes.fromhex(inner.args[0].value).decode()
+                    for pattern in _FORBIDDEN_STRINGS:
+                        if pattern in decoded_str:
+                            line = getattr(node, "lineno", "?")
+                            violations.append(
+                                f"Line {line}: forbidden string via fromhex().decode()"
+                            )
+                except (ValueError, UnicodeDecodeError):
+                    line = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"Line {line}: dynamic fromhex().decode() construction is forbidden"
+                    )
+            elif (
+                isinstance(inner, ast.BinOp)
+                and isinstance(inner.op, ast.Add)
+                and isinstance(inner.left, ast.Constant)
+                and isinstance(inner.left.value, bytes)
+                and isinstance(inner.right, ast.Constant)
+                and isinstance(inner.right.value, bytes)
+            ):
+                try:
+                    decoded_str = (inner.left.value + inner.right.value).decode()
+                except UnicodeDecodeError:
+                    decoded_str = ""
+                for pattern in _FORBIDDEN_STRINGS:
+                    if pattern in decoded_str:
+                        line = getattr(node, "lineno", "?")
+                        violations.append(
+                            f"Line {line}: forbidden string via byte concatenation + decode()"
+                        )
             elif isinstance(inner, ast.Constant) and isinstance(inner.value, bytes):
                 try:
                     decoded_str = inner.value.decode()
@@ -655,6 +697,22 @@ def validate_code_structure(code: str) -> list[str]:
                             violations.append(
                                 f"Line {line}: forbidden string constructed via str.join()"
                             )
+            elif (
+                isinstance(arg, ast.Call)
+                and isinstance(arg.func, ast.Name)
+                and arg.func.id == "reversed"
+                and arg.args
+                and len(arg.args) == 1
+                and isinstance(arg.args[0], ast.Constant)
+                and isinstance(arg.args[0].value, str)
+            ):
+                joined = node.func.value.value.join(reversed(arg.args[0].value))
+                for pattern in _FORBIDDEN_STRINGS:
+                    if pattern in joined:
+                        line = getattr(node, "lineno", "?")
+                        violations.append(
+                            f"Line {line}: forbidden string constructed via reversed join"
+                        )
 
     # Scan for string concatenation obfuscation: "__set" + "attr__"
     # Walk full BinOp tree recursively to catch multi-level concat like "a" + "b" + "c"

@@ -197,9 +197,19 @@ def _bypass_cases() -> list[tuple[str, str]]:
     add("Del __name__", "del __name__\n")
     add("__name__ as function arg", "def hack(__name__='__main__'):\n    pass\n")
     add("Torch attr mutation __name__", "import torch\ntorch.nn.functional.__name__ = '__main__'\n")
+    add("Tuple unpacking __name__", "__name__, _ = '__main__', None\n")
+    add("List unpacking __name__", "[__name__] = ['__main__']\n")
+    add("Star unpacking __name__", "*__name__, = ['__main__']\n")
+    add("Multi-target assignment __name__", "_ = __name__ = '__main__'\n")
+    add("Dict comprehension __name__", "{__name__: 1 for __name__ in ['__main__']}\n")
+    add("Set comprehension __name__", "{__name__ for __name__ in ['__main__']}\n")
+    add("Generator expression __name__", "next(__name__ for __name__ in ['__main__'])\n")
+    add("Async function def __name__", "async def __name__(): pass\n")
+    add("Lambda __name__ param", "f = lambda __name__: __name__\n")
 
     # === STRING OBFUSCATION ===
     add("str(bytearray) obfuscation", "x = str(bytearray([102, 95, 98, 97, 99, 107]), 'ascii')\n")
+    add("str(bytes) obfuscation", "x = str(bytes([102, 95, 98, 97, 99, 107]), 'ascii')\n")
     add("bytes().decode() obfuscation", "x = bytes([102, 95, 98, 97, 99, 107]).decode()\n")
     add("b-literal .decode()", "x = b'f_back'.decode()\n")
     add("str.join() obfuscation", 'x = "".join(["f", "_", "b", "a", "c", "k"])\n')
@@ -207,6 +217,13 @@ def _bypass_cases() -> list[tuple[str, str]]:
     add("%-format obfuscation (single)", 'x = "%s_back" % "f"\n')
     add("%-format obfuscation (tuple)", 'x = "%s%s" % ("f_", "back")\n')
     add("f-string constant parts", "x = f\"{'f'}_back\"\n")
+    add("Hex escape string literal", 'x = "\\x66\\x5f\\x62\\x61\\x63\\x6b"\n')
+    add("Unicode escape string literal", 'x = "\\u0066\\u005f\\u0062\\u0061\\u0063\\u006b"\n')
+    add("bytes.fromhex().decode()", 'x = bytes.fromhex("665f6261636b").decode()\n')
+    add("bytearray.fromhex().decode()", 'x = bytearray.fromhex("665f6261636b").decode()\n')
+    add("Reversed string join", 'x = "".join(reversed("kcab_f"))\n')
+    add("Multi-line string concat", 'x = ("f_"\n"back")\n')
+    add("Byte addition decode", "x = (b'f_' + b'back').decode()\n")
 
     # === FORBIDDEN MODULE IMPORTS ===
     add("import os", "import os\n")
@@ -229,6 +246,25 @@ def _bypass_cases() -> list[tuple[str, str]]:
     add("from os import path", "from os import path\n")
     add("import unittest.mock", "import unittest.mock\n")
     add("Dotted torch.distributed", "import torch.distributed\n")
+    add("import _thread", "import _thread\n")
+    add("import multiprocessing", "import multiprocessing\n")
+    add("import signal", "import signal\n")
+    add("import shutil", "import shutil\n")
+    add("import tempfile", "import tempfile\n")
+    add("import marshal", "import marshal\n")
+    add("import dis", "import dis\n")
+    add("import code", "import code\n")
+    add("import codecs", "import codecs\n")
+    add("import base64", "import base64\n")
+    add("import pdb", "import pdb\n")
+    add("import runpy", "import runpy\n")
+    add("import atexit", "import atexit\n")
+    add("import traceback", "import traceback\n")
+    add("import io", "import io\n")
+    add("import http", "import http\n")
+    add("import urllib", "import urllib\n")
+    add("from torch.multiprocessing import spawn", "from torch.multiprocessing import spawn\n")
+    add("import numpy.ctypeslib", "import numpy.ctypeslib\n")
 
     # === FORBIDDEN BUILTINS / NAMES ===
     add("exec() call", "exec('print(1)')\n")
@@ -248,6 +284,10 @@ def _bypass_cases() -> list[tuple[str, str]]:
     add("chr() reference", "f = chr\n")
     add("ord() reference", "f = ord\n")
     add("breakpoint() call", "breakpoint()\n")
+    add("input() reference", "f = input\n")
+    add("__build_class__ reference", "f = __build_class__\n")
+    add("exec via method call", "import torch\ntorch.exec('x=1')\n")
+    add("eval via method call", "import torch\ntorch.eval('1+1')\n")
 
     # === FRAME / INTROSPECTION ACCESS ===
     add("f_globals attribute", "import torch\nx = torch.f_globals\n")
@@ -263,6 +303,27 @@ def _bypass_cases() -> list[tuple[str, str]]:
     add("ag_frame attribute", "import torch\nx = torch.ag_frame\n")
     add("tb_frame attribute", "import torch\nx = torch.tb_frame\n")
     add("__getattribute__ attribute", "import torch\nx = torch.__getattribute__\n")
+    add("f_code attribute", "import torch\nx = torch.f_code\n")
+    add("f_builtins attribute", "import torch\nx = torch.f_builtins\n")
+    add("gi_code attribute", "import torch\nx = torch.gi_code\n")
+    add("cr_code attribute", "import torch\nx = torch.cr_code\n")
+    add("ag_code attribute", "import torch\nx = torch.ag_code\n")
+    add("tb_next attribute", "import torch\nx = torch.tb_next\n")
+    add("__func__ attribute", "import torch\nx = torch.__func__\n")
+    add("__self__ attribute", "import torch\nx = torch.__self__\n")
+    add("__bases__ attribute", "import torch\nx = torch.__bases__\n")
+    add("__mro__ attribute", "import torch\nx = torch.__mro__\n")
+    add("__init_subclass__ attribute", "import torch\nx = torch.__init_subclass__\n")
+    add("__class__ string literal", 'x = "__class__"\n')
+    add("__setattr__ string literal", 'x = "__setattr__"\n')
+    add("__delattr__ string literal", 'x = "__delattr__"\n')
+    add("__import__ string literal", 'x = "__import__"\n')
+    add("__globals__ string literal", 'x = "__globals__"\n')
+    add("__code__ string literal", 'x = "__code__"\n')
+
+    # === CLASS HIERARCHY ESCAPE ===
+    add("str class bases access", "x = ''.__class__.__bases__\n")
+    add("int class subclasses", "x = (1).__class__.__subclasses__\n")
 
     # === TORCH MONKEY-PATCHING ===
     add("torch._C access", "import torch\nx = torch._C\n")
@@ -276,12 +337,38 @@ def _bypass_cases() -> list[tuple[str, str]]:
         "torch.nn.functional.cross_entropy overwrite",
         "import torch\nimport torch.nn.functional as F\nF.cross_entropy = lambda *a, **k: None\n",
     )
+    add("from torch import load", "from torch import load\n")
+    add("torch._inductor access", "import torch\nx = torch._inductor\n")
+    add(
+        "torch._inductor.config write",
+        "import torch\ntorch._inductor.config.fallback_random = True\n",
+    )
+    add(
+        "torch.autograd.backward overwrite",
+        "import torch\ntorch.autograd.backward = lambda *a: None\n",
+    )
+    add(
+        "torch.backends.cudnn.deterministic write",
+        "import torch\ntorch.backends.cudnn.deterministic = True\n",
+    )
+    add("Star import from torch", "from torch import *\n")
+    add("Star import from torch.nn", "from torch.nn import *\n")
+    add("Star import from torch.nn.functional", "from torch.nn.functional import *\n")
 
     # === TIMER TAMPERING ===
     add("perf_counter attr access", "import torch\nx = torch.perf_counter\n")
     add("monotonic attr access", "import torch\nx = torch.monotonic\n")
     add("elapsed_time assignment", "import torch\ntorch.cuda.Event.elapsed_time = lambda *a: 0.0\n")
     add("synchronize assignment", "import torch\ntorch.cuda.synchronize = lambda: None\n")
+    add("perf_counter_ns access", "import torch\nx = torch.perf_counter_ns\n")
+    add("monotonic_ns access", "import torch\nx = torch.monotonic_ns\n")
+    add("_perf_counter string", 'x = "_perf_counter"\n')
+    add("_monotonic string", 'x = "_monotonic"\n')
+    add("_REAL_PC_ID string", 'x = "_REAL_PC_ID"\n')
+    add("_REAL_MONO_ID string", 'x = "_REAL_MONO_ID"\n')
+    add("_REAL_ET_ID string", 'x = "_REAL_ET_ID"\n')
+    add("_cuda_elapsed_time string", 'x = "_cuda_elapsed_time"\n')
+    add("_cuda_synchronize string", 'x = "_cuda_synchronize"\n')
 
     # === GRADIENT TOGGLE ===
     add("set_grad_enabled call", "import torch\ntorch.set_grad_enabled(False)\n")
@@ -292,6 +379,25 @@ def _bypass_cases() -> list[tuple[str, str]]:
     add("__dict__ attribute", "import torch\nx = torch.__dict__\n")
     add("object.__setattr__", "import torch\nobject.__setattr__(torch, 'x', 1)\n")
     add("object.__delattr__", "import torch\nobject.__delattr__(torch, 'x')\n")
+
+    # === MOCK / PATCHING ===
+    add("mock.patch string", 'x = "mock.patch"\n')
+    add("MagicMock string", 'x = "MagicMock"\n')
+    add("unittest.mock string", 'x = "unittest.mock"\n')
+
+    # === OPERATOR HELPERS ===
+    add("attrgetter string", 'x = "attrgetter"\n')
+    add("methodcaller string", 'x = "methodcaller"\n')
+    add("operator.attrgetter string", 'x = "operator.attrgetter"\n')
+
+    # === HIDDEN MODULES / SENSITIVE KEYS ===
+    add("_hidden_modules string", 'x = "_hidden_modules"\n')
+    add("_sensitive_keys string", 'x = "_sensitive_keys"\n')
+
+    # === OPTIMIZER INTERNALS ===
+    add("_opt_impl string", 'x = "_opt_impl"\n')
+    add("_grad_snapshot_gpu string", 'x = "_grad_snapshot_gpu"\n')
+    add("step_count string", 'x = "step_count"\n')
 
     # === sys.modules ACCESS ===
     add("sys.modules string", 'x = "sys.modules"\n')
@@ -308,6 +414,49 @@ def _bypass_cases() -> list[tuple[str, str]]:
 
     # === FORBIDDEN IMPORT SUBSTRINGS ===
     add("cpp_extension import", "from torch.utils import cpp_extension\n")
+    add("cpp_extension in dotted import", "import torch.utils.cpp_extension\n")
+
+    # === DYNAMIC IMPORT / MODULE ACCESS ===
+    add("importlib string", 'x = "importlib"\n')
+    add("import_module string", 'x = "import_module"\n')
+    add("__import__ via name", "f = __import__\n")
+
+    # === GC / INTROSPECTION STRINGS ===
+    add("get_objects string", 'x = "get_objects"\n')
+    add("get_referrers string", 'x = "get_referrers"\n')
+    add("get_referents string", 'x = "get_referents"\n')
+
+    # === NESTED / INDIRECT ATTACKS ===
+    add(
+        "Nested class with __name__ attr",
+        "class X:\n    __name__ = '__main__'\n",
+    )
+    add(
+        "Lambda body with forbidden name",
+        "f = lambda: exec\n",
+    )
+    add(
+        "Comprehension hiding setattr",
+        "_ = [setattr for _ in range(1)]\n",
+    )
+    add(
+        "Default arg hiding forbidden func",
+        "def f(x=exec): pass\n",
+    )
+    add(
+        "Annotation hiding forbidden string",
+        "def f(x: '__globals__' = None): pass\n",
+    )
+
+    # === DOUBLE / TRIPLE ENCODING ===
+    add(
+        "Nested bytes decode",
+        "x = bytes([95, 95, 103, 108, 111, 98, 97, 108, 115, 95, 95]).decode('utf-8')\n",
+    )
+    add(
+        "Bytearray list + decode",
+        "x = bytearray([95, 95, 103, 108, 111, 98, 97, 108, 115, 95, 95]).decode()\n",
+    )
 
     return cases
 
