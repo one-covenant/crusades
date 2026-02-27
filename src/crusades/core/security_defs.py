@@ -465,12 +465,48 @@ def forbidden_name_binding_reason(node: ast.AST) -> str | None:
     return None
 
 
+def _literal_str_arg(node: ast.Call, pos: int = 0, name: str | None = None) -> str | None:
+    """Extract a literal string argument from an AST Call node.
+
+    Checks positional arg at *pos* first, then keyword arg named *name*.
+    Returns the string value or ``None``.
+    """
+    if node.args and len(node.args) > pos:
+        arg = node.args[pos]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+    if name:
+        for kw in node.keywords:
+            if (
+                kw.arg == name
+                and isinstance(kw.value, ast.Constant)
+                and isinstance(kw.value.value, str)
+            ):
+                return kw.value.value
+    return None
+
+
+def _decode_with_encoding(raw: bytes, enc_node: ast.Call) -> str | None:
+    """Decode *raw* bytes using encoding extracted from *enc_node* (.decode() call).
+
+    Honors both positional and keyword ``encoding`` / ``errors`` arguments.
+    Falls back to UTF-8 when no encoding is specified.
+    """
+    encoding = _literal_str_arg(enc_node, pos=0, name="encoding") or "utf-8"
+    errors = _literal_str_arg(enc_node, pos=1, name="errors") or "strict"
+    try:
+        return raw.decode(encoding, errors)
+    except (ValueError, UnicodeDecodeError, LookupError):
+        return None
+
+
 def try_decode_bytes_node(node: ast.AST) -> str | None:
     """Try to statically resolve a ``.decode()`` call on bytes to a string.
 
     Handles: ``bytes([...]).decode()``, ``bytearray([...]).decode()``,
     ``bytes.fromhex("...").decode()``, ``(b'x' + b'y').decode()``,
-    and ``b'literal'.decode()``.  Returns the decoded string or None.
+    and ``b'literal'.decode()``.  Honors explicit ``encoding`` and
+    ``errors`` parameters.  Returns the decoded string or None.
     """
     if not (
         isinstance(node, ast.Call)
@@ -490,16 +526,17 @@ def try_decode_bytes_node(node: ast.AST) -> str | None:
         and len(inner.args) == 1
         and isinstance(inner.args[0], ast.List)
     ):
+        int_values = []
+        for elt in inner.args[0].elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
+                int_values.append(elt.value)
+            else:
+                return None
         try:
-            int_values = []
-            for elt in inner.args[0].elts:
-                if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
-                    int_values.append(elt.value)
-                else:
-                    return None
-            return bytes(int_values).decode()
-        except (ValueError, UnicodeDecodeError):
+            raw = bytes(int_values)
+        except ValueError:
             return None
+        return _decode_with_encoding(raw, node)
 
     # bytes.fromhex("hex").decode() / bytearray.fromhex("hex").decode()
     if (
@@ -514,9 +551,10 @@ def try_decode_bytes_node(node: ast.AST) -> str | None:
         and isinstance(inner.args[0].value, str)
     ):
         try:
-            return bytes.fromhex(inner.args[0].value).decode()
-        except (ValueError, UnicodeDecodeError):
+            raw = bytes.fromhex(inner.args[0].value)
+        except ValueError:
             return None
+        return _decode_with_encoding(raw, node)
 
     # (b'x' + b'y').decode()
     if (
@@ -527,17 +565,12 @@ def try_decode_bytes_node(node: ast.AST) -> str | None:
         and isinstance(inner.right, ast.Constant)
         and isinstance(inner.right.value, bytes)
     ):
-        try:
-            return (inner.left.value + inner.right.value).decode()
-        except UnicodeDecodeError:
-            return None
+        raw = inner.left.value + inner.right.value
+        return _decode_with_encoding(raw, node)
 
     # b'literal'.decode()
     if isinstance(inner, ast.Constant) and isinstance(inner.value, bytes):
-        try:
-            return inner.value.decode()
-        except UnicodeDecodeError:
-            return None
+        return _decode_with_encoding(inner.value, node)
 
     return None
 
@@ -545,13 +578,14 @@ def try_decode_bytes_node(node: ast.AST) -> str | None:
 def try_decode_str_bytes_constructor(node: ast.AST) -> str | None:
     """Try to resolve ``str(bytes([...]), 'enc')`` / ``str(bytearray([...]), 'enc')``.
 
+    Honors explicit encoding and errors parameters (positional and keyword).
     Returns the decoded string or None.
     """
     if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "str"
-        and len(node.args) >= 2
+        and len(node.args) >= 1
     ):
         return None
 
@@ -561,17 +595,22 @@ def try_decode_str_bytes_constructor(node: ast.AST) -> str | None:
     if inner.func.id not in ("bytes", "bytearray"):
         return None
 
-    try:
-        if inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List):
-            int_values = []
-            for elt in inner.args[0].elts:
-                if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
-                    int_values.append(elt.value)
-                else:
-                    return None
-            return bytes(int_values).decode()
+    # Extract encoding: str(bytes_obj, "utf-16le") or str(bytes_obj, encoding="utf-16le")
+    encoding = _literal_str_arg(node, pos=1, name="encoding") or "utf-8"
+    errors = _literal_str_arg(node, pos=2, name="errors") or "strict"
+
+    if not (inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List)):
         return None
-    except (ValueError, UnicodeDecodeError):
+
+    int_values = []
+    for elt in inner.args[0].elts:
+        if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
+            int_values.append(elt.value)
+        else:
+            return None
+    try:
+        return bytes(int_values).decode(encoding, errors)
+    except (ValueError, UnicodeDecodeError, LookupError):
         return None
 
 

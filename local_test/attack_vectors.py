@@ -225,6 +225,32 @@ def _bypass_cases() -> list[tuple[str, str]]:
     add("Multi-line string concat", 'x = ("f_"\n"back")\n')
     add("Byte addition decode", "x = (b'f_' + b'back').decode()\n")
 
+    # Non-default encoding bypass attempts
+    add(
+        "bytes([...]).decode('utf-16le')",
+        'x = bytes([102, 0, 95, 0, 98, 0, 97, 0, 99, 0, 107, 0]).decode("utf-16le")\n',
+    )
+    add(
+        "bytes.fromhex().decode(encoding='utf-16le')",
+        'x = bytes.fromhex("66005f006200610063006b00").decode(encoding="utf-16le")\n',
+    )
+    add(
+        "str(bytes([...]), 'utf-16le')",
+        'x = str(bytes([102, 0, 95, 0, 98, 0, 97, 0, 99, 0, 107, 0]), "utf-16le")\n',
+    )
+    add(
+        "str(bytearray([...]), encoding='utf-16le')",
+        'x = str(bytearray([102, 0, 95, 0, 98, 0, 97, 0, 99, 0, 107, 0]), encoding="utf-16le")\n',
+    )
+    add(
+        "bytes([...]).decode('latin-1')",
+        'x = bytes([102, 95, 98, 97, 99, 107]).decode("latin-1")\n',
+    )
+    add(
+        "b'literal'.decode('ascii')",
+        "x = b'f_back'.decode('ascii')\n",
+    )
+
     # === FORBIDDEN MODULE IMPORTS ===
     add("import os", "import os\n")
     add("import sys", "import sys\n")
