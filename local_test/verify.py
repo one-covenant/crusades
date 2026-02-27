@@ -141,12 +141,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
     # of these is forbidden — legitimate code never monkey-patches torch.
     torch_submodule_aliases: set[str] = set()
 
-    main_guard_nodes = _collect_main_guard_nodes(tree)
-
     for node in ast.walk(tree):
-        if id(node) in main_guard_nodes:
-            continue
-
         # --- Torch alias tracking ---
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -238,12 +233,17 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
             line = getattr(node, "lineno", "?")
             violations.append(f"Line {line}: reference to '{node.id}' is forbidden")
 
-        # Block __name__ reassignment
+        # Block __name__ reassignment (Assign and AnnAssign)
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == "__name__":
                     line = getattr(node, "lineno", "?")
                     violations.append(f"Line {line}: reassignment of __name__ is forbidden")
+
+        if isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "__name__":
+                line = getattr(node, "lineno", "?")
+                violations.append(f"Line {line}: reassignment of __name__ is forbidden")
 
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_OBJECT_DUNDER_ATTRS:
             if isinstance(node.value, ast.Name) and node.value.id == "object":
@@ -482,15 +482,13 @@ def validate_code_structure(code: str) -> list[str]:
     except SyntaxError as exc:
         return [f"Syntax error at line {exc.lineno}: {exc.msg}"]
 
-    scan_tree = ast.Module(
-        body=[node for node in tree.body if not _is_main_guard(node)],
-        type_ignores=tree.type_ignores,
-    )
-
-    violations.extend(_scan_for_dangerous_patterns(scan_tree))
+    # Scan the FULL tree — do NOT strip `if __name__ == "__main__":` blocks.
+    # Attackers can force them to execute via `__name__: str = "__main__"`
+    # (AnnAssign) or other reassignment tricks, so they must be scanned.
+    violations.extend(_scan_for_dangerous_patterns(tree))
 
     # Scan string literals for forbidden patterns
-    for node in ast.walk(scan_tree):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             for pattern in _FORBIDDEN_STRINGS:
                 if pattern in node.value:
@@ -498,7 +496,7 @@ def validate_code_structure(code: str) -> list[str]:
                     violations.append(f"Line {line}: forbidden string pattern '{pattern}' detected")
 
     # Scan bytes().decode() and b"...".decode() for forbidden patterns
-    for node in ast.walk(scan_tree):
+    for node in ast.walk(tree):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -546,7 +544,7 @@ def validate_code_structure(code: str) -> list[str]:
 
     # Scan attribute names (e.g. _e._perf_counter) — AST string scan only
     # catches ast.Constant values, not ast.Attribute.attr names
-    for node in ast.walk(scan_tree):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
             for pattern in _FORBIDDEN_STRINGS:
                 if node.attr == pattern:
@@ -554,7 +552,7 @@ def validate_code_structure(code: str) -> list[str]:
                     violations.append(f"Line {line}: forbidden attribute name '{node.attr}'")
 
     # Scan for str.join() obfuscation: "".join(["s","e","t","a","t","t","r"])
-    for node in ast.walk(scan_tree):
+    for node in ast.walk(tree):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -596,7 +594,7 @@ def validate_code_structure(code: str) -> list[str]:
                 return left_parts + right_parts
         return None
 
-    for node in ast.walk(scan_tree):
+    for node in ast.walk(tree):
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             parts = _collect_concat_parts(node)
             if parts and len(parts) >= 2:
@@ -609,7 +607,7 @@ def validate_code_structure(code: str) -> list[str]:
                         )
 
     # Scan for %-format obfuscation: "%s%s" % ("__set", "attr__")
-    for node in ast.walk(scan_tree):
+    for node in ast.walk(tree):
         if (
             isinstance(node, ast.BinOp)
             and isinstance(node.op, ast.Mod)
@@ -638,7 +636,7 @@ def validate_code_structure(code: str) -> list[str]:
                     pass
 
     # Scan for f-string obfuscation: f"{'__set'}{'attr__'}"
-    for node in ast.walk(scan_tree):
+    for node in ast.walk(tree):
         if isinstance(node, ast.JoinedStr):
             parts = []
             all_const = True

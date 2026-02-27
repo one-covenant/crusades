@@ -83,6 +83,8 @@ docker run --gpus '"device=0"' -it --rm \
     -v "$(pwd)/local_test/train.py":/test/train.py \
     -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py \
     -v "$(pwd)/hparams/hparams.json":/app/hparams.json \
+    -v "$(pwd)/environments/templar/env.py":/app/env.py \
+    -v "$(pwd)/src/crusades/core/security_defs.py":/app/crusades/core/security_defs.py \
     -e PYTHONPATH=/app \
     templar-eval:latest \
     python3 /test/simulate.py
@@ -189,7 +191,7 @@ A static security scanner blocks dangerous patterns (forbidden imports, monkey-p
 
 Any genuine optimization is fair game — `torch.compile`, mixed precision, Flash Attention, Triton kernels, CUDA Graphs, custom loss functions, and more. If the scanner rejects something that should be allowed, repot to us.
 
-> **Note:** The validator skips `if __name__ == "__main__":` entirely, so you can import locally-useful modules (like `pathlib`) inside that guard for testing.
+> **Note:** The validator scans **all** code including `if __name__ == "__main__":` blocks. Use a separate test script if you need locally-useful imports (like `pathlib`) for testing.
 
 ---
 

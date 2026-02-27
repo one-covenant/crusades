@@ -14,6 +14,9 @@ here so the two stay in sync automatically.
 # f-strings, %-formatting, and attribute names throughout the AST.
 
 FORBIDDEN_STRINGS: list[str] = [
+    # Module identity — reassignment enables main-guard code execution
+    "__name__",
+    "__main__",
     # Dunder escape hatches
     "__setattr__",
     "__delattr__",

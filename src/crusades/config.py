@@ -76,6 +76,7 @@ class PaymentConfig(BaseModel):
     skip_payment_hotkeys: list[str] = []  # Hotkeys exempt from payment (e.g., validator's own)
     rpc_timeout: int = 30  # Seconds before an RPC call is considered hung
     rpc_retries: int = 2  # Retry count for transient RPC failures
+    archive_endpoint: str = "wss://archive.chain.opentensor.ai:443"
 
     @field_validator("payment_address")
     @classmethod
