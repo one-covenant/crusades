@@ -120,7 +120,7 @@ def _make_timer_vault():
     ce_id = id(ce)
 
     def get_timers():
-        return pc, mo, sy, et
+        return pc, mo, sy, et, ce
 
     def get_real_ids():
         return pc_id, mo_id, sy_id, et_id, ce_id
@@ -210,7 +210,17 @@ def _load_miner_module(train_path: Path):
 
 
 def _reset_torch_state():
-    """Reset torch global state between evaluations."""
+    """Reset torch global state between evaluations.
+
+    Restores timer/function references from the closure vault rather than from
+    module globals.  This makes the reset self-healing: even if a miner managed
+    to mutate the module-level ``_perf_counter`` etc. via ``frame.f_globals``,
+    the vault values are immune (closure variables are not reachable through
+    frame introspection) and will restore the worker to a clean state.
+    """
+    global _perf_counter, _monotonic, _cuda_synchronize, _cuda_elapsed_time, _real_cross_entropy
+    global _REAL_PC_ID, _REAL_MONO_ID, _REAL_SYNC_ID, _REAL_ET_ID, _REAL_CE_ID
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -222,15 +232,34 @@ def _reset_torch_state():
     if "miner_train" in sys.modules:
         del sys.modules["miner_train"]
 
-    time.perf_counter = _perf_counter
-    time.monotonic = _monotonic
-    F.cross_entropy = _real_cross_entropy
-    if torch.cuda.is_available():
-        torch.cuda.synchronize = _cuda_synchronize
-        if _cuda_elapsed_time is not None:
-            torch.cuda.Event.elapsed_time = _cuda_elapsed_time
+    vpc, vmo, vsy, vet, vce = _vault_get_timers()
 
-    logger.debug("Torch state reset complete")
+    # Restore the actual library-level entry points from vault
+    time.perf_counter = vpc
+    time.monotonic = vmo
+    F.cross_entropy = vce
+    if torch.cuda.is_available():
+        torch.cuda.synchronize = vsy
+        if vet is not None:
+            torch.cuda.Event.elapsed_time = vet
+
+    # Refresh module globals so they stay in sync with the vault.
+    # Without this, a poisoned global would persist and diverge from
+    # the (clean) library-level function, causing the next runtime
+    # integrity check to flag a mismatch.
+    _perf_counter = vpc
+    _monotonic = vmo
+    _real_cross_entropy = vce
+    _cuda_synchronize = vsy
+    _cuda_elapsed_time = vet
+
+    _REAL_PC_ID = id(vpc)
+    _REAL_MONO_ID = id(vmo)
+    _REAL_SYNC_ID = id(vsy)
+    _REAL_ET_ID = id(vet) if vet is not None else None
+    _REAL_CE_ID = id(vce)
+
+    logger.debug("Torch state reset complete (vault-sourced)")
 
 
 def _enforce_backend_state():
@@ -2016,7 +2045,7 @@ class Actor:
             # Capture vault timer refs into locals BEFORE loading miner code.
             # Closure variables inside the vault are immune to frame.f_globals
             # patching, and these locals can't be reached by the miner either.
-            _vpc, _vmo, _vsy, _vet = _vault_get_timers()
+            _vpc, _vmo, _vsy, _vet, _vce = _vault_get_timers()
             _vpc_id, _vmo_id, _vsy_id, _vet_id, _vce_id = _vault_get_real_ids()
 
             # NOW load the miner module — after the reference is safely captured.
