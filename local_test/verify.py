@@ -128,6 +128,56 @@ def _collect_main_guard_nodes(tree: ast.AST) -> set[int]:
     return skip_ids
 
 
+def _forbidden_name_binding_reason(node: ast.AST) -> str | None:
+    """Return violation text when `node` binds/modifies __name__."""
+    forbidden_name = "__name__"
+
+    if (
+        isinstance(node, ast.Name)
+        and node.id == forbidden_name
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+    ):
+        return "modification of __name__ is forbidden"
+
+    if isinstance(node, ast.alias):
+        if node.asname == forbidden_name:
+            return "aliasing import to __name__ is forbidden"
+        if node.name == forbidden_name:
+            return "importing __name__ is forbidden"
+
+    if isinstance(node, ast.arg) and node.arg == forbidden_name:
+        return "using __name__ as an argument is forbidden"
+
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if node.name == forbidden_name:
+            return "defining __name__ is forbidden"
+
+    if isinstance(node, ast.ExceptHandler) and node.name == forbidden_name:
+        return "binding __name__ in exception handler is forbidden"
+
+    if isinstance(node, ast.MatchAs) and node.name == forbidden_name:
+        return "binding __name__ in match pattern is forbidden"
+
+    if isinstance(node, ast.MatchStar) and node.name == forbidden_name:
+        return "binding __name__ in match pattern is forbidden"
+
+    if isinstance(node, ast.MatchMapping) and node.rest == forbidden_name:
+        return "binding __name__ in match mapping pattern is forbidden"
+
+    if isinstance(node, ast.Global) and forbidden_name in node.names:
+        return "declaring global __name__ is forbidden"
+
+    if isinstance(node, ast.Nonlocal) and forbidden_name in node.names:
+        return "declaring nonlocal __name__ is forbidden"
+
+    # Python 3.12: generic type parameters, e.g. `def f[__name__](): ...`
+    if hasattr(ast, "TypeVar") and isinstance(node, ast.TypeVar):
+        if node.name == forbidden_name:
+            return "using __name__ as a type parameter is forbidden"
+
+    return None
+
+
 def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
     violations = []
 
@@ -238,12 +288,10 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
             line = getattr(node, "lineno", "?")
             violations.append(f"Line {line}: reference to '{node.id}' is forbidden")
 
-        # Block __name__ reassignment
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "__name__":
-                    line = getattr(node, "lineno", "?")
-                    violations.append(f"Line {line}: reassignment of __name__ is forbidden")
+        name_binding_violation = _forbidden_name_binding_reason(node)
+        if name_binding_violation:
+            line = getattr(node, "lineno", "?")
+            violations.append(f"Line {line}: {name_binding_violation}")
 
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_OBJECT_DUNDER_ATTRS:
             if isinstance(node.value, ast.Name) and node.value.id == "object":
@@ -464,11 +512,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> list[str]:
                     line = getattr(deco, "lineno", "?")
                     violations.append(f"Line {line}: decorator @{deco.id} is forbidden")
 
-        # Block AugAssign on __name__
-        if isinstance(node, ast.AugAssign):
-            if isinstance(node.target, ast.Name) and node.target.id == "__name__":
-                line = getattr(node, "lineno", "?")
-                violations.append(f"Line {line}: modification of __name__ is forbidden")
+
 
     return violations
 
@@ -543,6 +587,54 @@ def validate_code_structure(code: str) -> list[str]:
                     if pattern in decoded_str:
                         line = getattr(node, "lineno", "?")
                         violations.append(f"Line {line}: forbidden string via b'...'.decode()")
+
+    # Scan str(bytes([...]), "ascii") and str(bytearray([...]), "ascii")
+    # obfuscation used to evade plain string literal checks.
+    for node in ast.walk(scan_tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "str"
+            and node.args
+        ):
+            inner = node.args[0]
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id in ("bytes", "bytearray")
+            ):
+                try:
+                    if not (
+                        inner.args and len(inner.args) == 1 and isinstance(inner.args[0], ast.List)
+                    ):
+                        raise ValueError("not simple")
+
+                    int_values = []
+                    for elt in inner.args[0].elts:
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
+                            int_values.append(elt.value)
+                        else:
+                            raise ValueError("non-constant")
+
+                    encoding = "utf-8"
+                    if len(node.args) >= 2:
+                        if isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
+                            encoding = node.args[1].value
+                        else:
+                            raise ValueError("dynamic encoding")
+
+                    decoded_str = bytes(int_values).decode(encoding)
+                    for pattern in _FORBIDDEN_STRINGS:
+                        if pattern in decoded_str:
+                            line = getattr(node, "lineno", "?")
+                            violations.append(
+                                f"Line {line}: forbidden string via str(bytes/bytearray, encoding)"
+                            )
+                except (ValueError, UnicodeDecodeError, LookupError):
+                    line = getattr(node, "lineno", "?")
+                    violations.append(
+                        f"Line {line}: dynamic str(bytes/bytearray, encoding) construction is forbidden"
+                    )
 
     # Scan attribute names (e.g. _e._perf_counter) — AST string scan only
     # catches ast.Constant values, not ast.Attribute.attr names
