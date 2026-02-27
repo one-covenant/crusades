@@ -156,7 +156,7 @@ def _verify_security_blocked(validate_code_structure, code: str) -> tuple[bool, 
 def _env_security_blocked(validate_code_structure, code: str) -> tuple[bool, str]:
     safe, message = validate_code_structure(code)
     reason = message or ("No validation message" if safe else "Validation failed without message")
-    blocked = (not safe) and reason.startswith("Security violation:")
+    blocked = not safe
     return blocked, reason
 
 
