@@ -220,7 +220,7 @@ Edit `hparams/hparams.json`:
     "min_success_rate": 0.5,
     
     "docker": {
-        "num_gpus": 1,
+        "num_gpus": 2,
         "memory_limit": "80g",
         "shm_size": "32g"
     },
@@ -253,7 +253,7 @@ Edit `hparams/hparams.json`:
 | `burn_rate` | % of emissions to burn_uid | `0.95` (95%) |
 | `evaluation_runs` | Number of evaluation runs per submission | `5` |
 | `min_success_rate` | Minimum passing runs to accept | `0.5` (50%) |
-| `docker.num_gpus` | Number of GPUs (`1` = single-GPU, `>1` = multi-GPU via `torchrun`) | `1` |
+| `docker.num_gpus` | Number of GPUs (multi-GPU via `torchrun`) | `2` |
 | `docker.memory_limit` | Container memory limit | `"80g"` |
 | `docker.shm_size` | Shared memory (auto-scaled for multi-GPU NCCL) | `"32g"` |
 | `gradient_norm_ratio_max` | Max gradient relative error (1 + %) | `1.06` (6%) |

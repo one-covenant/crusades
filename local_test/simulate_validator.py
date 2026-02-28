@@ -9,21 +9,10 @@ same Docker container.
    docker build --network=host -f environments/templar/Dockerfile \
        -t templar-eval:latest .
 
-2. Single-GPU test:
-
-    docker run --gpus 1 -it --rm \
-        -v "$(pwd)/local_test/train.py":/test/train.py \
-        -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py \
-        -v "$(pwd)/hparams/hparams.json":/app/hparams.json \
-        -v "$(pwd)/environments/templar/env.py":/app/env.py \
-        -e PYTHONPATH=/app \
-        templar-eval:latest \
-        python3 /test/simulate.py
-
-3. Multi-GPU test (set docker.num_gpus in hparams.json):
+2. Run the simulation (requires 2x A100 GPUs for 7B model):
 
     docker run --gpus 2 -it --rm --ipc=host \
-        -v "$(pwd)/local_test/train.py":/test/train.py \
+        -v "$(pwd)/local_test/train_fsdp.py":/test/train.py \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py \
         -v "$(pwd)/hparams/hparams.json":/app/hparams.json \
         -v "$(pwd)/environments/templar/env.py":/app/env.py \
@@ -31,6 +20,8 @@ same Docker container.
         -e PYTHONPATH=/app \
         templar-eval:latest \
         python3 /test/simulate.py
+
+   Replace train_fsdp.py with train_tp.py to test tensor parallelism.
 """
 
 import asyncio

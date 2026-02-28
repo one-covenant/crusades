@@ -58,10 +58,9 @@ echo "HF_TOKEN=hf_your_token" > .env
 ```bash
 # Download model & data for local testing
 uv run local_test/setup_benchmark.py
-
-# Test your train.py locally (performance test)
-uv run local_test/train.py
 ```
+
+> **Hardware requirement:** The benchmark model (Qwen2.5-7B) needs ~130 GB for params + optimizer + gradients, which exceeds a single A100 80 GB. You need **2x A100 80 GB** with a memory-sharding strategy (FSDP or TP). Single-GPU and DDP will OOM.
 
 ### Simulate the Validator (Recommended)
 
@@ -72,12 +71,12 @@ Test your `train.py` inside the **exact same Docker container** the production v
 docker build --network=host -f environments/templar/Dockerfile \
     --no-cache -t templar-eval:latest .
 
-# Run the simulation (requires an A100 GPU or equivalent)
+# Run the simulation (requires 2x A100 GPUs)
 # Note: MFU/benchmark results will only closely match leaderboard numbers
 # when executed on the same GPU model (A100). Runs on other hardware may
 # produce divergent MFU results.
-docker run --gpus '"device=0"' -it --rm \
-    -v "$(pwd)/local_test/train.py":/test/train.py \
+docker run --gpus 2 -it --rm --ipc=host \
+    -v "$(pwd)/local_test/train_fsdp.py":/test/train.py \
     -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py \
     -v "$(pwd)/hparams/hparams.json":/app/hparams.json \
     -v "$(pwd)/environments/templar/env.py":/app/env.py \
@@ -86,6 +85,8 @@ docker run --gpus '"device=0"' -it --rm \
     templar-eval:latest \
     python3 /test/simulate.py
 ```
+
+Replace `train_fsdp.py` with `train_tp.py` to test tensor parallelism instead.
 
 This runs the full evaluation pipeline: security scan, reference baseline, warmup, timed eval, gradient/weight verification, and MFU calculation — all with the same thresholds as production.
 
@@ -145,86 +146,47 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 | `device` | `torch.device` | Target device (`cuda:0`, `cuda:1`, etc.). Use `device.index` for local rank. |
 | `num_gpus` | `int` | Number of GPUs. `1` = single-GPU, `>1` = multi-GPU with `torchrun` (process group already initialized). |
 
-### Single-GPU Baseline
+### Multi-GPU Example (FSDP)
 
-```python
-from dataclasses import dataclass
-import torch
-import torch.nn.functional as F
-
-@dataclass
-class InnerStepsResult:
-    final_logits: torch.Tensor  # 3D: (batch, seq_len-1, vocab) - NOT None
-    total_tokens: int           # Total tokens processed across all steps
-    final_loss: float           # Loss from last step (must be > 0)
-
-def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
-    total_tokens = 0
-    final_logits = None
-    final_loss = 0.0
-
-    for step in range(num_steps):
-        batch = next(data_iterator).to(device, dtype=torch.long)
-        input_ids = batch[:, :-1]
-        labels = batch[:, 1:]
-
-        outputs = model(input_ids)
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            ignore_index=-100,
-        )
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
-        total_tokens += batch.numel()
-        final_logits = logits.detach()
-        final_loss = loss.item()
-
-    return InnerStepsResult(
-        final_logits=final_logits,
-        total_tokens=total_tokens,
-        final_loss=final_loss,
-    )
-```
-
-### Multi-GPU Example (DDP)
+With the 7B benchmark model, miners **must** use a memory-sharding strategy. FSDP is recommended — it shards parameters, gradients, and optimizer states across GPUs.
 
 When `num_gpus > 1`, `optimizer` is `None`. The miner wraps the model and creates its own optimizer:
 
 ```python
-from torch.nn.parallel import DistributedDataParallel as DDP
+import functools
+import torch
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
-    if num_gpus > 1:
-        model = DDP(model, device_ids=[device.index])
+    # FSDP: shard model across GPUs
+    wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={type(model.model.layers[0])},
+    )
+    model = FSDP(model, sharding_strategy=ShardingStrategy.FULL_SHARD,
+                 auto_wrap_policy=wrap_policy, device_id=device.index)
 
-    if optimizer is None:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, fused=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=True)
 
-    # ... training loop (same as single-GPU) ...
+    # ... training loop ...
+    # Return gathered final_state for weight verification
 ```
 
-Any parallelism strategy works: DDP, FSDP, Tensor Parallelism, Pipeline Parallelism, or hybrids. The process group is already initialized by `torchrun` before `inner_steps` is called.
+See `local_test/train_fsdp.py` and `local_test/train_tp.py` for complete working examples. The process group is already initialized by `torchrun` before `inner_steps` is called.
+
+> **Note:** Single-GPU and DDP examples are kept in `local_test/` for reference but will OOM with the 7B model on A100 80 GB. Use FSDP or TP for the current benchmark.
 
 ### Rules
 
-**General (all modes):**
+**General:**
 - Process all tokens in each batch, return valid `final_logits` (not `None`)
 - Train all model parameters (no freezing layers)
 - Don't alias `torch` (e.g., `import torch as t`) -- the scanner needs the literal name
-
-**Single-GPU (`num_gpus == 1`):**
-- Use the provided `optimizer` directly (`optimizer.step()` / `optimizer.zero_grad()`)
-- The validator captures gradients through the optimizer wrapper for verification
-
-**Multi-GPU (`num_gpus > 1`):**
 - `optimizer` is `None` -- create your own after wrapping the model
-- You may use any parallelism: DDP, FSDP, TP, PP, or combinations
-- The original `model` object must have full (unsharded) parameters when `inner_steps` returns (DDP does this automatically; FSDP/TP require explicit parameter gathering)
-- Gradient verification is skipped; the validator verifies via loss and final weight comparison
+- You may use any memory-sharding parallelism: FSDP, TP, PP, or combinations
+- For FSDP/TP: return gathered `final_state` (full unsharded CPU tensors) in `InnerStepsResult` for weight verification
+- Gradient verification is skipped in multi-GPU mode; the validator verifies via loss and final weight comparison
 
 A static security scanner blocks dangerous patterns (forbidden imports, monkey-patching, timer tampering, etc.). See [`src/crusades/core/security_defs.py`](src/crusades/core/security_defs.py) for the full blocklist. Run the Docker-based [`simulate_validator.py`](local_test/simulate_validator.py) before submitting to catch violations early.
 
@@ -241,11 +203,11 @@ Key settings in `hparams/hparams.json`:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `netuid` | 3 | Subnet ID |
-| `evaluation_runs` | 5 | Runs per submission (median taken) |
+| `evaluation_runs` | 2 | Runs per submission (median taken) |
 | `eval_steps` | 5 | Training steps per evaluation |
-| `benchmark_model_name` | Qwen/Qwen2.5-3B | Model for evaluation |
-| `benchmark_batch_size` | 8 | Batch size for evaluation |
-| `docker.num_gpus` | 1 | Number of GPUs (1 = single-GPU, >1 = multi-GPU via `torchrun`) |
+| `benchmark_model_name` | Qwen/Qwen2.5-7B | Model for evaluation |
+| `benchmark_batch_size` | 4 | Batch size for evaluation |
+| `docker.num_gpus` | 2 | Number of GPUs (multi-GPU via `torchrun`) |
 
 ---
 

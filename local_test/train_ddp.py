@@ -1,5 +1,9 @@
 """DDP train.py -- data-parallel strategy (default).
 
+WARNING: DDP replicates the full model on every GPU, so each GPU needs
+~130GB for Qwen2.5-7B (params + optimizer + gradients).  This will OOM
+on A100 80GB.  Use train_fsdp.py or train_tp.py for the 7B benchmark.
+
 No get_strategy() needed (defaults to "ddp").  Each rank gets different
 data batches, gradients are all-reduced automatically.
 
