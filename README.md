@@ -206,7 +206,7 @@ Key settings in `hparams/hparams.json`:
 | `evaluation_runs` | 2 | Runs per submission (median taken) |
 | `eval_steps` | 5 | Training steps per evaluation |
 | `benchmark_model_name` | Qwen/Qwen2.5-7B | Model for evaluation |
-| `benchmark_batch_size` | 4 | Batch size for evaluation |
+| `benchmark_batch_size` | 16 | Batch size for evaluation |
 | `docker.num_gpus` | 2 | Number of GPUs (multi-GPU via `torchrun`) |
 
 ---

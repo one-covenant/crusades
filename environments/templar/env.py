@@ -1451,6 +1451,9 @@ class GradientCapturingOptimizer:
         return getattr(opt, name)
 
 
+_REFERENCE_MICRO_BATCH_SIZE = 4
+
+
 def _run_reference(
     model: torch.nn.Module,
     data_iterator: Iterator[torch.Tensor],
@@ -1461,6 +1464,12 @@ def _run_reference(
     ddp_model: torch.nn.Module | None = None,
 ) -> tuple[InnerStepsResult, GradientInfo | None]:
     """Run reference implementation for comparison.
+
+    Uses gradient accumulation with micro-batches to stay within GPU
+    memory for large models (e.g. 7B on A100 80GB).  The full batch
+    from *data_iterator* is split into chunks of ``_REFERENCE_MICRO_BATCH_SIZE``
+    and gradients are accumulated before each optimizer step — mathematically
+    equivalent to processing the full batch at once.
 
     When *ddp_model* is provided, the forward pass uses the DDP wrapper
     (triggering gradient all-reduce) while gradient capture reads from the
@@ -1473,6 +1482,7 @@ def _run_reference(
     _enforce_backend_state()
 
     eval_model = ddp_model if ddp_model is not None else model
+    mbs = _REFERENCE_MICRO_BATCH_SIZE
 
     total_tokens = 0
     final_logits = None
@@ -1483,19 +1493,26 @@ def _run_reference(
         batch = next(data_iterator)
         batch = batch.to(device, dtype=torch.long)
 
-        input_ids = batch[:, :-1]
-        labels = batch[:, 1:]
-        outputs = eval_model(input_ids)
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs
-        loss = _real_cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            ignore_index=-100,
-        )
+        micro_batches = [batch[i : i + mbs] for i in range(0, batch.size(0), mbs)]
+        num_accum = len(micro_batches)
 
-        loss.backward()
+        step_logits = None
+        step_loss_sum = 0.0
 
-        # Capture from unwrapped model (DDP puts all-reduced grads there)
+        for mb in micro_batches:
+            input_ids = mb[:, :-1]
+            labels = mb[:, 1:]
+            outputs = eval_model(input_ids)
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs
+            loss = _real_cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
+            (loss / num_accum).backward()
+            step_logits = logits
+            step_loss_sum += float(loss.item())
+
         if capture_final_gradients and step == num_steps - 1:
             final_gradients = _capture_gradients(model)
 
@@ -1503,8 +1520,8 @@ def _run_reference(
         optimizer.zero_grad(set_to_none=True)
 
         total_tokens += batch.numel()
-        final_logits = logits.detach().float()
-        final_loss = float(loss.item())
+        final_logits = step_logits.detach().float()
+        final_loss = step_loss_sum / num_accum
 
     result = InnerStepsResult(
         final_logits=final_logits,
