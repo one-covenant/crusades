@@ -61,9 +61,6 @@ uv run local_test/setup_benchmark.py
 
 # Test your train.py locally (performance test)
 uv run local_test/train.py
-
-# Verify your submission to avoid potential failures during validator checks
-uv run local_test/verify.py
 ```
 
 ### Simulate the Validator (Recommended)
@@ -229,7 +226,7 @@ Any parallelism strategy works: DDP, FSDP, Tensor Parallelism, Pipeline Parallel
 - The original `model` object must have full (unsharded) parameters when `inner_steps` returns (DDP does this automatically; FSDP/TP require explicit parameter gathering)
 - Gradient verification is skipped; the validator verifies via loss and final weight comparison
 
-A static security scanner blocks dangerous patterns (forbidden imports, monkey-patching, timer tampering, etc.). See [`src/crusades/core/security_defs.py`](src/crusades/core/security_defs.py) for the full blocklist. Run `uv run local_test/verify.py` before submitting to catch violations early.
+A static security scanner blocks dangerous patterns (forbidden imports, monkey-patching, timer tampering, etc.). See [`src/crusades/core/security_defs.py`](src/crusades/core/security_defs.py) for the full blocklist. Run the Docker-based [`simulate_validator.py`](local_test/simulate_validator.py) before submitting to catch violations early.
 
 Any genuine optimization is fair game -- `torch.compile`, mixed precision, Flash Attention, Triton kernels, CUDA Graphs, custom loss functions, and more. If the scanner rejects something that should be allowed, report to us.
 

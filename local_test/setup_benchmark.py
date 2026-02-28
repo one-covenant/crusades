@@ -169,16 +169,10 @@ def main():
     print("SETUP COMPLETE")
     print("=" * 60)
     print()
-    print("Running verification (local_test/verify.py)...")
+    print("To verify your train.py, run the Docker-based simulator:")
     print()
-
-    import subprocess
-
-    result = subprocess.run(
-        [sys.executable, str(project_root / "local_test" / "verify.py")],
-        cwd=str(project_root),
-    )
-    sys.exit(result.returncode)
+    print("  See local_test/simulate_validator.py for usage instructions.")
+    print()
 
 
 if __name__ == "__main__":

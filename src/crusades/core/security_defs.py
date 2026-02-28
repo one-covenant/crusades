@@ -1,10 +1,10 @@
 """
 Shared security policy constants and detection helpers for miner code validation.
 
-Single source of truth consumed by both the production validator
-(environments/templar/env.py) and the local pre-submission checker
-(local_test/verify.py).  Any additions or removals should be made
-here so the two stay in sync automatically.
+Single source of truth consumed by the production validator
+(environments/templar/env.py) and the local simulator
+(local_test/simulate_validator.py).  Any additions or removals
+should be made here so everything stays in sync automatically.
 """
 
 from __future__ import annotations
@@ -435,8 +435,8 @@ FORBIDDEN_INTROSPECTION_ATTRS: set[str] = {
 # ---------------------------------------------------------------------------
 # Shared AST detection helpers
 # ---------------------------------------------------------------------------
-# Used by both env.py and verify.py so detection logic is maintained in one
-# place.  Scanners import these and call them during AST walks.
+# Used by env.py so detection logic is maintained in one place.
+# Scanners import these and call them during AST walks.
 
 
 def forbidden_name_binding_reason(node: ast.AST) -> str | None:
