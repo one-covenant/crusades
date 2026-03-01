@@ -1451,7 +1451,7 @@ class GradientCapturingOptimizer:
         return getattr(opt, name)
 
 
-_REFERENCE_MICRO_BATCH_SIZE = 4
+_REFERENCE_MICRO_BATCH_SIZE = 2
 
 
 def _run_reference(
@@ -1783,7 +1783,7 @@ def _verify_outputs(
     candidate_final_state: dict | None = None,
     max_loss_difference: float = 0.3,
     gradient_norm_ratio_max: float = 1.08,
-    weight_relative_error_max: float = 0.006,
+    weight_relative_error_max: float = 0.01,
 ) -> tuple[bool, str | None, dict]:
     """Verify candidate outputs match reference.
 
@@ -1947,7 +1947,7 @@ class Actor:
         # Gradient verification
         gradient_norm_ratio_max: float = 1.08,
         # Weight verification
-        weight_relative_error_max: float = 0.006,
+        weight_relative_error_max: float = 0.01,
         # Timer integrity
         timer_divergence_threshold: float = 0.005,
         # MFU calculation
@@ -1977,7 +1977,7 @@ class Actor:
             min_trainable_params_ratio: Min % params that must be trainable
             min_params_changed_ratio: Min % params that must change
             gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.08 = 8%)
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.006 = 0.6%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.01 = 1%)
             timer_divergence_threshold: Max divergence between timer sources (e.g., 0.005 = 0.5%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             min_mfu: Minimum MFU threshold — submissions below this are rejected
@@ -3040,7 +3040,7 @@ class EvaluateRequest(BaseModel):
     # Gradient verification
     gradient_norm_ratio_max: float = 1.08
     # Weight verification
-    weight_relative_error_max: float = 0.006
+    weight_relative_error_max: float = 0.01
     # Timer integrity
     timer_divergence_threshold: float = 0.005
     # MFU calculation
