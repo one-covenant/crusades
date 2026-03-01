@@ -73,7 +73,6 @@ class PaymentConfig(BaseModel):
     enabled: bool = False
     fee_rao: int = 100_000_000  # 0.1 TAO in RAO (1 TAO = 1e9 RAO)
     payment_address: str = ""  # Explicit SS58 coldkey; empty = derive from burn_uid
-    skip_payment_hotkeys: list[str] = []  # Hotkeys exempt from payment (e.g., validator's own)
     rpc_timeout: int = 30  # Seconds before an RPC call is considered hung
     rpc_retries: int = 2  # Retry count for transient RPC failures
     archive_endpoint: str = "wss://archive.chain.opentensor.ai:443"
@@ -93,16 +92,9 @@ class PaymentConfig(BaseModel):
 
 
 class DockerConfig(BaseModel):
-    """Docker execution settings for validator evaluations.
+    """Docker execution settings for validator evaluations."""
 
-    GPU device options:
-    - "all": Use all available GPUs (default)
-    - "0": Use only GPU 0
-    - "0,1": Use GPUs 0 and 1
-    - "none": Disable GPU (CPU only)
-    """
-
-    gpu_devices: str = "all"  # "all", "0", "0,1", "none"
+    num_gpus: int = Field(default=1, ge=0)  # >1 uses torchrun for multi-GPU
     memory_limit: str = "32g"  # Docker memory limit
     shm_size: str = "8g"  # Shared memory size (important for PyTorch)
 

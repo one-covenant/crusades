@@ -1,14 +1,14 @@
 # Templar TPS Evaluation Environment Dependencies
 # Installed in validator's Docker image (templar-eval)
 
-# Core ML (torch 2.7.0+cu126 is pre-installed in the base image)
+# Core ML (torch 2.9.0+cu126 is pre-installed in the base image)
 transformers==4.57.6
 accelerate==1.12.0
 safetensors==0.7.0
-datasets==4.5.0
+datasets==4.6.0
 
 # HTTP Server (for Basilica custom Docker deployment)
-fastapi==0.129.0
+fastapi==0.133.1
 uvicorn==0.41.0
 pydantic==2.12.5
 

@@ -13,7 +13,7 @@
 │   │   2. Decrypt timelock-encrypted code URLs                               │   │
 │   │   3. Download miner's train.py from URL                                 │   │
 │   │   4. Evaluate via Docker or Basilica (multiple runs)                    │   │
-│   │   5. Verify: gradients, loss, parameters changed                        │   │
+│   │   5. Verify: loss, weights, gradients (single-GPU only)                 │   │
 │   │   6. Calculate MFU (Model FLOPs Utilization)                            │   │
 │   │   7. Update leaderboard with adaptive threshold                         │   │
 │   │   8. Set weights on blockchain (winner gets emissions)                  │   │
@@ -58,33 +58,59 @@ MFU = (actual_tflops / gpu_peak_tflops) * 100
 
 Where:
 - actual_tflops = (6 * model_params * total_tokens) / wall_time / 1e12
-- total_tokens = batch_size * seq_len * steps
+- total_tokens = batch_size * seq_len * steps (per rank)
 - 6 = forward (2x) + backward (4x) FLOPs per param per token
 - gpu_peak_tflops = 312.0 for A100 bfloat16 (from hparams)
 ```
 
-Higher MFU = more efficient use of GPU compute.
+Higher MFU = more efficient use of GPU compute. In multi-GPU mode, MFU is calculated per-GPU -- each rank processes its own shard of the data, so `total_tokens` and `wall_time` are both per-rank values.
 
 ### Verification Checks
 
 Each submission undergoes the following verification checks:
 
-| Check | Description | Threshold |
-|-------|-------------|-----------|
-| **Logits Present** | Must return actual logits (not None) | Required |
-| **Logits Shape** | Logits must be 3D (batch, seq, vocab) | Required |
-| **Sequence Length** | Logits seq dim must match expected | `seq_len - 1` |
-| **Token Count** | Must process the expected number of tokens | Exact match |
-| **Loss Validity** | Loss must be positive, not NaN, close to reference | `max_loss_difference: 0.3` |
-| **Gradient Relative Error** | `\|g - g_truth\| / \|g_truth\|` must be small | `gradient_norm_ratio_max: 1.06` (6%) |
-| **Gradient Coverage** | All layers must have gradients | `100%` |
-| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.008` |
-| **Trainable Params** | All params must be trainable | `100%` |
-| **Params Changed** | Most param elements must change during training | `min: 80%` |
-| **Timer Integrity** | Multiple timer sources must agree | `timer_divergence_threshold: 1%` |
-| **Min MFU** | Floor threshold — submissions below are rejected | `min_mfu: 45%` |
-| **Max Plausible MFU** | Ceiling cap — no legitimate code exceeds this | `max_plausible_mfu: 75%` |
-| **Success Rate** | Majority of runs must pass | `min_success_rate: 0.5` |
+| Check | Description | Threshold | Multi-GPU |
+|-------|-------------|-----------|-----------|
+| **Logits Present** | Must return actual logits (not None) | Required | Active |
+| **Logits Shape** | Logits must be 3D (batch, seq, vocab) | Required | Active |
+| **Sequence Length** | Logits seq dim must match expected | `seq_len - 1` | Active |
+| **Token Count** | Must process the expected number of tokens | Exact match | Active |
+| **Loss Validity** | Loss must be positive, not NaN, close to reference | `max_loss_difference: 0.3` | Active |
+| **Gradient Relative Error** | `\|g - g_truth\| / \|g_truth\|` must be small | `gradient_norm_ratio_max: 1.06` (6%) | **Skipped** |
+| **Gradient Coverage** | All layers must have gradients | `100%` | **Skipped** |
+| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.008` | Active |
+| **Trainable Params** | All params must be trainable | `100%` | Active |
+| **Params Changed** | Most param elements must change during training | `min: 80%` | Active |
+| **Timer Integrity** | Multiple timer sources must agree | `timer_divergence_threshold: 1%` | Active |
+| **Min MFU** | Floor threshold -- submissions below are rejected | `min_mfu: 45%` | Active |
+| **Max Plausible MFU** | Ceiling cap -- no legitimate code exceeds this | `max_plausible_mfu: 75%` | Active |
+| **Success Rate** | Majority of runs must pass | `min_success_rate: 0.5` | Active |
+
+> **Multi-GPU note:** Gradient checks are skipped when `num_gpus > 1` because the miner creates their own optimizer (required for FSDP/TP/PP). Training correctness is still verified via loss comparison and final weight matching.
+
+### Multi-GPU Evaluation
+
+When `docker.num_gpus > 1`, the evaluation runs in multi-GPU mode. This allows miners to use distributed parallelism strategies (DDP, FSDP, Tensor Parallelism, Pipeline Parallelism, or hybrids).
+
+**What changes for multi-GPU:**
+
+| Aspect | Single-GPU (`num_gpus=1`) | Multi-GPU (`num_gpus>1`) |
+|--------|---------------------------|--------------------------|
+| Launch command | `python eval_script.py` | `torchrun --nproc_per_node N eval_script.py` |
+| Docker network | `--network none` | Internal network (NCCL only, no egress) |
+| Data iterator | Sequential batches | Sharded across ranks (non-overlapping) |
+| Reference run | Rank 0 only | All ranks via DDP |
+| Optimizer | Validator-provided `GradientCapturingOptimizer` | `None` -- miner creates their own |
+| Gradient verification | Active | Skipped |
+| Weight verification | Active | Active |
+| MFU calculation | Per-GPU | Per-GPU (same formula) |
+
+**Miner contract for multi-GPU:**
+- `optimizer` will be `None` -- create your own after wrapping the model
+- Any parallelism strategy is allowed: DDP, FSDP, TP, PP, or combinations
+- `torch.distributed` process group is already initialized by `torchrun`
+- The original `model` object must have full (unsharded) parameters when `inner_steps` returns
+- `device.index` gives the local rank (`os` module is forbidden)
 
 ### Adaptive Threshold & Leaderboard
 
@@ -194,7 +220,7 @@ Edit `hparams/hparams.json`:
     "min_success_rate": 0.5,
     
     "docker": {
-        "gpu_devices": "0",
+        "num_gpus": 2,
         "memory_limit": "80g",
         "shm_size": "32g"
     },
@@ -227,8 +253,9 @@ Edit `hparams/hparams.json`:
 | `burn_rate` | % of emissions to burn_uid | `0.95` (95%) |
 | `evaluation_runs` | Number of evaluation runs per submission | `5` |
 | `min_success_rate` | Minimum passing runs to accept | `0.5` (50%) |
-| `gpu_devices` | Which GPUs to use | `"0"` |
-| `memory_limit` | Container memory limit | `"80g"` |
+| `docker.num_gpus` | Number of GPUs (multi-GPU via `torchrun`) | `2` |
+| `docker.memory_limit` | Container memory limit | `"80g"` |
+| `docker.shm_size` | Shared memory (auto-scaled for multi-GPU NCCL) | `"32g"` |
 | `gradient_norm_ratio_max` | Max gradient relative error (1 + %) | `1.06` (6%) |
 | `timer_divergence_threshold` | Max divergence between timer sources | `0.01` (1%) |
 | `min_mfu` | Floor MFU threshold — reject below this | `45.0` |

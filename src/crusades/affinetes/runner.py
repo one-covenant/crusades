@@ -150,13 +150,16 @@ class AffinetesRunner:
         "BASILICA_EVAL_IMAGE", "ghcr.io/one-covenant/templar-eval:latest"
     )
 
+    _INTERNAL_NETWORK = "crusades_nccl_internal"
+    _internal_network_created = False
+
     def __init__(
         self,
         mode: Literal["docker", "basilica"] = "docker",
         basilica_api_key: str | None = None,
-        docker_gpu_devices: str = "all",
         docker_memory_limit: str = "32g",
         docker_shm_size: str = "8g",
+        num_gpus: int = 1,
         timeout: int = 600,
         model_url: str | None = None,
         data_url: str | None = None,
@@ -191,9 +194,9 @@ class AffinetesRunner:
         Args:
             mode: Execution mode ("docker" for local, "basilica" for remote)
             basilica_api_key: Basilica API key (or BASILICA_API_TOKEN env var)
-            docker_gpu_devices: GPU devices for Docker ("all", "0", "0,1", "none")
             docker_memory_limit: Docker memory limit (e.g., "32g")
             docker_shm_size: Shared memory size for Docker (e.g., "8g")
+            num_gpus: Number of GPUs to use (0=CPU-only, 1=single GPU, >1=multi-GPU)
             timeout: Evaluation timeout in seconds
             model_url: Default model URL (HuggingFace model ID)
             data_url: Default data URL (HuggingFace dataset)
@@ -216,9 +219,9 @@ class AffinetesRunner:
         """
         self.mode = mode
         self.basilica_api_key = basilica_api_key or os.getenv("BASILICA_API_TOKEN")
-        self.docker_gpu_devices = docker_gpu_devices
         self.docker_memory_limit = docker_memory_limit
         self.docker_shm_size = docker_shm_size
+        self.num_gpus = num_gpus
         self.timeout = timeout
         self.default_model_url = model_url
         self.default_data_url = data_url
@@ -260,6 +263,43 @@ class AffinetesRunner:
             logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
             logger.info(f"   Min GPU Memory: {self.basilica_min_gpu_memory_gb}GB")
             logger.info(f"   CPU/Memory: {self.basilica_cpu} / {self.basilica_memory}")
+
+    @classmethod
+    def _ensure_internal_network(cls) -> None:
+        """Create an internal Docker network for multi-GPU NCCL."""
+        if cls._internal_network_created:
+            return
+        try:
+            # Check if network already exists
+            result = subprocess.run(
+                ["docker", "network", "inspect", cls._INTERNAL_NETWORK],
+                capture_output=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                cls._internal_network_created = True
+                return
+
+            result = subprocess.run(
+                [
+                    "docker",
+                    "network",
+                    "create",
+                    "--internal",
+                    cls._INTERNAL_NETWORK,
+                ],
+                capture_output=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                logger.error(
+                    f"Failed to create Docker network '{cls._INTERNAL_NETWORK}': "
+                    f"{result.stderr.decode().strip()}"
+                )
+                return
+            cls._internal_network_created = True
+        except Exception as e:
+            logger.error(f"Error creating Docker network '{cls._INTERNAL_NETWORK}': {e}")
 
     async def evaluate(
         self,
@@ -381,12 +421,15 @@ class AffinetesRunner:
         eval_script = f'''
 import asyncio
 import json
+import os
 import sys
 sys.path.insert(0, '/app')
 
 from env import Actor
 
 async def main():
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
     # Read miner's code
     with open('/app/scripts/miner_train.py') as f:
         code = f.read()
@@ -418,8 +461,10 @@ async def main():
         max_plausible_mfu={self.max_plausible_mfu},
         min_mfu={self.min_mfu},
         require_cuda_timing=True,
+        num_gpus={self.num_gpus},
     )
-    print("EVAL_RESULT:" + json.dumps(result))
+    if local_rank == 0:
+        print("EVAL_RESULT:" + json.dumps(result))
 
 asyncio.run(main())
 '''
@@ -449,35 +494,47 @@ asyncio.run(main())
                 f"{train_path}:/app/scripts/miner_train.py:ro",
             ]
 
-            # Add GPU if configured
-            if self.docker_gpu_devices and self.docker_gpu_devices.lower() != "none":
-                if self.docker_gpu_devices.lower() == "all":
-                    docker_cmd.extend(["--gpus", "all"])
-                else:
-                    docker_cmd.extend(["--gpus", f"device={self.docker_gpu_devices}"])
+            if self.num_gpus > 0:
+                docker_cmd.extend(["--gpus", str(self.num_gpus)])
 
-            # Memory limits (from hparams.json docker config)
+            # Memory limits; scale shm for multi-GPU NCCL
+            shm_size = self.docker_shm_size
+            if self.num_gpus > 1:
+                base_shm_gb = int(self.docker_shm_size.rstrip("gG"))
+                shm_size = f"{max(base_shm_gb, 2 * self.num_gpus)}g"
             docker_cmd.extend(
                 [
                     "--memory",
                     self.docker_memory_limit,
                     "--shm-size",
-                    self.docker_shm_size,
+                    shm_size,
                 ]
             )
 
-            # Docker sandbox configuration
+            # Sandbox: scale pids-limit for torchrun
+            pids_limit = 1024 * max(self.num_gpus, 1)
+            if self.num_gpus <= 1:
+                docker_cmd.extend(["--network", "none"])
+            else:
+                # Multi-GPU: internal network (no egress), no DNS
+                self._ensure_internal_network()
+                docker_cmd.extend(
+                    [
+                        "--network",
+                        self._INTERNAL_NETWORK,
+                        "--dns",
+                        "0.0.0.0",
+                    ]
+                )
             docker_cmd.extend(
                 [
-                    "--network",
-                    "none",
                     "--cap-drop",
                     "ALL",
                     "--security-opt",
                     "no-new-privileges",
                     "--read-only",
                     "--pids-limit",
-                    "1024",
+                    str(pids_limit),
                     # Writable /tmp for temporary files (exec needed for torch.compile)
                     "--tmpfs",
                     "/tmp:rw,exec,nosuid,size=4g",
@@ -497,13 +554,24 @@ asyncio.run(main())
             )
 
             # Image and command
-            docker_cmd.extend(
-                [
-                    self.validator_image,
-                    "python",
-                    "/app/scripts/eval_script.py",
-                ]
-            )
+            if self.num_gpus > 1:
+                docker_cmd.extend(
+                    [
+                        self.validator_image,
+                        "torchrun",
+                        "--nproc_per_node",
+                        str(self.num_gpus),
+                        "/app/scripts/eval_script.py",
+                    ]
+                )
+            else:
+                docker_cmd.extend(
+                    [
+                        self.validator_image,
+                        "python",
+                        "/app/scripts/eval_script.py",
+                    ]
+                )
 
             logger.info(f"Running evaluation in {self.validator_image}...")
             logger.debug(f"   Full Docker command: {' '.join(docker_cmd)}")
@@ -733,6 +801,7 @@ asyncio.run(main())
                 "gpu_peak_tflops": self.gpu_peak_tflops,
                 "max_plausible_mfu": self.max_plausible_mfu,
                 "min_mfu": self.min_mfu,
+                "num_gpus": self.basilica_gpu_count,
             }
 
             logger.info("[BASILICA] Sending evaluation request...")

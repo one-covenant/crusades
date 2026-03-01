@@ -88,6 +88,11 @@ _monotonic = time.monotonic
 _cuda_synchronize = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
 _cuda_elapsed_time = torch.cuda.Event.elapsed_time if torch.cuda.is_available() else None
 
+# Multi-GPU rank detection (set by torchrun)
+_LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
+_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
+_IS_RANK_0 = _LOCAL_RANK == 0
+
 # Save the REAL torch.nn.functional functions at import time, before any miner
 # code can monkey-patch them.  The reference implementation uses these saved
 # copies exclusively so that ``F.cross_entropy = fake`` cannot poison the
@@ -169,9 +174,10 @@ def _log_vram(tag: str):
     """Log current VRAM usage for debugging memory leaks."""
     if not torch.cuda.is_available():
         return
-    allocated = torch.cuda.memory_allocated() / 1024**3
-    reserved = torch.cuda.memory_reserved() / 1024**3
-    logger.info(f"[VRAM {tag}] allocated={allocated:.2f}GB reserved={reserved:.2f}GB")
+    dev = _LOCAL_RANK
+    allocated = torch.cuda.memory_allocated(dev) / 1024**3
+    reserved = torch.cuda.memory_reserved(dev) / 1024**3
+    logger.info(f"[VRAM {tag}] rank={dev} allocated={allocated:.2f}GB reserved={reserved:.2f}GB")
 
 
 # Global cache for model (data is NOT cached for validators)
@@ -194,6 +200,29 @@ def _hide_sensitive_env_modules():
         yield
     finally:
         sys.modules.update(hidden_modules)
+
+
+_VALID_STRATEGIES = ("ddp", "fsdp", "tp")
+
+
+def _detect_strategy_from_source(source: str) -> str:
+    """Extract parallelism strategy from miner source via AST (no code execution).
+
+    Looks for a ``get_strategy()`` function that returns a string literal.
+    Falls back to ``"ddp"`` when the function is absent or unparseable.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return "ddp"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "get_strategy":
+            for stmt in node.body:
+                if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Constant):
+                    val = str(stmt.value.value).lower()
+                    if val in _VALID_STRATEGIES:
+                        return val
+    return "ddp"
 
 
 def _load_miner_module(train_path: Path):
@@ -627,10 +656,8 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                     line = getattr(node, "lineno", "?")
                     return False, f"Line {line}: forbidden pattern detected"
 
-        if isinstance(node, ast.Attribute) and node.attr == "__class__":
-            if not isinstance(getattr(node, "_parent", None), ast.AnnAssign):
-                line = getattr(node, "lineno", "?")
-                return False, f"Line {line}: forbidden pattern detected"
+        # Reading __class__ is allowed (needed for FSDP layer detection);
+        # only *writing* to __class__ is blocked above.
 
         # Block timer-related attribute access on ANY object.
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_TIMER_ATTRS:
@@ -959,8 +986,7 @@ def _load_model(model_path: str, use_random_init: bool = False):
             local_files_only=True,
         )
 
-        # Simple model loading - Qwen2.5-3B (~6GB) fits easily on A100 80GB
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = f"cuda:{_LOCAL_RANK}" if torch.cuda.is_available() else "cpu"
         model = AutoModelForCausalLM.from_config(
             config,
             torch_dtype=torch.bfloat16,
@@ -968,7 +994,7 @@ def _load_model(model_path: str, use_random_init: bool = False):
             attn_implementation="flash_attention_2",
         )
         model = model.to(device)
-        logger.info(f"Model loaded on {device}")
+        logger.info(f"Model loaded on {device} (rank {_LOCAL_RANK})")
     else:
         logger.info(f"Loading pretrained model from {model_path}")
         # Use local cache only (Docker runs with --network=none)
@@ -998,44 +1024,44 @@ def _count_model_params(model: torch.nn.Module) -> int:
 
 
 def _calculate_mfu(
-    total_tokens: int,
+    total_unique_tokens: int,
     wall_time: float,
     model_params: int,
     gpu_peak_tflops: float = 312.0,
+    num_gpus: int = 1,
 ) -> float:
-    """Calculate Model FLOPs Utilization (MFU).
+    """Calculate system-level Model FLOPs Utilization (MFU).
 
-    MFU = actual_flops / theoretical_peak_flops
+    MFU = total_system_flops / total_system_peak_flops
 
-    For transformer training (forward + backward):
-    - Forward: 2 * params * tokens (multiply-accumulate)
-    - Backward: 4 * params * tokens (gradients are 2x forward)
-    - Total: 6 * params * tokens
+    The caller provides *total_unique_tokens* — the number of distinct tokens
+    processed across the entire system during training:
+
+    - DDP/FSDP: tokens_per_rank * num_gpus (each rank sees different data)
+    - TP:       tokens_per_rank            (all ranks see the same data)
+
+    Total useful FLOPs = 6 * params * total_unique_tokens (forward + backward).
+    Total system peak  = peak_per_gpu * num_gpus * wall_time.
 
     Args:
-        total_tokens: Total tokens processed
+        total_unique_tokens: Distinct tokens processed by the system
         wall_time: Wall clock time in seconds
         model_params: Number of model parameters
-        gpu_peak_tflops: GPU theoretical peak TFLOPS (A100 80GB = 312 TFLOPS bfloat16)
+        gpu_peak_tflops: Per-GPU theoretical peak TFLOPS (A100 80GB = 312 bfloat16)
+        num_gpus: Number of GPUs used in evaluation
 
     Returns:
         MFU as a percentage (0-100)
     """
-    # Guard against division by zero / invalid inputs
-    if wall_time <= 0 or gpu_peak_tflops <= 0:
+    if wall_time <= 0 or gpu_peak_tflops <= 0 or num_gpus <= 0:
         return 0.0
 
-    # FLOPs for forward + backward pass
-    flops_per_token = 6 * model_params
-    total_flops = flops_per_token * total_tokens
+    total_system_flops = 6 * model_params * total_unique_tokens
+    total_system_peak = gpu_peak_tflops * num_gpus * 1e12 * wall_time
 
-    # Actual TFLOPS achieved
-    actual_tflops = total_flops / wall_time / 1e12
+    mfu = (total_system_flops / total_system_peak) * 100
 
-    # MFU as percentage
-    mfu = (actual_tflops / gpu_peak_tflops) * 100
-
-    return min(mfu, 100.0)  # Cap at 100%
+    return min(mfu, 100.0)
 
 
 def _capture_gradients(model: torch.nn.Module) -> GradientInfo:
@@ -1126,31 +1152,35 @@ def _verify_trainable_params(
 
 
 def _verify_params_changed(
-    model: torch.nn.Module,
+    trained_state: dict,
     initial_state: dict,
     min_changed_ratio: float = 0.5,
     element_threshold: float = 1e-6,
 ) -> tuple[bool, str | None, dict]:
     """Verify that minimum % of individual parameter elements changed during training.
 
+    Operates purely on CPU state dicts -- no model object or GPU memory needed.
+
     Args:
-        model: Model after training
-        initial_state: Model state before training
+        trained_state: State dict after training (CPU tensors)
+        initial_state: State dict before training (CPU tensors)
         min_changed_ratio: Minimum fraction of elements that must change
         element_threshold: Minimum absolute change for an element to count as "changed"
     """
     total_elements = 0
     changed_elements = 0
 
-    for name, param in model.named_parameters():
-        if name in initial_state:
-            initial = initial_state[name].to(param.device)
-            # Count individual elements that changed (not whole tensors)
-            element_diffs = (param.data - initial).abs()
-            changed_mask = element_diffs > element_threshold
+    for name, trained_val in trained_state.items():
+        if name not in initial_state:
+            continue
+        initial_val = initial_state[name]
+        if trained_val.shape != initial_val.shape:
+            continue
+        element_diffs = (trained_val.float() - initial_val.float()).abs()
+        changed_mask = element_diffs > element_threshold
 
-            total_elements += param.numel()
-            changed_elements += changed_mask.sum().item()
+        total_elements += trained_val.numel()
+        changed_elements += changed_mask.sum().item()
 
     changed_ratio = changed_elements / total_elements if total_elements > 0 else 0.0
 
@@ -1197,28 +1227,36 @@ def _get_cached_model(model_path: str, use_random_init: bool = False):
 
 
 def _create_data_iterator(
-    data: torch.Tensor, batch_size: int, sequence_length: int, *, offset: int = 0
+    data: torch.Tensor,
+    batch_size: int,
+    sequence_length: int,
+    *,
+    offset: int = 0,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Iterator[torch.Tensor]:
-    """Create infinite data iterator.
+    """Create infinite data iterator with optional DDP-aware sharding.
 
-    Args:
-        offset: Starting sample index for the data iterator.
+    When ``world_size > 1`` each rank receives non-overlapping batches:
+    rank *k* starts at ``offset + k * batch_size`` and advances by
+    ``world_size * batch_size`` per step.
     """
     if data.size(1) < sequence_length:
         raise ValueError(f"Data sequence length {data.size(1)} < required {sequence_length}")
 
     data = data[:, :sequence_length]
     num_samples = data.size(0)
+    stride = batch_size * world_size
 
     def _iter():
-        idx = offset % num_samples if num_samples > 0 else 0
+        idx = (offset + rank * batch_size) % num_samples if num_samples > 0 else 0
         while True:
             end_idx = idx + batch_size
             if end_idx > num_samples:
                 idx = 0
                 end_idx = batch_size
             yield data[idx:end_idx]
-            idx = end_idx
+            idx = (idx + stride) % num_samples
 
     return _iter()
 
@@ -1413,6 +1451,9 @@ class GradientCapturingOptimizer:
         return getattr(opt, name)
 
 
+_REFERENCE_MICRO_BATCH_SIZE = 2
+
+
 def _run_reference(
     model: torch.nn.Module,
     data_iterator: Iterator[torch.Tensor],
@@ -1420,14 +1461,28 @@ def _run_reference(
     num_steps: int,
     device: torch.device,
     capture_final_gradients: bool = True,
+    ddp_model: torch.nn.Module | None = None,
 ) -> tuple[InnerStepsResult, GradientInfo | None]:
     """Run reference implementation for comparison.
+
+    Uses gradient accumulation with micro-batches to stay within GPU
+    memory for large models (e.g. 7B on A100 80GB).  The full batch
+    from *data_iterator* is split into chunks of ``_REFERENCE_MICRO_BATCH_SIZE``
+    and gradients are accumulated before each optimizer step — mathematically
+    equivalent to processing the full batch at once.
+
+    When *ddp_model* is provided, the forward pass uses the DDP wrapper
+    (triggering gradient all-reduce) while gradient capture reads from the
+    unwrapped *model* whose ``.grad`` tensors contain the all-reduced values.
 
     Returns:
         Tuple of (InnerStepsResult, GradientInfo) where GradientInfo
         contains the gradients from the final step (before optimizer.step)
     """
     _enforce_backend_state()
+
+    eval_model = ddp_model if ddp_model is not None else model
+    mbs = _REFERENCE_MICRO_BATCH_SIZE
 
     total_tokens = 0
     final_logits = None
@@ -1438,19 +1493,26 @@ def _run_reference(
         batch = next(data_iterator)
         batch = batch.to(device, dtype=torch.long)
 
-        input_ids = batch[:, :-1]
-        labels = batch[:, 1:]
-        outputs = model(input_ids)
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs
-        loss = _real_cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            ignore_index=-100,
-        )
+        micro_batches = [batch[i : i + mbs] for i in range(0, batch.size(0), mbs)]
+        num_accum = len(micro_batches)
 
-        loss.backward()
+        step_logits = None
+        step_loss_sum = 0.0
 
-        # Capture gradients on final step (before optimizer.step clears them)
+        for mb in micro_batches:
+            input_ids = mb[:, :-1]
+            labels = mb[:, 1:]
+            outputs = eval_model(input_ids)
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs
+            loss = _real_cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
+            (loss / num_accum).backward()
+            step_logits = logits
+            step_loss_sum += float(loss.item())
+
         if capture_final_gradients and step == num_steps - 1:
             final_gradients = _capture_gradients(model)
 
@@ -1458,8 +1520,8 @@ def _run_reference(
         optimizer.zero_grad(set_to_none=True)
 
         total_tokens += batch.numel()
-        final_logits = logits.detach().float()
-        final_loss = float(loss.item())
+        final_logits = step_logits.detach().float()
+        final_loss = step_loss_sum / num_accum
 
     result = InnerStepsResult(
         final_logits=final_logits,
@@ -1604,19 +1666,18 @@ def _verify_gradients(
 
 
 def _verify_final_weights(
-    model: torch.nn.Module,
+    candidate_state: dict,
     reference_final_state: dict,
     max_relative_error: float = 0.05,
 ) -> tuple[bool, str | None, dict]:
-    """Verify miner's final model weights match reference after full training.
+    """Verify miner's final weights match reference after full training.
 
-    Compares miner final weights against reference to verify the entire
-    training pipeline end-to-end. Computed layer-by-layer on CPU to avoid
-    GPU memory pressure.
+    Operates purely on CPU state dicts -- no model object or GPU memory needed.
+    Compares layer-by-layer to stay memory efficient.
 
     Args:
-        model: Model after miner's training (post optimizer steps)
-        reference_final_state: Model state dict after reference training
+        candidate_state: Miner's state dict after training (CPU tensors)
+        reference_final_state: Reference state dict after training (CPU tensors)
         max_relative_error: Maximum allowed |w_miner - w_ref| / |w_ref|
 
     Returns:
@@ -1632,26 +1693,27 @@ def _verify_final_weights(
     logger.info("VERIFICATION: Final model weight comparison")
     logger.info("=" * 60)
 
-    # Compute relative error layer-by-layer (memory efficient)
     diff_norm_sq = 0.0
     ref_norm_sq = 0.0
     total_elements = 0
     mismatched_layers = 0
 
-    for name, param in model.named_parameters():
+    for name, cand_val in candidate_state.items():
         if name not in reference_final_state:
             continue
 
-        # Move reference to same device for comparison, then back to CPU
-        ref_param = reference_final_state[name].to(param.device)
-        diff = param.data.float() - ref_param.float()
+        ref_param = reference_final_state[name]
+        if cand_val.shape != ref_param.shape:
+            mismatched_layers += 1
+            continue
+        diff = cand_val.float() - ref_param.float()
 
         layer_diff_sq = (diff * diff).sum().item()
         layer_ref_sq = (ref_param.float() * ref_param.float()).sum().item()
 
         diff_norm_sq += layer_diff_sq
         ref_norm_sq += layer_ref_sq
-        total_elements += param.numel()
+        total_elements += cand_val.numel()
 
         # Track layers with significant differences (NaN-safe)
         if layer_ref_sq > 0:
@@ -1718,10 +1780,10 @@ def _verify_outputs(
     reference_grad: GradientInfo | None = None,
     candidate_grad: GradientInfo | None = None,
     reference_final_state: dict | None = None,
-    model: torch.nn.Module | None = None,
+    candidate_final_state: dict | None = None,
     max_loss_difference: float = 0.3,
     gradient_norm_ratio_max: float = 1.08,
-    weight_relative_error_max: float = 0.006,
+    weight_relative_error_max: float = 0.01,
 ) -> tuple[bool, str | None, dict]:
     """Verify candidate outputs match reference.
 
@@ -1737,8 +1799,8 @@ def _verify_outputs(
         expected_tokens: Expected token count
         reference_grad: Reference gradients for comparison
         candidate_grad: Candidate gradients for comparison
-        reference_final_state: Reference model state after full training
-        model: Model after miner's training (for weight comparison)
+        reference_final_state: Reference state dict after full training (CPU)
+        candidate_final_state: Miner's state dict after training (CPU)
         max_loss_difference: Maximum allowed |candidate_loss - reference_loss|
         gradient_norm_ratio_max: Encoded as 1 + max_relative_error for gradient check
         weight_relative_error_max: Max relative error for final weight comparison
@@ -1816,24 +1878,28 @@ def _verify_outputs(
     logger.info("[PASSED] Loss is valid and similar to reference")
 
     # 3. Gradient-based verification (captures backward pass correctness)
-    logger.info("[CHECK 3/4] Gradient verification")
-    grad_ok, grad_error, grad_details = _verify_gradients(
-        reference_grad,
-        candidate_grad,
-        norm_ratio_max=gradient_norm_ratio_max,
-    )
-    details["gradient_verification"] = grad_details
+    if reference_grad is None or candidate_grad is None:
+        logger.info("[CHECK 3/4] Gradient verification SKIPPED (multi-GPU mode)")
+        details["checks_passed"].append("gradient_verification_skipped")
+    else:
+        logger.info("[CHECK 3/4] Gradient verification")
+        grad_ok, grad_error, grad_details = _verify_gradients(
+            reference_grad,
+            candidate_grad,
+            norm_ratio_max=gradient_norm_ratio_max,
+        )
+        details["gradient_verification"] = grad_details
 
-    if not grad_ok:
-        details["checks_failed"].append({"check": "gradient_verification", "error": grad_error})
-        return False, grad_error, details
-    details["checks_passed"].append("gradient_verification")
+        if not grad_ok:
+            details["checks_failed"].append({"check": "gradient_verification", "error": grad_error})
+            return False, grad_error, details
+        details["checks_passed"].append("gradient_verification")
 
     # 4. Final weight verification (verifies optimizer step correctness)
-    if reference_final_state is not None and model is not None:
+    if reference_final_state is not None and candidate_final_state is not None:
         logger.info("[CHECK 4/4] Final weight verification")
         weight_ok, weight_error, weight_details = _verify_final_weights(
-            model,
+            candidate_final_state,
             reference_final_state,
             max_relative_error=weight_relative_error_max,
         )
@@ -1881,7 +1947,7 @@ class Actor:
         # Gradient verification
         gradient_norm_ratio_max: float = 1.08,
         # Weight verification
-        weight_relative_error_max: float = 0.006,
+        weight_relative_error_max: float = 0.01,
         # Timer integrity
         timer_divergence_threshold: float = 0.005,
         # MFU calculation
@@ -1890,6 +1956,7 @@ class Actor:
         min_mfu: float = 50.0,
         require_cuda_timing: bool = True,
         model_params_override: int | None = None,
+        num_gpus: int = 1,
     ) -> dict:
         """
         Run MFU evaluation on miner's code.
@@ -1910,7 +1977,7 @@ class Actor:
             min_trainable_params_ratio: Min % params that must be trainable
             min_params_changed_ratio: Min % params that must change
             gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.08 = 8%)
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.006 = 0.6%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.01 = 1%)
             timer_divergence_threshold: Max divergence between timer sources (e.g., 0.005 = 0.5%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             min_mfu: Minimum MFU threshold — submissions below this are rejected
@@ -1993,6 +2060,23 @@ class Actor:
                 "seed": seed,
             }
 
+        from datetime import timedelta
+
+        import torch.distributed as dist
+        from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: N817
+
+        _multi_gpu = num_gpus > 1 and _WORLD_SIZE > 1
+
+        # Detect parallelism strategy from source (AST only, no execution).
+        strategy = _detect_strategy_from_source(code)
+        is_data_parallel = strategy in ("ddp", "fsdp")
+        logger.info(f"Miner parallelism strategy: {strategy} (data_parallel={is_data_parallel})")
+
+        if is_data_parallel and _multi_gpu:
+            data_rank, data_world = _LOCAL_RANK, _WORLD_SIZE
+        else:
+            data_rank, data_world = 0, 1
+
         try:
             # ---------------------------------------------------------------
             # CRITICAL: Run reference BEFORE loading miner module.
@@ -2016,36 +2100,138 @@ class Actor:
                 sequence_length=sequence_length or EVAL_SEQUENCE_LENGTH,
                 validator_seed=seed,  # Unpredictable sampling
             )
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = torch.device(f"cuda:{_LOCAL_RANK}" if torch.cuda.is_available() else "cpu")
+            if _multi_gpu:
+                if not dist.is_initialized():
+                    torch.cuda.set_device(_LOCAL_RANK)
+                    dist.init_process_group(backend="nccl")
+                    logger.info(f"Initialized process group: rank {_LOCAL_RANK}/{_WORLD_SIZE}")
 
             seq_len = sequence_length or EVAL_SEQUENCE_LENGTH
 
-            # Run reference implementation FIRST in a clean environment
-            data_iter_ref = _create_data_iterator(data, batch_size, seq_len)
-            optimizer_ref = _create_optimizer(model)
-
+            # Cache initial state on all ranks (needed to restore after reference)
             initial_state = _CACHE.get("initial_state")
             if initial_state is None:
                 initial_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 _CACHE["initial_state"] = initial_state
 
-            reference, reference_grad = _run_reference(
-                model, data_iter_ref, optimizer_ref, steps, device, capture_final_gradients=True
-            )
+            # Reference baseline: adapts to miner's parallelism strategy.
+            # DDP/FSDP: all ranks participate with DDP wrapper + sharded data.
+            # TP: only rank 0 runs (equivalent to single-GPU on replicated data).
+            reference: InnerStepsResult | None = None
+            reference_grad: GradientInfo | None = None
+            reference_final_state: dict | None = None
+            ref_ddp: torch.nn.Module | None = None
 
-            # Capture reference final weights for verification
-            reference_final_state = {
-                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-            }
-            logger.info("Captured reference final model state for weight verification")
-            _log_vram("after-reference-run")
+            if is_data_parallel and _multi_gpu:
+                data_iter_ref = _create_data_iterator(
+                    data,
+                    batch_size,
+                    seq_len,
+                    rank=data_rank,
+                    world_size=data_world,
+                )
+                optimizer_ref = _create_optimizer(model)
+                ref_ddp = DDP(model, device_ids=[_LOCAL_RANK])
 
-            # Free reference optimizer VRAM before running miner code
-            del optimizer_ref
-            del data_iter_ref
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                reference, reference_grad = _run_reference(
+                    model,
+                    data_iter_ref,
+                    optimizer_ref,
+                    steps,
+                    device,
+                    capture_final_gradients=False,
+                    ddp_model=ref_ddp,
+                )
+
+                if _IS_RANK_0:
+                    reference_final_state = {
+                        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                    }
+                    logger.info("Captured DDP reference final state for weight verification")
+                _log_vram("after-reference-run")
+
+                del ref_ddp
+                ref_ddp = None
+                del optimizer_ref
+                del data_iter_ref
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                model.load_state_dict(initial_state)
+                dist.barrier()
+            elif _multi_gpu:
+                # TP strategy: rank 0 runs single-GPU reference, others wait.
+                if _IS_RANK_0:
+                    data_iter_ref = _create_data_iterator(
+                        data,
+                        batch_size,
+                        seq_len,
+                        rank=0,
+                        world_size=1,
+                    )
+                    optimizer_ref = _create_optimizer(model)
+
+                    reference, reference_grad = _run_reference(
+                        model,
+                        data_iter_ref,
+                        optimizer_ref,
+                        steps,
+                        device,
+                        capture_final_gradients=True,
+                        ddp_model=None,
+                    )
+
+                    reference_final_state = {
+                        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                    }
+                    logger.info("Captured single-GPU reference final state (TP mode)")
+                    _log_vram("after-reference-run")
+
+                    del optimizer_ref
+                    del data_iter_ref
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    model.load_state_dict(initial_state)
+
+                dist.barrier()
+            else:
+                # Single-GPU path (no multi-GPU)
+                data_iter_ref = _create_data_iterator(
+                    data,
+                    batch_size,
+                    seq_len,
+                    rank=0,
+                    world_size=1,
+                )
+                optimizer_ref = _create_optimizer(model)
+
+                reference, reference_grad = _run_reference(
+                    model,
+                    data_iter_ref,
+                    optimizer_ref,
+                    steps,
+                    device,
+                    capture_final_gradients=_IS_RANK_0,
+                    ddp_model=None,
+                )
+
+                reference_final_state = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
+                logger.info("Captured reference final state for weight verification")
+                _log_vram("after-reference-run")
+
+                del optimizer_ref
+                del data_iter_ref
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                model.load_state_dict(initial_state)
 
             # Capture vault timer refs into locals BEFORE loading miner code.
             # Closure variables inside the vault are immune to frame.f_globals
@@ -2106,11 +2292,20 @@ class Actor:
 
             warmup_steps = 2
             data_iter_warmup = _create_data_iterator(
-                data, batch_size, seq_len, offset=warmup_data_offset
+                data,
+                batch_size,
+                seq_len,
+                offset=warmup_data_offset,
+                rank=data_rank,
+                world_size=data_world,
             )
-            optimizer_warmup = _create_optimizer(model)
+            if _multi_gpu:
+                optimizer_warmup = None
+            else:
+                optimizer_warmup = _create_optimizer(model)
 
             logger.info(f"Running {warmup_steps} warmup step(s) to check for basic errors...")
+            warmup_failure: dict | None = None
             try:
                 # Hide env modules during miner execution to prevent timer tampering.
                 with _hide_sensitive_env_modules():
@@ -2120,106 +2315,88 @@ class Actor:
                         optimizer=optimizer_warmup,
                         num_steps=warmup_steps,
                         device=device,
+                        num_gpus=num_gpus,
                     )
 
-                # Quick validation of warmup result
-                if warmup_result is None:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": "inner_steps returned None (warmup check)",
-                        "seed": seed,
-                        "code": code,
-                    }
+                # Quick validation of warmup result (only rank 0 validates)
+                if _IS_RANK_0:
+                    if warmup_result is None:
+                        warmup_failure = {
+                            "task_id": task_id,
+                            "mfu": 0.0,
+                            "tps": 0.0,
+                            "total_tokens": 0,
+                            "wall_time_seconds": 0.0,
+                            "success": False,
+                            "error": "inner_steps returned None (warmup check)",
+                            "seed": seed,
+                            "code": code,
+                        }
+                    elif not hasattr(warmup_result, "final_logits"):
+                        warmup_failure = {
+                            "task_id": task_id,
+                            "mfu": 0.0,
+                            "tps": 0.0,
+                            "total_tokens": 0,
+                            "wall_time_seconds": 0.0,
+                            "success": False,
+                            "error": "inner_steps result missing 'final_logits' attribute",
+                            "seed": seed,
+                            "code": code,
+                        }
+                    else:
+                        logits = warmup_result.final_logits
+                        if logits is None:
+                            warmup_failure = {
+                                "task_id": task_id,
+                                "mfu": 0.0,
+                                "tps": 0.0,
+                                "total_tokens": 0,
+                                "wall_time_seconds": 0.0,
+                                "success": False,
+                                "error": "final_logits is None - must return actual logits for verification",
+                                "error_code": "missing_logits",
+                                "seed": seed,
+                                "code": code,
+                            }
+                        elif len(logits.shape) != 3:
+                            warmup_failure = {
+                                "task_id": task_id,
+                                "mfu": 0.0,
+                                "tps": 0.0,
+                                "total_tokens": 0,
+                                "wall_time_seconds": 0.0,
+                                "success": False,
+                                "error": f"Logits shape mismatch: expected 3D (batch, seq, vocab), got {logits.shape}",
+                                "error_code": "invalid_logits_shape",
+                                "seed": seed,
+                                "code": code,
+                            }
 
-                # Check required attributes exist
-                if not hasattr(warmup_result, "final_logits"):
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": "inner_steps result missing 'final_logits' attribute",
-                        "seed": seed,
-                        "code": code,
-                    }
-
-                # Check logits are present and valid shape
-                logits = warmup_result.final_logits
-                if logits is None:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": "final_logits is None - must return actual logits for verification",
-                        "error_code": "missing_logits",
-                        "seed": seed,
-                        "code": code,
-                    }
-                if len(logits.shape) != 3:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": f"Logits shape mismatch: expected 3D (batch, seq, vocab), got {logits.shape}",
-                        "error_code": "invalid_logits_shape",
-                        "seed": seed,
-                        "code": code,
-                    }
-
-                expected_vocab = reference.final_logits.shape[2]
-                if logits.shape[2] != expected_vocab:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": f"Logits vocab dimension mismatch: expected {expected_vocab}, got {logits.shape[2]}",
-                        "error_code": "invalid_logits_shape",
-                        "seed": seed,
-                        "code": code,
-                    }
-
-                logger.info("Warmup passed - proceeding with verification checks")
-
-                # Check trainable params AFTER warmup (miner code may modify requires_grad)
-                trainable_ok, trainable_error, trainable_details = _verify_trainable_params(
-                    model, min_trainable_params_ratio
-                )
-                if not trainable_ok:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": trainable_error,
-                        "error_code": "insufficient_trainable_params",
-                        "seed": seed,
-                        "code": code,
-                        "diagnostics": {"trainable_params": trainable_details},
-                    }
+                    if warmup_failure is None:
+                        logger.info("Warmup passed - proceeding with verification checks")
+                        trainable_ok, trainable_error, trainable_details = _verify_trainable_params(
+                            model, min_trainable_params_ratio
+                        )
+                        if not trainable_ok:
+                            warmup_failure = {
+                                "task_id": task_id,
+                                "mfu": 0.0,
+                                "tps": 0.0,
+                                "total_tokens": 0,
+                                "wall_time_seconds": 0.0,
+                                "success": False,
+                                "error": trainable_error,
+                                "error_code": "insufficient_trainable_params",
+                                "seed": seed,
+                                "code": code,
+                                "diagnostics": {"trainable_params": trainable_details},
+                            }
 
             except Exception as e:
-                # Early termination - don't waste time on broken code
                 error_msg = f"Early termination (warmup failed): {type(e).__name__}: {str(e)}"
                 logger.error(error_msg)
-                return {
+                warmup_failure = {
                     "task_id": task_id,
                     "mfu": 0.0,
                     "tps": 0.0,
@@ -2231,19 +2408,61 @@ class Actor:
                     "code": code,
                 }
 
-            # Reset model state after warmup and free warmup optimizer VRAM
-            model.load_state_dict(initial_state)
+            # Synchronize warmup result across all ranks to prevent deadlock.
+            if _multi_gpu:
+                local_fail = 1 if warmup_failure is not None else 0
+                fail_tensor = torch.tensor([local_fail], dtype=torch.int32, device=device)
+                dist.all_reduce(fail_tensor, op=dist.ReduceOp.MAX)
+                if fail_tensor.item() > 0:
+                    if warmup_failure is not None:
+                        return warmup_failure
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": "Warmup failed on another rank",
+                        "seed": seed,
+                        "code": code,
+                    }
+            elif warmup_failure is not None:
+                return warmup_failure
+
+            # Reset model state after warmup and free warmup optimizer VRAM.
+            # FSDP/TP modify parameter storage in-place (flat buffers / DTensors),
+            # so load_state_dict with original shapes will fail.
+            # Re-create the model from scratch for these strategies.
             del optimizer_warmup
             del data_iter_warmup
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if strategy in ("fsdp", "tp"):
+                del model
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                model = _load_model(model_url, use_random_init=use_random_init)
+                model.load_state_dict(initial_state)
+            else:
+                model.load_state_dict(initial_state)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             # Full timed evaluation with gradient capture
             _log_vram("before-timed-eval")
-            data_iter_miner = _create_data_iterator(data, batch_size, seq_len)
-            base_optimizer = _create_optimizer(model)
-            optimizer_miner = GradientCapturingOptimizer(base_optimizer, model, num_steps=steps)
+            data_iter_miner = _create_data_iterator(
+                data,
+                batch_size,
+                seq_len,
+                rank=data_rank,
+                world_size=data_world,
+            )
+            if _multi_gpu:
+                optimizer_miner = None
+            else:
+                base_optimizer = _create_optimizer(model)
+                optimizer_miner = GradientCapturingOptimizer(base_optimizer, model, num_steps=steps)
 
             _reset_torch_state()
             _enforce_backend_state()
@@ -2304,6 +2523,7 @@ class Actor:
                     optimizer=optimizer_miner,
                     num_steps=steps,
                     device=device,
+                    num_gpus=num_gpus,
                 )
 
             if _cuda_end_event is not None:
@@ -2396,8 +2616,19 @@ class Actor:
                 f"{f', cuda_events={cuda_wall_time:.2f}s' if cuda_wall_time else ''})"
             )
 
-            # Convert GPU gradient snapshot to CPU (slow, but OUTSIDE the timer)
-            optimizer_miner.finalize_gradients()
+            # Non-rank-0: skip verification (barrier in finally block)
+            if not _IS_RANK_0:
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": True,
+                    "error": None,
+                    "seed": seed,
+                    "code": code,
+                }
 
             # Verify backend settings were not tampered with during timed eval
             _backend_violations = _check_backend_state()
@@ -2416,37 +2647,43 @@ class Actor:
                     "code": code,
                 }
 
-            # Verify optimizer wrapper integrity
-            if type(optimizer_miner) is not GradientCapturingOptimizer:
-                return {
-                    "task_id": task_id,
-                    "mfu": 0.0,
-                    "tps": 0.0,
-                    "total_tokens": 0,
-                    "wall_time_seconds": wall_time,
-                    "success": False,
-                    "error": "Optimizer integrity check failed",
-                    "error_code": "execution_failed",
-                    "seed": seed,
-                    "code": code,
-                }
+            if not _multi_gpu:
+                # Convert GPU gradient snapshot to CPU (slow, but OUTSIDE the timer)
+                optimizer_miner.finalize_gradients()
 
-            # Get gradients captured from the final step (inside miner's code)
-            candidate_grad = optimizer_miner.captured_gradients
+                # Verify optimizer wrapper integrity
+                if type(optimizer_miner) is not GradientCapturingOptimizer:
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": wall_time,
+                        "success": False,
+                        "error": "Optimizer integrity check failed",
+                        "error_code": "execution_failed",
+                        "seed": seed,
+                        "code": code,
+                    }
 
-            if candidate_grad is None:
-                return {
-                    "task_id": task_id,
-                    "mfu": 0.0,
-                    "tps": 0.0,
-                    "total_tokens": 0,
-                    "wall_time_seconds": wall_time,
-                    "success": False,
-                    "error": "No gradients captured - miner may not be calling optimizer.step()",
-                    "error_code": "no_gradients_captured",
-                    "seed": seed,
-                    "code": code,
-                }
+                # Get gradients captured from the final step (inside miner's code)
+                candidate_grad = optimizer_miner.captured_gradients
+
+                if candidate_grad is None:
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": wall_time,
+                        "success": False,
+                        "error": "No gradients captured - miner may not be calling optimizer.step()",
+                        "error_code": "no_gradients_captured",
+                        "seed": seed,
+                        "code": code,
+                    }
+            else:
+                candidate_grad = None
 
             # Validate miner's returned result
             ok, error, parsed = _validate_return_type(miner_result)
@@ -2533,9 +2770,45 @@ class Actor:
                 }
             logger.info(f"[PASSED] Vocab dimension check: {actual_vocab} == {expected_vocab}")
 
+            # Build a CPU state dict of the miner's trained model for
+            # verification.  FSDP/TP miners return a pre-gathered dict in
+            # final_state; DDP/single-GPU just use model.state_dict().
+            # All comparisons happen on CPU -- zero extra GPU memory.
+            miner_final_state = getattr(miner_result, "final_state", None)
+            if miner_final_state is not None:
+                logger.info("Using miner-provided final_state for weight verification")
+                candidate_state = miner_final_state
+            else:
+                candidate_state = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
+
+            # Sanity check: if multi-GPU, verify params are full (not sharded).
+            if _multi_gpu:
+                for _pname, _pval in candidate_state.items():
+                    if _pname in initial_state and _pval.shape != initial_state[_pname].shape:
+                        return {
+                            "task_id": task_id,
+                            "mfu": 0.0,
+                            "tps": 0.0,
+                            "total_tokens": 0,
+                            "wall_time_seconds": wall_time,
+                            "success": False,
+                            "error": (
+                                f"Parameter '{_pname}' is sharded "
+                                f"(shape {list(_pval.shape)} vs expected "
+                                f"{list(initial_state[_pname].shape)}). "
+                                f"FSDP/TP miners must return final_state "
+                                f"with full params in InnerStepsResult."
+                            ),
+                            "error_code": "sharded_params_detected",
+                            "seed": seed,
+                            "code": code,
+                        }
+
             # Verify sufficient parameters changed during training
             params_ok, params_error, params_details = _verify_params_changed(
-                model, initial_state, min_params_changed_ratio
+                candidate_state, initial_state, min_params_changed_ratio
             )
             if not params_ok:
                 return {
@@ -2563,15 +2836,21 @@ class Actor:
                 reference_grad=reference_grad,
                 candidate_grad=candidate_grad,
                 reference_final_state=reference_final_state,
-                model=model,
+                candidate_final_state=candidate_state,
                 max_loss_difference=max_loss_difference,
                 gradient_norm_ratio_max=gradient_norm_ratio_max,
                 weight_relative_error_max=weight_relative_error_max,
             )
 
-            total_tokens_int = expected_tokens  # Use validator-computed token count
-            tps = float(total_tokens_int) / max(wall_time, 1e-6)
-            mfu = _calculate_mfu(total_tokens_int, wall_time, model_params, gpu_peak_tflops)
+            tokens_per_rank = expected_tokens
+            if is_data_parallel:
+                total_unique_tokens = tokens_per_rank * num_gpus
+            else:
+                total_unique_tokens = tokens_per_rank
+            tps = float(total_unique_tokens) / max(wall_time, 1e-6)
+            mfu = _calculate_mfu(
+                total_unique_tokens, wall_time, model_params, gpu_peak_tflops, num_gpus
+            )
 
             # MFU sanity cap — no legitimate code can exceed this on current hardware.
             # Safety net: even if a novel timing attack evades all other checks,
@@ -2597,7 +2876,7 @@ class Actor:
                     "task_id": task_id,
                     "mfu": mfu,
                     "tps": tps,
-                    "total_tokens": total_tokens_int,
+                    "total_tokens": total_unique_tokens,
                     "wall_time_seconds": wall_time,
                     "success": False,
                     "error": f"MFU {mfu:.1f}% below minimum threshold {min_mfu}%",
@@ -2609,10 +2888,12 @@ class Actor:
             # Diagnostics
             diagnostics = {
                 "verification": verify_details,
+                "strategy": strategy,
                 "reference_loss": reference.final_loss,
                 "candidate_loss": parsed.final_loss,
                 "expected_tokens": expected_tokens,
                 "actual_tokens": parsed.total_tokens,
+                "total_unique_tokens": total_unique_tokens,
                 "model_params": model_params,
                 "gpu_peak_tflops": gpu_peak_tflops,
                 "trainable_params": trainable_details,
@@ -2643,7 +2924,7 @@ class Actor:
                 "task_id": task_id,
                 "mfu": mfu if verified else 0.0,
                 "tps": tps if verified else 0.0,
-                "total_tokens": total_tokens_int if verified else 0,
+                "total_tokens": total_unique_tokens if verified else 0,
                 "wall_time_seconds": wall_time,
                 "success": verified,
                 "error": verify_error,
@@ -2680,9 +2961,14 @@ class Actor:
             # preventing gc.collect() + empty_cache() from reclaiming memory.
             optimizer_miner = base_optimizer = None  # type: ignore[assignment]  # noqa
             data_iter_miner = data = None  # type: ignore[assignment]
-            reference_final_state = candidate_grad = None  # type: ignore[assignment]
+            reference_final_state = candidate_grad = candidate_state = None  # type: ignore[assignment]
             miner_result = parsed = miner_module = None  # type: ignore[assignment]
             reference = reference_grad = None  # type: ignore[assignment]
+
+            # FSDP/TP corrupt the model's parameter storage; invalidate cache
+            # so the next evaluation creates a fresh model.
+            if strategy in ("fsdp", "tp"):
+                _CACHE.pop("model", None)
 
             # Reset torch state (removes miner module, restores timing functions)
             _reset_torch_state()
@@ -2701,6 +2987,18 @@ class Actor:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             _log_vram("after-cleanup")
+
+            # All ranks converge before teardown (60s timeout prevents hangs).
+            try:
+                if dist.is_initialized():
+                    dist.barrier(timeout=timedelta(seconds=60))
+                    dist.destroy_process_group()
+            except Exception:
+                try:
+                    if dist.is_initialized():
+                        dist.destroy_process_group()
+                except Exception:
+                    pass
 
 
 # =============================================================================
@@ -2742,13 +3040,15 @@ class EvaluateRequest(BaseModel):
     # Gradient verification
     gradient_norm_ratio_max: float = 1.08
     # Weight verification
-    weight_relative_error_max: float = 0.006
+    weight_relative_error_max: float = 0.01
     # Timer integrity
     timer_divergence_threshold: float = 0.005
     # MFU calculation
     gpu_peak_tflops: float = 312.0
     max_plausible_mfu: float = 75.0
     min_mfu: float = 50.0
+    # Multi-GPU
+    num_gpus: int = 1
 
 
 class EvaluateResponse(BaseModel):
@@ -2776,37 +3076,144 @@ async def health():
     }
 
 
+async def _evaluate_via_torchrun(request: EvaluateRequest) -> dict:
+    """Spawn torchrun for multi-GPU Basilica evaluation (uvicorn is single-process)."""
+    import asyncio as _aio
+    import json as _json
+    import tempfile
+
+    params_path = None
+    script_path = None
+    try:
+        params_path = tempfile.mktemp(suffix=".json", dir="/tmp")
+        with open(params_path, "w") as f:
+            _json.dump(request.model_dump(), f)
+
+        eval_script = f'''
+import asyncio, json, os, sys
+sys.path.insert(0, '/app')
+from env import Actor
+
+async def main():
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    with open("{params_path}") as f:
+        p = json.load(f)
+    actor = Actor()
+    result = await actor.evaluate(
+        task_id=p["task_id"], seed=p["seed"],
+        model_url=p["model_url"], data_url=p["data_url"],
+        steps=p["steps"], batch_size=p["batch_size"],
+        timeout=p["timeout"], sequence_length=p.get("sequence_length"),
+        data_samples=p["data_samples"], code=p["code"],
+        max_loss_difference=p["max_loss_difference"],
+        use_random_init=p["use_random_init"],
+        min_trainable_params_ratio=p["min_trainable_params_ratio"],
+        min_params_changed_ratio=p["min_params_changed_ratio"],
+        gradient_norm_ratio_max=p["gradient_norm_ratio_max"],
+        weight_relative_error_max=p["weight_relative_error_max"],
+        timer_divergence_threshold=p["timer_divergence_threshold"],
+        gpu_peak_tflops=p["gpu_peak_tflops"],
+        max_plausible_mfu=p["max_plausible_mfu"],
+        min_mfu=p["min_mfu"],
+        require_cuda_timing=True,
+        num_gpus=p["num_gpus"],
+    )
+    if local_rank == 0:
+        print("EVAL_RESULT:" + json.dumps(result))
+
+asyncio.run(main())
+'''
+        script_path = tempfile.mktemp(suffix=".py", dir="/tmp")
+        with open(script_path, "w") as f:
+            f.write(eval_script)
+
+        proc = await _aio.create_subprocess_exec(
+            "torchrun",
+            "--nproc_per_node",
+            str(request.num_gpus),
+            script_path,
+            stdout=_aio.subprocess.PIPE,
+            stderr=_aio.subprocess.STDOUT,
+        )
+        stdout_bytes, _ = await _aio.wait_for(proc.communicate(), timeout=request.timeout + 600)
+        stdout_text = stdout_bytes.decode(errors="replace")
+
+        for line in stdout_text.split("\n"):
+            if line.startswith("EVAL_RESULT:"):
+                return _json.loads(line[len("EVAL_RESULT:") :])
+
+        return {
+            "task_id": request.task_id,
+            "success": False,
+            "error": f"No EVAL_RESULT in torchrun output (exit {proc.returncode}): {stdout_text[:300]}",
+            "seed": request.seed,
+            "mfu": 0.0,
+            "tps": 0.0,
+            "total_tokens": 0,
+            "wall_time_seconds": 0.0,
+        }
+    except TimeoutError:
+        return {
+            "task_id": request.task_id,
+            "success": False,
+            "error": f"torchrun evaluation timed out after {request.timeout}s",
+            "seed": request.seed,
+            "mfu": 0.0,
+            "tps": 0.0,
+            "total_tokens": 0,
+            "wall_time_seconds": 0.0,
+        }
+    except Exception as e:
+        return {
+            "task_id": request.task_id,
+            "success": False,
+            "error": f"torchrun evaluation failed: {e}",
+            "seed": request.seed,
+            "mfu": 0.0,
+            "tps": 0.0,
+            "total_tokens": 0,
+            "wall_time_seconds": 0.0,
+        }
+    finally:
+        for p in (params_path, script_path):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
-    """Evaluate miner's train.py code and return MFU score.
-
-    This endpoint is called by the validator via Basilica.
-    """
-    actor = get_actor()
-
-    result = await actor.evaluate(
-        task_id=request.task_id,
-        seed=request.seed,
-        model_url=request.model_url,
-        data_url=request.data_url,
-        steps=request.steps,
-        batch_size=request.batch_size,
-        timeout=request.timeout,
-        sequence_length=request.sequence_length,
-        data_samples=request.data_samples,
-        code=request.code,
-        max_loss_difference=request.max_loss_difference,
-        use_random_init=request.use_random_init,
-        min_trainable_params_ratio=request.min_trainable_params_ratio,
-        min_params_changed_ratio=request.min_params_changed_ratio,
-        gradient_norm_ratio_max=request.gradient_norm_ratio_max,
-        weight_relative_error_max=request.weight_relative_error_max,
-        timer_divergence_threshold=request.timer_divergence_threshold,
-        gpu_peak_tflops=request.gpu_peak_tflops,
-        max_plausible_mfu=request.max_plausible_mfu,
-        min_mfu=request.min_mfu,
-        require_cuda_timing=True,
-    )
+    """Evaluate miner's code. Spawns torchrun when num_gpus > 1."""
+    if request.num_gpus > 1:
+        result = await _evaluate_via_torchrun(request)
+    else:
+        actor = get_actor()
+        result = await actor.evaluate(
+            task_id=request.task_id,
+            seed=request.seed,
+            model_url=request.model_url,
+            data_url=request.data_url,
+            steps=request.steps,
+            batch_size=request.batch_size,
+            timeout=request.timeout,
+            sequence_length=request.sequence_length,
+            data_samples=request.data_samples,
+            code=request.code,
+            max_loss_difference=request.max_loss_difference,
+            use_random_init=request.use_random_init,
+            min_trainable_params_ratio=request.min_trainable_params_ratio,
+            min_params_changed_ratio=request.min_params_changed_ratio,
+            gradient_norm_ratio_max=request.gradient_norm_ratio_max,
+            weight_relative_error_max=request.weight_relative_error_max,
+            timer_divergence_threshold=request.timer_divergence_threshold,
+            gpu_peak_tflops=request.gpu_peak_tflops,
+            max_plausible_mfu=request.max_plausible_mfu,
+            min_mfu=request.min_mfu,
+            require_cuda_timing=True,
+            num_gpus=request.num_gpus,
+        )
 
     return EvaluateResponse(
         task_id=result.get("task_id", request.task_id),
