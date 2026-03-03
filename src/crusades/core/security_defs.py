@@ -348,7 +348,6 @@ ALLOWED_TORCH_SUBMODULE_IMPORTS: set[str] = {
     "torch.distributed.device_mesh",
     "torch.distributed.optim",
     "torch.utils.checkpoint",
-    "torch.multiprocessing",
 }
 
 # Prefixes of ``torch.*`` dotted paths where attribute *assignment* is
