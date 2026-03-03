@@ -1,17 +1,18 @@
 # Reference: DDP (Distributed Data Parallel) strategy
 #
-# WARNING: DDP replicates the full model on every GPU. For Qwen2.5-7B
-# with batch_size=16 on A100-80GB, this OOMs (~75GB just for model +
-# gradients + activations). Use FSDP instead for this benchmark.
-#
-# This example is provided for smaller models or GPUs with more VRAM.
+# Uses micro-batch gradient accumulation to fit Qwen2.5-7B on A100-80GB.
+# DDP replicates the full model per GPU, so batch_size=16 won't fit in
+# a single forward pass. Splitting into micro-batches of 2 is
+# mathematically equivalent to the full batch.
 #
 # Requirements for verification:
 #   - get_strategy() -> "ddp"
 #   - Return InnerStepsResult with final_logits (3D), total_tokens, final_loss
 #   - No final_state needed (validator reads weights directly from model)
 #   - Each rank processes different data (data-parallel)
+#
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -29,6 +30,9 @@ class InnerStepsResult:
 
 def get_strategy():
     return "ddp"
+
+
+MICRO_BATCH_SIZE = 2
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
@@ -56,24 +60,39 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
     for step in range(num_steps):
         batch = next(data_iterator).to(device, dtype=torch.long)
-        input_ids = batch[:, :-1]
-        labels = batch[:, 1:]
+        micro_batches = [
+            batch[i : i + MICRO_BATCH_SIZE] for i in range(0, batch.size(0), MICRO_BATCH_SIZE)
+        ]
+        num_accum = len(micro_batches)
+        step_loss_sum = 0.0
 
-        outputs = model(input_ids)
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            ignore_index=-100,
-        )
+        for i, mb in enumerate(micro_batches):
+            input_ids = mb[:, :-1]
+            labels = mb[:, 1:]
 
-        loss.backward()
+            # Skip gradient all-reduce until last micro-batch
+            no_sync = hasattr(model, "no_sync") and i < num_accum - 1
+            ctx = model.no_sync() if no_sync else nullcontext()
+
+            with ctx:
+                outputs = model(input_ids)
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1),
+                    ignore_index=-100,
+                )
+                (loss / num_accum).backward()
+
+            step_loss_sum += loss.item()
+            if i == num_accum - 1:
+                final_logits = logits.detach()
+
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
         total_tokens += batch.numel()
-        final_logits = logits.detach()
-        final_loss = loss.item()
+        final_loss = step_loss_sum / num_accum
 
     return InnerStepsResult(
         final_logits=final_logits,

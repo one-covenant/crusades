@@ -205,16 +205,17 @@ def _hide_sensitive_env_modules():
 _VALID_STRATEGIES = ("ddp", "fsdp", "tp")
 
 
-def _detect_strategy_from_source(source: str) -> str:
+def _detect_strategy_from_source(source: str) -> str | None:
     """Extract parallelism strategy from miner source via AST (no code execution).
 
     Looks for a ``get_strategy()`` function that returns a string literal.
-    Falls back to ``"ddp"`` when the function is absent or unparseable.
+    Returns ``None`` when the function is absent or unparseable — the caller
+    decides whether to default (single-GPU) or reject (multi-GPU).
     """
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return "ddp"
+        return None
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "get_strategy":
             for stmt in node.body:
@@ -222,7 +223,7 @@ def _detect_strategy_from_source(source: str) -> str:
                     val = str(stmt.value.value).lower()
                     if val in _VALID_STRATEGIES:
                         return val
-    return "ddp"
+    return None
 
 
 def _load_miner_module(train_path: Path):
@@ -2069,6 +2070,25 @@ class Actor:
 
         # Detect parallelism strategy from source (AST only, no execution).
         strategy = _detect_strategy_from_source(code)
+
+        if strategy is None:
+            if _multi_gpu:
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": 0.0,
+                    "success": False,
+                    "error": (
+                        "Multi-GPU evaluation requires get_strategy() in train.py "
+                        "returning one of: ddp, fsdp, tp"
+                    ),
+                    "seed": seed,
+                    "code": code,
+                }
+            strategy = "ddp"
+
         is_data_parallel = strategy in ("ddp", "fsdp")
         logger.info(f"Miner parallelism strategy: {strategy} (data_parallel={is_data_parallel})")
 
