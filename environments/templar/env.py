@@ -2155,10 +2155,14 @@ class Actor:
                 ref_ddp = None
                 del optimizer_ref
                 del data_iter_ref
+                _CACHE.pop("model", None)
+                del model
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
+                model = _load_model(model_url, use_random_init=use_random_init)
+                _CACHE["model"] = model
                 model.load_state_dict(initial_state)
                 dist.barrier()
             elif _multi_gpu:
@@ -2430,13 +2434,12 @@ class Actor:
             elif warmup_failure is not None:
                 return warmup_failure
 
-            # Reset model state after warmup and free warmup optimizer VRAM.
-            # FSDP/TP modify parameter storage in-place (flat buffers / DTensors),
-            # so load_state_dict with original shapes will fail.
-            # Re-create the model from scratch for these strategies.
+            # Reset model after warmup. Multi-GPU strategies (DDP/FSDP/TP) wrap
+            # the model in-place leaving residual buffers/hooks that prevent full
+            # VRAM reclaim. Reload from scratch to guarantee a clean slate.
             del optimizer_warmup
             del data_iter_warmup
-            if strategy in ("fsdp", "tp"):
+            if _multi_gpu:
                 _CACHE.pop("model", None)
                 del model
                 gc.collect()

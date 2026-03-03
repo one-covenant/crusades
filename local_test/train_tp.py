@@ -1,15 +1,12 @@
-"""TP train.py -- tensor-parallel strategy.
-
-Declares get_strategy() -> "tp".  All ranks receive the same data
-(replicated batches).  The model's linear layers are sharded
-column/row-wise across ranks via PyTorch's native DTensor APIs.
-
-Key details for weight verification:
-  - TP replaces parameter tensors with DTensors (distributed shards).
-  - We use DTensor.full_tensor() to gather shards back to full tensors
-    and return them as ``final_state`` so the validator can run weight
-    verification normally.
-"""
+# Reference: TP (Tensor Parallel) strategy
+#
+# Requirements for verification:
+#   - get_strategy() -> "tp"
+#   - Return InnerStepsResult with final_logits (3D), total_tokens, final_loss
+#   - Must return final_state: gathered full tensors from DTensor shards
+#     TP replaces params with DTensors so validator cannot read weights directly
+#   - All ranks receive the same data (NOT data-parallel)
+#
 
 from dataclasses import dataclass
 
@@ -36,7 +33,6 @@ def get_strategy():
 
 
 def _apply_tp(model, device_mesh):
-    """Apply tensor parallelism to transformer attention and MLP layers."""
     for name, module in model.named_modules():
         if hasattr(module, "q_proj") and hasattr(module, "o_proj"):
             parallelize_module(
@@ -63,7 +59,6 @@ def _apply_tp(model, device_mesh):
 
 
 def _gather_full_state(model):
-    """Gather TP-sharded parameters back to full tensors (CPU) for verification."""
     state = {}
     for name, param in model.named_parameters():
         p = param.data
@@ -115,7 +110,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         final_logits = logits.detach()
         final_loss = loss.item()
 
-    # Gather full params from DTensor shards for weight verification.
+    # Must gather full params from DTensor shards for weight verification
     full_state = None
     if num_gpus > 1:
         full_state = _gather_full_state(model)

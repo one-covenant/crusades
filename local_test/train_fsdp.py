@@ -1,16 +1,12 @@
-"""FSDP train.py -- fully-sharded data-parallel strategy.
-
-Declares get_strategy() -> "fsdp".  Shards optimizer state and gradients
-across ranks to reduce per-GPU memory while keeping mathematically
-equivalent results to DDP.
-
-Key details for weight verification:
-  - FSDP flattens parameter storage in-place, so after training the
-    validator cannot read original-shape weights from the model object.
-  - We gather full params via FULL_STATE_DICT (rank0_only=True) and
-    return them as ``final_state``.  The validator compares CPU dicts
-    directly -- no extra model load needed.
-"""
+# Reference: FSDP (Fully Sharded Data Parallel) strategy
+#
+# Requirements for verification:
+#   - get_strategy() -> "fsdp"
+#   - Return InnerStepsResult with final_logits (3D), total_tokens, final_loss
+#   - Must return final_state: gathered full state dict (rank 0 only)
+#     FSDP flattens params so validator cannot read weights directly
+#   - Each rank processes different data (data-parallel)
+#
 
 import functools
 import warnings
@@ -42,7 +38,6 @@ def get_strategy():
 
 
 def _get_wrap_policy(model):
-    """Build FSDP auto_wrap_policy by detecting the decoder layer class."""
     layer_cls = None
     if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
         layer_cls = model.model.layers[0].__class__
@@ -116,8 +111,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         final_logits = logits.detach()
         final_loss = loss.item()
 
-    # Gather full state dict with original shapes for weight verification.
-    # rank0_only=True avoids redundant CPU copies on non-rank-0 workers.
+    # Must gather full state dict for weight verification (rank 0 only)
     full_state = None
     if num_gpus > 1:
         rank = dist.get_rank() if dist.is_initialized() else 0

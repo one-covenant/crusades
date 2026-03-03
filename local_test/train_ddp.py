@@ -1,15 +1,12 @@
-"""DDP train.py -- data-parallel strategy (default).
-
-WARNING: DDP replicates the full model on every GPU, so each GPU needs
-~130GB for Qwen2.5-7B (params + optimizer + gradients).  This will OOM
-on A100 80GB.  Use train_fsdp.py or train_tp.py for the 7B benchmark.
-
-No get_strategy() needed (defaults to "ddp").  Each rank gets different
-data batches, gradients are all-reduced automatically.
-
-DDP preserves original parameter shapes, so no ``final_state`` gathering
-is needed -- the validator can read weights directly from the model.
-"""
+# Reference: DDP (Distributed Data Parallel) strategy
+#
+# Requirements for verification:
+#   - get_strategy() -> "ddp"
+#   - Return InnerStepsResult with final_logits (3D), total_tokens, final_loss
+#   - No final_state needed (validator reads weights directly from model)
+#   - Gradient checkpointing required for 7B on A100-80GB (DDP replicates full model)
+#   - Each rank processes different data (data-parallel)
+#
 
 from dataclasses import dataclass
 
@@ -26,9 +23,16 @@ class InnerStepsResult:
     final_state: dict | None = None
 
 
+def get_strategy():
+    return "ddp"
+
+
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     if hasattr(model, "config"):
         model.config.use_cache = False
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
 
     if num_gpus > 1:
         model = DDP(model, device_ids=[device.index])
