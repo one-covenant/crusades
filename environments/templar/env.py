@@ -33,7 +33,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from crusades.core.security_defs import (
     ALLOWED_TORCH_ASSIGNMENT_PREFIXES,
@@ -2104,7 +2104,7 @@ class Actor:
             if _multi_gpu:
                 if not dist.is_initialized():
                     torch.cuda.set_device(_LOCAL_RANK)
-                    dist.init_process_group(backend="nccl")
+                    dist.init_process_group(backend="nccl", timeout=timedelta(seconds=120))
                     logger.info(f"Initialized process group: rank {_LOCAL_RANK}/{_WORLD_SIZE}")
 
             seq_len = sequence_length or EVAL_SEQUENCE_LENGTH
@@ -3017,7 +3017,7 @@ class Actor:
             # All ranks converge before teardown (60s timeout prevents hangs).
             try:
                 if dist.is_initialized():
-                    dist.barrier(timeout=timedelta(seconds=60))
+                    dist.barrier()
                     dist.destroy_process_group()
             except Exception:
                 try:
@@ -3074,7 +3074,7 @@ class EvaluateRequest(BaseModel):
     max_plausible_mfu: float = 75.0
     min_mfu: float = 50.0
     # Multi-GPU
-    num_gpus: int = 1
+    num_gpus: int = Field(default=1, ge=1)
 
 
 class EvaluateResponse(BaseModel):
