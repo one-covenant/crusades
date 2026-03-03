@@ -76,6 +76,8 @@ docker build --network=host -f environments/templar/Dockerfile \
 # when executed on the same GPU model (A100). Runs on other hardware may
 # produce divergent MFU results.
 docker run --gpus 2 -it --rm --ipc=host \
+    --tmpfs /tmp:rw,exec,nosuid,size=4g \
+    --tmpfs /home/appuser/.triton:rw,exec,size=2g \
     -v "$(pwd)/local_test/train_fsdp.py":/test/train.py \
     -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py \
     -v "$(pwd)/hparams/hparams.json":/app/hparams.json \

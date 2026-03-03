@@ -1,10 +1,3 @@
-"""Single-GPU train.py -- reference example.
-
-WARNING: This script will OOM on A100 80GB with Qwen2.5-7B (~130GB needed
-for params + optimizer + gradients).  Use train_fsdp.py or train_tp.py for
-the 7B benchmark model.
-"""
-
 from dataclasses import dataclass
 
 import torch
@@ -45,15 +38,18 @@ def _prepare_model(model):
 
 def _get_compiled_fn(model):
     key = id(model)
-    if key in _COMPILED_FN:
-        return _COMPILED_FN[key]
+    cached = _COMPILED_FN.get(key)
+    if cached is not None:
+        return cached
+
+    ce_loss = F.cross_entropy
 
     def fwd_bwd(input_ids, labels):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = model(input_ids).logits
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
+            loss = ce_loss(
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
                 ignore_index=-100,
             )
         loss.backward()
@@ -72,13 +68,14 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     _prepare_model(model)
     step_fn = _get_compiled_fn(model)
 
-    all_inputs = []
-    all_labels = []
+    all_inputs = [None] * num_steps
+    all_labels = [None] * num_steps
     tokens_per_batch = 0
-    for _ in range(num_steps):
+
+    for i in range(num_steps):
         batch = next(data_iterator).to(device, dtype=torch.long, non_blocking=True)
-        all_inputs.append(batch[:, :-1].contiguous())
-        all_labels.append(batch[:, 1:].contiguous())
+        all_inputs[i] = batch[:, :-1].contiguous()
+        all_labels[i] = batch[:, 1:].contiguous()
         tokens_per_batch = batch.numel()
 
     opt_step = optimizer.step

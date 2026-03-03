@@ -2437,11 +2437,13 @@ class Actor:
             del optimizer_warmup
             del data_iter_warmup
             if strategy in ("fsdp", "tp"):
+                _CACHE.pop("model", None)
                 del model
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 model = _load_model(model_url, use_random_init=use_random_init)
+                _CACHE["model"] = model
                 model.load_state_dict(initial_state)
             else:
                 model.load_state_dict(initial_state)

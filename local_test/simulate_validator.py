@@ -12,6 +12,8 @@ same Docker container.
 2. Run the simulation (requires 2x A100 GPUs for 7B model):
 
     docker run --gpus 2 -it --rm --ipc=host \
+        --tmpfs /tmp:rw,exec,nosuid,size=4g \
+        --tmpfs /home/appuser/.triton:rw,exec,size=2g \
         -v "$(pwd)/local_test/train_fsdp.py":/test/train.py \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py \
         -v "$(pwd)/hparams/hparams.json":/app/hparams.json \
