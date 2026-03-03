@@ -1,12 +1,16 @@
 # Reference: DDP (Distributed Data Parallel) strategy
 #
+# WARNING: DDP replicates the full model on every GPU. For Qwen2.5-7B
+# with batch_size=16 on A100-80GB, this OOMs (~75GB just for model +
+# gradients + activations). Use FSDP instead for this benchmark.
+#
+# This example is provided for smaller models or GPUs with more VRAM.
+#
 # Requirements for verification:
 #   - get_strategy() -> "ddp"
 #   - Return InnerStepsResult with final_logits (3D), total_tokens, final_loss
 #   - No final_state needed (validator reads weights directly from model)
-#   - Gradient checkpointing required for 7B on A100-80GB (DDP replicates full model)
 #   - Each rank processes different data (data-parallel)
-#
 
 from dataclasses import dataclass
 

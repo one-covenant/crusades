@@ -2782,6 +2782,27 @@ class Actor:
             miner_final_state = getattr(miner_result, "final_state", None)
             if miner_final_state is not None:
                 logger.info("Using miner-provided final_state for weight verification")
+                expected_keys = set(initial_state.keys())
+                provided_keys = set(miner_final_state.keys())
+                missing_keys = expected_keys - provided_keys
+                if missing_keys:
+                    n_missing = len(missing_keys)
+                    sample = sorted(missing_keys)[:3]
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": wall_time,
+                        "success": False,
+                        "error": (
+                            f"final_state missing {n_missing}/{len(expected_keys)} "
+                            f"keys (e.g. {sample}). Must return complete state dict."
+                        ),
+                        "error_code": "incomplete_final_state",
+                        "seed": seed,
+                        "code": code,
+                    }
                 candidate_state = miner_final_state
             else:
                 candidate_state = {

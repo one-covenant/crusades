@@ -110,10 +110,14 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         final_logits = logits.detach()
         final_loss = loss.item()
 
-    # Must gather full params from DTensor shards for weight verification
+    # All ranks must call full_tensor() (collective op), only rank 0 keeps result
     full_state = None
     if num_gpus > 1:
-        full_state = _gather_full_state(model)
+        import torch.distributed as dist
+
+        gathered = _gather_full_state(model)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        full_state = gathered if rank == 0 else None
 
     return InnerStepsResult(
         final_logits=final_logits,
