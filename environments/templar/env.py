@@ -2855,6 +2855,7 @@ class Actor:
                 expected_keys = set(initial_state.keys())
                 provided_keys = set(miner_final_state.keys())
                 missing_keys = expected_keys - provided_keys
+                extra_keys = provided_keys - expected_keys
                 if missing_keys:
                     n_missing = len(missing_keys)
                     sample = sorted(missing_keys)[:3]
@@ -2873,15 +2874,14 @@ class Actor:
                         "seed": seed,
                         "code": code,
                     }
-                candidate_state = miner_final_state
-            else:
-                candidate_state = {
-                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-                }
-
-            # Sanity check: if multi-GPU, verify params are full (not sharded).
-            if _multi_gpu:
-                for _pname, _pval in candidate_state.items():
+                if extra_keys:
+                    for ek in extra_keys:
+                        del miner_final_state[ek]
+                    logger.warning(
+                        f"Stripped {len(extra_keys)} unexpected keys from "
+                        f"miner final_state (e.g. {sorted(extra_keys)[:3]})"
+                    )
+                for _pname, _pval in miner_final_state.items():
                     if _pname in initial_state and _pval.shape != initial_state[_pname].shape:
                         return {
                             "task_id": task_id,
@@ -2891,16 +2891,19 @@ class Actor:
                             "wall_time_seconds": wall_time,
                             "success": False,
                             "error": (
-                                f"Parameter '{_pname}' is sharded "
-                                f"(shape {list(_pval.shape)} vs expected "
-                                f"{list(initial_state[_pname].shape)}). "
-                                f"FSDP/TP miners must return final_state "
-                                f"with full params in InnerStepsResult."
+                                f"final_state parameter '{_pname}' has wrong shape "
+                                f"({list(_pval.shape)} vs expected "
+                                f"{list(initial_state[_pname].shape)})"
                             ),
-                            "error_code": "sharded_params_detected",
+                            "error_code": "invalid_final_state_shape",
                             "seed": seed,
                             "code": code,
                         }
+                candidate_state = miner_final_state
+            else:
+                candidate_state = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
 
             # Verify sufficient parameters changed during training
             params_ok, params_error, params_details = _verify_params_changed(
