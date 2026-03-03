@@ -76,13 +76,13 @@ Each submission undergoes the following verification checks:
 | **Sequence Length** | Logits seq dim must match expected | `seq_len - 1` | Active |
 | **Token Count** | Must process the expected number of tokens | Exact match | Active |
 | **Loss Validity** | Loss must be positive, not NaN, close to reference | `max_loss_difference: 0.3` | Active |
-| **Gradient Relative Error** | `\|g - g_truth\| / \|g_truth\|` must be small | `gradient_norm_ratio_max: 1.06` (6%) | **Skipped** |
+| **Gradient Relative Error** | `\|g - g_truth\| / \|g_truth\|` must be small | `gradient_norm_ratio_max: 1.08` (8%) | **Skipped** |
 | **Gradient Coverage** | All layers must have gradients | `100%` | **Skipped** |
-| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.008` | Active |
+| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.01` | Active |
 | **Trainable Params** | All params must be trainable | `100%` | Active |
-| **Params Changed** | Most param elements must change during training | `min: 80%` | Active |
-| **Timer Integrity** | Multiple timer sources must agree | `timer_divergence_threshold: 1%` | Active |
-| **Min MFU** | Floor threshold -- submissions below are rejected | `min_mfu: 45%` | Active |
+| **Params Changed** | Most param elements must change during training | `min: 70%` | Active |
+| **Timer Integrity** | Multiple timer sources must agree | `timer_divergence_threshold: 0.5%` | Active |
+| **Min MFU** | Floor threshold -- submissions below are rejected | `min_mfu: 35%` | Active |
 | **Max Plausible MFU** | Ceiling cap -- no legitimate code exceeds this | `max_plausible_mfu: 75%` | Active |
 | **Success Rate** | Majority of runs must pass | `min_success_rate: 0.5` | Active |
 
@@ -98,7 +98,7 @@ When `docker.num_gpus > 1`, the evaluation runs in multi-GPU mode. This allows m
 |--------|---------------------------|--------------------------|
 | Launch command | `python eval_script.py` | `torchrun --nproc_per_node N eval_script.py` |
 | Docker network | `--network none` | Internal network (NCCL only, no egress) |
-| Data iterator | Sequential batches | Sharded across ranks (non-overlapping) |
+| Data iterator | Sequential batches | Sharded (DDP/FSDP) or replicated (TP) based on `get_strategy()` |
 | Reference run | Rank 0 only | All ranks via DDP |
 | Optimizer | Validator-provided `GradientCapturingOptimizer` | `None` -- miner creates their own |
 | Gradient verification | Active | Skipped |
@@ -106,10 +106,11 @@ When `docker.num_gpus > 1`, the evaluation runs in multi-GPU mode. This allows m
 | MFU calculation | Per-GPU | Per-GPU (same formula) |
 
 **Miner contract for multi-GPU:**
+- Must define `get_strategy()` returning `"ddp"`, `"fsdp"`, or `"tp"` (defaults to `"ddp"` if absent)
 - `optimizer` will be `None` -- create your own after wrapping the model
 - Any parallelism strategy is allowed: DDP, FSDP, TP, PP, or combinations
 - `torch.distributed` process group is already initialized by `torchrun`
-- The original `model` object must have full (unsharded) parameters when `inner_steps` returns
+- For FSDP/TP: return `final_state` (full unsharded `state_dict` on CPU) in `InnerStepsResult` for weight verification
 - `device.index` gives the local rank (`os` module is forbidden)
 
 ### Adaptive Threshold & Leaderboard
@@ -127,7 +128,7 @@ Example:
 
 **Threshold behavior:**
 - **Increases** when a new leader makes a big improvement (e.g., 45% -> 60% = 33% improvement -> threshold becomes 33%)
-- **Decays** over time towards base (1%) to allow catching up
+- **Decays** over time towards base (0.2%) to allow catching up
 
 ### Weight Distribution
 
@@ -184,7 +185,7 @@ uv run -m neurons.validator \
 
 ### Prerequisites
 
-1. **NVIDIA GPU** with CUDA support (A100 recommended)
+1. **2x NVIDIA A100 GPUs** (or adjust `docker.num_gpus` in hparams.json)
 2. **Docker** with GPU support (`nvidia-container-toolkit`)
 3. **Built evaluation image**
 
@@ -215,7 +216,7 @@ Edit `hparams/hparams.json`:
     "burn_rate": 0.95,
     "burn_uid": 1,
     
-    "evaluation_runs": 5,
+    "evaluation_runs": 3,
     "eval_steps": 5,
     "min_success_rate": 0.5,
     
@@ -227,20 +228,20 @@ Edit `hparams/hparams.json`:
     
     "verification": {
         "max_loss_difference": 0.3,
-        "min_params_changed_ratio": 0.8,
-        "gradient_norm_ratio_max": 1.06,
-        "weight_relative_error_max": 0.008,
-        "timer_divergence_threshold": 0.01
+        "min_params_changed_ratio": 0.7,
+        "gradient_norm_ratio_max": 1.08,
+        "weight_relative_error_max": 0.01,
+        "timer_divergence_threshold": 0.005
     },
     
     "mfu": {
         "gpu_peak_tflops": 312.0,
         "max_plausible_mfu": 75.0,
-        "min_mfu": 45.0
+        "min_mfu": 35.0
     },
     
     "adaptive_threshold": {
-        "base_threshold": 0.01,
+        "base_threshold": 0.002,
         "decay_percent": 0.05,
         "decay_interval_blocks": 100
     }
@@ -251,14 +252,14 @@ Edit `hparams/hparams.json`:
 |---------|-------------|---------|
 | `netuid` | Subnet ID for Crusades | `3` |
 | `burn_rate` | % of emissions to burn_uid | `0.95` (95%) |
-| `evaluation_runs` | Number of evaluation runs per submission | `5` |
+| `evaluation_runs` | Number of evaluation runs per submission | `3` |
 | `min_success_rate` | Minimum passing runs to accept | `0.5` (50%) |
 | `docker.num_gpus` | Number of GPUs (multi-GPU via `torchrun`) | `2` |
 | `docker.memory_limit` | Container memory limit | `"80g"` |
 | `docker.shm_size` | Shared memory (auto-scaled for multi-GPU NCCL) | `"32g"` |
-| `gradient_norm_ratio_max` | Max gradient relative error (1 + %) | `1.06` (6%) |
-| `timer_divergence_threshold` | Max divergence between timer sources | `0.01` (1%) |
-| `min_mfu` | Floor MFU threshold — reject below this | `45.0` |
+| `gradient_norm_ratio_max` | Max gradient relative error (1 + %) | `1.08` (8%) |
+| `timer_divergence_threshold` | Max divergence between timer sources | `0.005` (0.5%) |
+| `min_mfu` | Floor MFU threshold — reject below this | `35.0` |
 | `max_plausible_mfu` | Ceiling MFU cap — no code exceeds this | `75.0` |
 | `gpu_peak_tflops` | GPU peak TFLOPS for MFU calculation | `312.0` (A100 bf16) |
 
@@ -349,11 +350,12 @@ Edit `hparams/hparams.json`:
     "basilica": {
         "image": "ghcr.io/YOUR_ORG/templar-eval:latest",
         "ttl_seconds": 3600,
-        "gpu_count": 1,
+        "gpu_count": 2,
         "gpu_models": ["A100"],
         "min_gpu_memory_gb": 80,
-        "cpu": "4",
-        "memory": "32Gi"
+        "interconnect": "SXM",
+        "cpu": "8",
+        "memory": "80Gi"
     }
 }
 ```
@@ -362,9 +364,12 @@ Edit `hparams/hparams.json`:
 |---------|-------------|---------|
 | `image` | Docker image URL | Required |
 | `ttl_seconds` | Deployment lifetime | 3600 (1 hour) |
-| `gpu_count` | Number of GPUs | 1 |
+| `gpu_count` | Number of GPUs | 2 |
 | `gpu_models` | Acceptable GPU types | ["A100"] |
 | `min_gpu_memory_gb` | Minimum VRAM | 80 |
+| `interconnect` | GPU interconnect type | "SXM" |
+| `cpu` | CPU cores | "8" |
+| `memory` | Container memory | "80Gi" |
 
 ### Step 4: Run Validator
 

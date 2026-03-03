@@ -139,9 +139,9 @@ async def _simulate_multi_gpu(payload):
 
     num_gpus = payload["num_gpus"]
 
-    params_path = tempfile.mktemp(suffix=".json", dir="/tmp")
-    with open(params_path, "w") as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", dir="/tmp", delete=False) as f:
         json.dump(payload, f)
+        params_path = f.name
 
     eval_script = f'''
 import asyncio, json, os, sys
@@ -177,9 +177,9 @@ async def main():
 
 asyncio.run(main())
 '''
-    script_path = tempfile.mktemp(suffix=".py", dir="/tmp")
-    with open(script_path, "w") as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", dir="/tmp", delete=False) as f:
         f.write(eval_script)
+        script_path = f.name
 
     proc = await asyncio.create_subprocess_exec(
         "torchrun",

@@ -127,9 +127,30 @@ See [docs/Validator.md](docs/Validator.md) for detailed validator setup.
 
 ## train.py Requirements
 
-Your `train.py` must implement the `inner_steps` function.
+You submit a **single `train.py` file**. The files in `local_test/` (`train_fsdp.py`, `train_tp.py`, `train_ddp.py`, `train.py`) are reference examples only — use them as a starting point for your own `train.py`.
 
-### Function Signature
+Your `train.py` must contain:
+1. **`inner_steps()`** — the training function (required)
+2. **`get_strategy()`** — declares your parallelism strategy (required for multi-GPU)
+
+### `get_strategy()`
+
+For multi-GPU submissions, define this function to tell the validator which parallelism strategy you use:
+
+```python
+def get_strategy():
+    return "fsdp"  # one of: "ddp", "fsdp", "tp"
+```
+
+| Strategy | Data Handling | Description |
+|----------|---------------|-------------|
+| `"ddp"` | Sharded (each rank gets different batches) | Default if `get_strategy()` is absent |
+| `"fsdp"` | Sharded (each rank gets different batches) | Like DDP but also shards model params/optimizer |
+| `"tp"` | Replicated (all ranks get the same batches) | Model layers sharded across ranks |
+
+This matters because the validator uses it to decide whether each GPU rank receives different data (DDP/FSDP) or the same data (TP). Declaring the wrong strategy will cause verification failures.
+
+### `inner_steps()` Signature
 
 ```python
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
@@ -146,6 +167,17 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 | `device` | `torch.device` | Target device (`cuda:0`, `cuda:1`, etc.). Use `device.index` for local rank. |
 | `num_gpus` | `int` | Number of GPUs. `1` = single-GPU, `>1` = multi-GPU with `torchrun` (process group already initialized). |
 
+### Return Value
+
+`inner_steps` must return an `InnerStepsResult` (dataclass available in the eval environment):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `final_logits` | `torch.Tensor` | Logits from the last forward pass. Must be 3D `(batch, seq_len-1, vocab)`. Cannot be `None`. |
+| `total_tokens` | `int` | Total tokens processed across all steps (= `batch_size × seq_len × num_steps`). |
+| `final_loss` | `float` | Loss value from the last training step. Must be positive and not NaN. |
+| `final_state` | `dict` (optional) | For FSDP/TP: full unsharded `state_dict` on CPU. Required for weight verification in multi-GPU mode. Not needed for single-GPU or DDP. |
+
 ### Multi-GPU Example (FSDP)
 
 With the 7B benchmark model, miners **must** use a memory-sharding strategy. FSDP is recommended — it shards parameters, gradients, and optimizer states across GPUs.
@@ -158,8 +190,10 @@ import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
+def get_strategy():
+    return "fsdp"
+
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
-    # FSDP: shard model across GPUs
     wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={type(model.model.layers[0])},
@@ -203,7 +237,7 @@ Key settings in `hparams/hparams.json`:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `netuid` | 3 | Subnet ID |
-| `evaluation_runs` | 2 | Runs per submission (median taken) |
+| `evaluation_runs` | 3 | Runs per submission (median taken) |
 | `eval_steps` | 5 | Training steps per evaluation |
 | `benchmark_model_name` | Qwen/Qwen2.5-7B | Model for evaluation |
 | `benchmark_batch_size` | 16 | Batch size for evaluation |

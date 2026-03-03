@@ -150,8 +150,7 @@ class AffinetesRunner:
         "BASILICA_EVAL_IMAGE", "ghcr.io/one-covenant/templar-eval:latest"
     )
 
-    _INTERNAL_NETWORK = "crusades_nccl_internal"
-    _internal_network_created = False
+    _INTERNAL_NETWORK_PREFIX = "crusades_nccl_"
 
     def __init__(
         self,
@@ -265,41 +264,44 @@ class AffinetesRunner:
             logger.info(f"   CPU/Memory: {self.basilica_cpu} / {self.basilica_memory}")
 
     @classmethod
-    def _ensure_internal_network(cls) -> None:
-        """Create an internal Docker network for multi-GPU NCCL."""
-        if cls._internal_network_created:
-            return
-        try:
-            # Check if network already exists
-            result = subprocess.run(
-                ["docker", "network", "inspect", cls._INTERNAL_NETWORK],
-                capture_output=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                cls._internal_network_created = True
-                return
+    def _create_eval_network(cls) -> str | None:
+        """Create a per-evaluation internal Docker network for multi-GPU NCCL.
 
+        Each evaluation gets its own isolated network to prevent cross-container
+        communication between concurrent evaluations.  Returns the network name
+        on success, ``None`` on failure (falls back to ``--network none``).
+        """
+        import uuid
+
+        network_name = f"{cls._INTERNAL_NETWORK_PREFIX}{uuid.uuid4().hex[:12]}"
+        try:
             result = subprocess.run(
-                [
-                    "docker",
-                    "network",
-                    "create",
-                    "--internal",
-                    cls._INTERNAL_NETWORK,
-                ],
+                ["docker", "network", "create", "--internal", network_name],
                 capture_output=True,
                 timeout=10,
             )
             if result.returncode != 0:
                 logger.error(
-                    f"Failed to create Docker network '{cls._INTERNAL_NETWORK}': "
+                    f"Failed to create Docker network '{network_name}': "
                     f"{result.stderr.decode().strip()}"
                 )
-                return
-            cls._internal_network_created = True
+                return None
+            return network_name
         except Exception as e:
-            logger.error(f"Error creating Docker network '{cls._INTERNAL_NETWORK}': {e}")
+            logger.error(f"Error creating Docker network '{network_name}': {e}")
+            return None
+
+    @staticmethod
+    def _remove_eval_network(network_name: str) -> None:
+        """Remove a per-evaluation Docker network (best-effort)."""
+        try:
+            subprocess.run(
+                ["docker", "network", "rm", network_name],
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception:
+            pass
 
     async def evaluate(
         self,
@@ -513,19 +515,15 @@ asyncio.run(main())
 
             # Sandbox: scale pids-limit for torchrun
             pids_limit = 1024 * max(self.num_gpus, 1)
+            eval_network = None
             if self.num_gpus <= 1:
                 docker_cmd.extend(["--network", "none"])
             else:
-                # Multi-GPU: internal network (no egress), no DNS
-                self._ensure_internal_network()
-                docker_cmd.extend(
-                    [
-                        "--network",
-                        self._INTERNAL_NETWORK,
-                        "--dns",
-                        "0.0.0.0",
-                    ]
-                )
+                eval_network = self._create_eval_network()
+                if eval_network is not None:
+                    docker_cmd.extend(["--network", eval_network, "--dns", "0.0.0.0"])
+                else:
+                    docker_cmd.extend(["--network", "none"])
             docker_cmd.extend(
                 [
                     "--cap-drop",
@@ -702,6 +700,8 @@ asyncio.run(main())
                 os.unlink(train_path)
             except Exception:
                 pass
+            if eval_network is not None:
+                self._remove_eval_network(eval_network)
 
     async def _evaluate_basilica(
         self,

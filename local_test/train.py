@@ -68,7 +68,7 @@ def _get_compiled_fn(model):
     return compiled
 
 
-def inner_steps(model, data_iterator, optimizer, num_steps, device):
+def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     _prepare_model(model)
     step_fn = _get_compiled_fn(model)
 
