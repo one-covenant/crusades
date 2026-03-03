@@ -222,7 +222,7 @@ See `local_test/train_fsdp.py` and `local_test/train_tp.py` for complete working
 - Process all tokens in each batch, return valid `final_logits` (not `None`)
 - Train all model parameters (no freezing layers)
 - Don't alias `torch` (e.g., `import torch as t`) -- the scanner needs the literal name
-- `optimizer` is `None` -- create your own after wrapping the model
+- In multi-GPU mode, `optimizer` is `None` -- create your own after wrapping the model
 - You may use any memory-sharding parallelism: FSDP, TP, PP, or combinations
 - For FSDP/TP: return gathered `final_state` (full unsharded CPU tensors) in `InnerStepsResult` for weight verification
 - Gradient verification is skipped in multi-GPU mode; the validator verifies via loss and final weight comparison
