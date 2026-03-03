@@ -1480,9 +1480,12 @@ def _run_reference(
         Tuple of (InnerStepsResult, GradientInfo) where GradientInfo
         contains the gradients from the final step (before optimizer.step)
     """
+    from contextlib import nullcontext
+
     _enforce_backend_state()
 
     eval_model = ddp_model if ddp_model is not None else model
+    use_no_sync = hasattr(eval_model, "no_sync")
     mbs = _REFERENCE_MICRO_BATCH_SIZE
 
     total_tokens = 0
@@ -1500,17 +1503,23 @@ def _run_reference(
         step_logits = None
         step_loss_sum = 0.0
 
-        for mb in micro_batches:
+        for idx, mb in enumerate(micro_batches):
             input_ids = mb[:, :-1]
             labels = mb[:, 1:]
-            outputs = eval_model(input_ids)
-            logits = outputs.logits if hasattr(outputs, "logits") else outputs
-            loss = _real_cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                labels.reshape(-1),
-                ignore_index=-100,
+
+            sync_ctx = (
+                eval_model.no_sync() if use_no_sync and idx < num_accum - 1 else nullcontext()
             )
-            (loss / num_accum).backward()
+            with sync_ctx:
+                outputs = eval_model(input_ids)
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs
+                loss = _real_cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1),
+                    ignore_index=-100,
+                )
+                (loss / num_accum).backward()
+
             step_logits = logits
             step_loss_sum += float(loss.item())
 
@@ -2187,41 +2196,66 @@ class Actor:
                 dist.barrier()
             elif _multi_gpu:
                 # TP strategy: rank 0 runs single-GPU reference, others wait.
+                # Wrap in try/except so dist.barrier() is always reached —
+                # otherwise a rank-0 exception deadlocks non-rank-0 processes.
+                tp_ref_error: str | None = None
                 if _IS_RANK_0:
-                    data_iter_ref = _create_data_iterator(
-                        data,
-                        batch_size,
-                        seq_len,
-                        rank=0,
-                        world_size=1,
-                    )
-                    optimizer_ref = _create_optimizer(model)
+                    try:
+                        data_iter_ref = _create_data_iterator(
+                            data,
+                            batch_size,
+                            seq_len,
+                            rank=0,
+                            world_size=1,
+                        )
+                        optimizer_ref = _create_optimizer(model)
 
-                    reference, reference_grad = _run_reference(
-                        model,
-                        data_iter_ref,
-                        optimizer_ref,
-                        steps,
-                        device,
-                        capture_final_gradients=True,
-                        ddp_model=None,
-                    )
+                        reference, reference_grad = _run_reference(
+                            model,
+                            data_iter_ref,
+                            optimizer_ref,
+                            steps,
+                            device,
+                            capture_final_gradients=True,
+                            ddp_model=None,
+                        )
 
-                    reference_final_state = {
-                        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-                    }
-                    logger.info("Captured single-GPU reference final state (TP mode)")
-                    _log_vram("after-reference-run")
+                        reference_final_state = {
+                            k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                        }
+                        logger.info("Captured single-GPU reference final state (TP mode)")
+                        _log_vram("after-reference-run")
 
-                    del optimizer_ref
-                    del data_iter_ref
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                        del optimizer_ref
+                        del data_iter_ref
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
-                    model.load_state_dict(initial_state)
+                        model.load_state_dict(initial_state)
+                    except Exception as e:
+                        tp_ref_error = f"TP reference run failed on rank 0: {e}"
+                        logger.error(tp_ref_error)
 
                 dist.barrier()
+
+                # Broadcast success/failure from rank 0 to all ranks.
+                fail_tensor = torch.tensor(
+                    [1 if tp_ref_error else 0], dtype=torch.int32, device=device
+                )
+                dist.broadcast(fail_tensor, src=0)
+                if fail_tensor.item() > 0:
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": tp_ref_error or "TP reference run failed on rank 0",
+                        "seed": seed,
+                        "code": code,
+                    }
             else:
                 # Single-GPU path (no multi-GPU)
                 data_iter_ref = _create_data_iterator(

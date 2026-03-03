@@ -1,16 +1,14 @@
 # Reference: DDP (Distributed Data Parallel) strategy
 #
 # Uses micro-batch gradient accumulation to fit Qwen2.5-7B on A100-80GB.
-# DDP replicates the full model per GPU, so batch_size=16 won't fit in
-# a single forward pass. Splitting into micro-batches of 2 is
-# mathematically equivalent to the full batch.
+# DDP replicates the full model per GPU — memory is tight (~77GB peak).
+# micro_batch=1 keeps activations small enough to leave headroom.
 #
 # Requirements for verification:
 #   - get_strategy() -> "ddp"
 #   - Return InnerStepsResult with final_logits (3D), total_tokens, final_loss
 #   - No final_state needed (validator reads weights directly from model)
 #   - Each rank processes different data (data-parallel)
-#
 
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -32,7 +30,7 @@ def get_strategy():
     return "ddp"
 
 
-MICRO_BATCH_SIZE = 2
+MICRO_BATCH_SIZE = 1
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
@@ -70,7 +68,6 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             input_ids = mb[:, :-1]
             labels = mb[:, 1:]
 
-            # Skip gradient all-reduce until last micro-batch
             no_sync = hasattr(model, "no_sync") and i < num_accum - 1
             ctx = model.no_sync() if no_sync else nullcontext()
 
