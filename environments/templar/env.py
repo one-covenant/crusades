@@ -2133,7 +2133,7 @@ class Actor:
             if _multi_gpu:
                 if not dist.is_initialized():
                     torch.cuda.set_device(_LOCAL_RANK)
-                    dist.init_process_group(backend="nccl", timeout=timedelta(seconds=120))
+                    dist.init_process_group(backend="nccl", timeout=timedelta(seconds=600))
                     logger.info(f"Initialized process group: rank {_LOCAL_RANK}/{_WORLD_SIZE}")
 
             seq_len = sequence_length or EVAL_SEQUENCE_LENGTH
@@ -2828,6 +2828,22 @@ class Actor:
                     "code": code,
                 }
             logger.info(f"[PASSED] Vocab dimension check: {actual_vocab} == {expected_vocab}")
+
+            # Non-rank-0 processes have no reference state and cannot run
+            # weight verification.  Return a stub so they reach the finally
+            # block (and dist.barrier) quickly instead of blocking rank 0's
+            # CPU-bound verification past the NCCL timeout.
+            if _multi_gpu and not _IS_RANK_0:
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": "non-rank-0 stub (rank 0 has real result)",
+                    "seed": seed,
+                }
 
             # Build a CPU state dict of the miner's trained model for
             # verification.  FSDP/TP miners return a pre-gathered dict in
