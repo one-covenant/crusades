@@ -2228,10 +2228,14 @@ class Actor:
 
                         del optimizer_ref
                         del data_iter_ref
+                        _CACHE.pop("model", None)
+                        del model
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
 
+                        model = _load_model(model_url, use_random_init=use_random_init)
+                        _CACHE["model"] = model
                         model.load_state_dict(initial_state)
                     except Exception as e:
                         tp_ref_error = f"TP reference run failed on rank 0: {e}"
@@ -2567,6 +2571,9 @@ class Actor:
             _pc = _vpc
             _mo = _vmo
             _sy = _vsy
+
+            if _multi_gpu:
+                dist.barrier()
 
             _sy()
             start_perf = _pc()

@@ -75,14 +75,17 @@ docker build --network=host -f environments/templar/Dockerfile \
 # Note: MFU/benchmark results will only closely match leaderboard numbers
 # when executed on the same GPU model (A100). Runs on other hardware may
 # produce divergent MFU results.
-docker run --gpus 2 -it --rm --ipc=host \
+docker run --gpus 2 -it --rm \
+    --memory 160g --shm-size 32g \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --read-only --pids-limit 2048 --network none \
     --tmpfs /tmp:rw,exec,nosuid,size=4g \
     --tmpfs /home/appuser/.triton:rw,exec,size=2g \
-    -v "$(pwd)/local_test/train_fsdp.py":/test/train.py \
-    -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py \
-    -v "$(pwd)/hparams/hparams.json":/app/hparams.json \
-    -v "$(pwd)/environments/templar/env.py":/app/env.py \
-    -v "$(pwd)/src/crusades/core/security_defs.py":/app/crusades/core/security_defs.py \
+    -v "$(pwd)/local_test/train_fsdp.py":/test/train.py:ro \
+    -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
+    -v "$(pwd)/hparams/hparams.json":/app/hparams.json:ro \
+    -v "$(pwd)/environments/templar/env.py":/app/env.py:ro \
+    -v "$(pwd)/src/crusades/core/security_defs.py":/app/crusades/core/security_defs.py:ro \
     -e PYTHONPATH=/app \
     templar-eval:latest \
     python3 /test/simulate.py
