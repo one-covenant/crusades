@@ -34,8 +34,8 @@
         "gpu_models": ["A100"],
         "min_gpu_memory_gb": 80,
         "interconnect": "SXM",
-        "cpu": "16",
-        "memory": "160Gi"
+        "cpu": "8",
+        "memory": "80Gi"
     },
 
     "verification": {
