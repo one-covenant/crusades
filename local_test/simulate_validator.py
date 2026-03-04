@@ -12,11 +12,7 @@ same Docker container.
 2. Run the simulation (requires 2x A100 GPUs for 7B model):
 
     docker run --gpus 2 -it --rm \
-        --memory 160g --shm-size 32g \
-        --cap-drop ALL --security-opt no-new-privileges \
-        --read-only --pids-limit 2048 --network none \
-        --tmpfs /tmp:rw,exec,nosuid,size=4g \
-        --tmpfs /home/appuser/.triton:rw,exec,size=2g \
+        --shm-size 32g \
         -v "$(pwd)/local_test/train_ddp.py":/test/train.py:ro \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
         -v "$(pwd)/hparams/hparams.json":/app/hparams.json:ro \
@@ -26,7 +22,7 @@ same Docker container.
         templar-eval:latest \
         python3 /test/simulate.py
 
-   Replace train_fsdp.py with train_tp.py to test tensor parallelism.
+   Replace train_ddp.py with train_fsdp.py or train_tp.py to test other strategies.
 """
 
 import asyncio

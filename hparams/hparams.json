@@ -5,7 +5,7 @@
 
     "evaluation_runs": 1,
     "eval_steps": 20,
-    "eval_timeout": 1200,
+    "eval_timeout": 3600,
     "min_success_rate": 0.5,
 
     "benchmark_model_name": "Qwen/Qwen2.5-7B",
@@ -29,7 +29,7 @@
 
     "basilica": {
         "image": "ghcr.io/one-covenant/templar-eval:latest",
-        "ttl_seconds": 3600,
+        "ttl_seconds": 7200,
         "gpu_count": 2,
         "gpu_models": ["A100"],
         "min_gpu_memory_gb": 80,

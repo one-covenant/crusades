@@ -76,11 +76,7 @@ docker build --network=host -f environments/templar/Dockerfile \
 # when executed on the same GPU model (A100). Runs on other hardware may
 # produce divergent MFU results.
 docker run --gpus 2 -it --rm \
-    --memory 160g --shm-size 32g \
-    --cap-drop ALL --security-opt no-new-privileges \
-    --read-only --pids-limit 2048 --network none \
-    --tmpfs /tmp:rw,exec,nosuid,size=4g \
-    --tmpfs /home/appuser/.triton:rw,exec,size=2g \
+    --shm-size 32g \
     -v "$(pwd)/local_test/train_fsdp.py":/test/train.py:ro \
     -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
     -v "$(pwd)/hparams/hparams.json":/app/hparams.json:ro \
@@ -91,7 +87,7 @@ docker run --gpus 2 -it --rm \
     python3 /test/simulate.py
 ```
 
-Replace `train_fsdp.py` with `train_tp.py` to test tensor parallelism instead.
+Replace `train_fsdp.py` with `train_ddp.py` or `train_tp.py` to test other strategies.
 
 This runs the full evaluation pipeline: security scan, reference baseline, warmup, timed eval, gradient/weight verification, and MFU calculation — all with the same thresholds as production.
 
