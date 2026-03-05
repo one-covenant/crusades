@@ -12,7 +12,12 @@ same Docker container.
 2. Run the simulation (requires 2x A100 GPUs for 7B model):
 
     docker run --gpus 2 -it --rm \
-        --shm-size 32g \
+        --ipc=host \
+        --ulimit memlock=-1:-1 \
+        -e NCCL_P2P_LEVEL=NVL \
+        -e NCCL_SHM_USE_CUDA_MEMCPY=1 \
+        -e NCCL_NVLS_ENABLE=1 \
+        -e NCCL_IB_DISABLE=1 \
         -v "$(pwd)/local_test/train_ddp.py":/test/train.py:ro \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
         -v "$(pwd)/hparams/hparams.json":/app/hparams.json:ro \
