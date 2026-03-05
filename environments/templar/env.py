@@ -2677,6 +2677,22 @@ class Actor:
                 f"{f', cuda_events={cuda_wall_time:.2f}s' if cuda_wall_time else ''})"
             )
 
+            # For multi-GPU, use the minimum wall_time across ranks.
+            # Rank 0 carries asymmetric overhead from state-dict gathering
+            # (FSDP full_state_dict + CPU offload) that is verification cost,
+            # not training compute — exclude it from MFU.
+            if _multi_gpu:
+                _wt = torch.tensor([wall_time], dtype=torch.float64, device=device)
+                dist.all_reduce(_wt, op=dist.ReduceOp.MIN)
+                _wt_min = _wt.item()
+                if wall_time - _wt_min > 0.5:
+                    logger.info(
+                        f"Using min wall_time across ranks: {_wt_min:.2f}s "
+                        f"(rank 0 measured {wall_time:.2f}s, "
+                        f"delta={wall_time - _wt_min:.2f}s verification overhead)"
+                    )
+                    wall_time = _wt_min
+
             # Non-rank-0: skip verification (barrier in finally block)
             if not _IS_RANK_0:
                 return {
