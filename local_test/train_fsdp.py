@@ -121,7 +121,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
                 sd = model.state_dict()
                 if rank == 0:
-                    full_state = {k: v.clone() for k, v in sd.items()}
+                    full_state = sd
 
     return InnerStepsResult(
         final_logits=final_logits,
