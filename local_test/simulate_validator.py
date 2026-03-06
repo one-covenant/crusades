@@ -18,7 +18,8 @@ same Docker container.
         -e NCCL_SHM_USE_CUDA_MEMCPY=1 \
         -e NCCL_NVLS_ENABLE=1 \
         -e NCCL_IB_DISABLE=1 \
-        -v "$(pwd)/local_test/train_ddp.py":/test/train.py:ro \
+        -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        -v "$(pwd)/local_test/train_fsdp.py":/test/train.py:ro \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
         -v "$(pwd)/hparams/hparams.json":/app/hparams.json:ro \
         -v "$(pwd)/environments/templar/env.py":/app/env.py:ro \
