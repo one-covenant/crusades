@@ -2180,6 +2180,9 @@ class Actor:
                     logger.info("Captured DDP reference final state for weight verification")
                 _log_vram("after-reference-run")
 
+                if reference is not None and reference.final_logits is not None:
+                    reference.final_logits = reference.final_logits.cpu()
+
                 del ref_ddp
                 ref_ddp = None
                 del optimizer_ref
@@ -2225,6 +2228,9 @@ class Actor:
                         }
                         logger.info("Captured single-GPU reference final state (TP mode)")
                         _log_vram("after-reference-run")
+
+                        if reference is not None and reference.final_logits is not None:
+                            reference.final_logits = reference.final_logits.cpu()
 
                         del optimizer_ref
                         del data_iter_ref
@@ -2281,6 +2287,9 @@ class Actor:
                 }
                 logger.info("Captured reference final state for weight verification")
                 _log_vram("after-reference-run")
+
+                if reference is not None and reference.final_logits is not None:
+                    reference.final_logits = reference.final_logits.cpu()
 
                 del optimizer_ref
                 del data_iter_ref
