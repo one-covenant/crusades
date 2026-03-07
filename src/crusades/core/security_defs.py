@@ -12,9 +12,10 @@ from __future__ import annotations
 import ast
 
 # Upper bound on the number of elements in a bytes([...]) / bytearray([...])
-# literal the scanner will attempt to decode.  Anything larger is rejected
-# outright as a potential resource-exhaustion / DoS vector.
-_MAX_BYTES_LITERAL_ELTS = 4096
+# literal.  Anything larger is rejected outright — there is no legitimate
+# reason for training code to contain large byte-array literals; they are
+# almost exclusively used to embed obfuscated payloads (pickle, ZIP, etc.).
+_MAX_BYTES_LITERAL_ELTS = 256
 
 
 class SuspiciousConstructionError(Exception):
@@ -121,6 +122,23 @@ FORBIDDEN_STRINGS: list[str] = [
     "initial_state",
     "_hidden_modules",
     "_sensitive_keys",
+    # Vault timer locals (stack-walking target)
+    "_vpc",
+    "_vmo",
+    "_vet",
+    "_vce",
+    "_vpc_id",
+    "_vmo_id",
+    "_vet_id",
+    "_vce_id",
+    "_vsy_id",
+    "_vault_get_timers",
+    "_vault_get_real_ids",
+    "_timer_state",
+    # ctypes frame manipulation
+    "PyFrame_LocalsToFast",
+    "LocalsToFast",
+    "pythonapi",
     # unittest.mock attribute patching
     "mock.patch",
     "MagicMock",

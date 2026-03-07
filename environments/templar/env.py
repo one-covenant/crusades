@@ -36,6 +36,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from crusades.core.security_defs import (
+    _MAX_BYTES_LITERAL_ELTS,
     ALLOWED_TORCH_ASSIGNMENT_PREFIXES,
     ALLOWED_TORCH_SUBMODULE_IMPORTS,
     FORBIDDEN_ASSIGNMENT_ATTRS,
@@ -543,6 +544,30 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                             return False, f"Line {line}: aliasing torch is forbidden"
                         torch_aliases.add(target.id)
 
+        # Walrus operator: if (t := torch): ... creates an untracked alias
+        if isinstance(node, ast.NamedExpr):
+            if isinstance(node.value, ast.Name) and node.value.id in torch_aliases:
+                if isinstance(node.target, ast.Name) and node.target.id != "torch":
+                    line = getattr(node, "lineno", "?")
+                    return False, f"Line {line}: aliasing torch via walrus operator is forbidden"
+
+        # Tuple/list unpacking: [t] = [torch], t, = torch, ...
+        if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Tuple, ast.List)):
+            for elt in node.value.elts:
+                if isinstance(elt, ast.Name) and elt.id in torch_aliases:
+                    for target in node.targets:
+                        names = []
+                        if isinstance(target, (ast.Tuple, ast.List)):
+                            names = [n.id for n in target.elts if isinstance(n, ast.Name)]
+                        elif isinstance(target, ast.Name):
+                            names = [target.id]
+                        for n in names:
+                            if n != "torch":
+                                line = getattr(node, "lineno", "?")
+                                return False, (
+                                    f"Line {line}: aliasing torch via unpacking is forbidden"
+                                )
+
         # Block attribute mutation on torch modules / submodule aliases.
         # Covers Assign, AugAssign (+=), and Delete (del) targets.
         # Catches: F.cross_entropy = fake, torch.nn.functional.cross_entropy = fake,
@@ -835,6 +860,42 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 if isinstance(deco, ast.Name) and deco.id in _forbidden_names:
                     line = getattr(deco, "lineno", "?")
                     return False, f"Line {line}: decorator @{deco.id} is forbidden"
+
+        # Reject large bytes([...])/bytearray([...]) literals regardless of usage.
+        # Attackers embed binary payloads (pickle, ZIP) in raw byte arrays
+        # that bypass string-based forbidden-pattern scanning.
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in ("bytes", "bytearray")
+            and node.args
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.List)
+            and len(node.args[0].elts) > _MAX_BYTES_LITERAL_ELTS
+        ):
+            line = getattr(node, "lineno", "?")
+            return False, (
+                f"Line {line}: bytes/bytearray literal with {len(node.args[0].elts)} "
+                f"elements exceeds limit of {_MAX_BYTES_LITERAL_ELTS}"
+            )
+
+        # Block weights_only=False in any .load() call — prevents pickle RCE
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "load"
+        ):
+            for kw in node.keywords:
+                if (
+                    kw.arg == "weights_only"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value is False
+                ):
+                    line = getattr(node, "lineno", "?")
+                    return False, (
+                        f"Line {line}: weights_only=False is forbidden"
+                        " (enables arbitrary code execution via pickle)"
+                    )
 
     return True, None
 
