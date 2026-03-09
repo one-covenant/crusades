@@ -550,6 +550,17 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 if isinstance(node.target, ast.Name) and node.target.id != "torch":
                     line = getattr(node, "lineno", "?")
                     return False, f"Line {line}: aliasing torch via walrus operator is forbidden"
+            # ld := torch.load, dyn := torch._dynamo — attribute on torch alias
+            if (
+                isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id in torch_aliases
+                and node.value.attr in _forbidden_torch_attribute_aliases
+            ):
+                line = getattr(node, "lineno", "?")
+                return False, (
+                    f"Line {line}: binding torch.{node.value.attr} via walrus operator is forbidden"
+                )
 
         # Tuple/list unpacking: [t] = [torch], t, = torch, ...
         if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Tuple, ast.List)):
@@ -567,6 +578,17 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                                 return False, (
                                     f"Line {line}: aliasing torch via unpacking is forbidden"
                                 )
+                # ld, = [torch.load] — attribute on torch alias via unpacking
+                if (
+                    isinstance(elt, ast.Attribute)
+                    and isinstance(elt.value, ast.Name)
+                    and elt.value.id in torch_aliases
+                    and elt.attr in _forbidden_torch_attribute_aliases
+                ):
+                    line = getattr(node, "lineno", "?")
+                    return False, (
+                        f"Line {line}: binding torch.{elt.attr} via unpacking is forbidden"
+                    )
 
         # Block attribute mutation on torch modules / submodule aliases.
         # Covers Assign, AugAssign (+=), and Delete (del) targets.
@@ -861,7 +883,9 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                     line = getattr(deco, "lineno", "?")
                     return False, f"Line {line}: decorator @{deco.id} is forbidden"
 
-        # Reject large bytes([...])/bytearray([...]) literals regardless of usage.
+        # Reject large bytes/bytearray literals regardless of usage.
+        # Covers both list and tuple constructors: bytes([...]), bytes((...)),
+        # bytearray([...]), bytearray((...)).
         # Attackers embed binary payloads (pickle, ZIP) in raw byte arrays
         # that bypass string-based forbidden-pattern scanning.
         if (
@@ -870,7 +894,7 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
             and node.func.id in ("bytes", "bytearray")
             and node.args
             and len(node.args) == 1
-            and isinstance(node.args[0], ast.List)
+            and isinstance(node.args[0], (ast.List, ast.Tuple))
             and len(node.args[0].elts) > _MAX_BYTES_LITERAL_ELTS
         ):
             line = getattr(node, "lineno", "?")

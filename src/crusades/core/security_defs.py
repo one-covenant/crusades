@@ -127,6 +127,7 @@ FORBIDDEN_STRINGS: list[str] = [
     "_vmo",
     "_vet",
     "_vce",
+    "_vsy",
     "_vpc_id",
     "_vmo_id",
     "_vet_id",
