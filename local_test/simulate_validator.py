@@ -6,8 +6,7 @@ same Docker container.
 
 1. Build the docker image (run from repo root):
 
-   docker build --network=host -f environments/templar/Dockerfile \
-       -t templar-eval:latest .
+   docker build --network=host --no-cache -f environments/templar/Dockerfile -t templar-eval:latest .
 
 2. Run the simulation (requires 2x A100 GPUs for 7B model):
 

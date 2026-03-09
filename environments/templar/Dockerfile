@@ -1,10 +1,10 @@
 # Usage: docker build --network=host -f environments/templar/Dockerfile -t templar-eval:latest .
 # Run from repo root so hparams.json is accessible
 
-FROM pytorch/pytorch:2.9.0-cuda12.6-cudnn9-devel
+FROM pytorch/pytorch:2.9.0-cuda12.6-cudnn9-runtime
 
-RUN apt-get update && apt-get install -y \
-    git curl ca-certificates build-essential ninja-build \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates gcc ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash appuser
@@ -17,12 +17,6 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 # flash-attn pre-built wheel (torch 2.9 + CUDA 12.6 + Python 3.11)
 RUN pip install --no-cache-dir --user \
     "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu126torch2.9-cp311-cp311-linux_x86_64.whl"
-
-USER root
-RUN apt-get purge -y g++ make dpkg-dev && apt-get autoremove -y \
-    && apt-get update && apt-get install -y --no-install-recommends gcc \
-    && rm -rf /var/lib/apt/lists/*
-USER appuser
 
 COPY --chown=appuser:appuser hparams/hparams.json /app/
 
