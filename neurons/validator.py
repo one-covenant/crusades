@@ -1074,7 +1074,11 @@ class Validator(BaseNode):
         await self._refresh_weight_block_from_chain()
 
         hparams = get_hparams()
-        current_block = self.commitment_reader.get_current_block()
+        try:
+            current_block = self.commitment_reader.get_current_block()
+        except Exception as e:
+            logger.warning(f"Could not get current block for weight setting (will retry next loop): {e}")
+            return
         blocks_since_last = current_block - self.last_weight_set_block
         min_blocks = hparams.set_weights_interval_blocks
 
