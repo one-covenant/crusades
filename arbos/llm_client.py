@@ -70,7 +70,7 @@ class LLMClient:
     def __init__(self):
         self._system_prompt = _load_system_prompt()
         self.provider = os.environ.get("LLM_PROVIDER", "chutes")
-        self.timeout = int(os.environ.get("LLM_TIMEOUT", "120"))
+        self.timeout = int(os.environ.get("LLM_TIMEOUT", "300"))
 
         if self.provider == "anthropic":
             self.api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -191,13 +191,20 @@ Rules:
         start = time.time()
         logger.info(f"Requesting improvement from {self.provider} ({self.model})...")
 
-        max_retries = 3
+        max_retries = 5
         for attempt in range(1, max_retries + 1):
             try:
                 text = self._call(messages)
                 elapsed = time.time() - start
                 logger.info(f"LLM responded in {elapsed:.1f}s")
                 return _parse_response(text)
+            except httpx.ReadTimeout:
+                logger.warning(
+                    f"LLM read timeout (attempt {attempt}/{max_retries}, timeout={self.timeout}s)"
+                )
+                if attempt == max_retries:
+                    raise
+                time.sleep(10)
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
                 detail = ""
@@ -216,17 +223,21 @@ Rules:
                         f"Add funds or switch LLM_PROVIDER in arbos/.env"
                     ) from e
 
-                logger.warning(
-                    f"LLM API error (attempt {attempt}/{max_retries}): HTTP {status} — {detail}"
-                )
                 if status == 404:
                     raise RuntimeError(
                         f"Model '{self.model}' not found on {self.provider} (HTTP 404). "
                         f"Check available models or set LLM_MODEL in arbos/.env"
                     ) from e
+
+                logger.warning(
+                    f"LLM API error (attempt {attempt}/{max_retries}): HTTP {status} — {detail}"
+                )
                 if attempt == max_retries:
                     raise
-                time.sleep(2**attempt)
+                # Longer backoff for rate limits (429)
+                wait = 30 * attempt if status == 429 else 2**attempt
+                logger.info(f"Retrying in {wait}s...")
+                time.sleep(wait)
             except ValueError as e:
                 logger.warning(
                     f"Failed to parse LLM response (attempt {attempt}/{max_retries}): {e}"
