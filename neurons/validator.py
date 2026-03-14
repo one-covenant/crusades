@@ -1086,7 +1086,7 @@ class Validator(BaseNode):
         hparams = get_hparams()
         try:
             current_block = self.commitment_reader.get_current_block()
-        except Exception as e:
+        except (TimeoutError, OSError, ConnectionError) as e:
             logger.warning(
                 f"Could not get current block for weight setting (will retry next loop): {e}"
             )
