@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import difflib
 import json
 import logging
 import os
@@ -58,6 +59,22 @@ def setup_logging() -> logging.Logger:
     return log
 
 
+def compute_code_diff(old_code: str, new_code: str, max_lines: int = 20) -> str:
+    """Return a compact unified diff showing only changed lines."""
+    old_lines = old_code.splitlines(keepends=True)
+    new_lines = new_code.splitlines(keepends=True)
+    diff = list(
+        difflib.unified_diff(old_lines, new_lines, fromfile="best.py", tofile="candidate.py", n=1)
+    )
+    if not diff:
+        return "(no changes)"
+    # Skip the --- +++ header, keep only +/- lines with 1 line of context
+    meaningful = [line.rstrip("\n") for line in diff[2:] if line.startswith(("+", "-", "@"))]
+    if len(meaningful) > max_lines:
+        meaningful = meaningful[:max_lines] + [f"... ({len(meaningful) - max_lines} more lines)"]
+    return "\n".join(meaningful)
+
+
 @dataclass
 class Attempt:
     step: int
@@ -65,6 +82,7 @@ class Attempt:
     mfu: float
     success: bool
     error: str | None = None
+    code_diff: str | None = None
     timestamp: str = ""
 
     def __post_init__(self):
@@ -137,14 +155,26 @@ def format_history(history: list[dict], best_mfu: float = 0.0, max_entries: int 
     recent = history[-max_entries:]
     lines = []
     for h in recent:
+        mfu_val = h.get("mfu", 0)
+        is_success = h.get("success", False)
         status = (
             "IMPROVED"
-            if h.get("success") and h.get("mfu", 0) > 0 and h["mfu"] >= best_mfu
-            else ("OK" if h.get("success") else "FAIL")
+            if is_success and mfu_val > 0 and mfu_val >= best_mfu
+            else "OK"
+            if is_success and mfu_val > 0
+            else "FAIL"
         )
-        mfu_str = f"{h['mfu']:.2f}%" if h.get("mfu", 0) > 0 else "N/A"
-        err = f" | error: {h['error'][:100]}" if h.get("error") else ""
-        lines.append(f"- Step {h['step']}: [{status}] MFU={mfu_str} | {h['reasoning'][:200]}{err}")
+        mfu_str = f"{mfu_val:.2f}%" if mfu_val > 0 else "N/A"
+        entry = f"### Step {h['step']}: [{status}] MFU={mfu_str}\n"
+        entry += f"Strategy: {h['reasoning'][:300]}\n"
+
+        if h.get("error"):
+            entry += f"Error: {h['error'][:200]}\n"
+
+        if h.get("code_diff") and h["code_diff"] != "(no changes)":
+            entry += f"Changes made:\n```\n{h['code_diff']}\n```\n"
+
+        lines.append(entry)
     return "\n".join(lines)
 
 
@@ -310,13 +340,20 @@ def run_agent(args):
                 state.save()
                 continue
 
+            diff = compute_code_diff(best_code, response.code)
             candidate_path = RUNS_DIR / f"step_{step:04d}_candidate.py"
             candidate_path.write_text(response.code)
 
             if args.dry_run:
                 log.info(f"[DRY RUN] Candidate saved to: {candidate_path}")
                 state.add_attempt(
-                    Attempt(step=step, reasoning=response.reasoning, mfu=0.0, success=True)
+                    Attempt(
+                        step=step,
+                        reasoning=response.reasoning,
+                        mfu=0.0,
+                        success=True,
+                        code_diff=diff,
+                    )
                 )
                 state.save()
                 continue
@@ -334,6 +371,7 @@ def run_agent(args):
                         mfu=0.0,
                         success=False,
                         error=str(e),
+                        code_diff=diff,
                     )
                 )
                 state.save()
@@ -351,6 +389,7 @@ def run_agent(args):
                         mfu=0.0,
                         success=False,
                         error=result.error,
+                        code_diff=diff,
                     )
                 )
                 state.save()
@@ -401,6 +440,7 @@ def run_agent(args):
                     reasoning=response.reasoning,
                     mfu=result.mfu,
                     success=True,
+                    code_diff=diff,
                 )
             )
             state.save()

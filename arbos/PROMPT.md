@@ -47,8 +47,9 @@ subprocess, os, sys, pathlib, io, socket, http, urllib, requests, shutil, tempfi
 FORBIDDEN names — do NOT use:
 exec, eval, compile, open, setattr, getattr, delattr, globals, locals, __import__, breakpoint, dir, vars, chr, ord, input, memoryview
 
-FORBIDDEN torch access:
-torch.compile, torch.load, torch._C, torch._dynamo, torch._inductor
+FORBIDDEN torch access (do NOT import or alias these):
+torch.load, torch._C, torch._dynamo, torch._inductor
+Note: torch.compile() is ALLOWED as a direct call (e.g. torch.compile(fn)). Wrap in try/except for safety.
 
 ALLOWED imports:
 torch, torch.nn, torch.nn.functional, torch.cuda, torch.amp, torch.distributed, torch.distributed.fsdp, torch.distributed.fsdp.wrap, torch.distributed.tensor, torch.distributed.tensor.parallel, torch.distributed.device_mesh, torch.utils.checkpoint, functools, warnings, math, dataclasses, flash_attn
@@ -58,7 +59,7 @@ torch, torch.nn, torch.nn.functional, torch.cuda, torch.amp, torch.distributed, 
 - FSDP sharding strategy (SHARD_GRAD_OP vs FULL_SHARD vs NO_SHARD)
 - Mixed precision policy (bf16 params, reduce, buffer)
 - Optimizer tuning (lr, weight_decay, betas, fused=True)
-- torch.compile modes (default, reduce-overhead, max-autotune)
+- torch.compile modes (default, reduce-overhead, max-autotune) — wrap in try/except
 - Flash attention / flash CE loss
 - Data pre-loading and pinning
 - Memory layout optimization (contiguous tensors)

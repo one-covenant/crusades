@@ -85,7 +85,7 @@ class LLMClient:
             self.base_url = os.environ.get("CHUTES_BASE_URL", "https://llm.chutes.ai/v1")
             self.model = os.environ.get(
                 "LLM_MODEL",
-                "deepseek-ai/DeepSeek-V3",
+                "deepseek-ai/DeepSeek-R1-0528-TEE",
             )
 
         if not self.api_key:
@@ -152,25 +152,39 @@ class LLMClient:
         hparams: dict,
     ) -> LLMResponse:
         """Ask the LLM to suggest one improvement to the train.py code."""
-        user_msg = f"""Current best train.py (MFU: {mfu:.2f}%):
+        num_gpus = (hparams.get("docker") or {}).get("num_gpus", 2)
+        user_msg = f"""## Current best train.py (MFU: {mfu:.2f}%)
 
 ```python
 {code}
 ```
 
-Evaluation environment:
+## Evaluation environment
 - Model: {hparams["benchmark_model_name"]}
 - Batch size: {hparams["benchmark_batch_size"]}
 - Sequence length: {hparams["benchmark_sequence_length"]}
 - Steps: {hparams["eval_steps"]}
-- GPUs: {hparams.get("docker", {}).get("num_gpus", 2)} x A100 80GB SXM
+- GPUs: {num_gpus} x A100 80GB SXM (NVLink connected)
+- Peak FLOPs: 312 TFLOPS per GPU (bf16)
 
-Previous attempts (IMPORTANT — do NOT repeat failed strategies or strategies that gave lower MFU):
+## Key constraints
+- With only {num_gpus} GPUs, FULL_SHARD adds more communication than it saves. SHARD_GRAD_OP is usually better.
+- The evaluator measures wall-clock time for all {hparams["eval_steps"]} steps. First-step compilation overhead hurts MFU.
+- Loss must stay within 0.3 of reference — aggressive lr/precision changes can cause loss_mismatch failures.
+- Code MUST return final_state (full state dict) for verification.
+
+## Previous attempts — CRITICAL, read carefully
 {history}
 
-Your goal: beat the current best MFU of {mfu:.2f}%.
-Suggest ONE focused improvement. Do NOT repeat any strategy from the history above.
-Return the complete updated train.py file."""
+## Your task
+Beat the current best MFU of {mfu:.2f}%. Suggest ONE focused, NOVEL improvement.
+
+Rules:
+1. Do NOT repeat any strategy from the history above — each must be genuinely different.
+2. Study the current code carefully. Only change what is necessary for your optimization.
+3. Keep working code patterns intact (e.g. FSDP wrapping, state dict gathering).
+4. Prefer small, targeted changes over full rewrites.
+5. Return the complete updated train.py file."""
 
         messages = [{"role": "user", "content": user_msg}]
 

@@ -141,12 +141,15 @@ def test_format_history():
             "mfu": 0,
             "success": False,
             "error": "syntax error in code",
+            "code_diff": "-old_line\n+new_line",
         },
     ]
     output = format_history(history, best_mfu=50.0)
     check("contains IMPROVED step", "[IMPROVED]" in output)
     check("contains FAIL step", "[FAIL]" in output)
     check("contains MFU value", "50.00%" in output)
+    check("contains code diff", "-old_line" in output)
+    check("contains error", "syntax error" in output)
 
 
 def test_save_best():
@@ -261,7 +264,7 @@ def test_llm_client_init():
 
     client = LLMClient()
     check("default provider is chutes", client.provider == "chutes")
-    check("default model is DeepSeek-V3", client.model == "deepseek-ai/DeepSeek-V3")
+    check("default model is DeepSeek-R1", client.model == "deepseek-ai/DeepSeek-R1-0528-TEE")
     check("base_url set", "chutes.ai" in client.base_url)
     check("system prompt loaded", len(client._system_prompt) > 100)
 
