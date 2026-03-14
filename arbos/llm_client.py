@@ -86,7 +86,7 @@ class LLMClient:
                 f"Unknown LLM_PROVIDER '{self.provider}'. "
                 f"Must be one of: chutes, openrouter, anthropic"
             )
-        self.timeout = int(os.environ.get("LLM_TIMEOUT", "300"))
+        self.timeout = int(os.environ.get("LLM_TIMEOUT", "600"))
 
         if self.provider == "anthropic":
             self.api_key = os.environ.get("ANTHROPIC_API_KEY", "")
