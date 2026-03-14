@@ -44,9 +44,20 @@ def _parse_response(raw_text: str) -> LLMResponse:
     if reasoning_match:
         reasoning = reasoning_match.group(1).strip()
 
-    code_match = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
-    if code_match:
-        code = code_match.group(1).strip()
+    # Find all python code blocks; pick the one after CODE: marker, or the largest
+    all_blocks = list(re.finditer(r"```python\s*\n(.*?)```", text, re.DOTALL))
+    if all_blocks:
+        code_section = re.search(r"CODE:\s*\n(.*)", text, re.DOTALL)
+        if code_section:
+            # Find the first code block that starts within or after the CODE: section
+            code_start = code_section.start()
+            for block in all_blocks:
+                if block.start() >= code_start:
+                    code = block.group(1).strip()
+                    break
+        if not code:
+            # Fall back to the largest block (most likely the full file)
+            code = max((b.group(1).strip() for b in all_blocks), key=len)
     elif "def inner_steps" in text:
         lines = text.split("\n")
         code_lines = []
@@ -70,6 +81,11 @@ class LLMClient:
     def __init__(self):
         self._system_prompt = _load_system_prompt()
         self.provider = os.environ.get("LLM_PROVIDER", "chutes")
+        if self.provider not in ("chutes", "openrouter", "anthropic"):
+            raise ValueError(
+                f"Unknown LLM_PROVIDER '{self.provider}'. "
+                f"Must be one of: chutes, openrouter, anthropic"
+            )
         self.timeout = int(os.environ.get("LLM_TIMEOUT", "300"))
 
         if self.provider == "anthropic":
@@ -232,9 +248,10 @@ Rules:
                 logger.warning(
                     f"LLM API error (attempt {attempt}/{max_retries}): HTTP {status} — {detail}"
                 )
+                if status not in (429, 500, 502, 503, 504):
+                    raise
                 if attempt == max_retries:
                     raise
-                # Longer backoff for rate limits (429)
                 wait = 30 * attempt if status == 429 else 2**attempt
                 logger.info(f"Retrying in {wait}s...")
                 time.sleep(wait)
