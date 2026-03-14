@@ -17,12 +17,18 @@ sys.path.insert(0, str(ARBOS_DIR))
 from agent import (  # noqa: E402
     AgentState,
     Attempt,
+    format_diagnostics,
     format_history,
     load_hparams,
     save_best,
     validate_code,
 )
-from llm_client import LLMResponse, _parse_response, _strip_thinking_tags  # noqa: E402
+from llm_client import (  # noqa: E402
+    LLMResponse,
+    _load_system_prompt,
+    _parse_response,
+    _strip_thinking_tags,
+)
 
 PASS = "\033[92mPASS\033[0m"
 FAIL = "\033[91mFAIL\033[0m"
@@ -129,6 +135,38 @@ def test_state_persistence():
             agent_mod.STATE_FILE = orig
 
 
+def test_format_diagnostics():
+    print("\n--- format_diagnostics ---")
+    check("empty diagnostics", format_diagnostics({}) == "")
+    check("None diagnostics", format_diagnostics(None) == "")
+
+    diag_with_checks = {
+        "verification": {
+            "checks_failed": [
+                {"check": "loss_mismatch", "error": "Loss difference 0.45 > 0.3"},
+            ],
+            "gradient_verification": {"relative_error": 0.05},
+        },
+        "reference_loss": 2.45,
+        "candidate_loss": 2.90,
+        "strategy": "fsdp",
+    }
+    text = format_diagnostics(diag_with_checks)
+    check("contains check_failed", "loss_mismatch" in text)
+    check("contains gradient error", "0.05" in text)
+    check("contains reference_loss", "2.45" in text)
+    check("contains candidate_loss", "2.9" in text)
+    check("contains strategy", "fsdp" in text)
+
+    diag_with_params = {
+        "params_changed": {"ratio": 0.82},
+        "trainable_params": {"ratio": 1.0},
+    }
+    text2 = format_diagnostics(diag_with_params)
+    check("contains params_changed_ratio", "0.82" in text2)
+    check("contains trainable_params_ratio", "1.0" in text2)
+
+
 def test_format_history():
     print("\n--- format_history ---")
     check("empty history", format_history([]) == "No previous attempts.")
@@ -141,6 +179,8 @@ def test_format_history():
             "mfu": 0,
             "success": False,
             "error": "syntax error in code",
+            "error_code": "execution_failed",
+            "diagnostics_text": "  reference_loss: 2.45\n  candidate_loss: 2.90",
             "code_diff": "-old_line\n+new_line",
         },
     ]
@@ -150,6 +190,8 @@ def test_format_history():
     check("contains MFU value", "50.00%" in output)
     check("contains code diff", "-old_line" in output)
     check("contains error", "syntax error" in output)
+    check("contains error_code", "execution_failed" in output)
+    check("contains diagnostics", "reference_loss" in output)
 
 
 def test_save_best():
@@ -266,7 +308,7 @@ def test_llm_client_init():
     check("default provider is chutes", client.provider == "chutes")
     check("default model is DeepSeek-R1", client.model == "deepseek-ai/DeepSeek-R1-0528-TEE")
     check("base_url set", "chutes.ai" in client.base_url)
-    check("system prompt loaded", len(client._system_prompt) > 100)
+    check("system prompt loaded", len(_load_system_prompt()) > 100)
 
     os.environ["LLM_PROVIDER"] = "openrouter"
     os.environ["OPENROUTER_API_KEY"] = "test-or-key"
@@ -436,6 +478,7 @@ if __name__ == "__main__":
     test_hparams()
     test_validate_code()
     test_state_persistence()
+    test_format_diagnostics()
     test_format_history()
     test_save_best()
     test_strip_thinking_tags()

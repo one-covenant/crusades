@@ -59,19 +59,16 @@ def setup_logging() -> logging.Logger:
     return log
 
 
-def compute_code_diff(old_code: str, new_code: str, max_lines: int = 20) -> str:
-    """Return a compact unified diff showing only changed lines."""
+def compute_code_diff(old_code: str, new_code: str) -> str:
+    """Return a unified diff showing changed lines."""
     old_lines = old_code.splitlines(keepends=True)
     new_lines = new_code.splitlines(keepends=True)
     diff = list(
-        difflib.unified_diff(old_lines, new_lines, fromfile="best.py", tofile="candidate.py", n=1)
+        difflib.unified_diff(old_lines, new_lines, fromfile="best.py", tofile="candidate.py", n=2)
     )
     if not diff:
         return "(no changes)"
-    # Skip the --- +++ header, keep only +/- lines with 1 line of context
     meaningful = [line.rstrip("\n") for line in diff[2:] if line.startswith(("+", "-", "@"))]
-    if len(meaningful) > max_lines:
-        meaningful = meaningful[:max_lines] + [f"... ({len(meaningful) - max_lines} more lines)"]
     return "\n".join(meaningful)
 
 
@@ -82,6 +79,8 @@ class Attempt:
     mfu: float
     success: bool
     error: str | None = None
+    error_code: str | None = None
+    diagnostics_text: str | None = None
     code_diff: str | None = None
     timestamp: str = ""
 
@@ -149,27 +148,86 @@ def save_best(code: str, step: int, mfu: float) -> Path:
     return path
 
 
+def format_diagnostics(diag: dict) -> str:
+    """Format Basilica diagnostics dict into readable text for the LLM."""
+    if not diag:
+        return ""
+    parts = []
+
+    verification = diag.get("verification", {})
+    if verification:
+        failed = verification.get("checks_failed", [])
+        if failed:
+            for check in failed:
+                name = check.get("check", "unknown")
+                err = check.get("error", "")
+                parts.append(f"  check_failed: {name} — {err}")
+        passed = verification.get("checks_passed", [])
+        if passed:
+            parts.append(f"  checks_passed: {', '.join(str(c) for c in passed)}")
+        grad = verification.get("gradient_verification", {})
+        if grad:
+            for k, v in grad.items():
+                parts.append(f"  gradient_{k}: {v}")
+        weight = verification.get("weight_verification", {})
+        if weight:
+            for k, v in weight.items():
+                parts.append(f"  weight_{k}: {v}")
+
+    for key in (
+        "reference_loss",
+        "candidate_loss",
+        "strategy",
+        "expected_tokens",
+        "actual_tokens",
+        "total_unique_tokens",
+        "model_params",
+        "gpu_peak_tflops",
+    ):
+        if key in diag:
+            parts.append(f"  {key}: {diag[key]}")
+
+    params_changed = diag.get("params_changed", {})
+    if params_changed:
+        for k, v in params_changed.items():
+            parts.append(f"  params_changed_{k}: {v}")
+
+    trainable = diag.get("trainable_params", {})
+    if trainable:
+        for k, v in trainable.items():
+            parts.append(f"  trainable_{k}: {v}")
+
+    return "\n".join(parts)
+
+
 def format_history(history: list[dict], best_mfu: float = 0.0, max_entries: int = 15) -> str:
     if not history:
         return "No previous attempts."
     recent = history[-max_entries:]
     lines = []
+    running_best = 0.0
     for h in recent:
         mfu_val = h.get("mfu", 0)
         is_success = h.get("success", False)
-        status = (
-            "IMPROVED"
-            if is_success and mfu_val > 0 and mfu_val >= best_mfu
-            else "OK"
-            if is_success and mfu_val > 0
-            else "FAIL"
-        )
+        if is_success and mfu_val > running_best:
+            status = "IMPROVED"
+            running_best = mfu_val
+        elif is_success and mfu_val > 0:
+            status = "OK"
+        else:
+            status = "FAIL"
         mfu_str = f"{mfu_val:.2f}%" if mfu_val > 0 else "N/A"
         entry = f"### Step {h['step']}: [{status}] MFU={mfu_str}\n"
-        entry += f"Strategy: {h['reasoning'][:300]}\n"
+        entry += f"Strategy: {h['reasoning']}\n"
+
+        if h.get("error_code"):
+            entry += f"Error code: {h['error_code']}\n"
 
         if h.get("error"):
-            entry += f"Error: {h['error'][:200]}\n"
+            entry += f"Error: {h['error']}\n"
+
+        if h.get("diagnostics_text"):
+            entry += f"Diagnostics:\n{h['diagnostics_text']}\n"
 
         if h.get("code_diff") and h["code_diff"] != "(no changes)":
             entry += f"Changes made:\n```\n{h['code_diff']}\n```\n"
@@ -269,6 +327,10 @@ def run_agent(args):
                 )
             else:
                 log.warning(f"Initial test failed: {result.error}")
+                if result.error_code:
+                    log.warning(f"Error code: {result.error_code}")
+                if result.diagnostics:
+                    log.debug(f"Diagnostics: {result.diagnostics}")
                 log.info("Starting with MFU=0 (will accept any passing result)")
                 state.add_attempt(
                     Attempt(
@@ -277,6 +339,8 @@ def run_agent(args):
                         mfu=0.0,
                         success=False,
                         error=result.error,
+                        error_code=result.error_code,
+                        diagnostics_text=format_diagnostics(result.diagnostics),
                     )
                 )
         else:
@@ -381,14 +445,21 @@ def run_agent(args):
                 log.warning(f"Evaluation FAILED: {result.error}")
                 if result.error_code:
                     log.warning(f"Error code: {result.error_code}")
+                if result.diagnostics:
+                    log.debug(f"Diagnostics: {result.diagnostics}")
+
+                diag_text = format_diagnostics(result.diagnostics)
+
                 consecutive_failures += 1
                 state.add_attempt(
                     Attempt(
                         step=step,
                         reasoning=response.reasoning,
-                        mfu=0.0,
+                        mfu=result.mfu,
                         success=False,
                         error=result.error,
+                        error_code=result.error_code,
+                        diagnostics_text=diag_text,
                         code_diff=diff,
                     )
                 )
@@ -441,6 +512,7 @@ def run_agent(args):
                     mfu=result.mfu,
                     success=True,
                     code_diff=diff,
+                    diagnostics_text=f"  tps: {result.tps:.1f}\n  wall_time: {result.wall_time:.1f}s\n  tokens: {result.total_tokens}",
                 )
             )
             state.save()

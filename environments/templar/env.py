@@ -3356,7 +3356,7 @@ asyncio.run(main())
         return {
             "task_id": request.task_id,
             "success": False,
-            "error": f"No EVAL_RESULT in torchrun output (exit {proc.returncode}): {stdout_text[:300]}",
+            "error": f"No EVAL_RESULT in torchrun output (exit {proc.returncode}): {stdout_text[-1000:]}",
             "seed": request.seed,
             "mfu": 0.0,
             "tps": 0.0,

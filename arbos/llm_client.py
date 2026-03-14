@@ -34,8 +34,22 @@ def _strip_thinking_tags(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
+def _extract_think_summary(raw_text: str, max_chars: int = 500) -> str:
+    """Extract the last paragraph from <think> tags as a reasoning summary."""
+    match = re.search(r"<think>(.*?)</think>", raw_text, re.DOTALL)
+    if not match:
+        return ""
+    thinking = match.group(1).strip()
+    paragraphs = [p.strip() for p in thinking.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return ""
+    summary = paragraphs[-1]
+    return summary[:max_chars]
+
+
 def _parse_response(raw_text: str) -> LLMResponse:
     """Extract reasoning and code from LLM response."""
+    think_summary = _extract_think_summary(raw_text)
     text = _strip_thinking_tags(raw_text)
     reasoning = ""
     code = ""
@@ -43,6 +57,8 @@ def _parse_response(raw_text: str) -> LLMResponse:
     reasoning_match = re.search(r"REASONING:\s*\n?(.*?)(?=\nCODE:|\n```)", text, re.DOTALL)
     if reasoning_match:
         reasoning = reasoning_match.group(1).strip()
+    if not reasoning:
+        reasoning = think_summary
 
     # Find all python code blocks; pick the one after CODE: marker, or the largest
     all_blocks = list(re.finditer(r"```python\s*\n(.*?)```", text, re.DOTALL))
@@ -79,7 +95,6 @@ class LLMClient:
     """Multi-provider LLM client."""
 
     def __init__(self):
-        self._system_prompt = _load_system_prompt()
         self.provider = os.environ.get("LLM_PROVIDER", "chutes")
         if self.provider not in ("chutes", "openrouter", "anthropic"):
             raise ValueError(
@@ -122,7 +137,7 @@ class LLMClient:
         body = {
             "model": self.model,
             "max_tokens": 8192,
-            "system": self._system_prompt,
+            "system": _load_system_prompt(),
             "messages": messages,
         }
         with httpx.Client(timeout=self.timeout) as client:
@@ -141,7 +156,7 @@ class LLMClient:
             "model": self.model,
             "max_tokens": 8192,
             "messages": [
-                {"role": "system", "content": self._system_prompt},
+                {"role": "system", "content": _load_system_prompt()},
                 *messages,
             ],
         }
