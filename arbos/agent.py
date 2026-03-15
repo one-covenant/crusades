@@ -29,6 +29,9 @@ from datetime import datetime
 from pathlib import Path
 
 ARBOS_DIR = Path(__file__).parent
+PROJECT_ROOT = ARBOS_DIR.parent
+if str(PROJECT_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
 RUNS_DIR = ARBOS_DIR / "runs"
 BEST_DIR = ARBOS_DIR / "best_submissions"
 STATE_FILE = ARBOS_DIR / "state.json"
@@ -135,6 +138,16 @@ def validate_code(code: str) -> tuple[bool, str]:
         compile(code, "<candidate>", "exec")
     except SyntaxError as e:
         return False, f"Syntax error: {e}"
+
+    try:
+        from security_scanner import validate_code_security
+
+        ok, msg = validate_code_security(code)
+        if not ok:
+            return False, msg
+    except ImportError:
+        pass
+
     return True, "OK"
 
 
@@ -392,19 +405,28 @@ def run_agent(args):
 
             log.info(f"Strategy: {response.reasoning}")
 
+            diff = compute_code_diff(best_code, response.code)
+
             valid, msg = validate_code(response.code)
             if not valid:
                 log.warning(f"Invalid code: {msg}")
+                error_code = (
+                    "security_violation" if "Security violation" in msg else "validation_error"
+                )
                 consecutive_failures += 1
                 state.add_attempt(
                     Attempt(
-                        step=step, reasoning=response.reasoning, mfu=0.0, success=False, error=msg
+                        step=step,
+                        reasoning=response.reasoning,
+                        mfu=0.0,
+                        success=False,
+                        error=msg,
+                        error_code=error_code,
+                        code_diff=diff,
                     )
                 )
                 state.save()
                 continue
-
-            diff = compute_code_diff(best_code, response.code)
             candidate_path = RUNS_DIR / f"step_{step:04d}_candidate.py"
             candidate_path.write_text(response.code)
 

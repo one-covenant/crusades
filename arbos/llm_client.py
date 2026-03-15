@@ -34,17 +34,32 @@ def _strip_thinking_tags(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
-def _extract_think_summary(raw_text: str, max_chars: int = 500) -> str:
-    """Extract the last paragraph from <think> tags as a reasoning summary."""
+def _extract_think_summary(raw_text: str, max_chars: int = 3000) -> str:
+    """Extract key reasoning from <think> tags.
+
+    Takes the last several paragraphs (conclusion/decision section) which typically
+    contains the most actionable reasoning from DeepSeek-R1's chain-of-thought.
+    Falls back to single-paragraph or line-based splitting for short think blocks.
+    """
     match = re.search(r"<think>(.*?)</think>", raw_text, re.DOTALL)
     if not match:
         return ""
     thinking = match.group(1).strip()
+    if not thinking:
+        return ""
+
     paragraphs = [p.strip() for p in thinking.split("\n\n") if p.strip()]
     if not paragraphs:
-        return ""
-    summary = paragraphs[-1]
-    return summary[:max_chars]
+        lines = [ln.strip() for ln in thinking.split("\n") if ln.strip()]
+        if lines:
+            tail = "\n".join(lines[-20:])
+            return tail[-max_chars:] if len(tail) > max_chars else tail
+        return thinking[-max_chars:]
+
+    tail = "\n\n".join(paragraphs[-7:])
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return tail
 
 
 def _parse_response(raw_text: str) -> LLMResponse:
@@ -54,11 +69,29 @@ def _parse_response(raw_text: str) -> LLMResponse:
     reasoning = ""
     code = ""
 
-    reasoning_match = re.search(r"REASONING:\s*\n?(.*?)(?=\nCODE:|\n```)", text, re.DOTALL)
-    if reasoning_match:
-        reasoning = reasoning_match.group(1).strip()
+    reasoning_patterns = [
+        r"(?:\*\*)?REASONING:?(?:\*\*)?:?\s*\n?(.*?)(?=\n(?:\*\*)?CODE|\n```)",
+        r"#+\s*REASONING:?\s*\n?(.*?)(?=\n#+\s*CODE|\nCODE:|\n```)",
+        r"^(.*?)(?=\nCODE:|\n```python)",
+    ]
+    for pattern in reasoning_patterns:
+        m = re.search(pattern, text, re.DOTALL)
+        if m and m.group(1).strip():
+            reasoning = re.sub(r"^\*\*\s*", "", m.group(1).strip())
+            break
+
+    if think_summary:
+        if reasoning:
+            reasoning = f"{reasoning}\n\n[From chain-of-thought]: {think_summary}"
+        else:
+            reasoning = think_summary
+
     if not reasoning:
-        reasoning = think_summary
+        pre_code = re.split(r"```python", text, maxsplit=1)[0].strip()
+        if pre_code and len(pre_code) > 20:
+            reasoning = pre_code[-2000:]
+        else:
+            reasoning = "No reasoning provided."
 
     # Find all python code blocks; pick the one after CODE: marker, or the largest
     all_blocks = list(re.finditer(r"```python\s*\n(.*?)```", text, re.DOTALL))
@@ -136,15 +169,33 @@ class LLMClient:
         }
         body = {
             "model": self.model,
-            "max_tokens": 8192,
+            "max_tokens": 16384,
+            "temperature": 0.6,
             "system": _load_system_prompt(),
             "messages": messages,
         }
+        if "extended" in self.model.lower() or "thinking" in self.model.lower():
+            body.pop("temperature", None)
         with httpx.Client(timeout=self.timeout) as client:
             resp = client.post(f"{self.base_url}/messages", headers=headers, json=body)
             resp.raise_for_status()
             data = resp.json()
             return data["content"][0]["text"]
+
+    def _model_traits(self) -> dict:
+        """Detect model family traits for optimal API usage."""
+        m = self.model.lower()
+        is_openai_reasoning = bool(re.search(r"\bo[13][\b\-]", m))
+        is_deepseek_reasoning = "deepseek" in m and "r1" in m
+        is_qwq = "qwq" in m
+        is_reasoning = is_openai_reasoning or is_deepseek_reasoning or is_qwq
+
+        return {
+            "merge_system_into_user": is_reasoning,
+            "supports_temperature": not is_openai_reasoning,
+            "system_role": "developer" if is_openai_reasoning else "system",
+            "has_think_tags": is_deepseek_reasoning or is_qwq,
+        }
 
     def _call_openai_compat(self, messages: list[dict]) -> str:
         """Call OpenAI-compatible API (Chutes, OpenRouter)."""
@@ -152,14 +203,35 @@ class LLMClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        system_prompt = _load_system_prompt()
+        traits = self._model_traits()
+
+        if traits["merge_system_into_user"]:
+            api_messages = []
+            for msg in messages:
+                if msg["role"] == "user":
+                    api_messages.append(
+                        {
+                            "role": "user",
+                            "content": f"{system_prompt}\n\n---\n\n{msg['content']}",
+                        }
+                    )
+                else:
+                    api_messages.append(msg)
+        else:
+            api_messages = [
+                {"role": traits["system_role"], "content": system_prompt},
+                *messages,
+            ]
+
         body = {
             "model": self.model,
-            "max_tokens": 8192,
-            "messages": [
-                {"role": "system", "content": _load_system_prompt()},
-                *messages,
-            ],
+            "max_tokens": 16384,
+            "messages": api_messages,
         }
+        if traits["supports_temperature"]:
+            body["temperature"] = 0.6
+
         with httpx.Client(timeout=self.timeout) as client:
             resp = client.post(
                 f"{self.base_url}/chat/completions",
@@ -190,32 +262,25 @@ class LLMClient:
 {code}
 ```
 
-## Evaluation environment
-- Model: {hparams["benchmark_model_name"]}
-- Batch size: {hparams["benchmark_batch_size"]}
-- Sequence length: {hparams["benchmark_sequence_length"]}
-- Steps: {hparams["eval_steps"]}
-- GPUs: {num_gpus} x A100 80GB SXM (NVLink connected)
-- Peak FLOPs: 312 TFLOPS per GPU (bf16)
+## Hardware
+- {num_gpus}x A100 80GB SXM (NVLink), 312 TFLOPS bf16 peak each
+- Model: {hparams["benchmark_model_name"]} (~7B params — fits on a single GPU)
+- Batch: {hparams["benchmark_batch_size"]}, Seq len: {hparams["benchmark_sequence_length"]}, Steps: {hparams["eval_steps"]}
 
-## Key constraints
-- With only {num_gpus} GPUs, FULL_SHARD adds more communication than it saves. SHARD_GRAD_OP is usually better.
-- The evaluator measures wall-clock time for all {hparams["eval_steps"]} steps. First-step compilation overhead hurts MFU.
-- Loss must stay within 0.3 of reference — aggressive lr/precision changes can cause loss_mismatch failures.
-- Code MUST return final_state (full state dict) for verification.
-
-## Previous attempts — CRITICAL, read carefully
+## Previous attempts — study these carefully, learn from successes AND failures
 {history}
 
-## Your task
-Beat the current best MFU of {mfu:.2f}%. Suggest ONE focused, NOVEL improvement.
+## Your mission
+Current best MFU: {mfu:.2f}%. BEAT IT. Push MFU as high as physically possible.
 
-Rules:
-1. Do NOT repeat any strategy from the history above — each must be genuinely different.
-2. Study the current code carefully. Only change what is necessary for your optimization.
-3. Keep working code patterns intact (e.g. FSDP wrapping, state dict gathering).
-4. Prefer small, targeted changes over full rewrites.
-5. Return the complete updated train.py file."""
+You are NOT limited to tweaking the current approach. You can:
+- Switch parallelism strategy entirely (FSDP → DDP, or TP, or something creative)
+- Rewrite the training loop from scratch if needed
+- Combine multiple optimizations in one attempt
+- Try radical, unconventional approaches
+
+DO NOT repeat a strategy that already failed. DO learn from what worked.
+Return the COMPLETE updated train.py file."""
 
         messages = [{"role": "user", "content": user_msg}]
 

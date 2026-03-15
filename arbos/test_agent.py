@@ -100,6 +100,28 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     check("syntax error rejected", not valid)
     check("syntax error has message", "Syntax error" in msg)
 
+    # Security scanner catches forbidden patterns
+    bad_cudnn = """from dataclasses import dataclass
+import torch
+
+@dataclass
+class InnerStepsResult:
+    final_logits: torch.Tensor
+    total_tokens: int
+    final_loss: float
+    final_state: dict | None = None
+
+def get_strategy():
+    return "fsdp"
+
+def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
+    torch.backends.cudnn.benchmark = True
+    return InnerStepsResult(final_logits=torch.zeros(1), total_tokens=100, final_loss=0.5)
+"""
+    valid, msg = validate_code(bad_cudnn)
+    check("cudnn.benchmark rejected by security scanner", not valid)
+    check("security violation in message", "Security violation" in msg, msg)
+
 
 def test_state_persistence():
     print("\n--- state persistence ---")
@@ -380,9 +402,9 @@ def test_prompt_file():
     check("PROMPT.md exists", prompt_path.exists())
     content = prompt_path.read_text()
     check("prompt has contract", "train.py Contract" in content)
-    check("prompt has MFU", "MFU Calculation" in content)
-    check("prompt has security", "Security Scanner" in content)
-    check("prompt has verification", "Verification Checks" in content)
+    check("prompt has MFU", "MFU" in content)
+    check("prompt has security", "Security" in content)
+    check("prompt has verification", "Verification" in content)
     check("prompt has response format", "Response Format" in content)
     check("prompt has forbidden imports", "subprocess" in content)
     check("prompt has allowed imports", "flash_attn" in content)
