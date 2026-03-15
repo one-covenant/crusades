@@ -230,7 +230,7 @@ class LLMClient:
             "messages": api_messages,
         }
         if traits["supports_temperature"]:
-            body["temperature"] = 0.6
+            body["temperature"] = float(os.environ.get("LLM_TEMPERATURE", "0.6"))
 
         with httpx.Client(timeout=self.timeout) as client:
             resp = client.post(
@@ -267,20 +267,10 @@ class LLMClient:
 - Model: {hparams["benchmark_model_name"]}
 - Batch: {hparams["benchmark_batch_size"]}, Seq len: {hparams["benchmark_sequence_length"]}, Steps: {hparams["eval_steps"]}
 
-## Previous attempts — study these carefully, learn from successes AND failures
+## Previous attempts
 {history}
 
-## Your mission
-Current best MFU: {mfu:.2f}%. BEAT IT. Push MFU as high as physically possible.
-
-You are NOT limited to tweaking the current approach. You can:
-- Switch parallelism strategy entirely (FSDP → DDP, or TP, or something creative)
-- Rewrite the training loop from scratch if needed
-- Combine multiple optimizations in one attempt
-- Try radical, unconventional approaches
-
-DO NOT repeat a strategy that already failed. DO learn from what worked.
-Return the COMPLETE updated train.py file."""
+Current best MFU: {mfu:.2f}%. Beat it. Return the COMPLETE updated train.py."""
 
         messages = [{"role": "user", "content": user_msg}]
 

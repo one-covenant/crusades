@@ -85,6 +85,7 @@ class Attempt:
     error_code: str | None = None
     diagnostics_text: str | None = None
     code_diff: str | None = None
+    candidate_code: str | None = None
     timestamp: str = ""
 
     def __post_init__(self):
@@ -104,6 +105,9 @@ class AgentState:
         self.history.append(asdict(attempt))
         if len(self.history) > 50:
             self.history = self.history[-50:]
+        # Only keep candidate_code on the most recent failed entry to limit state size
+        for h in self.history[:-1]:
+            h.pop("candidate_code", None)
 
     def save(self):
         STATE_FILE.write_text(json.dumps(asdict(self), indent=2))
@@ -246,6 +250,17 @@ def format_history(history: list[dict], best_mfu: float = 0.0, max_entries: int 
             entry += f"Changes made:\n```\n{h['code_diff']}\n```\n"
 
         lines.append(entry)
+
+    # Include the full failing code from the most recent failed attempt so the
+    # LLM can see exactly what broke (diffs alone are hard to reason about for
+    # strategy switches like FSDP → DDP).
+    last = recent[-1]
+    if not last.get("success") and last.get("candidate_code"):
+        lines.append(
+            f"\n### MOST RECENT FAILING CODE (Step {last['step']}):\n"
+            f"```python\n{last['candidate_code']}\n```\n"
+        )
+
     return "\n".join(lines)
 
 
@@ -423,6 +438,7 @@ def run_agent(args):
                         error=msg,
                         error_code=error_code,
                         code_diff=diff,
+                        candidate_code=response.code,
                     )
                 )
                 state.save()
@@ -458,6 +474,7 @@ def run_agent(args):
                         success=False,
                         error=str(e),
                         code_diff=diff,
+                        candidate_code=response.code,
                     )
                 )
                 state.save()
@@ -483,6 +500,7 @@ def run_agent(args):
                         error_code=result.error_code,
                         diagnostics_text=diag_text,
                         code_diff=diff,
+                        candidate_code=response.code,
                     )
                 )
                 state.save()

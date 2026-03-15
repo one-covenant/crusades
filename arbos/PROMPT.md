@@ -29,8 +29,10 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1) 
 - Python 3.11, PyTorch 2.x stable (NOT nightly), flash_attn installed
 - `optimizer` argument is None for multi-GPU — create your own
 - `torch.distributed` is ALREADY initialized — do NOT call `init_process_group()` or `destroy_process_group()`
-- Model is ALREADY on the correct device — do NOT call `model.to(device)` unless changing dtype
 - `dist.get_rank()` and `dist.get_world_size()` work immediately
+- `device` parameter is a `torch.device` (e.g. `torch.device('cuda:0')`)
+- **FSDP**: handles device placement via `device_id=device` — no manual `model.to(device)` needed
+- **DDP**: does NOT manage device placement — you MUST call `model = model.to(device)` before `DDP(model, ...)` to ensure all parameters AND buffers are on GPU. Skipping this causes "Expected all tensors on same device, cuda:0 and cpu" errors.
 - FSDP/DDP: each GPU gets different data shards. TP: all GPUs get same data.
 
 ## Verification Thresholds
@@ -64,23 +66,31 @@ Your code is scanned locally before GPU evaluation. If you hit a security violat
 
 2. `torch.compile(model)` breaks `state_dict()` for ALL strategies → only compile individual functions, NOT the model object. For FSDP specifically, it breaks `FSDP.state_dict_type()` causing `incomplete_final_state`.
 
-3. `torch.compile` causes OOM with CUDA Graphs (~4GB extra per GPU). Only compile small functions (e.g., forward-only), never the full model. Wrap in try/except.
+3. **Do NOT use `torch.cuda.CUDAGraph()` directly** — transformer models have dropout/RNG operations incompatible with graph capture. `torch.compile` with default mode handles graph optimization safely when possible.
 
-4. If using DDP: it already syncs gradients → do NOT add manual `dist.all_reduce()` on gradients (doubles them, fails verification)
+4. `torch.compile` can cause OOM (~4GB extra per GPU). Only compile small functions (e.g., forward-only), never the full model. **Important**: `torch.compile()` errors happen on FIRST CALL, not at definition time. Wrap the first call in try/except, not just the compile setup.
 
-5. Nightly-only APIs (`CheckpointImpl`, `_apply_ac_to_model`) don't exist in stable PyTorch — do NOT use them
+5. If using DDP: it already syncs gradients → do NOT add manual `dist.all_reduce()` on gradients (doubles them, fails verification)
 
-6. Always `from dataclasses import dataclass` — it's not available without explicit import
+6. Nightly-only APIs (`CheckpointImpl`, `_apply_ac_to_model`) don't exist in stable PyTorch — do NOT use them
 
-7. **Activation checkpointing with Qwen2 layers is HARD**: Qwen2DecoderLayer.forward() takes keyword arguments (`attention_mask`, `position_ids`, `past_key_values`, `use_cache`, `cache_position`, `position_embeddings`). `torch.utils.checkpoint.checkpoint()` needs `use_reentrant=False` to properly handle kwargs. Do NOT naively wrap layers — it will fail with `Unexpected keyword arguments`. If you can't get it working, skip checkpointing entirely.
+7. Always `from dataclasses import dataclass` — it's not available without explicit import
 
-8. `torch.compile` with `mode="max-autotune-no-cudagraphs"` or `mode="max-autotune"` causes weight divergence beyond verification threshold (0.008). Stick to `mode="default"` or skip compile.
+8. **Activation checkpointing with Qwen2 layers is HARD**: Qwen2DecoderLayer.forward() takes keyword arguments (`attention_mask`, `position_ids`, `past_key_values`, `use_cache`, `cache_position`, `position_embeddings`). `torch.utils.checkpoint.checkpoint()` needs `use_reentrant=False` to properly handle kwargs. Do NOT naively wrap layers — it will fail with `Unexpected keyword arguments`. If you can't get it working, skip checkpointing entirely.
 
-9. `bucket_cap_mb` and `gradient_as_bucket_view` are NOT valid FSDP constructor parameters. These are DDP parameters.
+9. `torch.compile` with `mode="max-autotune-no-cudagraphs"` or `mode="max-autotune"` causes weight divergence beyond verification threshold (0.008). Stick to `mode="default"` or skip compile.
 
-10. For FSDP token counting: each GPU processes different data. `total_tokens` must count only THIS rank's tokens, not sum across ranks. If you double-count, verification fails with `token_count_mismatch`.
+10. `bucket_cap_mb` and `gradient_as_bucket_view` are NOT valid FSDP constructor parameters. These are DDP parameters.
 
-11. `.view(-1)` fails on non-contiguous tensors inside `torch.compile`. Use `.reshape(-1)` or `.contiguous().view(-1)` instead.
+11. For FSDP token counting: each GPU processes different data. `total_tokens` must count only THIS rank's tokens, not sum across ranks. If you double-count, verification fails with `token_count_mismatch`.
+
+12. `.view(-1)` fails on non-contiguous tensors inside `torch.compile`. Use `.reshape(-1)` or `.contiguous().view(-1)` instead.
+
+13. **`torch.compile` + DDP is incompatible**: `torch.compile(fn, fullgraph=True)` called inside a DDP-wrapped model fails because DDP's internal `Logger.set_runtime_stats_and_log()` cannot be traced by Dynamo. Even `fullgraph=False` can fail. If using DDP, avoid `torch.compile` entirely or compile ONLY pure functions that don't touch the DDP wrapper.
+
+14. **FSDP `NO_SHARD` still requires `device_id=device`**: Switching from `SHARD_GRAD_OP` to `NO_SHARD` doesn't change FSDP's device management — you MUST still pass `device_id=device` in the FSDP constructor. Missing this causes "Expected all tensors on same device" errors identical to DDP device issues.
+
+15. **`torch.compile` on forward gives ~12% MFU boost**: Empirically, removing `torch.compile` from a working FSDP setup drops MFU from ~55% to ~43%. The compile overhead is small compared to the benefit. Always keep `torch.compile(fwd, mode="default")` on the forward function.
 
 ## Proven Optimization Patterns (use as building blocks)
 
@@ -102,7 +112,7 @@ Your code is scanned locally before GPU evaluation. If you hit a security violat
        try: return torch.compile(fwd, mode="default", dynamic=False)
        except Exception: return fwd
    ```
-   Cache by model id to avoid recompilation. Wrap in try/except — if it OOMs or fails, fall back to uncompiled.
+   Cache by model id to avoid recompilation. **Critical**: compile errors happen on first call, not setup. Use a `_compile_failed` flag: if first call raises, fall back to uncompiled `fwd` for remaining steps.
 
 3. **FSDP communication overlap**: `limit_all_gathers=True, forward_prefetch=True`
 
@@ -121,6 +131,7 @@ Your code is scanned locally before GPU evaluation. If you hit a security violat
        all_labels.append(batch[:, 1:].contiguous())
    torch.cuda.synchronize(device)
    ```
+   **CRITICAL**: labels must come from `batch[:, 1:]`, NOT from `inputs[:, 1:]`. Inputs are `batch[:, :-1]`, so `inputs[:, 1:]` = `batch[:, 1:-1]` which is one token short and causes shape mismatch assertion errors.
 
 7. **TF32 matmul**: `torch.backends.cuda.matmul.allow_tf32 = True` — free throughput boost.
 
@@ -139,39 +150,79 @@ with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
 
 **DDP**:
 ```python
+# BEFORE wrapping: model = model.to(device)  # ensures all params+buffers on GPU
+# model = DDP(model, device_ids=[device], output_device=device)
 full_state = model.module.state_dict() if dist.get_rank() == 0 else None
 ```
 
 **TP**: return `model.state_dict()` directly (no module wrapper).
 
-## Memory Reality (read this before choosing a strategy)
+## Memory Reality
 
 3B bf16 model = ~6GB. Full training setup per GPU:
 - Model: 6GB + AdamW fp32 states: 12GB + Gradients: 6GB + Activations: ~10GB = **~34GB on 80GB**
-- With 3B, **DDP fits comfortably** on a single A100 80GB — no sharding needed
-- FSDP still works but adds unnecessary communication overhead for this model size
-- Fastest path: try DDP with fused AdamW + TF32 + flash CE + batch prefetch + compiled forward
+- Plenty of headroom on 80GB — all strategies (DDP, FSDP, TP) are viable
+- 2x A100 SXM connected via NVLink (600 GB/s bidirectional) — communication is fast
 
-## IMPORTANT: Start Simple, Then Layer On
+## IMPORTANT: Don't Repeat Failures
 
 If previous attempts failed, DO NOT repeat the same approach with minor tweaks. Instead:
-1. First get a WORKING improvement over baseline — even +0.5% MFU counts
-2. Easiest win: switch to **DDP** with flash CE + fused AdamW + TF32 + batch prefetch + compiled forward (3B model fits easily in DDP)
-3. FSDP works but adds unnecessary communication overhead for 3B — DDP is simpler and faster
-4. Only add complexity (compile, streams, custom kernels) AFTER you have a working improvement
-5. Read the error messages carefully — they tell you exactly what went wrong
+1. Read error messages carefully — they tell you exactly what went wrong
+2. Try a fundamentally DIFFERENT strategy or optimization direction
+3. First get a WORKING improvement — even +0.5% MFU counts
+4. Only add complexity AFTER you have a working baseline
+5. Each attempt should explore something new
 
 ## Optimization Directions
 
-If your current approach is stuck, try something DIFFERENT — don't repeat similar strategies:
+FIRST optimize the current working approach — there are likely significant gains without
+changing the parallelism strategy. Only switch strategies after exhausting optimizations on
+the current one OR when you have a strong reason another strategy is fundamentally faster.
 
-- **Sharding strategy**: With 3B model, DDP is the simplest and likely fastest. FSDP adds unnecessary overhead. Try DDP first.
-- **FSDP backward prefetch**: `backward_prefetch=BackwardPrefetch.BACKWARD_PRE` overlaps gradient comm with compute — but use ONLY with `mode="default"` compile, not aggressive modes.
-- **Compute**: flash CE loss, fused AdamW, TF32, `torch.compile(fwd, mode="default")` for forward-only
-- **Data pipeline**: prefetch ALL batches upfront with `non_blocking=True` + `synchronize()`, `.contiguous()`, CUDA streams
-- **Python overhead**: local variable binding in hot loops (`opt_step = optimizer.step`), avoid per-step allocations
-- **Learning rate**: experiment with higher LR (e.g., 3e-4) or warmup — doesn't affect MFU directly but can change training dynamics
-- **Radical**: custom triton kernels, fused attention+MLP, weight-only bf16 optimizer states
+Think about WHERE time is spent: forward pass, backward pass, optimizer step, communication, data loading, Python overhead. Target the biggest bottleneck.
+
+**Parallelism strategies** (optimize the CURRENT strategy first before switching!):
+- **FSDP**: Already proven to work. Tune `sharding_strategy` (SHARD_GRAD_OP vs FULL_SHARD vs NO_SHARD), `backward_prefetch`, `limit_all_gathers`, `forward_prefetch`. Lots of room to optimize.
+- **DDP**: Simpler for 3B model. Only syncs gradients. Must call `model.to(device)` first. Use `gradient_as_bucket_view=True`, tune `bucket_cap_mb`.
+- **TP (Tensor Parallelism)**: Splits layers across GPUs. NVLink makes TP fast. All GPUs get same data — no data sharding. Worth trying for max utilization.
+- **Hybrid**: Combine strategies creatively.
+
+**Compute optimizations**:
+- Flash CE loss (flash_attn.losses.cross_entropy) — faster than F.cross_entropy
+- Fused AdamW (`fused=True`) — single CUDA kernel for optimizer step
+- TF32 matmul (`torch.backends.cuda.matmul.allow_tf32 = True`) — free throughput boost
+- `torch.compile(fwd, mode="default")` on forward-only function (never the model)
+- Selective compilation — compile individual operations or layers, not everything
+- `torch.compile` with `fullgraph=True` for zero graph breaks (if possible)
+
+**Communication optimizations**:
+- FSDP: `backward_prefetch=BackwardPrefetch.BACKWARD_PRE` overlaps gradient comm with compute
+- FSDP: `limit_all_gathers=True, forward_prefetch=True`
+- DDP: `gradient_as_bucket_view=True, bucket_cap_mb=25` — tune bucket size
+- Overlap compute and communication with CUDA streams
+
+**Data pipeline**:
+- Prefetch ALL batches upfront with `non_blocking=True` + `synchronize()` once
+- `.contiguous()` on all tensors — avoids implicit copies
+- Dedicated CUDA stream for data transfers
+
+**Memory & throughput**:
+- bf16 everywhere (model already in bf16)
+- Gradient accumulation — process more tokens per optimizer step
+- Activation checkpointing (HARD with Qwen2 — see pitfall 8, but huge memory savings if done right)
+- BF16 optimizer states (instead of FP32) — halves optimizer memory
+
+**Python overhead**:
+- Local variable binding in hot loops (`opt_step = optimizer.step`)
+- Avoid per-step allocations, conditionals, and Python-level loops where possible
+- Pre-compute everything possible before the training loop
+
+**Radical ideas**:
+- Custom Triton kernels for fused operations
+- Fused backward + optimizer step
+- Pipeline within a single step (forward next batch while backward current)
+- Custom autograd functions to fuse backward computations
+- Weight-only bf16 optimizer states
 
 ## Response Format
 
