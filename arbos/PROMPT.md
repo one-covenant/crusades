@@ -120,7 +120,7 @@ Your code is scanned locally before GPU evaluation. If you hit a security violat
 
 5. **Model preparation** — disable unnecessary outputs before wrapping:
    `model.config.use_cache = False`, `output_hidden_states = False`, `output_attentions = False`
-   Fix `layer_idx` to prevent dynamo recompilation on all attention layers.
+   Fix `layer_idx` to prevent dynamo recompilation: set ALL layers to the SAME value (e.g., `layer.self_attn.layer_idx = 0`). Do NOT use the actual index (`= i`) — that causes dynamo to recompile a separate graph per layer (36 layers × ~4GB each = OOM crash).
 
 6. **Batch pre-loading** — load all batches upfront with `non_blocking=True`, call `torch.cuda.synchronize()` once:
    ```python
@@ -163,6 +163,13 @@ full_state = model.module.state_dict() if dist.get_rank() == 0 else None
 - Model: 6GB + AdamW fp32 states: 12GB + Gradients: 6GB + Activations: ~10GB = **~34GB on 80GB**
 - Plenty of headroom on 80GB — all strategies (DDP, FSDP, TP) are viable
 - 2x A100 SXM connected via NVLink (600 GB/s bidirectional) — communication is fast
+
+## Error Signals
+
+- **HTTP 502 Bad Gateway** = your code CRASHED the evaluation container (OOM, segfault, or process killed). This is NOT a server issue — your code caused it. Make a MORE CONSERVATIVE change next time.
+- **RuntimeError / AssertionError** = code bug, read the message carefully
+- **insufficient_mfu** = code ran but MFU was below 45% threshold
+- **Security violation** = forbidden import/name/pattern, read the rule
 
 ## IMPORTANT: Don't Repeat Failures
 
