@@ -70,16 +70,16 @@ BASILICA_API_TOKEN=your-basilica-token-here
 
 ```bash
 # Miner (default — pays 0.05 TAO submission fee)
-uv run arbos/agent.py --train-py local_test/train_fsdp.py
+uv run arbos/agent.py --train-py local_test/train.py
 
 # Validator team (burn_uid 3 — no fee)
-uv run arbos/agent.py --train-py local_test/train_fsdp.py --mode validator
+uv run arbos/agent.py --train-py local_test/train.py --mode validator
 
 # Dry run (test LLM generation only, no Basilica GPU costs)
-uv run arbos/agent.py --train-py local_test/train_fsdp.py --dry-run
+uv run arbos/agent.py --train-py local_test/train.py --dry-run
 
 # Limit to N steps
-uv run arbos/agent.py --train-py local_test/train_fsdp.py --max-steps 20
+uv run arbos/agent.py --train-py local_test/train.py --max-steps 20
 ```
 
 When you see **"READY FOR SUBMISSION"** in the logs:

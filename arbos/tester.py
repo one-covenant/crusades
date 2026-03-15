@@ -46,30 +46,26 @@ class BasilicaTester:
         self._cleanup_stale_deployments()
 
     def _cleanup_stale_deployments(self):
-        """Delete any leftover deployments from previous runs on startup."""
+        """Log any leftover deployments — but don't delete them.
+
+        The validator may have active deployments on the same Basilica account,
+        and the SDK doesn't expose the instance_name we set at creation time,
+        so we can't distinguish arbos vs validator deployments safely.
+        Each evaluation already deletes its own deployment in the finally block,
+        and stale ones auto-expire via TTL.
+        """
         if not BASILICA_AVAILABLE:
             return
         try:
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(self._async_cleanup_stale())
-            finally:
-                loop.close()
+            client = BasilicaClient()
+            resp = client.list_deployments()
+            if resp.deployments:
+                logger.info(
+                    f"Note: {len(resp.deployments)} active deployment(s) on this account "
+                    "(not deleting — may belong to the validator)"
+                )
         except Exception as e:
-            logger.warning(f"Could not clean stale deployments: {e}")
-
-    async def _async_cleanup_stale(self):
-        client = BasilicaClient()
-        deployments = await client.list_async()
-        if not deployments:
-            return
-        logger.info(f"Found {len(deployments)} stale deployment(s), cleaning up...")
-        for d in deployments:
-            try:
-                await d.delete_async()
-                logger.info(f"  Deleted: {d.name}")
-            except Exception as e:
-                logger.warning(f"  Failed to delete {d.name}: {e}")
+            logger.warning(f"Could not check deployments: {e}")
 
     def _build_payload(self, code: str) -> dict:
         h = self._hparams
