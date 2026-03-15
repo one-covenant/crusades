@@ -264,7 +264,7 @@ class LLMClient:
 
 ## Hardware
 - {num_gpus}x A100 80GB SXM (NVLink), 312 TFLOPS bf16 peak each
-- Model: {hparams["benchmark_model_name"]} (~7B params — fits on a single GPU)
+- Model: {hparams["benchmark_model_name"]}
 - Batch: {hparams["benchmark_batch_size"]}, Seq len: {hparams["benchmark_sequence_length"]}, Steps: {hparams["eval_steps"]}
 
 ## Previous attempts — study these carefully, learn from successes AND failures

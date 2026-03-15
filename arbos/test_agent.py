@@ -366,7 +366,7 @@ def test_tester_payload():
     tester = BasilicaTester(h)
     payload = tester._build_payload("# test code")
 
-    check("payload has model_url", payload["model_url"] == "Qwen/Qwen2.5-7B")
+    check("payload has model_url", payload["model_url"] == "Qwen/Qwen2.5-3B")
     check("payload has data_url", payload["data_url"] == "HuggingFaceFW/fineweb")
     check("payload has batch_size", payload["batch_size"] == 16)
     check("payload has sequence_length", payload["sequence_length"] == 1024)

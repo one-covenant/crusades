@@ -25,7 +25,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1) 
 ## Environment
 
 - 2x A100 80GB SXM, NVLink, 312 TFLOPS bf16 peak each
-- Qwen/Qwen2.5-7B (~7B params, bf16 ≈ 14GB — fits entirely in one GPU)
+- Qwen/Qwen2.5-3B (~3B params, bf16 ≈ 6GB — fits easily on one GPU)
 - Python 3.11, PyTorch 2.x stable (NOT nightly), flash_attn installed
 - `optimizer` argument is None for multi-GPU — create your own
 - `torch.distributed` is ALREADY initialized — do NOT call `init_process_group()` or `destroy_process_group()`
@@ -146,18 +146,18 @@ full_state = model.module.state_dict() if dist.get_rank() == 0 else None
 
 ## Memory Reality (read this before choosing a strategy)
 
-7B bf16 model = ~14GB. But a full training setup per GPU needs:
-- Model: 14GB + AdamW fp32 states: 28GB + Gradients: 14GB + Activations: ~15GB = **~71GB on 80GB**
-- **FSDP SHARD_GRAD_OP** shards optimizer+gradients across 2 GPUs, saving ~21GB per GPU — this is why the baseline works and why you should optimize FSDP first
-- Fastest path to improvement: **keep FSDP**, add flash CE, fused AdamW, TF32, batch prefetch, compiled forward, communication overlap
-- Plain DDP will OOM at batch_size=16. Only consider DDP much later with gradient accumulation + activation checkpointing.
+3B bf16 model = ~6GB. Full training setup per GPU:
+- Model: 6GB + AdamW fp32 states: 12GB + Gradients: 6GB + Activations: ~10GB = **~34GB on 80GB**
+- With 3B, **DDP fits comfortably** on a single A100 80GB — no sharding needed
+- FSDP still works but adds unnecessary communication overhead for this model size
+- Fastest path: try DDP with fused AdamW + TF32 + flash CE + batch prefetch + compiled forward
 
 ## IMPORTANT: Start Simple, Then Layer On
 
 If previous attempts failed, DO NOT repeat the same approach with minor tweaks. Instead:
 1. First get a WORKING improvement over baseline — even +0.5% MFU counts
-2. Easiest win: **keep FSDP strategy**, add flash CE + fused AdamW + TF32 + batch prefetch + compiled forward + communication overlap
-3. Do NOT switch to DDP — it OOMs at batch_size=16 without significant memory reduction
+2. Easiest win: switch to **DDP** with flash CE + fused AdamW + TF32 + batch prefetch + compiled forward (3B model fits easily in DDP)
+3. FSDP works but adds unnecessary communication overhead for 3B — DDP is simpler and faster
 4. Only add complexity (compile, streams, custom kernels) AFTER you have a working improvement
 5. Read the error messages carefully — they tell you exactly what went wrong
 
@@ -165,7 +165,7 @@ If previous attempts failed, DO NOT repeat the same approach with minor tweaks. 
 
 If your current approach is stuck, try something DIFFERENT — don't repeat similar strategies:
 
-- **Sharding strategy**: Try `NO_SHARD` (each GPU holds full model, no all-gather overhead — only gradient all-reduce). With 7B bf16 model the memory fits if you're careful.
+- **Sharding strategy**: With 3B model, DDP is the simplest and likely fastest. FSDP adds unnecessary overhead. Try DDP first.
 - **FSDP backward prefetch**: `backward_prefetch=BackwardPrefetch.BACKWARD_PRE` overlaps gradient comm with compute — but use ONLY with `mode="default"` compile, not aggressive modes.
 - **Compute**: flash CE loss, fused AdamW, TF32, `torch.compile(fwd, mode="default")` for forward-only
 - **Data pipeline**: prefetch ALL batches upfront with `non_blocking=True` + `synchronize()`, `.contiguous()`, CUDA streams
