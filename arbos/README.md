@@ -66,56 +66,28 @@ CHUTES_API_KEY=your-chutes-key-here
 BASILICA_API_TOKEN=your-basilica-token-here
 ```
 
-### 3. Provide your starting train.py
-
-The agent needs a starting file to improve upon. Use any valid `train.py`:
+### 3. Run
 
 ```bash
-# Use the reference FSDP implementation
-python arbos/agent.py --train-py local_test/train_fsdp.py
+# Miner (default — pays 0.05 TAO submission fee)
+uv run arbos/agent.py --train-py local_test/train_fsdp.py
 
-# Or use your own
-python arbos/agent.py --train-py /path/to/your/train.py
+# Validator team (burn_uid 3 — no fee)
+uv run arbos/agent.py --train-py local_test/train_fsdp.py --mode validator
+
+# Dry run (test LLM generation only, no Basilica GPU costs)
+uv run arbos/agent.py --train-py local_test/train_fsdp.py --dry-run
+
+# Limit to N steps
+uv run arbos/agent.py --train-py local_test/train_fsdp.py --max-steps 20
 ```
 
-## Usage
-
-### For Miners
-
+When you see **"READY FOR SUBMISSION"** in the logs:
+1. Check the saved file in `arbos/best_submissions/`
+2. Host it at a URL (GitHub Gist, etc.)
+3. Submit:
 ```bash
-# Start the optimization loop
-python arbos/agent.py --train-py local_test/train_fsdp.py --mode miner
-
-# When you see "READY FOR SUBMISSION":
-# 1. Check the saved file in arbos/best_submissions/
-# 2. Host it at a URL (GitHub Gist, etc.)
-# 3. Submit: uv run -m neurons.miner submit <url> --wallet.name <name> --wallet.hotkey <hotkey>
-```
-
-### For Validator Team
-
-```bash
-# Same agent, different mode (no submission fee from burn_uid 3)
-python arbos/agent.py --train-py local_test/train_fsdp.py --mode validator
-
-# When you see "READY FOR SUBMISSION":
-# Submit from burn_uid 3 wallet (no fee)
-```
-
-### Dry Run (No GPU Costs)
-
-Test the LLM code generation without Basilica:
-
-```bash
-python arbos/agent.py --train-py local_test/train_fsdp.py --dry-run
-```
-
-Candidates are saved to `arbos/runs/` for manual review.
-
-### Limit Steps
-
-```bash
-python arbos/agent.py --train-py local_test/train_fsdp.py --max-steps 20
+uv run -m neurons.miner submit <url> --wallet.name <name> --wallet.hotkey <hotkey>
 ```
 
 ## Output
@@ -174,11 +146,13 @@ To start fresh, delete `arbos/state.json`.
 
 ```
 arbos/
-├── agent.py           Main loop, CLI, state management, logging
-├── llm_client.py      Multi-provider LLM client (Chutes/OpenRouter/Anthropic)
-├── tester.py          Basilica deployment management and evaluation
-├── .env.example       Configuration template
-└── README.md          This file
+├── agent.py              Main loop, CLI, state management, logging
+├── llm_client.py         Multi-provider LLM client (Chutes/OpenRouter/Anthropic)
+├── tester.py             Basilica deployment management and evaluation
+├── security_scanner.py   AST-based pre-validation (catches violations before GPU eval)
+├── PROMPT.md             LLM system prompt (editable — see Customization below)
+├── .env.example          Configuration template
+└── README.md             This file
 ```
 
 ## LLM Provider Comparison
@@ -201,7 +175,10 @@ Yes. State is saved to `arbos/state.json`. Just run the same command again.
 The agent retries with exponential backoff. Consecutive failures trigger delays up to 2 minutes.
 
 **Q: How much does Basilica cost?**
-Each evaluation deploys 2x A100 80GB for the test duration. The deployment is reused across multiple tests within its TTL (2 hours by default).
+Each evaluation creates a fresh 2x A100 80GB deployment, runs the test, then deletes it. Cost is per-evaluation based on GPU time.
 
 **Q: What's the difference between miner and validator mode?**
 Only the submission instructions in the logs. Miner mode says "0.05 TAO fee"; validator mode says "burn_uid 3, no fee". The optimization loop is identical.
+
+**Q: Can I customize the LLM prompt?**
+Yes. Edit `arbos/PROMPT.md` — the agent reloads it on every LLM call. This is the main lever for guiding what optimizations the LLM tries. Add domain knowledge, warn about pitfalls, or steer toward specific strategies.
