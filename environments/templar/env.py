@@ -2654,6 +2654,13 @@ class Actor:
             _reset_torch_state()
             _enforce_backend_state()
 
+            _model_config_snapshot = None
+            if hasattr(model, "config"):
+                _cfg = model.config
+                _model_config_snapshot = {
+                    k: getattr(_cfg, k) for k in vars(_cfg) if not k.startswith("_")
+                }
+
             _opt_hparams_snapshot = None
             if optimizer_miner is not None:
                 _opt_hparams_snapshot = copy.deepcopy(
@@ -2911,6 +2918,36 @@ class Actor:
                     "code": code,
                 }
 
+            _safe_config_changes = {
+                "use_cache",
+                "output_hidden_states",
+                "output_attentions",
+                "return_dict",
+            }
+            if _model_config_snapshot is not None and hasattr(model, "config"):
+                _cfg_after = model.config
+                _config_changes = []
+                for _ck, _cv in _model_config_snapshot.items():
+                    if _ck in _safe_config_changes:
+                        continue
+                    _cv_after = getattr(_cfg_after, _ck, _cv)
+                    if _cv_after != _cv:
+                        _config_changes.append(f"{_ck}: {_cv!r} -> {_cv_after!r}")
+                if _config_changes:
+                    logger.error(f"Model config tampered: {_config_changes}")
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": wall_time,
+                        "success": False,
+                        "error": f"Model config was modified during training: {', '.join(_config_changes[:5])}",
+                        "error_code": "config_tampering",
+                        "seed": seed,
+                        "code": code,
+                    }
+
             # Verify backend settings were not tampered with during timed eval
             _backend_violations = _check_backend_state()
             if _backend_violations:
@@ -3089,10 +3126,23 @@ class Actor:
                 }
 
             # Build a CPU state dict of the miner's trained model for
-            # verification.  FSDP/TP miners return a pre-gathered dict in
-            # final_state; DDP/single-GPU just use model.state_dict().
-            # All comparisons happen on CPU -- zero extra GPU memory.
+            # verification.  In multi-GPU mode, final_state is REQUIRED —
+            # miners must return a full state_dict on CPU.
+            # Single-GPU falls back to model.state_dict() if not provided.
             miner_final_state = getattr(miner_result, "final_state", None)
+            if _multi_gpu and miner_final_state is None:
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": wall_time,
+                    "success": False,
+                    "error": "final_state is required in multi-GPU mode for weight verification",
+                    "error_code": "missing_final_state",
+                    "seed": seed,
+                    "code": code,
+                }
             if miner_final_state is not None:
                 logger.info("Using miner-provided final_state for weight verification")
                 expected_keys = set(initial_state.keys())

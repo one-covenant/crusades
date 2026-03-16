@@ -149,6 +149,10 @@ FORBIDDEN_STRINGS: list[str] = [
     "mock.patch",
     "MagicMock",
     "unittest.mock",
+    # Model config tampering — reduces computation while formula credits full work
+    "sliding_window",
+    "use_sliding_window",
+    "max_window_layers",
 ]
 
 # ---------------------------------------------------------------------------
