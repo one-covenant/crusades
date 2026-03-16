@@ -2687,6 +2687,16 @@ class Actor:
                     num_gpus=num_gpus,
                 )
 
+            # Materialize and coerce result fields before stopping timer
+            _logits = miner_result.final_logits
+            _loss = float(miner_result.final_loss)
+            _tokens = int(miner_result.total_tokens)
+            miner_result = InnerStepsResult(
+                final_logits=_logits,
+                total_tokens=_tokens,
+                final_loss=_loss,
+            )
+
             if _cuda_end_event is not None:
                 _cuda_end_event.record()
             _sy()
