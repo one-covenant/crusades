@@ -15,6 +15,7 @@ Flow:
 """
 
 import ast
+import copy
 import gc
 import hashlib
 import importlib.util
@@ -1029,9 +1030,22 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
 
 
 def _validate_return_type(result) -> tuple[bool, str | None, InnerStepsResult | None]:
-    """Validate that inner_steps returned correct type."""
+    """Validate that inner_steps returned correct type.
+
+    Rejects proxy/lazy objects that override __getattr__ to defer computation,
+    which is a known exploit vector for faking MFU.
+    """
     if isinstance(result, InnerStepsResult):
         return True, None, result
+
+    result_type = type(result)
+    if "__getattr__" in result_type.__dict__:
+        return (
+            False,
+            f"Rejected proxy/lazy return type {result_type.__name__}: "
+            f"__getattr__ override detected (deferred computation not allowed)",
+            None,
+        )
 
     if all(hasattr(result, attr) for attr in ("final_logits", "total_tokens", "final_loss")):
         return (
@@ -1792,7 +1806,8 @@ def _verify_final_weights(
     diff_norm_sq = 0.0
     ref_norm_sq = 0.0
     total_elements = 0
-    mismatched_layers = 0
+    shape_mismatched_layers = 0
+    error_exceeded_layers = 0
 
     for name, cand_val in candidate_state.items():
         if name not in reference_final_state:
@@ -1800,7 +1815,7 @@ def _verify_final_weights(
 
         ref_param = reference_final_state[name]
         if cand_val.shape != ref_param.shape:
-            mismatched_layers += 1
+            shape_mismatched_layers += 1
             continue
         diff = cand_val.cpu().float() - ref_param.cpu().float()
 
@@ -1811,11 +1826,12 @@ def _verify_final_weights(
         ref_norm_sq += layer_ref_sq
         total_elements += cand_val.numel()
 
-        # Track layers with significant differences (NaN-safe)
         if layer_ref_sq > 0:
             layer_rel_error = (layer_diff_sq**0.5) / (layer_ref_sq**0.5)
             if not math.isfinite(layer_rel_error) or layer_rel_error > max_relative_error:
-                mismatched_layers += 1
+                error_exceeded_layers += 1
+
+    mismatched_layers = shape_mismatched_layers + error_exceeded_layers
 
     ref_norm = ref_norm_sq**0.5
     diff_norm = diff_norm_sq**0.5
@@ -1829,14 +1845,27 @@ def _verify_final_weights(
     details["diff_norm"] = diff_norm
     details["ref_norm"] = ref_norm
     details["total_elements"] = total_elements
-    details["mismatched_layers"] = mismatched_layers
 
     logger.info(f"[CHECK] Weight relative error: {relative_error:.6f}")
     logger.info(f"   |w_miner - w_ref|: {diff_norm:.6f}")
     logger.info(f"   |w_ref|: {ref_norm:.6f}")
     logger.info(f"   Max allowed: {max_relative_error:.6f}")
     logger.info(f"   Total elements: {total_elements:,}")
-    logger.info(f"   Mismatched layers: {mismatched_layers}")
+    logger.info(f"   Shape mismatched layers: {shape_mismatched_layers}")
+    logger.info(f"   Per-layer error exceeded layers: {error_exceeded_layers}")
+    details["mismatched_layers"] = mismatched_layers
+    details["shape_mismatched_layers"] = shape_mismatched_layers
+    details["error_exceeded_layers"] = error_exceeded_layers
+
+    if shape_mismatched_layers > 0:
+        error = (
+            f"{shape_mismatched_layers} layer(s) have shape mismatches — "
+            f"model architecture was modified"
+        )
+        details["checks_failed"].append({"check": "shape_mismatch", "error": error})
+        details["error_code"] = "shape_mismatch"
+        logger.error(f"[FAILED] {error}")
+        return False, error, details
 
     # Guard against NaN injection in weights
     if not math.isfinite(relative_error):
@@ -2625,6 +2654,15 @@ class Actor:
             _reset_torch_state()
             _enforce_backend_state()
 
+            _opt_hparams_snapshot = None
+            if optimizer_miner is not None:
+                _opt_hparams_snapshot = copy.deepcopy(
+                    [
+                        {k: v for k, v in pg.items() if k != "params"}
+                        for pg in optimizer_miner.param_groups
+                    ]
+                )
+
             # ── Runtime timer integrity check ────────────────────────────
             # Verify module globals against vault-stored IDs (closure-protected,
             # immune to frame.f_globals patching).
@@ -2687,11 +2725,53 @@ class Actor:
                     num_gpus=num_gpus,
                 )
 
+            # Anti-deferred-computation: force materialization of training
+            # result fields BEFORE stopping the timer.  A lazy proxy (e.g.
+            # one using __getattr__ to defer real training until field access)
+            # would otherwise run its heavy work after timing ends, faking
+            # high MFU.
+            #
+            # We deliberately EXCLUDE final_state from the timed section:
+            # for FSDP miners, model.state_dict() triggers a full_state_dict
+            # all-gather across ranks — that's verification overhead, not
+            # training compute.  Including it would unfairly penalize FSDP.
+            #
+            # This is safe because final_logits + final_loss + CUDA sync
+            # already prove real GPU training happened (the loss must match
+            # the seed-specific reference within 0.3, which is unpredictable
+            # without actually running the forward/backward passes).
+            _mat_logits = getattr(miner_result, "final_logits", None)
+            _mat_tokens = getattr(miner_result, "total_tokens", None)
+            _mat_loss = getattr(miner_result, "final_loss", None)
+            if isinstance(_mat_logits, torch.Tensor):
+                _mat_logits.shape
+            _sy()
+
             if _cuda_end_event is not None:
                 _cuda_end_event.record()
             _sy()
             end_perf = _pc()
             end_mono = _mo()
+
+            # Access final_state OUTSIDE the timer (verification-only).
+            # Guard against lazy values by checking each tensor is real.
+            _mat_state = getattr(miner_result, "final_state", None)
+            if isinstance(_mat_state, dict):
+                for _sk, _sv in _mat_state.items():
+                    if isinstance(_sv, torch.Tensor):
+                        _sv.data_ptr()
+                    elif _sv is not None and not isinstance(_sv, (int, float, bool, str)):
+                        _state_vtype = type(_sv)
+                        if (
+                            "__getattr__" in _state_vtype.__dict__
+                            or "__get__" in _state_vtype.__dict__
+                        ):
+                            logger.error(
+                                f"Lazy/proxy object detected in final_state['{_sk}']: "
+                                f"{_state_vtype.__name__}"
+                            )
+                            _mat_state = None
+                            break
 
             # Post-eval tamper check on module-level refs
             if not _runtime_ids_ok():
@@ -2783,8 +2863,32 @@ class Actor:
             # not training compute — exclude it from MFU.
             if _multi_gpu:
                 _wt = torch.tensor([wall_time], dtype=torch.float64, device=device)
+                _wt_max_t = _wt.clone()
                 dist.all_reduce(_wt, op=dist.ReduceOp.MIN)
+                dist.all_reduce(_wt_max_t, op=dist.ReduceOp.MAX)
                 _wt_min = _wt.item()
+                _wt_max = _wt_max_t.item()
+                _wt_rel_div = (_wt_max - _wt_min) / max(_wt_max, 1e-9)
+                if _wt_rel_div > 0.20:
+                    logger.error(
+                        f"Rank wall_time divergence too high: "
+                        f"min={_wt_min:.2f}s max={_wt_max:.2f}s "
+                        f"relative_divergence={_wt_rel_div:.1%}"
+                    )
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": _wt_max,
+                        "success": False,
+                        "error": f"Rank wall_time divergence {_wt_rel_div:.1%} exceeds 20% threshold "
+                        f"(min={_wt_min:.2f}s, max={_wt_max:.2f}s). "
+                        f"Possible asymmetric work distribution.",
+                        "error_code": "wall_time_divergence",
+                        "seed": seed,
+                        "code": code,
+                    }
                 if wall_time - _wt_min > 0.5:
                     logger.info(
                         f"Using min wall_time across ranks: {_wt_min:.2f}s "
@@ -2827,6 +2931,27 @@ class Actor:
             if not _multi_gpu:
                 # Convert GPU gradient snapshot to CPU (slow, but OUTSIDE the timer)
                 optimizer_miner.finalize_gradients()
+
+                # Verify optimizer hyperparameters were not tampered with
+                if _opt_hparams_snapshot is not None:
+                    _opt_hparams_current = [
+                        {k: v for k, v in pg.items() if k != "params"}
+                        for pg in optimizer_miner.param_groups
+                    ]
+                    if _opt_hparams_current != _opt_hparams_snapshot:
+                        return {
+                            "task_id": task_id,
+                            "mfu": 0.0,
+                            "tps": 0.0,
+                            "total_tokens": 0,
+                            "wall_time_seconds": wall_time,
+                            "success": False,
+                            "error": "Optimizer hyperparameters were modified during training "
+                            "(lr, betas, weight_decay, etc. must not be changed)",
+                            "error_code": "optimizer_tampering",
+                            "seed": seed,
+                            "code": code,
+                        }
 
                 # Verify optimizer wrapper integrity
                 if type(optimizer_miner) is not GradientCapturingOptimizer:
