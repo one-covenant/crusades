@@ -1111,11 +1111,12 @@ def _load_model(model_path: str, use_random_init: bool = False):
         )
 
         device = f"cuda:{_LOCAL_RANK}" if torch.cuda.is_available() else "cpu"
+        attn_impl = "flash_attention_2" if torch.cuda.is_available() else "eager"
         model = AutoModelForCausalLM.from_config(
             config,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_impl,
         )
         model = model.to(device)
         logger.info(f"Model loaded on {device} (rank {_LOCAL_RANK})")
