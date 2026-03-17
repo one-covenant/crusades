@@ -30,7 +30,9 @@ class InnerStepsResult:
 
 
 def get_strategy():
-    return "ddp"
+    # Pure data-parallel: every GPU gets different data.
+    # Use "ddp" for any GPU count, or a dict for a fixed topology.
+    return {"dp_size": 2, "tp_size": 1}
 
 
 MICRO_BATCH_SIZE = 1
