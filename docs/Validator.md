@@ -98,15 +98,14 @@ When `docker.num_gpus > 1`, the evaluation runs in multi-GPU mode. This allows m
 |--------|---------------------------|--------------------------|
 | Launch command | `python eval_script.py` | `torchrun --nproc_per_node N eval_script.py` |
 | Docker network | `--network none` | Internal network (NCCL only, no egress) |
-| Data iterator | Sequential batches | Sharded (DDP/FSDP) or replicated (TP) based on `get_strategy()` |
-| Reference run | Rank 0 only | All ranks via DDP |
-| Optimizer | Validator-provided `GradientCapturingOptimizer` | `None` -- miner creates their own |
-| Gradient verification | Active | Skipped |
+| Data iterator | Sequential batches | Sharded or replicated based on `get_strategy()` topology |
+| Reference run | Single-GPU reference | All ranks via FSDP FULL_SHARD |
+| Optimizer | `None` -- miner creates their own | `None` -- miner creates their own |
 | Weight verification | Active | Active |
-| MFU calculation | Per-GPU | Per-GPU (same formula) |
+| MFU calculation | Per-GPU | Per-GPU × `dp_size` unique tokens |
 
 **Miner contract for multi-GPU:**
-- Must define `get_strategy()` returning `"ddp"`, `"fsdp"`, or `"tp"` (defaults to `"ddp"` if absent)
+- Must define `get_strategy()` returning `{"dp_size": N, "tp_size": M}` where `N * M == num_gpus` (legacy strings `"ddp"`, `"fsdp"`, `"tp"` also accepted)
 - `optimizer` will be `None` -- create your own after wrapping the model
 - Any parallelism strategy is allowed: DDP, FSDP, TP, PP, or combinations
 - `torch.distributed` process group is already initialized by `torchrun`

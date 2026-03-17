@@ -156,21 +156,6 @@ class InnerStepsResult:
     final_loss: float
 
 
-@dataclass
-class GradientInfo:
-    """Captured gradient information for verification.
-
-    MEMORY OPTIMIZATION: grad_vector is a list of per-layer tensors stored on CPU,
-    rather than a single concatenated tensor. This avoids allocating ~6-12GB for
-    large models. Cosine similarity is computed incrementally layer-by-layer.
-    """
-
-    grad_norm: float  # L2 norm of all gradients
-    grad_vector: list | None = None  # List of per-layer gradient tensors (on CPU)
-    layers_with_grad: int = 0  # Layers with non-zero gradients
-    total_layers: int = 0  # Total trainable layers
-
-
 def _log_vram(tag: str):
     """Log current VRAM usage for debugging memory leaks."""
     if not torch.cuda.is_available():
@@ -1205,55 +1190,6 @@ def _calculate_mfu(
     return min(mfu, 100.0)
 
 
-def _capture_gradients(model: torch.nn.Module) -> GradientInfo:
-    """Capture gradient information from model after backward pass.
-
-    MEMORY OPTIMIZATION: Instead of concatenating all gradients into a single
-    large tensor (which can be ~6-12GB for 3B models), we store per-layer
-    gradient vectors on CPU. Cosine similarity is computed incrementally
-    in _verify_gradients() to avoid memory pressure.
-
-    Returns:
-        GradientInfo with norm and per-layer gradient vectors (on CPU)
-    """
-    grad_vectors_cpu = []  # Store per-layer on CPU to save GPU memory
-    total_norm_sq = 0.0
-    layers_with_grad = 0
-    layers_without_grad = 0
-
-    for param in model.parameters():
-        if param.grad is not None:
-            # Move to CPU immediately to free GPU memory
-            grad_flat = param.grad.detach().cpu().float().view(-1)
-            total_norm_sq += grad_flat.pow(2).sum().item()
-            # Check if gradient is actually non-zero (not just allocated)
-            if grad_flat.abs().sum().item() > 1e-10:
-                layers_with_grad += 1
-                grad_vectors_cpu.append(grad_flat)
-            else:
-                layers_without_grad += 1
-                grad_vectors_cpu.append(grad_flat)  # Still store for shape matching
-        else:
-            layers_without_grad += 1
-            grad_vectors_cpu.append(None)
-
-    grad_norm = total_norm_sq**0.5
-
-    # Log layer gradient coverage
-    total_layers = layers_with_grad + layers_without_grad
-    if total_layers > 0:
-        coverage = layers_with_grad / total_layers
-        logger.info(f"Gradient coverage: {layers_with_grad}/{total_layers} layers ({coverage:.1%})")
-        if layers_without_grad > 0:
-            logger.warning(f"WARNING: {layers_without_grad} layers have zero/no gradients!")
-
-    return GradientInfo(
-        grad_norm=grad_norm,
-        grad_vector=grad_vectors_cpu,  # Now a list of per-layer tensors on CPU
-        layers_with_grad=layers_with_grad,
-        total_layers=total_layers,
-    )
-
 
 def _verify_trainable_params(
     model: torch.nn.Module,
@@ -1415,183 +1351,6 @@ def _create_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
     )
 
 
-class GradientCapturingOptimizer:
-    """Optimizer wrapper for gradient verification."""
-
-    __slots__ = (
-        "_opt_impl",
-        "model",
-        "captured_gradients",
-        "step_count",
-        "num_steps",
-        "_grad_snapshot_gpu",
-        "_initialized",
-    )
-
-    _PUBLIC_ATTRS = frozenset(
-        {
-            "step",
-            "zero_grad",
-            "param_groups",
-            "state",
-            "state_dict",
-            "load_state_dict",
-            "add_param_group",
-            "finalize_gradients",
-            "captured_gradients",
-            "num_steps",
-            "model",
-            "step_count",
-        }
-    )
-
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        model: torch.nn.Module,
-        num_steps: int,
-    ):
-        object.__setattr__(self, "_opt_impl", optimizer)
-        object.__setattr__(self, "model", model)
-        object.__setattr__(self, "captured_gradients", None)
-        object.__setattr__(self, "step_count", 0)
-        object.__setattr__(self, "num_steps", num_steps)
-        object.__setattr__(self, "_grad_snapshot_gpu", None)
-        object.__setattr__(self, "_initialized", True)
-
-    def __getattribute__(self, name):
-        if name.startswith("__") and name.endswith("__"):
-            return object.__getattribute__(self, name)
-        if name in GradientCapturingOptimizer._PUBLIC_ATTRS:
-            return object.__getattribute__(self, name)
-        if name.startswith("_"):
-            raise AttributeError(f"Access to '{name}' is not allowed on optimizer wrapper")
-        return object.__getattribute__(self, name)
-
-    def __dir__(self):
-        return sorted(GradientCapturingOptimizer._PUBLIC_ATTRS)
-
-    def __setattr__(self, name, value):
-        try:
-            initialized = object.__getattribute__(self, "_initialized")
-        except AttributeError:
-            initialized = False
-        if initialized:
-            raise AttributeError(
-                f"Cannot modify attribute '{name}' on optimizer wrapper (read-only after init)"
-            )
-        object.__setattr__(self, name, value)
-
-    def step(self, *args, **kwargs):
-        current_step = object.__getattribute__(self, "step_count")
-        object.__setattr__(self, "step_count", current_step + 1)
-
-        # On final step, snapshot gradients on GPU (fast clone, stays on device)
-        if current_step == object.__getattribute__(self, "num_steps") - 1:
-            snapshot = []
-            model = object.__getattribute__(self, "model")
-            for param in model.parameters():
-                if param.grad is not None:
-                    snapshot.append(param.grad.detach().clone())
-                else:
-                    snapshot.append(None)
-            object.__setattr__(self, "_grad_snapshot_gpu", snapshot)
-
-        opt = object.__getattribute__(self, "_opt_impl")
-        return opt.step(*args, **kwargs)
-
-    def finalize_gradients(self) -> None:
-        snapshot = object.__getattribute__(self, "_grad_snapshot_gpu")
-        if snapshot is None:
-            return
-
-        grad_vectors_cpu = []
-        total_norm_sq = 0.0
-        layers_with_grad = 0
-        layers_without_grad = 0
-
-        for grad_gpu in snapshot:
-            if grad_gpu is not None:
-                grad_flat = grad_gpu.cpu().float().view(-1)
-                total_norm_sq += grad_flat.pow(2).sum().item()
-                if grad_flat.abs().sum().item() > 1e-10:
-                    layers_with_grad += 1
-                    grad_vectors_cpu.append(grad_flat)
-                else:
-                    layers_without_grad += 1
-                    grad_vectors_cpu.append(grad_flat)
-            else:
-                layers_without_grad += 1
-                grad_vectors_cpu.append(None)
-
-        grad_norm = total_norm_sq**0.5
-        total_layers = layers_with_grad + layers_without_grad
-        if total_layers > 0:
-            coverage = layers_with_grad / total_layers
-            logger.info(
-                f"Gradient coverage: {layers_with_grad}/{total_layers} layers ({coverage:.1%})"
-            )
-            if layers_without_grad > 0:
-                logger.warning(f"WARNING: {layers_without_grad} layers have zero/no gradients!")
-
-        object.__setattr__(
-            self,
-            "captured_gradients",
-            GradientInfo(
-                grad_norm=grad_norm,
-                grad_vector=grad_vectors_cpu,
-                layers_with_grad=layers_with_grad,
-                total_layers=total_layers,
-            ),
-        )
-
-        # Free GPU snapshot memory
-        object.__setattr__(self, "_grad_snapshot_gpu", None)
-
-    def zero_grad(self, set_to_none: bool = False):
-        """Forward to underlying optimizer."""
-        opt = object.__getattribute__(self, "_opt_impl")
-        return opt.zero_grad(set_to_none=set_to_none)
-
-    @property
-    def param_groups(self):
-        """Forward param_groups access to underlying optimizer."""
-        opt = object.__getattribute__(self, "_opt_impl")
-        return opt.param_groups
-
-    @param_groups.setter
-    def param_groups(self, value):
-        """Forward param_groups setter to underlying optimizer."""
-        opt = object.__getattribute__(self, "_opt_impl")
-        opt.param_groups = value
-
-    def state_dict(self):
-        """Forward to underlying optimizer."""
-        opt = object.__getattribute__(self, "_opt_impl")
-        return opt.state_dict()
-
-    def load_state_dict(self, state_dict):
-        """Forward to underlying optimizer."""
-        opt = object.__getattribute__(self, "_opt_impl")
-        return opt.load_state_dict(state_dict)
-
-    def add_param_group(self, param_group):
-        """Forward to underlying optimizer."""
-        opt = object.__getattribute__(self, "_opt_impl")
-        return opt.add_param_group(param_group)
-
-    @property
-    def state(self):
-        """Forward state access to underlying optimizer."""
-        opt = object.__getattribute__(self, "_opt_impl")
-        return opt.state
-
-    def __getattr__(self, name):
-        if name.startswith("_") and not (name.startswith("__") and name.endswith("__")):
-            raise AttributeError(f"Access to '{name}' is not allowed on optimizer wrapper")
-        opt = object.__getattribute__(self, "_opt_impl")
-        return getattr(opt, name)
-
 
 _REFERENCE_MICRO_BATCH_SIZE = 2
 
@@ -1602,9 +1361,8 @@ def _run_reference(
     optimizer: torch.optim.Optimizer,
     num_steps: int,
     device: torch.device,
-    capture_final_gradients: bool = True,
     ddp_model: torch.nn.Module | None = None,
-) -> tuple[InnerStepsResult, GradientInfo | None]:
+) -> InnerStepsResult:
     """Run reference implementation for comparison.
 
     Uses gradient accumulation with micro-batches to stay within GPU
@@ -1619,8 +1377,7 @@ def _run_reference(
     accumulation, so micro-batching works unchanged for either wrapper.
 
     Returns:
-        Tuple of (InnerStepsResult, GradientInfo) where GradientInfo
-        contains the gradients from the final step (before optimizer.step)
+        InnerStepsResult with final logits, token count, and loss.
     """
     from contextlib import nullcontext
 
@@ -1633,7 +1390,6 @@ def _run_reference(
     total_tokens = 0
     final_logits = None
     final_loss = 0.0
-    final_gradients = None
 
     for step in range(num_steps):
         batch = next(data_iterator)
@@ -1665,9 +1421,6 @@ def _run_reference(
             step_logits = logits
             step_loss_sum += float(loss.item())
 
-        if capture_final_gradients and step == num_steps - 1:
-            final_gradients = _capture_gradients(model)
-
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -1675,146 +1428,12 @@ def _run_reference(
         final_logits = step_logits.detach().float()
         final_loss = step_loss_sum / num_accum
 
-    result = InnerStepsResult(
+    return InnerStepsResult(
         final_logits=final_logits,
         total_tokens=total_tokens,
         final_loss=final_loss,
     )
-    return result, final_gradients
 
-
-def _verify_gradients(
-    reference_grad: GradientInfo | None,
-    candidate_grad: GradientInfo | None,
-    norm_ratio_max: float = 1.02,
-) -> tuple[bool, str | None, dict]:
-    """Verify candidate gradients match reference."""
-    relative_error_threshold = norm_ratio_max - 1.0
-
-    details = {
-        "relative_error_threshold": relative_error_threshold,
-        "checks_passed": [],
-        "checks_failed": [],
-    }
-
-    logger.info("=" * 60)
-    logger.info("VERIFICATION: Gradient-based verification")
-    logger.info("=" * 60)
-
-    if reference_grad is None or candidate_grad is None:
-        error = "Missing gradient information for verification"
-        details["checks_failed"].append({"check": "gradient_availability", "error": error})
-        logger.error(f"[FAILED] {error}")
-        return False, error, details
-
-    details["reference_grad_norm"] = reference_grad.grad_norm
-    details["candidate_grad_norm"] = candidate_grad.grad_norm
-    details["candidate_layers_with_grad"] = candidate_grad.layers_with_grad
-    details["candidate_total_layers"] = candidate_grad.total_layers
-
-    # Check 0: All layers must have gradients
-    if candidate_grad.total_layers > 0:
-        grad_coverage = candidate_grad.layers_with_grad / candidate_grad.total_layers
-        details["gradient_coverage"] = grad_coverage
-        logger.info(f"[CHECK 0/2] Gradient coverage: {grad_coverage:.1%}")
-        logger.info(
-            f"   Layers with gradients: {candidate_grad.layers_with_grad}/{candidate_grad.total_layers}"
-        )
-
-        if grad_coverage < 1.0:
-            error = (
-                f"Not all layers have gradients: {candidate_grad.layers_with_grad}/{candidate_grad.total_layers} "
-                f"({grad_coverage:.1%}) - possible layer freezing detected"
-            )
-            details["checks_failed"].append({"check": "gradient_coverage", "error": error})
-            details["error_code"] = "gradient_coverage_failed"
-            logger.error(f"[FAILED] {error}")
-            return False, error, details
-        details["checks_passed"].append("gradient_coverage")
-        logger.info("[PASSED] All layers have gradients")
-
-    # Check 1: Relative gradient error |g - g_truth| / |g_truth|
-    # Catches ALL deviations: truncation, layer freezing, step skipping, etc.
-    ref_vecs = reference_grad.grad_vector
-    cand_vecs = candidate_grad.grad_vector
-
-    if ref_vecs is not None and cand_vecs is not None and len(ref_vecs) > 0:
-        if len(ref_vecs) != len(cand_vecs):
-            error = f"Gradient layer count mismatch: ref={len(ref_vecs)}, cand={len(cand_vecs)}"
-            details["checks_failed"].append({"check": "gradient_shape", "error": error})
-            logger.error(f"[FAILED] {error}")
-            return False, error, details
-
-        # Compute |g - g_truth|^2 and |g_truth|^2 incrementally (layer-by-layer)
-        diff_norm_sq = 0.0
-        ref_norm_sq = 0.0
-        total_elements = 0
-
-        for ref_layer, cand_layer in zip(ref_vecs, cand_vecs):
-            if ref_layer is None or cand_layer is None:
-                continue
-
-            if ref_layer.shape != cand_layer.shape:
-                error = f"Gradient shape mismatch at layer: ref={ref_layer.shape}, cand={cand_layer.shape}"
-                details["checks_failed"].append({"check": "gradient_shape", "error": error})
-                logger.error(f"[FAILED] {error}")
-                return False, error, details
-
-            diff = cand_layer - ref_layer
-            diff_norm_sq += (diff * diff).sum().item()
-            ref_norm_sq += (ref_layer * ref_layer).sum().item()
-            total_elements += ref_layer.numel()
-
-        ref_norm = ref_norm_sq**0.5
-        diff_norm = diff_norm_sq**0.5
-
-        if ref_norm > 0:
-            relative_error = diff_norm / ref_norm
-        else:
-            relative_error = 0.0 if diff_norm == 0 else float("inf")
-
-        details["relative_error"] = relative_error
-        details["diff_norm"] = diff_norm
-        details["ref_norm"] = ref_norm
-        details["gradient_elements"] = total_elements
-
-        logger.info(f"[CHECK 1/2] Gradient relative error: {relative_error:.6f}")
-        logger.info(f"   |g - g_truth|: {diff_norm:.6f}")
-        logger.info(f"   |g_truth|: {ref_norm:.6f}")
-        logger.info(f"   Max allowed: {relative_error_threshold:.6f}")
-        logger.info(f"   Total gradient elements: {total_elements:,}")
-
-        # Guard against NaN injection — NaN > threshold is always False in IEEE 754
-        if not math.isfinite(relative_error):
-            error = (
-                f"Gradient relative error is non-finite ({relative_error}) - "
-                "possible NaN injection detected"
-            )
-            details["checks_failed"].append({"check": "gradient_nan_guard", "error": error})
-            details["error_code"] = "gradient_nan_injection"
-            logger.error(f"[FAILED] {error}")
-            return False, error, details
-
-        if relative_error > relative_error_threshold:
-            error = (
-                f"Gradient relative error {relative_error:.6f} exceeds threshold "
-                f"{relative_error_threshold:.6f} (|g - g_truth| / |g_truth|)"
-            )
-            details["checks_failed"].append({"check": "gradient_relative_error", "error": error})
-            details["error_code"] = "gradient_relative_error_failed"
-            logger.error(f"[FAILED] {error}")
-            return False, error, details
-        details["checks_passed"].append("gradient_relative_error")
-        logger.info("[PASSED] Gradient relative error within threshold")
-    else:
-        logger.warning("Gradient vectors unavailable, skipping relative error check")
-
-    logger.info("=" * 60)
-    logger.info("VERIFICATION: GRADIENT CHECKS PASSED")
-    logger.info(f"   Checks passed: {details['checks_passed']}")
-    logger.info("=" * 60)
-
-    return True, None, details
 
 
 def _verify_final_weights(
@@ -2322,13 +1941,12 @@ class Actor:
                 )
                 optimizer_ref = _create_optimizer(ref_fsdp)
 
-                reference, _ = _run_reference(
+                reference = _run_reference(
                     model,
                     data_iter_ref,
                     optimizer_ref,
                     steps,
                     device,
-                    capture_final_gradients=False,
                     ddp_model=ref_fsdp,
                 )
 
@@ -2364,14 +1982,12 @@ class Actor:
             else:
                 optimizer_ref = _create_optimizer(model)
 
-                reference, _ = _run_reference(
+                reference = _run_reference(
                     model,
                     data_iter_ref,
                     optimizer_ref,
                     steps,
                     device,
-                    capture_final_gradients=False,
-                    ddp_model=None,
                 )
 
                 reference_final_state = {
