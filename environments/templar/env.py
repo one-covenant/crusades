@@ -1039,7 +1039,7 @@ def _validate_return_type(result) -> tuple[bool, str | None, InnerStepsResult | 
         return True, None, result
 
     result_type = type(result)
-    if "__getattr__" in result_type.__dict__:
+    if any("__getattr__" in cls.__dict__ for cls in result_type.__mro__):
         return (
             False,
             f"Rejected proxy/lazy return type {result_type.__name__}: "
@@ -2751,7 +2751,7 @@ class Actor:
             _mat_tokens = getattr(miner_result, "total_tokens", None)
             _mat_loss = getattr(miner_result, "final_loss", None)
             if isinstance(_mat_logits, torch.Tensor):
-                _mat_logits.shape
+                _ = _mat_logits.shape
             _sy()
 
             if _cuda_end_event is not None:
@@ -2769,9 +2769,9 @@ class Actor:
                         _sv.data_ptr()
                     elif _sv is not None and not isinstance(_sv, (int, float, bool, str)):
                         _state_vtype = type(_sv)
-                        if (
-                            "__getattr__" in _state_vtype.__dict__
-                            or "__get__" in _state_vtype.__dict__
+                        if any(
+                            "__getattr__" in cls.__dict__ or "__get__" in cls.__dict__
+                            for cls in _state_vtype.__mro__
                         ):
                             logger.error(
                                 f"Lazy/proxy object detected in final_state['{_sk}']: "
@@ -3129,7 +3129,10 @@ class Actor:
             # verification.  In multi-GPU mode, final_state is REQUIRED —
             # miners must return a full state_dict on CPU.
             # Single-GPU falls back to model.state_dict() if not provided.
-            miner_final_state = getattr(miner_result, "final_state", None)
+            # Re-use the already-sanitized _mat_state (from line ~2765) instead
+            # of re-reading miner_result.final_state, which could trigger
+            # deferred computation via __getattr__ on a second access.
+            miner_final_state = _mat_state
             if _multi_gpu and miner_final_state is None:
                 return {
                     "task_id": task_id,
