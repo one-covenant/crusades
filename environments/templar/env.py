@@ -2259,9 +2259,9 @@ class Actor:
                 initial_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 _CACHE["initial_state"] = initial_state
 
-            # Reference baseline: adapts to miner's parallelism strategy.
-            # DDP/FSDP: all ranks participate with DDP wrapper + sharded data.
-            # TP: only rank 0 runs (equivalent to single-GPU on replicated data).
+            # Reference baseline: two paths based on miner's parallelism strategy.
+            # 1. Data-parallel (DDP/FSDP): all ranks participate with DDP wrapper + sharded data.
+            # 2. Everything else (TP, single-GPU): single-GPU reference on rank 0.
             reference: InnerStepsResult | None = None
             reference_grad: GradientInfo | None = None
             reference_final_state: dict | None = None
@@ -2313,12 +2313,15 @@ class Actor:
                 model.load_state_dict(initial_state)
                 model.to(torch.device(f"cuda:{_LOCAL_RANK}"))
                 dist.barrier()
-            elif _multi_gpu:
-                # TP strategy: rank 0 runs single-GPU reference, others wait.
-                # Wrap in try/except so dist.barrier() is always reached —
-                # otherwise a rank-0 exception deadlocks non-rank-0 processes.
-                tp_ref_error: str | None = None
-                if _IS_RANK_0:
+            else:
+                # Unified single-GPU reference path for TP and single-GPU.
+                # Both use rank=0, world_size=1, no DDP wrapper, full gradient
+                # capture.  For TP (multi-GPU), only rank 0 runs; others wait
+                # at barrier.  Wrapped in try/except so barrier is always reached.
+                _sg_ref_error: str | None = None
+                _should_run = _IS_RANK_0 or not _multi_gpu
+
+                if _should_run:
                     try:
                         data_iter_ref = _create_data_iterator(
                             data,
@@ -2342,7 +2345,9 @@ class Actor:
                         reference_final_state = {
                             k: v.detach().cpu().clone() for k, v in model.state_dict().items()
                         }
-                        logger.info("Captured single-GPU reference final state (TP mode)")
+                        logger.info(
+                            "Captured single-GPU reference final state for weight verification"
+                        )
                         _log_vram("after-reference-run")
 
                         if reference is not None and reference.final_logits is not None:
@@ -2356,17 +2361,28 @@ class Actor:
                         model.load_state_dict(initial_state)
                         model.to(torch.device(f"cuda:{_LOCAL_RANK}"))
                     except Exception as e:
-                        tp_ref_error = f"TP reference run failed on rank 0: {e}"
-                        logger.error(tp_ref_error)
+                        _sg_ref_error = f"Reference run failed on rank 0: {e}"
+                        logger.error(_sg_ref_error)
 
-                dist.barrier()
-
-                # Broadcast success/failure from rank 0 to all ranks.
-                fail_tensor = torch.tensor(
-                    [1 if tp_ref_error else 0], dtype=torch.int32, device=device
-                )
-                dist.broadcast(fail_tensor, src=0)
-                if fail_tensor.item() > 0:
+                if _multi_gpu:
+                    dist.barrier()
+                    fail_tensor = torch.tensor(
+                        [1 if _sg_ref_error else 0], dtype=torch.int32, device=device
+                    )
+                    dist.broadcast(fail_tensor, src=0)
+                    if fail_tensor.item() > 0:
+                        return {
+                            "task_id": task_id,
+                            "mfu": 0.0,
+                            "tps": 0.0,
+                            "total_tokens": 0,
+                            "wall_time_seconds": 0.0,
+                            "success": False,
+                            "error": _sg_ref_error or "Reference run failed on rank 0",
+                            "seed": seed,
+                            "code": code,
+                        }
+                elif _sg_ref_error:
                     return {
                         "task_id": task_id,
                         "mfu": 0.0,
@@ -2374,48 +2390,14 @@ class Actor:
                         "total_tokens": 0,
                         "wall_time_seconds": 0.0,
                         "success": False,
-                        "error": tp_ref_error or "TP reference run failed on rank 0",
+                        "error": _sg_ref_error,
                         "seed": seed,
                         "code": code,
                     }
-            else:
-                # Single-GPU path (no multi-GPU)
-                data_iter_ref = _create_data_iterator(
-                    data,
-                    batch_size,
-                    seq_len,
-                    rank=0,
-                    world_size=1,
-                )
-                optimizer_ref = _create_optimizer(model)
 
-                reference, reference_grad = _run_reference(
-                    model,
-                    data_iter_ref,
-                    optimizer_ref,
-                    steps,
-                    device,
-                    capture_final_gradients=_IS_RANK_0,
-                    ddp_model=None,
-                )
-
-                reference_final_state = {
-                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-                }
-                logger.info("Captured reference final state for weight verification")
-                _log_vram("after-reference-run")
-
-                if reference is not None and reference.final_logits is not None:
-                    reference.final_logits = reference.final_logits.cpu()
-
-                del optimizer_ref
-                del data_iter_ref
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-
-                model.load_state_dict(initial_state)
-                model.to(torch.device(f"cuda:{_LOCAL_RANK}"))
 
             # Capture vault timer refs into locals BEFORE loading miner code.
             # Closure variables inside the vault are immune to frame.f_globals
@@ -2969,26 +2951,20 @@ class Actor:
                 # Convert GPU gradient snapshot to CPU (slow, but OUTSIDE the timer)
                 optimizer_miner.finalize_gradients()
 
-                # Verify optimizer hyperparameters were not tampered with
+                # Check optimizer hyperparameters for tampering (warning only —
+                # multi-GPU miners don't face this check, so we keep it
+                # informational to avoid asymmetric rejection).
                 if _opt_hparams_snapshot is not None:
                     _opt_hparams_current = [
                         {k: v for k, v in pg.items() if k != "params"}
                         for pg in optimizer_miner.param_groups
                     ]
                     if _opt_hparams_current != _opt_hparams_snapshot:
-                        return {
-                            "task_id": task_id,
-                            "mfu": 0.0,
-                            "tps": 0.0,
-                            "total_tokens": 0,
-                            "wall_time_seconds": wall_time,
-                            "success": False,
-                            "error": "Optimizer hyperparameters were modified during training "
-                            "(lr, betas, weight_decay, etc. must not be changed)",
-                            "error_code": "optimizer_tampering",
-                            "seed": seed,
-                            "code": code,
-                        }
+                        logger.warning(
+                            "Optimizer hyperparameters were modified during training "
+                            "(lr, betas, weight_decay, etc.) — weight verification "
+                            "will catch any impact on final weights"
+                        )
 
                 # Verify optimizer wrapper integrity
                 if type(optimizer_miner) is not GradientCapturingOptimizer:
@@ -3126,14 +3102,13 @@ class Actor:
                 }
 
             # Build a CPU state dict of the miner's trained model for
-            # verification.  In multi-GPU mode, final_state is REQUIRED —
+            # verification.  final_state is REQUIRED for ALL strategies —
             # miners must return a full state_dict on CPU.
-            # Single-GPU falls back to model.state_dict() if not provided.
             # Re-use the already-sanitized _mat_state (from line ~2765) instead
             # of re-reading miner_result.final_state, which could trigger
             # deferred computation via __getattr__ on a second access.
             miner_final_state = _mat_state
-            if _multi_gpu and miner_final_state is None:
+            if miner_final_state is None:
                 return {
                     "task_id": task_id,
                     "mfu": 0.0,
@@ -3141,7 +3116,7 @@ class Actor:
                     "total_tokens": 0,
                     "wall_time_seconds": wall_time,
                     "success": False,
-                    "error": "final_state is required in multi-GPU mode for weight verification",
+                    "error": "final_state is required for weight verification",
                     "error_code": "missing_final_state",
                     "seed": seed,
                     "code": code,
@@ -3196,10 +3171,6 @@ class Actor:
                             "code": code,
                         }
                 candidate_state = miner_final_state
-            else:
-                candidate_state = {
-                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-                }
 
             # Verify sufficient parameters changed during training
             params_ok, params_error, params_details = _verify_params_changed(
@@ -3360,10 +3331,10 @@ class Actor:
             miner_result = parsed = miner_module = None  # type: ignore[assignment]
             reference = reference_grad = None  # type: ignore[assignment]
 
-            # FSDP/TP corrupt the model's parameter storage; invalidate cache
-            # so the next evaluation creates a fresh model.
-            if strategy in ("fsdp", "tp"):
-                _CACHE.pop("model", None)
+            # Always invalidate model cache between evaluations.  FSDP/TP
+            # corrupt parameter storage, and DDP/single-GPU miners can leave
+            # hooks or modified buffers.  Fresh model each run is safest.
+            _CACHE.pop("model", None)
 
             # Reset torch state (removes miner module, restores timing functions)
             _reset_torch_state()

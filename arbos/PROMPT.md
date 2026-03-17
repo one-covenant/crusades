@@ -13,7 +13,7 @@ class InnerStepsResult:
     final_logits: torch.Tensor   # logits from last forward pass
     total_tokens: int            # total tokens processed across ALL steps
     final_loss: float            # loss from last step
-    final_state: dict | None     # REQUIRED: full model state dict, must not be None
+    final_state: dict            # REQUIRED: full model state_dict on CPU (all keys, correct shapes)
 
 def get_strategy() -> str:
     return "fsdp"  # or "ddp" or "tp"
@@ -44,7 +44,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1) 
 | Gradient norm ratio | ≤ 1.08 |
 | Weight relative error | ≤ 0.008 |
 | Timer divergence | ≤ 0.005 |
-| final_state | non-None, all model keys, correct shapes |
+| final_state | REQUIRED (all strategies), all model keys, correct shapes |
 | Model config | must match pre-execution snapshot (architectural attrs) |
 
 ## Security (code is pre-scanned — violations give specific error messages)
@@ -67,7 +67,7 @@ Beyond static code scanning, the validator performs runtime checks:
 
 - **Model config snapshot**: The model's configuration is snapshotted before your `inner_steps` runs. After execution, it's compared against the snapshot. Modifying architectural config attributes (e.g., `hidden_size`, `num_attention_heads`, `num_hidden_layers`, `intermediate_size`) will be detected and rejected as `config_tampering`. Safe changes like `use_cache`, `output_hidden_states`, `output_attentions`, `return_dict` are allowed.
 - **Proxy/lazy object detection**: Return values are checked for deferred computation. Any object with `__getattr__` or `__get__` overrides anywhere in its inheritance chain (full MRO walk) will be rejected. You cannot use proxy wrappers or lazy evaluation to defer work outside the timed section.
-- **final_state validation**: In multi-GPU mode, `final_state` must be a dict containing all model keys with correct shapes. Values are materialized and checked — lazy tensors or proxy objects are rejected. The sanitized state is used for weight verification (no second access to your result object).
+- **final_state validation**: `final_state` is required for ALL strategies (single-GPU included). It must be a dict containing all model keys with correct shapes. Values are materialized and checked — lazy tensors or proxy objects are rejected. The sanitized state is used for weight verification (no second access to your result object).
 
 ## Critical Pitfalls
 
@@ -152,9 +152,9 @@ Beyond static code scanning, the validator performs runtime checks:
 8. **Reduce Python overhead** — bind optimizer methods to local variables in training loop:
    `opt_step = optimizer.step; opt_zero = optimizer.zero_grad`
 
-## State Dict Patterns (MUST return correct final_state — required for ALL multi-GPU strategies)
+## State Dict Patterns (MUST return correct final_state — required for ALL strategies)
 
-`final_state` is **mandatory** in multi-GPU mode (DDP, FSDP, TP). Returning `None` will be rejected with `missing_final_state`. The state must contain all model keys with correct shapes — missing keys cause `incomplete_final_state`.
+`final_state` is **mandatory** for every submission (single-GPU, DDP, FSDP, TP). Returning `None` will be rejected with `missing_final_state`. The state must contain all model keys with correct shapes — missing keys cause `incomplete_final_state`.
 
 **FSDP**:
 ```python
