@@ -1190,7 +1190,6 @@ def _calculate_mfu(
     return min(mfu, 100.0)
 
 
-
 def _verify_trainable_params(
     model: torch.nn.Module,
     min_trainable_ratio: float = 1.0,
@@ -1351,7 +1350,6 @@ def _create_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
     )
 
 
-
 _REFERENCE_MICRO_BATCH_SIZE = 2
 
 
@@ -1433,7 +1431,6 @@ def _run_reference(
         total_tokens=total_tokens,
         final_loss=final_loss,
     )
-
 
 
 def _verify_final_weights(
@@ -1933,6 +1930,14 @@ class Actor:
                 from torch.distributed.fsdp import (
                     FullyShardedDataParallel as FSDP,  # noqa: N817
                 )
+
+                # Gradient checkpointing is incompatible with FULL_SHARD when
+                # the model is wrapped as a single FSDP unit (no auto_wrap_policy):
+                # FSDP frees param storage after forward, but checkpointing tries
+                # to re-access it during backward.  Disable it for the reference —
+                # micro-batch size 2 keeps memory well within bounds.
+                if hasattr(model, "gradient_checkpointing_disable"):
+                    model.gradient_checkpointing_disable()
 
                 ref_fsdp = FSDP(
                     model,

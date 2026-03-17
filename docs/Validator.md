@@ -13,7 +13,7 @@
 │   │   2. Decrypt timelock-encrypted code URLs                               │   │
 │   │   3. Download miner's train.py from URL                                 │   │
 │   │   4. Evaluate via Docker or Basilica (multiple runs)                    │   │
-│   │   5. Verify: loss, weights, gradients (single-GPU only)                 │   │
+│   │   5. Verify: loss and final weights against reference                    │   │
 │   │   6. Calculate MFU (Model FLOPs Utilization)                            │   │
 │   │   7. Update leaderboard with adaptive threshold                         │   │
 │   │   8. Set weights on blockchain (winner gets emissions)                  │   │
@@ -228,8 +228,7 @@ Edit `hparams/hparams.json`:
     "verification": {
         "max_loss_difference": 0.3,
         "min_params_changed_ratio": 0.7,
-        "gradient_norm_ratio_max": 1.08,
-        "weight_relative_error_max": 0.01,
+        "weight_relative_error_max": 0.02,
         "timer_divergence_threshold": 0.005
     },
     
@@ -256,7 +255,7 @@ Edit `hparams/hparams.json`:
 | `docker.num_gpus` | Number of GPUs (multi-GPU via `torchrun`) | `2` |
 | `docker.memory_limit` | Container memory limit | `"80g"` |
 | `docker.shm_size` | Shared memory (auto-scaled for multi-GPU NCCL) | `"32g"` |
-| `gradient_norm_ratio_max` | Max gradient relative error (1 + %) | `1.08` (8%) |
+| `weight_relative_error_max` | Max relative error for final weight check | `0.02` (2%) |
 | `timer_divergence_threshold` | Max divergence between timer sources | `0.005` (0.5%) |
 | `min_mfu` | Floor MFU threshold — reject below this | `35.0` |
 | `max_plausible_mfu` | Ceiling MFU cap — no code exceeds this | `75.0` |

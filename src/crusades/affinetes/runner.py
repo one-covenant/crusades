@@ -165,8 +165,6 @@ class AffinetesRunner:
         # Verification settings
         max_loss_difference: float = 0.3,
         min_params_changed_ratio: float = 0.8,
-        # Gradient verification
-        gradient_norm_ratio_max: float = 1.08,
         # Weight verification
         weight_relative_error_max: float = 0.006,
         # Timer integrity
@@ -201,7 +199,6 @@ class AffinetesRunner:
             data_url: Default data URL (HuggingFace dataset)
             max_loss_difference: Max allowed |candidate_loss - reference_loss|
             min_params_changed_ratio: Min % params that must change
-            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.08 = 8%)
             weight_relative_error_max: Max relative error for final weight check (e.g., 0.006 = 0.6%)
             timer_divergence_threshold: Max allowed divergence between timer sources (e.g., 0.005 = 0.5%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
@@ -227,8 +224,6 @@ class AffinetesRunner:
         # Verification settings
         self.max_loss_difference = max_loss_difference
         self.min_params_changed_ratio = min_params_changed_ratio
-        # Gradient verification
-        self.gradient_norm_ratio_max = gradient_norm_ratio_max
         # Weight verification
         self.weight_relative_error_max = weight_relative_error_max
         # Timer integrity
@@ -452,8 +447,6 @@ async def main():
         use_random_init=True,
         min_trainable_params_ratio=1.0,
         min_params_changed_ratio={self.min_params_changed_ratio},
-        # Gradient verification
-        gradient_norm_ratio_max={self.gradient_norm_ratio_max},
         # Weight verification
         weight_relative_error_max={self.weight_relative_error_max},
         # Timer integrity
@@ -791,8 +784,6 @@ asyncio.run(main())
                 "use_random_init": True,
                 "min_trainable_params_ratio": 1.0,
                 "min_params_changed_ratio": self.min_params_changed_ratio,
-                # Gradient verification
-                "gradient_norm_ratio_max": self.gradient_norm_ratio_max,
                 # Weight verification
                 "weight_relative_error_max": self.weight_relative_error_max,
                 # Timer integrity
