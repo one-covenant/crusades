@@ -76,9 +76,7 @@ Each submission undergoes the following verification checks:
 | **Sequence Length** | Logits seq dim must match expected | `seq_len - 1` | Active |
 | **Token Count** | Must process the expected number of tokens | Exact match | Active |
 | **Loss Validity** | Loss must be positive, not NaN, close to reference | `max_loss_difference: 0.3` | Active |
-| **Gradient Relative Error** | `\|g - g_truth\| / \|g_truth\|` must be small | `gradient_norm_ratio_max: 1.08` (8%) | **Skipped** |
-| **Gradient Coverage** | All layers must have gradients | `100%` | **Skipped** |
-| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.01` | Active |
+| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.02` | Active |
 | **Trainable Params** | All params must be trainable | `100%` | Active |
 | **Params Changed** | Most param elements must change during training | `min: 70%` | Active |
 | **Timer Integrity** | Multiple timer sources must agree | `timer_divergence_threshold: 0.5%` | Active |
@@ -86,7 +84,7 @@ Each submission undergoes the following verification checks:
 | **Max Plausible MFU** | Ceiling cap -- no legitimate code exceeds this | `max_plausible_mfu: 75%` | Active |
 | **Success Rate** | Majority of runs must pass | `min_success_rate: 0.5` | Active |
 
-> **Multi-GPU note:** Gradient checks are skipped when `num_gpus > 1` because the miner creates their own optimizer (required for FSDP/TP/PP). Training correctness is still verified via loss comparison and final weight matching.
+> **Note:** Training correctness is verified via loss comparison and final weight matching against a uniform FSDP reference model.
 
 ### Multi-GPU Evaluation
 

@@ -99,7 +99,7 @@ Beyond static code scanning, the validator performs runtime checks:
 
 8. **Activation checkpointing with Qwen2 layers is HARD**: Qwen2DecoderLayer.forward() takes keyword arguments (`attention_mask`, `position_ids`, `past_key_values`, `use_cache`, `cache_position`, `position_embeddings`). `torch.utils.checkpoint.checkpoint()` needs `use_reentrant=False` to properly handle kwargs. Do NOT naively wrap layers — it will fail with `Unexpected keyword arguments`. If you can't get it working, skip checkpointing entirely.
 
-9. `torch.compile` with `mode="max-autotune-no-cudagraphs"` or `mode="max-autotune"` causes weight divergence beyond verification threshold (0.008). Use `mode="reduce-overhead"` (best performance, uses CUDA graphs safely) or `mode="default"` (lower warmup cost but slower per-step).
+9. `torch.compile` with `mode="max-autotune-no-cudagraphs"` or `mode="max-autotune"` causes weight divergence beyond verification threshold (0.02). Use `mode="reduce-overhead"` (best performance, uses CUDA graphs safely) or `mode="default"` (lower warmup cost but slower per-step).
 
 10. `bucket_cap_mb` and `gradient_as_bucket_view` are NOT valid FSDP constructor parameters. These are DDP parameters.
 
