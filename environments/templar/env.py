@@ -206,24 +206,64 @@ def _hide_sensitive_env_modules():
 _VALID_STRATEGIES = ("ddp", "fsdp", "tp")
 
 
-def _detect_strategy_from_source(source: str) -> str | None:
-    """Extract parallelism strategy from miner source via AST (no code execution).
+@dataclass
+class ParallelismConfig:
+    """Parallelism topology declared by a miner's ``get_strategy()``."""
 
-    Looks for a ``get_strategy()`` function that returns a string literal.
-    Returns ``None`` when the function is absent or unparseable — the caller
-    decides whether to default (single-GPU) or reject (multi-GPU).
+    dp_size: int
+    tp_size: int
+
+
+def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismConfig | None:
+    """Extract parallelism topology from miner source via AST (no code execution).
+
+    Supports two ``get_strategy()`` return formats:
+
+    - **Legacy string**: ``return "ddp"`` / ``"fsdp"`` / ``"tp"`` — converted
+      to ``ParallelismConfig`` using *num_gpus*.
+    - **Dict literal**: ``return {"dp_size": 2, "tp_size": 2}`` — parsed
+      directly.  Only simple ``ast.Constant`` keys/values are accepted.
+
+    Returns ``None`` when the function is absent, unparseable, or contains
+    non-literal expressions.
     """
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return None
+
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "get_strategy":
-            for stmt in node.body:
-                if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Constant):
-                    val = str(stmt.value.value).lower()
-                    if val in _VALID_STRATEGIES:
-                        return val
+        if not (isinstance(node, ast.FunctionDef) and node.name == "get_strategy"):
+            continue
+        for stmt in node.body:
+            if not isinstance(stmt, ast.Return) or stmt.value is None:
+                continue
+
+            # Legacy string format: "ddp" / "fsdp" / "tp"
+            if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+                val = stmt.value.value.lower()
+                if val in _VALID_STRATEGIES:
+                    if val in ("ddp", "fsdp"):
+                        return ParallelismConfig(dp_size=num_gpus, tp_size=1)
+                    return ParallelismConfig(dp_size=1, tp_size=num_gpus)
+
+            # Dict literal format: {"dp_size": int, "tp_size": int}
+            if isinstance(stmt.value, ast.Dict):
+                d: dict[str, int] = {}
+                for k, v in zip(stmt.value.keys, stmt.value.values):
+                    if (
+                        isinstance(k, ast.Constant)
+                        and isinstance(k.value, str)
+                        and isinstance(v, ast.Constant)
+                        and isinstance(v.value, int)
+                    ):
+                        d[k.value] = v.value
+                if "dp_size" in d and "tp_size" in d:
+                    dp = d["dp_size"]
+                    tp = d["tp_size"]
+                    if dp >= 1 and tp >= 1:
+                        return ParallelismConfig(dp_size=dp, tp_size=tp)
+
     return None
 
 
@@ -1136,8 +1176,10 @@ def _calculate_mfu(
     The caller provides *total_unique_tokens* — the number of distinct tokens
     processed across the entire system during training:
 
-    - DDP/FSDP: tokens_per_rank * num_gpus (each rank sees different data)
-    - TP:       tokens_per_rank            (all ranks see the same data)
+        total_unique_tokens = tokens_per_rank * dp_size
+
+    where dp_size is the data-parallel dimension of the miner's topology
+    (dp_size=num_gpus for pure DDP, dp_size=1 for pure TP, mixed for hybrid).
 
     Total useful FLOPs = 6 * params * total_unique_tokens (forward + backward).
     Total system peak  = peak_per_gpu * num_gpus * wall_time.
@@ -2163,10 +2205,10 @@ class Actor:
 
         _multi_gpu = num_gpus > 1 and _WORLD_SIZE > 1
 
-        # Detect parallelism strategy from source (AST only, no execution).
-        strategy = _detect_strategy_from_source(code)
+        # Detect parallelism topology from source (AST only, no execution).
+        par_config = _detect_strategy_from_source(code, num_gpus)
 
-        if strategy is None:
+        if par_config is None:
             if _multi_gpu:
                 return {
                     "task_id": task_id,
@@ -2177,20 +2219,35 @@ class Actor:
                     "success": False,
                     "error": (
                         "Multi-GPU evaluation requires get_strategy() in train.py "
-                        "returning one of: ddp, fsdp, tp"
+                        'returning "ddp"/"fsdp"/"tp" or {"dp_size": N, "tp_size": M}'
                     ),
                     "seed": seed,
                     "code": code,
                 }
-            strategy = "ddp"
+            par_config = ParallelismConfig(dp_size=1, tp_size=1)
 
-        is_data_parallel = strategy in ("ddp", "fsdp")
-        logger.info(f"Miner parallelism strategy: {strategy} (data_parallel={is_data_parallel})")
+        if _multi_gpu and par_config.dp_size * par_config.tp_size != num_gpus:
+            return {
+                "task_id": task_id,
+                "mfu": 0.0,
+                "tps": 0.0,
+                "total_tokens": 0,
+                "wall_time_seconds": 0.0,
+                "success": False,
+                "error": (
+                    f"dp_size({par_config.dp_size}) * tp_size({par_config.tp_size}) "
+                    f"= {par_config.dp_size * par_config.tp_size} != num_gpus({num_gpus})"
+                ),
+                "seed": seed,
+                "code": code,
+            }
 
-        if is_data_parallel and _multi_gpu:
-            data_rank, data_world = _LOCAL_RANK, _WORLD_SIZE
-        else:
-            data_rank, data_world = 0, 1
+        logger.info(
+            f"Miner parallelism: dp_size={par_config.dp_size}, tp_size={par_config.tp_size}"
+        )
+
+        data_rank = _LOCAL_RANK // par_config.tp_size if _multi_gpu else 0
+        data_world = par_config.dp_size if _multi_gpu else 1
 
         try:
             # ---------------------------------------------------------------
@@ -2233,24 +2290,19 @@ class Actor:
             # ── Unified reference baseline ──────────────────────────────────
             # Multi-GPU: always FSDP FULL_SHARD (scales to any model size,
             # all ranks participate regardless of miner strategy).
-            # Data distribution varies: sharded for DDP/FSDP miners (each rank
-            # sees different data) vs replicated for TP/single-GPU miners (all
-            # ranks see same data).  This is a mathematical necessity, not a
-            # code inconsistency.
+            # Data distribution matches the miner's declared topology:
+            # ranks in the same TP group share data, different DP groups
+            # get different data.  dp_size/tp_size drive the formula.
             reference: InnerStepsResult | None = None
             reference_final_state: dict | None = None
             ref_fsdp: torch.nn.Module | None = None
-
-            data_sharded = is_data_parallel and _multi_gpu
-            ref_data_rank = data_rank if data_sharded else 0
-            ref_data_world = data_world if data_sharded else 1
 
             data_iter_ref = _create_data_iterator(
                 data,
                 batch_size,
                 seq_len,
-                rank=ref_data_rank,
-                world_size=ref_data_world,
+                rank=data_rank,
+                world_size=data_world,
             )
 
             if _multi_gpu:
@@ -3078,10 +3130,7 @@ class Actor:
             )
 
             tokens_per_rank = expected_tokens
-            if is_data_parallel:
-                total_unique_tokens = tokens_per_rank * num_gpus
-            else:
-                total_unique_tokens = tokens_per_rank
+            total_unique_tokens = tokens_per_rank * par_config.dp_size
             tps = float(total_unique_tokens) / max(wall_time, 1e-6)
             mfu = _calculate_mfu(
                 total_unique_tokens, wall_time, model_params, gpu_peak_tflops, num_gpus
@@ -3123,7 +3172,7 @@ class Actor:
             # Diagnostics
             diagnostics = {
                 "verification": verify_details,
-                "strategy": strategy,
+                "strategy": {"dp_size": par_config.dp_size, "tp_size": par_config.tp_size},
                 "reference_loss": reference.final_loss,
                 "candidate_loss": parsed.final_loss,
                 "expected_tokens": expected_tokens,
