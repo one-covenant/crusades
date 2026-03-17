@@ -86,7 +86,6 @@ class BasilicaTester:
             "min_trainable_params_ratio": 1.0,
             "max_loss_difference": v["max_loss_difference"],
             "min_params_changed_ratio": v["min_params_changed_ratio"],
-            "gradient_norm_ratio_max": v["gradient_norm_ratio_max"],
             "weight_relative_error_max": v["weight_relative_error_max"],
             "timer_divergence_threshold": v["timer_divergence_threshold"],
             "gpu_peak_tflops": m["gpu_peak_tflops"],

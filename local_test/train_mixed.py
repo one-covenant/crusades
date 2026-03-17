@@ -6,28 +6,22 @@
 #   - Within each TP group, tensors are sharded (tensor-parallel)
 #   - Equivalent to: get_strategy() -> {"dp_size": 2, "tp_size": 2}
 #
+# Neither FSDP nor DDP can wrap TP's DTensor parameters (both try to
+# flatten/view params, which DTensor's sharding propagation rejects).
+# Instead we manually all-reduce gradients across the DP process group
+# after each backward pass.
+#
 # Requirements for verification:
 #   - get_strategy() returning {"dp_size": 2, "tp_size": 2}
 #   - Return InnerStepsResult with final_logits, total_tokens, final_loss
 #   - Must return final_state: gathered full tensors from DTensor shards
-#     FSDP flattens params and TP replaces with DTensors; need full gather.
 
-import functools
-import warnings
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import (
-    FullStateDictConfig,
-    MixedPrecision,
-    ShardingStrategy,
-    StateDictType,
-)
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # noqa: N817
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
@@ -45,26 +39,6 @@ class InnerStepsResult:
 
 def get_strategy():
     return {"dp_size": 2, "tp_size": 2}
-
-
-def _get_wrap_policy(model):
-    layer_cls = None
-    if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
-        layer_cls = model.model.layers[0].__class__
-    elif (
-        hasattr(model, "transformer")
-        and hasattr(model.transformer, "h")
-        and len(model.transformer.h) > 0
-    ):
-        layer_cls = model.transformer.h[0].__class__
-
-    if layer_cls is None:
-        return None
-
-    return functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={layer_cls},
-    )
 
 
 def _apply_tp(model, tp_mesh):
@@ -91,6 +65,20 @@ def _apply_tp(model, tp_mesh):
                 },
             )
     return model
+
+
+def _allreduce_grads(model, dp_pg):
+    """Average gradients across DP group (replaces DDP/FSDP gradient sync).
+
+    TP converts parameters to DTensors; calling dist.all_reduce on a DTensor
+    triggers DTensor dispatch which fails without a matching DeviceMesh.
+    We operate on the underlying local tensor shard instead.
+    """
+    for param in model.parameters():
+        if param.grad is not None:
+            g = param.grad
+            local_g = g._local_tensor if hasattr(g, "_local_tensor") else g
+            dist.all_reduce(local_g, op=dist.ReduceOp.AVG, group=dp_pg)
 
 
 def _gather_full_state(model):
@@ -121,32 +109,18 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         model.config.use_cache = False
 
     is_multi = num_gpus > 1
+    dp_pg = None
+    dp_size = 1
+
     if is_multi:
         dp_size = 2
         tp_size = num_gpus // dp_size
 
-        # 2D mesh: ("dp", "tp") — dp_size groups of tp_size ranks each
         mesh_2d = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
         tp_mesh = mesh_2d["tp"]
+        dp_pg = mesh_2d.get_group("dp")
 
         model = _apply_tp(model, tp_mesh)
-
-        wrap_policy = _get_wrap_policy(model)
-        mp_policy = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        )
-        dp_pg = mesh_2d.get_group("dp")
-        model = FSDP(
-            model,
-            auto_wrap_policy=wrap_policy,
-            sharding_strategy=ShardingStrategy.NO_SHARD,
-            mixed_precision=mp_policy,
-            device_id=device,
-            use_orig_params=True,
-            process_group=dp_pg,
-        )
 
     if optimizer is None:
         optimizer = torch.optim.AdamW(
@@ -175,6 +149,10 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         )
 
         loss.backward()
+
+        if dp_pg is not None:
+            _allreduce_grads(model, dp_pg)
+
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -184,16 +162,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
     if is_multi:
         rank = dist.get_rank() if dist.is_initialized() else 0
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-                sd = model.state_dict()
-        gathered = {}
-        for key, val in sd.items():
-            if hasattr(val, "full_tensor"):
-                val = val.full_tensor()
-            gathered[key] = val.detach().cpu().clone()
+        gathered = _gather_full_state(model)
         full_state = gathered if rank == 0 else None
     else:
         full_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}

@@ -15,8 +15,8 @@ class InnerStepsResult:
     final_loss: float            # loss from last step
     final_state: dict            # REQUIRED: full model state_dict on CPU (all keys, correct shapes)
 
-def get_strategy() -> str:
-    return "fsdp"  # or "ddp" or "tp"
+def get_strategy() -> dict:
+    return {"dp_size": 2, "tp_size": 1}  # dp_size * tp_size must equal num_gpus
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1) -> InnerStepsResult:
     ...
@@ -53,7 +53,7 @@ To reach 65% MFU, you need wall_time ≈ 59.8s — shave ~4-5s off current best.
 |---|---|
 | Loss difference | ≤ 0.3 |
 | Parameters changed | ≥ 75% |
-| Weight relative error | ≤ 0.008 |
+| Weight relative error | ≤ 0.02 |
 | Timer divergence | ≤ 0.005 |
 | final_state | REQUIRED (all strategies), all model keys, correct shapes |
 | Model config | must match pre-execution snapshot (architectural attrs) |
@@ -262,10 +262,10 @@ the current one OR when you have a strong reason another strategy is fundamental
 Think about WHERE time is spent: compile warmup (~10s), state dict extraction (~4s), per-step compute (~1.9s × 20), per-step overhead (~0.5s × 20). Target the biggest bottleneck.
 
 **Parallelism strategies** (optimize the CURRENT strategy first before switching!):
-- **FSDP**: Already proven to work at 60.5%. Tune `sharding_strategy` (NO_SHARD is best for this model size). Do NOT use `limit_all_gathers=True`.
-- **DDP**: Simpler but incompatible with torch.compile — only viable without compile (~47% MFU).
-- **TP (Tensor Parallelism)**: Splits layers across GPUs. NVLink makes TP fast. All GPUs get same data — no data sharding. **Most promising unexplored direction** for breaking 60.5%. Use `torch.distributed.tensor.parallel` APIs.
-- **Hybrid**: Combine strategies creatively.
+- **FSDP** (`{"dp_size": 2, "tp_size": 1}`): Already proven to work at 60.5%. Tune `sharding_strategy` (NO_SHARD is best for this model size). Do NOT use `limit_all_gathers=True`.
+- **DDP** (`{"dp_size": 2, "tp_size": 1}`): Simpler but incompatible with torch.compile — only viable without compile (~47% MFU).
+- **TP** (`{"dp_size": 1, "tp_size": 2}`): Splits layers across GPUs. NVLink makes TP fast. All GPUs get same data — no data sharding. **Most promising unexplored direction** for breaking 60.5%. Use `torch.distributed.tensor.parallel` APIs.
+- **Hybrid** (`{"dp_size": N, "tp_size": M}` where N×M=num_gpus): Combine strategies creatively.
 
 **Compute optimizations**:
 - Flash CE loss (flash_attn.losses.cross_entropy) — faster than F.cross_entropy

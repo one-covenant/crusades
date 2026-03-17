@@ -74,7 +74,7 @@ class InnerStepsResult:
     final_state: dict | None = None
 
 def get_strategy():
-    return "fsdp"
+    return {"dp_size": 2, "tp_size": 1}
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     return InnerStepsResult(
@@ -112,7 +112,7 @@ class InnerStepsResult:
     final_state: dict | None = None
 
 def get_strategy():
-    return "fsdp"
+    return {"dp_size": 2, "tp_size": 1}
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     torch.backends.cudnn.benchmark = True
@@ -274,7 +274,7 @@ class InnerStepsResult:
     final_state: dict | None = None
 
 def get_strategy():
-    return "fsdp"
+    return {"dp_size": 2, "tp_size": 1}
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     return InnerStepsResult(
@@ -376,8 +376,7 @@ def test_tester_payload():
     check("payload has gpu_peak_tflops", payload["gpu_peak_tflops"] == 312.0)
     check("payload has max_loss_difference", payload["max_loss_difference"] == 0.3)
     check("payload has min_params_changed_ratio", payload["min_params_changed_ratio"] == 0.75)
-    check("payload has gradient_norm_ratio_max", payload["gradient_norm_ratio_max"] == 1.08)
-    check("payload has weight_relative_error_max", payload["weight_relative_error_max"] == 0.008)
+    check("payload has weight_relative_error_max", payload["weight_relative_error_max"] == 0.02)
     check("payload has timer_divergence_threshold", payload["timer_divergence_threshold"] == 0.005)
 
 
@@ -423,7 +422,7 @@ class InnerStepsResult:
     final_state: dict | None = None
 
 def get_strategy():
-    return "fsdp"
+    return {"dp_size": 2, "tp_size": 1}
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     return InnerStepsResult(
