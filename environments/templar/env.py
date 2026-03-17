@@ -15,7 +15,6 @@ Flow:
 """
 
 import ast
-import copy
 import gc
 import hashlib
 import importlib.util
@@ -1572,9 +1571,10 @@ def _run_reference(
     and gradients are accumulated before each optimizer step — mathematically
     equivalent to processing the full batch at once.
 
-    When *ddp_model* is provided, the forward pass uses the DDP wrapper
-    (triggering gradient all-reduce) while gradient capture reads from the
-    unwrapped *model* whose ``.grad`` tensors contain the all-reduced values.
+    When *ddp_model* is provided, the forward pass uses the distributed
+    wrapper (DDP or FSDP) while gradient capture reads from the unwrapped
+    *model*.  Both DDP and FSDP expose ``no_sync()`` for gradient
+    accumulation, so micro-batching works unchanged for either wrapper.
 
     Returns:
         Tuple of (InnerStepsResult, GradientInfo) where GradientInfo
@@ -1902,32 +1902,25 @@ def _verify_outputs(
     reference: InnerStepsResult,
     candidate: InnerStepsResult,
     expected_tokens: int,
-    reference_grad: GradientInfo | None = None,
-    candidate_grad: GradientInfo | None = None,
     reference_final_state: dict | None = None,
     candidate_final_state: dict | None = None,
     max_loss_difference: float = 0.3,
-    gradient_norm_ratio_max: float = 1.08,
-    weight_relative_error_max: float = 0.01,
+    weight_relative_error_max: float = 0.02,
 ) -> tuple[bool, str | None, dict]:
     """Verify candidate outputs match reference.
 
-    Verification checks:
+    Verification checks (uniform across all parallelism strategies):
     1. Token count matches expected
     2. Loss is valid and similar to reference (small difference)
-    3. Gradient-based verification (captures backward pass correctness)
-    4. Final weight verification (captures optimizer step correctness)
+    3. Final weight verification (captures optimizer step correctness)
 
     Args:
         reference: Reference implementation results
         candidate: Miner's implementation results
         expected_tokens: Expected token count
-        reference_grad: Reference gradients for comparison
-        candidate_grad: Candidate gradients for comparison
         reference_final_state: Reference state dict after full training (CPU)
         candidate_final_state: Miner's state dict after training (CPU)
         max_loss_difference: Maximum allowed |candidate_loss - reference_loss|
-        gradient_norm_ratio_max: Encoded as 1 + max_relative_error for gradient check
         weight_relative_error_max: Max relative error for final weight comparison
 
     Returns:
@@ -1948,7 +1941,7 @@ def _verify_outputs(
 
     # 1. Verify token count matches expected
     logger.info(
-        f"[CHECK 1/4] Token count: expected={expected_tokens}, got={candidate.total_tokens}"
+        f"[CHECK 1/3] Token count: expected={expected_tokens}, got={candidate.total_tokens}"
     )
     if candidate.total_tokens != expected_tokens:
         error = f"Token count mismatch: expected {expected_tokens}, got {candidate.total_tokens}"
@@ -1959,7 +1952,7 @@ def _verify_outputs(
     logger.info("[PASSED] Token count matches")
 
     # 2. Verify loss is reasonable and similar to reference
-    logger.info(f"[CHECK 2/4] Loss validity: candidate_loss={candidate.final_loss:.6f}")
+    logger.info(f"[CHECK 2/3] Loss validity: candidate_loss={candidate.final_loss:.6f}")
     if candidate.final_loss != candidate.final_loss:  # NaN check
         error = "Loss is NaN"
         details["checks_failed"].append({"check": "loss_validity", "error": error})
@@ -2002,27 +1995,9 @@ def _verify_outputs(
     details["checks_passed"].append("loss_validity")
     logger.info("[PASSED] Loss is valid and similar to reference")
 
-    # 3. Gradient-based verification (captures backward pass correctness)
-    if reference_grad is None or candidate_grad is None:
-        logger.info("[CHECK 3/4] Gradient verification SKIPPED (multi-GPU mode)")
-        details["checks_passed"].append("gradient_verification_skipped")
-    else:
-        logger.info("[CHECK 3/4] Gradient verification")
-        grad_ok, grad_error, grad_details = _verify_gradients(
-            reference_grad,
-            candidate_grad,
-            norm_ratio_max=gradient_norm_ratio_max,
-        )
-        details["gradient_verification"] = grad_details
-
-        if not grad_ok:
-            details["checks_failed"].append({"check": "gradient_verification", "error": grad_error})
-            return False, grad_error, details
-        details["checks_passed"].append("gradient_verification")
-
-    # 4. Final weight verification (verifies optimizer step correctness)
+    # 3. Final weight verification (verifies optimizer step correctness)
     if reference_final_state is not None and candidate_final_state is not None:
-        logger.info("[CHECK 4/4] Final weight verification")
+        logger.info("[CHECK 3/3] Final weight verification")
         weight_ok, weight_error, weight_details = _verify_final_weights(
             candidate_final_state,
             reference_final_state,
@@ -2069,10 +2044,8 @@ class Actor:
         use_random_init: bool = True,
         min_trainable_params_ratio: float = 1.0,
         min_params_changed_ratio: float = 0.75,
-        # Gradient verification
-        gradient_norm_ratio_max: float = 1.08,
-        # Weight verification
-        weight_relative_error_max: float = 0.01,
+        # Weight verification (2% tolerates FSDP reduce-scatter FP drift)
+        weight_relative_error_max: float = 0.02,
         # Timer integrity
         timer_divergence_threshold: float = 0.005,
         # MFU calculation
@@ -2101,8 +2074,7 @@ class Actor:
             use_random_init: Use random weights
             min_trainable_params_ratio: Min % params that must be trainable
             min_params_changed_ratio: Min % params that must change
-            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.08 = 8%)
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.01 = 1%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.02 = 2%)
             timer_divergence_threshold: Max divergence between timer sources (e.g., 0.005 = 0.5%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             min_mfu: Minimum MFU threshold — submissions below this are rejected
@@ -2188,7 +2160,6 @@ class Actor:
         from datetime import timedelta
 
         import torch.distributed as dist
-        from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: N817
 
         _multi_gpu = num_gpus > 1 and _WORLD_SIZE > 1
 
@@ -2259,47 +2230,72 @@ class Actor:
                 initial_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 _CACHE["initial_state"] = initial_state
 
-            # Reference baseline: two paths based on miner's parallelism strategy.
-            # 1. Data-parallel (DDP/FSDP): all ranks participate with DDP wrapper + sharded data.
-            # 2. Everything else (TP, single-GPU): single-GPU reference on rank 0.
+            # ── Unified reference baseline ──────────────────────────────────
+            # Multi-GPU: always FSDP FULL_SHARD (scales to any model size,
+            # all ranks participate regardless of miner strategy).
+            # Data distribution varies: sharded for DDP/FSDP miners (each rank
+            # sees different data) vs replicated for TP/single-GPU miners (all
+            # ranks see same data).  This is a mathematical necessity, not a
+            # code inconsistency.
             reference: InnerStepsResult | None = None
-            reference_grad: GradientInfo | None = None
             reference_final_state: dict | None = None
-            ref_ddp: torch.nn.Module | None = None
+            ref_fsdp: torch.nn.Module | None = None
 
-            if is_data_parallel and _multi_gpu:
-                data_iter_ref = _create_data_iterator(
-                    data,
-                    batch_size,
-                    seq_len,
-                    rank=data_rank,
-                    world_size=data_world,
+            data_sharded = is_data_parallel and _multi_gpu
+            ref_data_rank = data_rank if data_sharded else 0
+            ref_data_world = data_world if data_sharded else 1
+
+            data_iter_ref = _create_data_iterator(
+                data,
+                batch_size,
+                seq_len,
+                rank=ref_data_rank,
+                world_size=ref_data_world,
+            )
+
+            if _multi_gpu:
+                from torch.distributed.fsdp import (
+                    FullStateDictConfig,
+                    ShardingStrategy,
+                    StateDictType,
                 )
-                optimizer_ref = _create_optimizer(model)
-                ref_ddp = DDP(model, device_ids=[_LOCAL_RANK])
+                from torch.distributed.fsdp import (
+                    FullyShardedDataParallel as FSDP,  # noqa: N817
+                )
 
-                reference, reference_grad = _run_reference(
+                ref_fsdp = FSDP(
+                    model,
+                    sharding_strategy=ShardingStrategy.FULL_SHARD,
+                    device_id=torch.device(f"cuda:{_LOCAL_RANK}"),
+                )
+                optimizer_ref = _create_optimizer(ref_fsdp)
+
+                reference, _ = _run_reference(
                     model,
                     data_iter_ref,
                     optimizer_ref,
                     steps,
                     device,
                     capture_final_gradients=False,
-                    ddp_model=ref_ddp,
+                    ddp_model=ref_fsdp,
                 )
 
+                # All ranks must call state_dict (FSDP all-gathers internally);
+                # rank0_only=True means only rank 0 receives the full tensors.
+                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                with FSDP.state_dict_type(ref_fsdp, StateDictType.FULL_STATE_DICT, save_policy):
+                    full_sd = ref_fsdp.state_dict()
                 if _IS_RANK_0:
-                    reference_final_state = {
-                        k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-                    }
-                    logger.info("Captured DDP reference final state for weight verification")
+                    reference_final_state = {k: v.detach().clone() for k, v in full_sd.items()}
+                    logger.info("Captured FSDP reference final state for weight verification")
+                del full_sd
                 _log_vram("after-reference-run")
 
                 if reference is not None and reference.final_logits is not None:
                     reference.final_logits = reference.final_logits.cpu()
 
-                del ref_ddp
-                ref_ddp = None
+                del ref_fsdp
+                ref_fsdp = None
                 del optimizer_ref
                 del data_iter_ref
                 _CACHE.pop("model", None)
@@ -2314,90 +2310,34 @@ class Actor:
                 model.to(torch.device(f"cuda:{_LOCAL_RANK}"))
                 dist.barrier()
             else:
-                # Unified single-GPU reference path for TP and single-GPU.
-                # Both use rank=0, world_size=1, no DDP wrapper, full gradient
-                # capture.  For TP (multi-GPU), only rank 0 runs; others wait
-                # at barrier.  Wrapped in try/except so barrier is always reached.
-                _sg_ref_error: str | None = None
-                _should_run = _IS_RANK_0 or not _multi_gpu
+                optimizer_ref = _create_optimizer(model)
 
-                if _should_run:
-                    try:
-                        data_iter_ref = _create_data_iterator(
-                            data,
-                            batch_size,
-                            seq_len,
-                            rank=0,
-                            world_size=1,
-                        )
-                        optimizer_ref = _create_optimizer(model)
+                reference, _ = _run_reference(
+                    model,
+                    data_iter_ref,
+                    optimizer_ref,
+                    steps,
+                    device,
+                    capture_final_gradients=False,
+                    ddp_model=None,
+                )
 
-                        reference, reference_grad = _run_reference(
-                            model,
-                            data_iter_ref,
-                            optimizer_ref,
-                            steps,
-                            device,
-                            capture_final_gradients=True,
-                            ddp_model=None,
-                        )
+                reference_final_state = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
+                logger.info("Captured single-GPU reference final state for weight verification")
+                _log_vram("after-reference-run")
 
-                        reference_final_state = {
-                            k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-                        }
-                        logger.info(
-                            "Captured single-GPU reference final state for weight verification"
-                        )
-                        _log_vram("after-reference-run")
+                if reference is not None and reference.final_logits is not None:
+                    reference.final_logits = reference.final_logits.cpu()
 
-                        if reference is not None and reference.final_logits is not None:
-                            reference.final_logits = reference.final_logits.cpu()
-
-                        del optimizer_ref
-                        del data_iter_ref
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        model.load_state_dict(initial_state)
-                        model.to(torch.device(f"cuda:{_LOCAL_RANK}"))
-                    except Exception as e:
-                        _sg_ref_error = f"Reference run failed on rank 0: {e}"
-                        logger.error(_sg_ref_error)
-
-                if _multi_gpu:
-                    dist.barrier()
-                    fail_tensor = torch.tensor(
-                        [1 if _sg_ref_error else 0], dtype=torch.int32, device=device
-                    )
-                    dist.broadcast(fail_tensor, src=0)
-                    if fail_tensor.item() > 0:
-                        return {
-                            "task_id": task_id,
-                            "mfu": 0.0,
-                            "tps": 0.0,
-                            "total_tokens": 0,
-                            "wall_time_seconds": 0.0,
-                            "success": False,
-                            "error": _sg_ref_error or "Reference run failed on rank 0",
-                            "seed": seed,
-                            "code": code,
-                        }
-                elif _sg_ref_error:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": 0.0,
-                        "success": False,
-                        "error": _sg_ref_error,
-                        "seed": seed,
-                        "code": code,
-                    }
-
+                del optimizer_ref
+                del data_iter_ref
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                model.load_state_dict(initial_state)
+                model.to(torch.device(f"cuda:{_LOCAL_RANK}"))
 
             # Capture vault timer refs into locals BEFORE loading miner code.
             # Closure variables inside the vault are immune to frame.f_globals
@@ -2465,10 +2405,7 @@ class Actor:
                 rank=data_rank,
                 world_size=data_world,
             )
-            if _multi_gpu:
-                optimizer_warmup = None
-            else:
-                optimizer_warmup = _create_optimizer(model)
+            optimizer_warmup = None
 
             logger.info(f"Running {warmup_steps} warmup step(s) to check for basic errors...")
             warmup_failure: dict | None = None
@@ -2618,7 +2555,8 @@ class Actor:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-            # Full timed evaluation with gradient capture
+            # Full timed evaluation — optimizer is always None so miners
+            # create their own (uniform across all parallelism strategies).
             _log_vram("before-timed-eval")
             data_iter_miner = _create_data_iterator(
                 data,
@@ -2627,11 +2565,7 @@ class Actor:
                 rank=data_rank,
                 world_size=data_world,
             )
-            if _multi_gpu:
-                optimizer_miner = None
-            else:
-                base_optimizer = _create_optimizer(model)
-                optimizer_miner = GradientCapturingOptimizer(base_optimizer, model, num_steps=steps)
+            optimizer_miner = None
 
             _reset_torch_state()
             _enforce_backend_state()
@@ -2642,15 +2576,6 @@ class Actor:
                 _model_config_snapshot = {
                     k: getattr(_cfg, k) for k in vars(_cfg) if not k.startswith("_")
                 }
-
-            _opt_hparams_snapshot = None
-            if optimizer_miner is not None:
-                _opt_hparams_snapshot = copy.deepcopy(
-                    [
-                        {k: v for k, v in pg.items() if k != "params"}
-                        for pg in optimizer_miner.param_groups
-                    ]
-                )
 
             # ── Runtime timer integrity check ────────────────────────────
             # Verify module globals against vault-stored IDs (closure-protected,
@@ -2947,59 +2872,6 @@ class Actor:
                     "code": code,
                 }
 
-            if not _multi_gpu:
-                # Convert GPU gradient snapshot to CPU (slow, but OUTSIDE the timer)
-                optimizer_miner.finalize_gradients()
-
-                # Check optimizer hyperparameters for tampering (warning only —
-                # multi-GPU miners don't face this check, so we keep it
-                # informational to avoid asymmetric rejection).
-                if _opt_hparams_snapshot is not None:
-                    _opt_hparams_current = [
-                        {k: v for k, v in pg.items() if k != "params"}
-                        for pg in optimizer_miner.param_groups
-                    ]
-                    if _opt_hparams_current != _opt_hparams_snapshot:
-                        logger.warning(
-                            "Optimizer hyperparameters were modified during training "
-                            "(lr, betas, weight_decay, etc.) — weight verification "
-                            "will catch any impact on final weights"
-                        )
-
-                # Verify optimizer wrapper integrity
-                if type(optimizer_miner) is not GradientCapturingOptimizer:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": wall_time,
-                        "success": False,
-                        "error": "Optimizer integrity check failed",
-                        "error_code": "execution_failed",
-                        "seed": seed,
-                        "code": code,
-                    }
-
-                # Get gradients captured from the final step (inside miner's code)
-                candidate_grad = optimizer_miner.captured_gradients
-
-                if candidate_grad is None:
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": wall_time,
-                        "success": False,
-                        "error": "No gradients captured - miner may not be calling optimizer.step()",
-                        "error_code": "no_gradients_captured",
-                        "seed": seed,
-                        "code": code,
-                    }
-            else:
-                candidate_grad = None
-
             # Validate miner's returned result
             ok, error, parsed = _validate_return_type(miner_result)
             if not ok or parsed is None:
@@ -3194,17 +3066,14 @@ class Actor:
             # Calculate expected tokens
             expected_tokens = batch_size * seq_len * steps
 
-            # Verify outputs using gradient-based AND weight-based verification
+            # Verify outputs using weight-based verification
             verified, verify_error, verify_details = _verify_outputs(
                 reference,
                 parsed,
                 expected_tokens,
-                reference_grad=reference_grad,
-                candidate_grad=candidate_grad,
                 reference_final_state=reference_final_state,
                 candidate_final_state=candidate_state,
                 max_loss_difference=max_loss_difference,
-                gradient_norm_ratio_max=gradient_norm_ratio_max,
                 weight_relative_error_max=weight_relative_error_max,
             )
 
@@ -3325,11 +3194,11 @@ class Actor:
             # Without this, local references keep optimizer states (~2x model
             # VRAM), data tensors, gradient copies, and reference state alive,
             # preventing gc.collect() + empty_cache() from reclaiming memory.
-            optimizer_miner = base_optimizer = None  # type: ignore[assignment]  # noqa
+            optimizer_miner = None  # type: ignore[assignment]
             data_iter_miner = data = None  # type: ignore[assignment]
-            reference_final_state = candidate_grad = candidate_state = None  # type: ignore[assignment]
+            reference_final_state = candidate_state = None  # type: ignore[assignment]
             miner_result = parsed = miner_module = None  # type: ignore[assignment]
-            reference = reference_grad = None  # type: ignore[assignment]
+            reference = None  # type: ignore[assignment]
 
             # Always invalidate model cache between evaluations.  FSDP/TP
             # corrupt parameter storage, and DDP/single-GPU miners can leave
@@ -3403,10 +3272,8 @@ class EvaluateRequest(BaseModel):
     use_random_init: bool = True
     min_trainable_params_ratio: float = 1.0
     min_params_changed_ratio: float = 0.75
-    # Gradient verification
-    gradient_norm_ratio_max: float = 1.08
-    # Weight verification
-    weight_relative_error_max: float = 0.01
+    # Weight verification (2% tolerates FSDP reduce-scatter FP drift)
+    weight_relative_error_max: float = 0.02
     # Timer integrity
     timer_divergence_threshold: float = 0.005
     # MFU calculation
@@ -3475,7 +3342,6 @@ async def main():
         use_random_init=p["use_random_init"],
         min_trainable_params_ratio=p["min_trainable_params_ratio"],
         min_params_changed_ratio=p["min_params_changed_ratio"],
-        gradient_norm_ratio_max=p["gradient_norm_ratio_max"],
         weight_relative_error_max=p["weight_relative_error_max"],
         timer_divergence_threshold=p["timer_divergence_threshold"],
         gpu_peak_tflops=p["gpu_peak_tflops"],
@@ -3571,7 +3437,6 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
             use_random_init=request.use_random_init,
             min_trainable_params_ratio=request.min_trainable_params_ratio,
             min_params_changed_ratio=request.min_params_changed_ratio,
-            gradient_norm_ratio_max=request.gradient_norm_ratio_max,
             weight_relative_error_max=request.weight_relative_error_max,
             timer_divergence_threshold=request.timer_divergence_threshold,
             gpu_peak_tflops=request.gpu_peak_tflops,
