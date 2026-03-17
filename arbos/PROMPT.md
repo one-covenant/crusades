@@ -44,7 +44,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1) 
 | Gradient norm ratio | ≤ 1.08 |
 | Weight relative error | ≤ 0.008 |
 | Timer divergence | ≤ 0.005 |
-| final_state | non-None, all model keys |
+| final_state | non-None, all model keys, correct shapes |
+| Model config | must match pre-execution snapshot (architectural attrs) |
 
 ## Security (code is pre-scanned — violations give specific error messages)
 
@@ -56,8 +57,17 @@ Your code is scanned locally before GPU evaluation. If you hit a security violat
 - **Forbidden**: `torch.set_grad_enabled(False)`, `torch.inference_mode()`
 - **Forbidden**: `from torch import compile` — but `torch.compile(fn)` as a direct call IS allowed
 - **Forbidden**: star imports (`from X import *`), `__dict__` access, `torch.load()`
+- **Forbidden strings**: `sliding_window`, `use_sliding_window`, `max_window_layers` — modifying these in model config reduces computation while the MFU formula still credits full work
 - **Allowed**: `torch.backends.cuda.matmul.allow_tf32 = True`, `torch.set_float32_matmul_precision('high')`
 - **Allowed imports**: functools, warnings, math, dataclasses, flash_attn, and torch submodules (torch.nn, torch.distributed, torch.distributed.fsdp, torch.cuda, torch.amp, torch.utils.checkpoint, etc.)
+
+### Runtime Verification (happens AFTER your code runs)
+
+Beyond static code scanning, the validator performs runtime checks:
+
+- **Model config snapshot**: The model's configuration is snapshotted before your `inner_steps` runs. After execution, it's compared against the snapshot. Modifying architectural config attributes (e.g., `hidden_size`, `num_attention_heads`, `num_hidden_layers`, `intermediate_size`) will be detected and rejected as `config_tampering`. Safe changes like `use_cache`, `output_hidden_states`, `output_attentions`, `return_dict` are allowed.
+- **Proxy/lazy object detection**: Return values are checked for deferred computation. Any object with `__getattr__` or `__get__` overrides anywhere in its inheritance chain (full MRO walk) will be rejected. You cannot use proxy wrappers or lazy evaluation to defer work outside the timed section.
+- **final_state validation**: In multi-GPU mode, `final_state` must be a dict containing all model keys with correct shapes. Values are materialized and checked — lazy tensors or proxy objects are rejected. The sanitized state is used for weight verification (no second access to your result object).
 
 ## Critical Pitfalls
 
@@ -142,7 +152,9 @@ Your code is scanned locally before GPU evaluation. If you hit a security violat
 8. **Reduce Python overhead** — bind optimizer methods to local variables in training loop:
    `opt_step = optimizer.step; opt_zero = optimizer.zero_grad`
 
-## State Dict Patterns (MUST return correct final_state)
+## State Dict Patterns (MUST return correct final_state — required for ALL multi-GPU strategies)
+
+`final_state` is **mandatory** in multi-GPU mode (DDP, FSDP, TP). Returning `None` will be rejected with `missing_final_state`. The state must contain all model keys with correct shapes — missing keys cause `incomplete_final_state`.
 
 **FSDP**:
 ```python
@@ -154,12 +166,23 @@ with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
 
 **DDP**:
 ```python
-# BEFORE wrapping: model = model.to(device)  # ensures all params+buffers on GPU
-# model = DDP(model, device_ids=[device], output_device=device)
-full_state = model.module.state_dict() if dist.get_rank() == 0 else None
+raw_model = model.module if hasattr(model, "module") else model
+full_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
 ```
 
-**TP**: return `model.state_dict()` directly (no module wrapper).
+**TP**: Gather distributed tensors, include tied weights:
+```python
+state = {}
+for name, param in model.named_parameters():
+    p = param.data
+    if hasattr(p, "full_tensor"): p = p.full_tensor()
+    state[name] = p.detach().cpu().clone()
+for key in model.state_dict():
+    if key not in state:
+        val = model.state_dict()[key]
+        if hasattr(val, "full_tensor"): val = val.full_tensor()
+        state[key] = val.detach().cpu().clone()
+```
 
 ## Memory Reality
 
