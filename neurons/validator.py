@@ -169,6 +169,8 @@ class Validator(BaseNode):
             timeout=hparams.eval_timeout,
             max_loss_difference=hparams.verification.max_loss_difference,
             min_params_changed_ratio=hparams.verification.min_params_changed_ratio,
+            # Gradient verification
+            gradient_norm_ratio_max=hparams.verification.gradient_norm_ratio_max,
             # Weight verification
             weight_relative_error_max=hparams.verification.weight_relative_error_max,
             # Timer integrity
@@ -774,6 +776,9 @@ class Validator(BaseNode):
             fatal_error = False
             try:
                 for run_idx in range(runs_remaining):
+                    if run_idx > 0:
+                        await asyncio.sleep(60)
+
                     current_run = len(my_evals) + run_idx + 1
                     seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}:{secrets.token_hex(16)}"
 
