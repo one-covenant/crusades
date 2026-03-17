@@ -2226,7 +2226,7 @@ class Actor:
                 }
             par_config = ParallelismConfig(dp_size=1, tp_size=1)
 
-        if _multi_gpu and par_config.dp_size * par_config.tp_size != num_gpus:
+        if par_config.dp_size * par_config.tp_size != num_gpus:
             return {
                 "task_id": task_id,
                 "mfu": 0.0,

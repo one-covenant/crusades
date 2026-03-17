@@ -1,12 +1,14 @@
 # Reference: TP (Tensor Parallel) strategy
 #
+# Topology: dp_size=1, tp_size=num_gpus
+#   - All ranks receive the same data (NOT data-parallel)
+#   - Equivalent to: get_strategy() -> {"dp_size": 1, "tp_size": num_gpus}
+#
 # Requirements for verification:
-#   - get_strategy() -> "tp"
-#   - Return InnerStepsResult with final_logits (3D), total_tokens, final_loss
+#   - get_strategy() returning "tp" or {"dp_size": 1, "tp_size": N}
+#   - Return InnerStepsResult with final_logits, total_tokens, final_loss
 #   - Must return final_state: gathered full tensors from DTensor shards
 #     TP replaces params with DTensors so validator cannot read weights directly
-#   - All ranks receive the same data (NOT data-parallel)
-#
 
 from dataclasses import dataclass
 
@@ -59,6 +61,7 @@ def _apply_tp(model, device_mesh):
 
 
 def _gather_full_state(model):
+    """Gather full tensors from DTensor shards (collective op, all ranks must call)."""
     state = {}
     for name, param in model.named_parameters():
         p = param.data
@@ -84,7 +87,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     if hasattr(model, "config"):
         model.config.use_cache = False
 
-    if num_gpus > 1:
+    is_tp = num_gpus > 1
+    if is_tp:
         mesh = init_device_mesh("cuda", (num_gpus,))
         model = _apply_tp(model, mesh)
 
@@ -94,7 +98,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             lr=1e-4,
             weight_decay=0.1,
             betas=(0.9, 0.95),
-            fused=num_gpus == 1,
+            fused=not is_tp,
         )
 
     total_tokens = 0
@@ -122,14 +126,16 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         final_logits = logits.detach()
         final_loss = loss.item()
 
-    # All ranks must call full_tensor() (collective op), only rank 0 keeps result
-    full_state = None
-    if num_gpus > 1:
+    # Gather full state dict for weight verification.
+    # TP requires full_tensor() calls (collective); single-GPU can read directly.
+    if is_tp:
         import torch.distributed as dist
 
         gathered = _gather_full_state(model)
         rank = dist.get_rank() if dist.is_initialized() else 0
         full_state = gathered if rank == 0 else None
+    else:
+        full_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     return InnerStepsResult(
         final_logits=final_logits,
