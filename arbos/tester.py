@@ -300,7 +300,7 @@ class LocalDockerTester:
 
     def _docker_cmd(self, code_path: str, params_path: str, script_path: str) -> list[str]:
         if self._gpu_devices:
-            gpu_flag = f"device={self._gpu_devices}"
+            gpu_flag = f'"device={self._gpu_devices}"'
         else:
             gpu_flag = str(self._num_gpus)
 
