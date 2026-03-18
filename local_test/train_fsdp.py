@@ -32,7 +32,7 @@ class InnerStepsResult:
     final_logits: torch.Tensor
     total_tokens: int
     final_loss: float
-    final_state: dict | None = None
+    final_state: dict | None
 
 
 def get_strategy():
