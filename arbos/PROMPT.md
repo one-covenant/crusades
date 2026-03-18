@@ -34,7 +34,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1) 
 - **FSDP**: handles device placement via `device_id=device` — no manual `model.to(device)` needed
 - **DDP**: does NOT manage device placement — you MUST call `model = model.to(device)` before `DDP(model, ...)` to ensure all parameters AND buffers are on GPU. Skipping this causes "Expected all tensors on same device, cuda:0 and cpu" errors.
 - FSDP/DDP: each GPU gets different data shards. TP: all GPUs get same data.
-- **Warmup**: The validator runs 1 warmup step before the timed section. For multi-GPU, the model is **reloaded from scratch** after warmup (to clean DDP/FSDP hooks). This means `torch.compile` with `reduce-overhead` (CUDA graphs) must recapture graphs in the timed section — warmup compilation is NOT cached. However, `torch._dynamo`'s inductor kernel cache persists across model instances, so `mode="default"` compilation IS partially cached from warmup.
+- **Warmup**: The validator runs 2 warmup steps before the timed section. For multi-GPU, the model is **reloaded from scratch** after warmup (to clean DDP/FSDP hooks). This means `torch.compile` with `reduce-overhead` (CUDA graphs) must recapture graphs in the timed section — warmup compilation is NOT cached. However, `torch._dynamo`'s inductor kernel cache persists across model instances, so `mode="default"` compilation IS partially cached from warmup.
 
 ## Overhead Budget (20 steps, ~64s wall time)
 

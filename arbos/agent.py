@@ -675,6 +675,19 @@ Examples:
     )
     args = parser.parse_args()
 
+    local_only_flags = []
+    if args.num_gpus is not None:
+        local_only_flags.append("--num-gpus")
+    if args.gpu_devices is not None:
+        local_only_flags.append("--gpu-devices")
+    if args.docker_image is not None:
+        local_only_flags.append("--docker-image")
+    if local_only_flags and not args.local:
+        parser.error(
+            f"{', '.join(local_only_flags)} require --local (otherwise Basilica is used "
+            f"and these flags are ignored)"
+        )
+
     run_agent(args)
 
 
