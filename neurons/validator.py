@@ -794,6 +794,27 @@ class Validator(BaseNode):
                         task_id=current_run,
                     )
 
+                    if (
+                        not result.success
+                        and result.error
+                        and "EADDRINUSE" in result.error
+                        and self.affinetes_mode == "basilica"
+                    ):
+                        logger.warning(
+                            f"Run {current_run}: EADDRINUSE — recycling deployment and retrying once"
+                        )
+                        await self.affinetes_runner.delete_basilica_deployment()
+                        await asyncio.sleep(10)
+                        result = await self.affinetes_runner.evaluate(
+                            code=miner_code,
+                            seed=seed,
+                            steps=hparams.eval_steps,
+                            batch_size=hparams.benchmark_batch_size,
+                            sequence_length=hparams.benchmark_sequence_length,
+                            data_samples=hparams.benchmark_data_samples,
+                            task_id=current_run,
+                        )
+
                     if result.success:
                         logger.info(
                             f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}"
