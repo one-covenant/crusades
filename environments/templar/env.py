@@ -1351,7 +1351,7 @@ def _create_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
     )
 
 
-_REFERENCE_MICRO_BATCH_SIZE = 16
+_REFERENCE_MICRO_BATCH_SIZE = 8
 
 
 def _run_reference(
@@ -1364,10 +1364,12 @@ def _run_reference(
 ) -> InnerStepsResult:
     """Run reference implementation for comparison.
 
-    Uses large micro-batches (16) to minimize floating-point divergence
-    from gradient accumulation while fitting in GPU memory alongside FSDP
-    FULL_SHARD.  For batch_size=32 this means only 2 accumulations per
-    step — negligible rounding compared to micro_batch=2 (16 accumulations).
+    Uses moderately large micro-batches (8) to balance activation memory
+    against floating-point divergence from gradient accumulation.  FSDP
+    FULL_SHARD (single-unit wrap, no auto_wrap_policy) stores activations
+    for ALL layers; micro_batch=16 OOMs on 3B Qwen (36 layers, 11008
+    intermediate).  For batch_size=32, micro_batch=8 means 4 accumulations
+    per step — low rounding compared to micro_batch=2 (16 accumulations).
 
     When *ddp_model* is provided, the forward pass uses the distributed
     wrapper (DDP or FSDP) while gradient capture reads from the unwrapped
