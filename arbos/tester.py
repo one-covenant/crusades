@@ -340,9 +340,9 @@ class LocalDockerTester:
         ]
 
         if self._num_gpus > 1:
-            import random
+            import secrets
 
-            master_port = random.randint(29500, 39500)
+            master_port = 29500 + secrets.randbelow(10001)
             cmd.extend(
                 [
                     "torchrun",
