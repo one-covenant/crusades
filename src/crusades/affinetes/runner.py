@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import random
 import subprocess
 import tempfile
 import time
@@ -546,12 +547,15 @@ asyncio.run(main())
 
             # Image and command
             if self.num_gpus > 1:
+                master_port = random.randint(29500, 39500)
                 docker_cmd.extend(
                     [
                         self.validator_image,
                         "torchrun",
                         "--nproc_per_node",
                         str(self.num_gpus),
+                        "--master_port",
+                        str(master_port),
                         "/app/scripts/eval_script.py",
                     ]
                 )

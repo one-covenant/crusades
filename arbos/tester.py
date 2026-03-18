@@ -340,8 +340,18 @@ class LocalDockerTester:
         ]
 
         if self._num_gpus > 1:
+            import random
+
+            master_port = random.randint(29500, 39500)
             cmd.extend(
-                ["torchrun", "--nproc_per_node", str(self._num_gpus), "/test/eval_runner.py"]
+                [
+                    "torchrun",
+                    "--nproc_per_node",
+                    str(self._num_gpus),
+                    "--master_port",
+                    str(master_port),
+                    "/test/eval_runner.py",
+                ]
             )
         else:
             cmd.extend(["python3", "/test/eval_runner.py"])
