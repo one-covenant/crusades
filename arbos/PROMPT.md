@@ -53,7 +53,7 @@ To reach 65% MFU, you need wall_time ≈ 59.8s — shave ~4-5s off current best.
 |---|---|
 | Loss difference | ≤ 0.3 |
 | Parameters changed | ≥ 75% |
-| Weight relative error | ≤ 0.02 |
+| Weight relative error | ≤ 0.01 |
 | Timer divergence | ≤ 0.005 |
 | final_state | REQUIRED (all strategies), all model keys, correct shapes |
 | Model config | must match pre-execution snapshot (architectural attrs) |
@@ -99,7 +99,7 @@ Beyond static code scanning, the validator performs runtime checks:
 
 8. **Activation checkpointing with Qwen2 layers is HARD**: Qwen2DecoderLayer.forward() takes keyword arguments (`attention_mask`, `position_ids`, `past_key_values`, `use_cache`, `cache_position`, `position_embeddings`). `torch.utils.checkpoint.checkpoint()` needs `use_reentrant=False` to properly handle kwargs. Do NOT naively wrap layers — it will fail with `Unexpected keyword arguments`. If you can't get it working, skip checkpointing entirely.
 
-9. `torch.compile` with `mode="max-autotune-no-cudagraphs"` or `mode="max-autotune"` causes weight divergence beyond verification threshold (0.02). Use `mode="reduce-overhead"` (best performance, uses CUDA graphs safely) or `mode="default"` (lower warmup cost but slower per-step).
+9. `torch.compile` with `mode="max-autotune-no-cudagraphs"` or `mode="max-autotune"` causes weight divergence beyond verification threshold (0.01). Use `mode="reduce-overhead"` (best performance, uses CUDA graphs safely) or `mode="default"` (lower warmup cost but slower per-step).
 
 10. `bucket_cap_mb` and `gradient_as_bucket_view` are NOT valid FSDP constructor parameters. These are DDP parameters.
 

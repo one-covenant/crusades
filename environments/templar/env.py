@@ -1351,7 +1351,7 @@ def _create_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
     )
 
 
-_REFERENCE_MICRO_BATCH_SIZE = 2
+_REFERENCE_MICRO_BATCH_SIZE = 16
 
 
 def _run_reference(
@@ -1364,11 +1364,10 @@ def _run_reference(
 ) -> InnerStepsResult:
     """Run reference implementation for comparison.
 
-    Uses gradient accumulation with micro-batches to stay within GPU
-    memory for large models (e.g. 7B on A100 80GB).  The full batch
-    from *data_iterator* is split into chunks of ``_REFERENCE_MICRO_BATCH_SIZE``
-    and gradients are accumulated before each optimizer step — mathematically
-    equivalent to processing the full batch at once.
+    Uses large micro-batches (16) to minimize floating-point divergence
+    from gradient accumulation while fitting in GPU memory alongside FSDP
+    FULL_SHARD.  For batch_size=32 this means only 2 accumulations per
+    step — negligible rounding compared to micro_batch=2 (16 accumulations).
 
     When *ddp_model* is provided, the forward pass uses the distributed
     wrapper (DDP or FSDP) while gradient capture reads from the unwrapped
@@ -1564,7 +1563,7 @@ def _verify_outputs(
     reference_final_state: dict | None = None,
     candidate_final_state: dict | None = None,
     max_loss_difference: float = 0.3,
-    weight_relative_error_max: float = 0.02,
+    weight_relative_error_max: float = 0.01,
 ) -> tuple[bool, str | None, dict]:
     """Verify candidate outputs match reference.
 
@@ -1703,8 +1702,8 @@ class Actor:
         use_random_init: bool = True,
         min_trainable_params_ratio: float = 1.0,
         min_params_changed_ratio: float = 0.75,
-        # Weight verification (2% tolerates FSDP reduce-scatter FP drift)
-        weight_relative_error_max: float = 0.02,
+        # Weight verification (1% — full-batch reference minimizes FP drift)
+        weight_relative_error_max: float = 0.01,
         # Timer integrity
         timer_divergence_threshold: float = 0.005,
         # MFU calculation
@@ -1733,7 +1732,7 @@ class Actor:
             use_random_init: Use random weights
             min_trainable_params_ratio: Min % params that must be trainable
             min_params_changed_ratio: Min % params that must change
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.02 = 2%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.01 = 1%)
             timer_divergence_threshold: Max divergence between timer sources (e.g., 0.005 = 0.5%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             min_mfu: Minimum MFU threshold — submissions below this are rejected
@@ -1935,8 +1934,7 @@ class Actor:
                 # Gradient checkpointing is incompatible with FULL_SHARD when
                 # the model is wrapped as a single FSDP unit (no auto_wrap_policy):
                 # FSDP frees param storage after forward, but checkpointing tries
-                # to re-access it during backward.  Disable it for the reference —
-                # micro-batch size 2 keeps memory well within bounds.
+                # to re-access it during backward.  Disable it for the reference.
                 if hasattr(model, "gradient_checkpointing_disable"):
                     model.gradient_checkpointing_disable()
 
@@ -2943,8 +2941,8 @@ class EvaluateRequest(BaseModel):
     use_random_init: bool = True
     min_trainable_params_ratio: float = 1.0
     min_params_changed_ratio: float = 0.75
-    # Weight verification (2% tolerates FSDP reduce-scatter FP drift)
-    weight_relative_error_max: float = 0.02
+    # Weight verification (1% — full-batch reference minimizes FP drift)
+    weight_relative_error_max: float = 0.01
     # Timer integrity
     timer_divergence_threshold: float = 0.005
     # MFU calculation

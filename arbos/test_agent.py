@@ -376,7 +376,7 @@ def test_tester_payload():
     check("payload has gpu_peak_tflops", payload["gpu_peak_tflops"] == 312.0)
     check("payload has max_loss_difference", payload["max_loss_difference"] == 0.3)
     check("payload has min_params_changed_ratio", payload["min_params_changed_ratio"] == 0.75)
-    check("payload has weight_relative_error_max", payload["weight_relative_error_max"] == 0.02)
+    check("payload has weight_relative_error_max", payload["weight_relative_error_max"] == 0.01)
     check("payload has timer_divergence_threshold", payload["timer_divergence_threshold"] == 0.005)
 
 
@@ -390,7 +390,7 @@ def test_local_tester_payload():
 
     check("local payload model_url", payload["model_url"] == "Qwen/Qwen2.5-3B")
     check("local payload num_gpus=4", payload["num_gpus"] == 4)
-    check("local payload has verification fields", payload["weight_relative_error_max"] == 0.02)
+    check("local payload has verification fields", payload["weight_relative_error_max"] == 0.01)
 
     cmd = tester._docker_cmd("/tmp/code.py", "/tmp/params.json", "/tmp/runner.py")
     check("docker cmd starts with docker", cmd[0] == "docker")

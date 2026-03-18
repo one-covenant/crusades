@@ -167,7 +167,7 @@ class AffinetesRunner:
         max_loss_difference: float = 0.3,
         min_params_changed_ratio: float = 0.8,
         # Weight verification
-        weight_relative_error_max: float = 0.02,
+        weight_relative_error_max: float = 0.01,
         # Timer integrity
         timer_divergence_threshold: float = 0.005,
         # MFU calculation
@@ -200,7 +200,7 @@ class AffinetesRunner:
             data_url: Default data URL (HuggingFace dataset)
             max_loss_difference: Max allowed |candidate_loss - reference_loss|
             min_params_changed_ratio: Min % params that must change
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.02 = 2%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.01 = 1%)
             timer_divergence_threshold: Max allowed divergence between timer sources (e.g., 0.005 = 0.5%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             max_plausible_mfu: Reject MFU above this threshold (anti-cheat)
