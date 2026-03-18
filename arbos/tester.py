@@ -393,15 +393,27 @@ class LocalDockerTester:
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
             )
 
+            deadline = time.monotonic() + timeout
             result_data = None
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line.startswith("EVAL_RESULT:"):
-                    result_data = json.loads(line[len("EVAL_RESULT:") :])
-                else:
-                    logger.info(f"[docker] {line}")
+            try:
+                for line in proc.stdout:
+                    if time.monotonic() > deadline:
+                        proc.kill()
+                        raise subprocess.TimeoutExpired(cmd, timeout)
+                    line = line.rstrip()
+                    if line.startswith("EVAL_RESULT:"):
+                        result_data = json.loads(line[len("EVAL_RESULT:") :])
+                    else:
+                        logger.info(f"[docker] {line}")
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                return EvalResult(
+                    success=False,
+                    error=f"Docker evaluation timed out after {timeout}s",
+                )
 
-            proc.wait(timeout=timeout)
+            proc.wait(timeout=30)
 
             if result_data is None:
                 return EvalResult(

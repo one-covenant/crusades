@@ -108,13 +108,22 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     if hasattr(model, "config"):
         model.config.use_cache = False
 
+    strategy = get_strategy()
+    expected_gpus = strategy["dp_size"] * strategy["tp_size"]
+    if num_gpus != expected_gpus:
+        raise ValueError(
+            f"get_strategy() requires {expected_gpus} GPUs "
+            f"(dp_size={strategy['dp_size']} * tp_size={strategy['tp_size']}), "
+            f"but num_gpus={num_gpus}"
+        )
+
     is_multi = num_gpus > 1
     dp_pg = None
     dp_size = 1
 
     if is_multi:
-        dp_size = 2
-        tp_size = num_gpus // dp_size
+        dp_size = strategy["dp_size"]
+        tp_size = strategy["tp_size"]
 
         mesh_2d = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
         tp_mesh = mesh_2d["tp"]
