@@ -794,8 +794,10 @@ class Validator(BaseNode):
 
                     if (
                         not result.success
-                        and result.error
-                        and "EADDRINUSE" in result.error
+                        and (
+                            result.error_code == "EADDRINUSE"
+                            or (result.error and "EADDRINUSE" in result.error)
+                        )
                         and self.affinetes_mode == "basilica"
                     ):
                         logger.warning(

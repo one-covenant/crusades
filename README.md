@@ -159,6 +159,8 @@ The validator requires `dp_size * tp_size == num_gpus`. Common configurations:
 
 Legacy string values (`"ddp"`, `"fsdp"`, `"tp"`) are still accepted but the dict format is preferred.
 
+**Important:** `get_strategy()` must return a literal value (string or dict). The validator parses this function via AST and only accepts direct `return` literals. Returning a computed value through a variable or helper function will be rejected even if the value itself is valid.
+
 This matters because the validator uses `dp_size` and `tp_size` to decide data distribution and MFU token counting. Declaring the wrong topology will cause weight verification failures.
 
 ### `inner_steps()` Signature
