@@ -1,7 +1,7 @@
 {
-    "netuid": 2,
+    "netuid": 3,
     "burn_rate": 0.95,
-    "burn_uid": 0,
+    "burn_uid": 1,
 
     "evaluation_runs": 3,
     "eval_steps": 20,
@@ -16,9 +16,9 @@
     "benchmark_sequence_length": 1024,
     "benchmark_batch_size": 32,
 
-    "set_weights_interval_blocks": 5,
-    "reveal_blocks": 5,
-    "min_blocks_between_commits": 1,
+    "set_weights_interval_blocks": 100,
+    "reveal_blocks": 20,
+    "min_blocks_between_commits": 360,
     "block_time": 12,
 
     "docker": {
@@ -41,7 +41,8 @@
     "verification": {
         "max_loss_difference": 0.3,
         "min_params_changed_ratio": 0.75,
-        "weight_relative_error_max": 0.01,
+        "gradient_norm_ratio_max": 1.08,
+        "weight_relative_error_max": 0.008,
         "timer_divergence_threshold": 0.005
     },
 
