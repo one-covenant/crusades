@@ -264,7 +264,7 @@ Monitor crusades activity in real-time with the terminal dashboard.
 
 ```bash
 # Connect to the official Crusades API
-uv run -m crusades.tui --url 69.19.137.219:8080
+uv run -m crusades.tui --url 62.169.159.5:8080
 ```
 
 ### Features

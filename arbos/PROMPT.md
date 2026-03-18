@@ -123,6 +123,130 @@ Beyond static code scanning, the validator performs runtime checks:
 
 18. **State dict extraction for FSDP NO_SHARD**: With `NO_SHARD`, all parameters are already full on each rank. The heavy `FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, ...)` machinery adds ~3-5s overhead. Consider simpler extraction if possible. Note: this time is inside the timer and directly hurts MFU.
 
+## Kernel Optimization (highest-leverage direction)
+
+`flash_attn` 2.8.3 and `triton` 3.5.0 are pre-installed. **Replacing default PyTorch ops with fused kernels is the most underexplored and highest-impact optimization path.** Every transformer layer runs the same sequence of ops 36 times per forward pass — even a 5% speedup per op compounds to significant MFU gains.
+
+### Three approaches (ordered by practicality)
+
+**Approach 1: flash_attn's Triton ops (easiest — full backward support)**
+
+These are pre-built Triton kernels with custom backward passes. Drop-in replacements:
+
+| Kernel | Import | What it replaces | Backward |
+|---|---|---|---|
+| Triton RMS norm | `flash_attn.ops.triton.layer_norm.rms_norm_fn` | Qwen2's `RMSNorm` — 73 calls/fwd (36 layers × 2 + final) | YES |
+| SwiGLU activation | `flash_attn.ops.activations.swiglu` | Qwen2's `silu(gate) * up` — 36 calls/fwd | YES |
+| Flash CE loss | `flash_attn.losses.cross_entropy.CrossEntropyLoss` | `F.cross_entropy` — fused softmax+CE | YES |
+| Triton rotary | `flash_attn.ops.triton.rotary.apply_rotary` | Qwen2's rotary embeddings — 36 calls/fwd | YES |
+| Rotary embedding | `flash_attn.layers.rotary.apply_rotary_emb` | Same, alternative impl | YES |
+
+**NOT available** (missing CUDA extensions): `flash_attn.ops.rms_norm`, `flash_attn.ops.fused_dense`.
+
+**Approach 2: Fused PyTorch functions + torch.compile (medium — compiler generates backward)**
+
+Write a plain PyTorch function that fuses multiple ops, then `torch.compile` it. The compiler generates optimized Triton kernels for BOTH forward and backward automatically:
+
+```python
+def fused_residual_norm_fwd(hidden, residual, weight, eps):
+    hidden = hidden + residual
+    variance = hidden.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    hidden = hidden * torch.rsqrt(variance + eps)
+    return hidden * weight
+
+compiled_res_norm = torch.compile(fused_residual_norm_fwd, mode="default", dynamic=False)
+```
+
+The compiler fuses residual add + variance + rsqrt + multiply into fewer kernel launches. This works for any operation combination and handles backward automatically.
+
+**Approach 3: Custom @triton.jit kernels (advanced — forward only)**
+
+Write your own GPU kernels for maximum control. `triton` 3.5.0 is available and NOT blocked by security.
+
+**CRITICAL LIMITATION**: Custom `@triton.jit` kernels only support FORWARD pass. Backward through them fails because `torch.autograd.Function` requires `@staticmethod` which is blocked by security. For backward, use Approach 1 (flash_attn ops) or Approach 2 (torch.compile).
+
+**Use custom Triton for**: loss computation, data preprocessing, or any op where you don't need gradients.
+
+```python
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fused_add_rms_norm_kernel(
+    X, Residual, W, Out, ResOut,
+    stride, N, eps,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < N
+    x = tl.load(X + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
+    res = tl.load(Residual + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
+    x = x + res
+    tl.store(ResOut + row * stride + cols, x.to(tl.bfloat16), mask=mask)
+    var = tl.sum(x * x, axis=0) / N
+    rrms = 1.0 / tl.sqrt(var + eps)
+    x_hat = x * rrms
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+    tl.store(Out + row * stride + cols, (x_hat * w).to(tl.bfloat16), mask=mask)
+
+@triton.jit
+def _fused_silu_mul_kernel(
+    Gate, Up, Out,
+    stride, N,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < N
+    gate = tl.load(Gate + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(Up + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
+    tl.store(Out + row * stride + cols, (gate * tl.sigmoid(gate) * up).to(tl.bfloat16), mask=mask)
+```
+
+**Triton rules**: `tl.arange` size MUST be a power of 2. Qwen2.5-3B: `hidden_size=2048` (already power of 2), `intermediate_size=8960` (use `BLOCK=16384`, next power of 2, with mask).
+
+### How to monkey-patch Qwen2 layers
+
+The model is pre-loaded — replace internal layer forwards with fused kernels:
+
+```python
+from flash_attn.ops.triton.layer_norm import rms_norm_fn
+from flash_attn.ops.activations import swiglu
+
+def _patch_model(model):
+    """Replace Qwen2 ops with fused flash_attn kernels."""
+    # Patch all RMSNorm layers (73 total: 36×2 per layer + 1 final)
+    for layer in model.model.layers:
+        for norm in (layer.input_layernorm, layer.post_attention_layernorm):
+            w, eps = norm.weight, norm.variance_epsilon
+            norm.forward = lambda x, _w=w, _e=eps: rms_norm_fn(x, _w, None, eps=_e)
+    fn = model.model.norm
+    w, eps = fn.weight, fn.variance_epsilon
+    fn.forward = lambda x, _w=w, _e=eps: rms_norm_fn(x, _w, None, eps=_e)
+
+    # Patch MLP: replace silu(gate) * up with fused swiglu
+    for layer in model.model.layers:
+        mlp = layer.mlp
+        original_gate = mlp.gate_proj
+        original_up = mlp.up_proj
+        original_down = mlp.down_proj
+        def fused_mlp_forward(x, _g=original_gate, _u=original_up, _d=original_down):
+            gate_out = _g(x)
+            up_out = _u(x)
+            return _d(swiglu(gate_out, up_out))
+        mlp.forward = fused_mlp_forward
+```
+
+This is safe: (1) mathematical result is identical — weight verification passes, (2) model config is unchanged — config snapshot passes, (3) direct attribute assignment on model instances is allowed by security policy.
+
+### Recommended kernel optimization strategy
+
+1. **Start here**: Patch all 73 RMSNorm calls with `rms_norm_fn` + 36 MLP activations with `swiglu`. This is the easiest win — ~109 ops replaced per forward pass.
+2. **Then**: Compile the patched forward+loss as one function with `torch.compile(mode="reduce-overhead")`. The compiler fuses remaining ops around your fast kernels.
+3. **Then**: Write custom `@triton.jit` kernels for the loss computation (forward-only, no grad needed) or data preprocessing.
+4. **Advanced**: Write a completely custom forward pass that manually iterates through layers, calling fused kernels for each sublayer. Skip the HuggingFace model overhead entirely.
+
 ## Proven Optimization Patterns (use as building blocks)
 
 1. **Flash CE loss** — faster than F.cross_entropy:
@@ -232,8 +356,9 @@ If previous attempts failed or showed no improvement, DO NOT repeat the same app
 1. Read error messages carefully — they tell you exactly what went wrong
 2. Try a **fundamentally DIFFERENT** strategy or optimization direction
 3. Track what has been tried and its result — never re-try something that gave <0.5% improvement
-4. If stuck at a plateau for 3+ steps, **switch parallelism strategy entirely** (e.g., FSDP → TP, or FSDP → manual all-reduce + compile)
+4. If stuck at a plateau for 3+ steps, **try kernel replacement** (flash_attn Triton ops for RMSNorm, rotary, SwiGLU) or **switch parallelism strategy entirely** (e.g., FSDP → TP)
 5. Each attempt should explore something genuinely new, not a minor variation of a failed approach
+6. **Kernel-based optimization is the most underexplored direction** — most prior attempts focused on compile modes and parallelism strategies, not on replacing individual ops with fused kernels
 
 ## What Has Been Tried (empirical results on this exact workload)
 
@@ -246,7 +371,10 @@ These are MEASURED results — do not re-test them:
 - Removing MixedPrecision from FSDP = **no measurable improvement** (~60.4%)
 - Various inductor config changes = **no improvement or regression**
 
-**What to try next** (unexplored territory):
+**What to try next** (unexplored territory — ordered by expected impact):
+- **Kernel replacement**: Patch Qwen2's RMSNorm, rotary embeddings, and MLP activation with flash_attn Triton kernels. These run on every layer of every forward pass — 72 norms + 36 rotaries + 36 activations = 144 kernel swaps per step × 20 steps. Even 5% faster per op compounds significantly.
+- **Kernel replacement + torch.compile**: Replace slow ops with fused kernels, THEN compile the patched forward. The compiler fuses remaining ops around your fast kernels — best of both worlds.
+- **Custom Triton fused residual+norm**: Write a `@triton.jit` kernel that fuses `residual_add + rms_norm` into one pass (avoids extra memory read/write). Each transformer layer does this twice.
 - **Tensor Parallelism (TP)**: Splits model layers across GPUs. Each GPU does less compute per token but all see the same data. NVLink makes TP communication fast. Could eliminate data-parallel overhead entirely.
 - **Faster state dict extraction**: With NO_SHARD, try `FSDP.summon_full_params()` or direct unwrapping instead of `FULL_STATE_DICT` type — could save 3-5s.
 - **`mode="default"` compile with inductor cache from warmup**: Since `default` mode's inductor kernels persist from warmup, the timed section might have near-zero compile warmup. Could beat `reduce-overhead` despite slower per-step.
@@ -267,12 +395,19 @@ Think about WHERE time is spent: compile warmup (~10s), state dict extraction (~
 - **TP** (`{"dp_size": 1, "tp_size": 2}`): Splits layers across GPUs. NVLink makes TP fast. All GPUs get same data — no data sharding. **Most promising unexplored direction** for breaking 60.5%. Use `torch.distributed.tensor.parallel` APIs.
 - **Hybrid** (`{"dp_size": N, "tp_size": M}` where N×M=num_gpus): Combine strategies creatively.
 
-**Compute optimizations**:
-- Flash CE loss (flash_attn.losses.cross_entropy) — faster than F.cross_entropy
+**Kernel-based optimizations** (highest leverage — replace PyTorch ops with fused kernels):
+- **Triton RMS norm** (`flash_attn.ops.triton.layer_norm.rms_norm_fn`) — replaces 73 RMSNorm calls per forward pass. Monkey-patch `layer.input_layernorm.forward` and `layer.post_attention_layernorm.forward` for all 36 layers + final norm. This is the single highest-impact kernel swap.
+- **Triton rotary** (`flash_attn.ops.triton.rotary.apply_rotary` or `flash_attn.layers.rotary.apply_rotary_emb`) — replaces 36 rotary embedding computations per forward. Patch `layer.self_attn.rotary_emb` or inline into a custom attention forward.
+- **SwiGLU** (`flash_attn.ops.activations.swiglu`) — fused gate+activation for Qwen2's MLP (SiLU-gated pattern). Replaces `act_fn(gate_proj(x)) * up_proj(x)` with a single kernel.
+- **Custom Triton kernels** (`@triton.jit`) — triton 3.5.0 is available. Write fused kernels for any repeated pattern (e.g., fused residual+norm, fused loss+backward).
+- Flash CE loss (`flash_attn.losses.cross_entropy`) — faster than F.cross_entropy
 - Fused AdamW (`fused=True`) — single CUDA kernel for optimizer step
+
+**Standard compute optimizations**:
 - TF32 matmul (`torch.backends.cuda.matmul.allow_tf32 = True`) — free throughput boost
 - `torch.compile(fwd, mode="reduce-overhead")` on forward-only function (never the model)
 - Do NOT use `fullgraph=True` — empirically hurts by ~2%
+- **Combine `torch.compile` with kernel patches**: Replace slow ops with fast kernels FIRST, then compile. `torch.compile` will fuse the remaining ops around your fast kernels.
 
 **Communication optimizations**:
 - FSDP: `backward_prefetch=BackwardPrefetch.BACKWARD_PRE` overlaps gradient comm with compute
@@ -294,10 +429,11 @@ Think about WHERE time is spent: compile warmup (~10s), state dict extraction (~
 - Pre-compute everything possible before the training loop
 
 **Radical ideas (high risk, high reward)**:
-- Custom Triton kernels for fused operations
-- Fused backward + optimizer step
+- **Full custom forward pass**: Instead of calling `model(input_ids)`, manually iterate `model.model.layers`, calling fused kernels for each sublayer: `rms_norm_fn` → attention → residual add → `rms_norm_fn` → fused MLP with `swiglu` → residual add. Skip all HuggingFace wrapper overhead (cache management, mask generation, output wrapping). Return logits directly via `model.lm_head(hidden)`.
+- **Custom @triton.jit for forward-only ops**: Fused residual+norm kernel (saves a full memory read/write), fused CE loss kernel. These are forward-only (backward limitation), use for loss or non-differentiable paths.
+- **torch.compile over kernel-patched model**: Patch RMSNorm+SwiGLU with flash_attn ops, then compile the whole forward+loss. The compiler fuses the remaining ops (residual adds, linear projections, attention) around your already-fast kernels — the combination can be faster than either alone.
+- Fused backward + optimizer step via torch.compile
 - Pipeline within a single step (forward next batch while backward current)
-- Custom autograd functions to fuse backward computations
 
 ## Response Format
 
