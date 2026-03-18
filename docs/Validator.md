@@ -76,7 +76,7 @@ Each submission undergoes the following verification checks:
 | **Sequence Length** | Logits seq dim must match expected | `seq_len - 1` | Active |
 | **Token Count** | Must process the expected number of tokens | Exact match | Active |
 | **Loss Validity** | Loss must be positive, not NaN, close to reference | `max_loss_difference: 0.3` | Active |
-| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.01` | Active |
+| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.008` | Active |
 | **Trainable Params** | All params must be trainable | `100%` | Active |
 | **Params Changed** | Most param elements must change during training | `min: 70%` | Active |
 | **Timer Integrity** | Multiple timer sources must agree | `timer_divergence_threshold: 0.5%` | Active |
@@ -226,7 +226,7 @@ Edit `hparams/hparams.json`:
     "verification": {
         "max_loss_difference": 0.3,
         "min_params_changed_ratio": 0.7,
-        "weight_relative_error_max": 0.01,
+        "weight_relative_error_max": 0.008,
         "timer_divergence_threshold": 0.005
     },
     
@@ -253,7 +253,7 @@ Edit `hparams/hparams.json`:
 | `docker.num_gpus` | Number of GPUs (multi-GPU via `torchrun`) | `2` |
 | `docker.memory_limit` | Container memory limit | `"80g"` |
 | `docker.shm_size` | Shared memory (auto-scaled for multi-GPU NCCL) | `"32g"` |
-| `weight_relative_error_max` | Max relative error for final weight check | `0.01` (1%) |
+| `weight_relative_error_max` | Max relative error for final weight check | `0.008` (0.8%) |
 | `timer_divergence_threshold` | Max divergence between timer sources | `0.005` (0.5%) |
 | `min_mfu` | Floor MFU threshold — reject below this | `35.0` |
 | `max_plausible_mfu` | Ceiling MFU cap — no code exceeds this | `75.0` |

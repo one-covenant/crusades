@@ -1565,7 +1565,7 @@ def _verify_outputs(
     reference_final_state: dict | None = None,
     candidate_final_state: dict | None = None,
     max_loss_difference: float = 0.3,
-    weight_relative_error_max: float = 0.01,
+    weight_relative_error_max: float = 0.008,
 ) -> tuple[bool, str | None, dict]:
     """Verify candidate outputs match reference.
 
@@ -1704,8 +1704,8 @@ class Actor:
         use_random_init: bool = True,
         min_trainable_params_ratio: float = 1.0,
         min_params_changed_ratio: float = 0.75,
-        # Weight verification (1% — full-batch reference minimizes FP drift)
-        weight_relative_error_max: float = 0.01,
+        # Weight verification (0.8% — micro-batch=8 reference keeps FP drift low)
+        weight_relative_error_max: float = 0.008,
         # Timer integrity
         timer_divergence_threshold: float = 0.005,
         # MFU calculation
@@ -1734,7 +1734,7 @@ class Actor:
             use_random_init: Use random weights
             min_trainable_params_ratio: Min % params that must be trainable
             min_params_changed_ratio: Min % params that must change
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.01 = 1%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.008 = 0.8%)
             timer_divergence_threshold: Max divergence between timer sources (e.g., 0.005 = 0.5%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             min_mfu: Minimum MFU threshold — submissions below this are rejected
@@ -2943,8 +2943,8 @@ class EvaluateRequest(BaseModel):
     use_random_init: bool = True
     min_trainable_params_ratio: float = 1.0
     min_params_changed_ratio: float = 0.75
-    # Weight verification (1% — full-batch reference minimizes FP drift)
-    weight_relative_error_max: float = 0.01
+    # Weight verification (0.8% — micro-batch=8 reference keeps FP drift low)
+    weight_relative_error_max: float = 0.008
     # Timer integrity
     timer_divergence_threshold: float = 0.005
     # MFU calculation
