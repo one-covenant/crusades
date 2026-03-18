@@ -269,7 +269,7 @@ class LocalDockerTester:
             project_root = Path(__file__).parent.parent
         self._project_root = project_root
 
-        self._image = image or hparams.get("basilica", {}).get("image", "templar-eval:latest")
+        self._image = image or "templar-eval:latest"
 
     def _build_payload(self, code: str) -> dict:
         h = self._hparams
@@ -300,7 +300,7 @@ class LocalDockerTester:
 
     def _docker_cmd(self, code_path: str, params_path: str, script_path: str) -> list[str]:
         if self._gpu_devices:
-            gpu_flag = f'"device={self._gpu_devices}"'
+            gpu_flag = f"device={self._gpu_devices}"
         else:
             gpu_flag = str(self._num_gpus)
 
