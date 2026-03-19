@@ -501,11 +501,9 @@ class Validator(BaseNode):
         # burn_alpha extrinsic must be signed by the stake owner.
         validator_coldkey = self.wallet.coldkeypub.ss58_address
         if payment_address != validator_coldkey:
-            logger.warning(
-                f"Cannot burn fee for {submission_id}: payment went to "
-                f"{payment_address[:16]}... which is not this validator's "
-                f"coldkey ({validator_coldkey[:16]}...). "
-                f"The recipient must burn manually."
+            logger.debug(
+                f"Skipping burn for {submission_id}: payment_address "
+                f"{payment_address[:16]}... is not this validator's coldkey"
             )
         else:
             try:
