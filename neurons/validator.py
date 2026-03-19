@@ -502,14 +502,25 @@ class Validator(BaseNode):
 
         # Fire-and-forget: burn the fee alpha in the background so the
         # submission pipeline isn't blocked by the on-chain RPC round-trip.
-        asyncio.create_task(
-            self._burn_payment_alpha(
-                amount=payment.alpha_amount,
-                netuid=netuid,
-                hotkey=burn_hotkey,
-                submission_id=submission_id,
+        # We can only burn alpha that belongs to our own coldkey — the
+        # burn_alpha extrinsic must be signed by the stake owner.
+        validator_coldkey = self.wallet.coldkeypub.ss58_address
+        if payment_address == validator_coldkey:
+            asyncio.create_task(
+                self._burn_payment_alpha(
+                    amount=payment.alpha_amount,
+                    netuid=netuid,
+                    hotkey=burn_hotkey,
+                    submission_id=submission_id,
+                )
             )
-        )
+        else:
+            logger.warning(
+                f"Cannot burn fee for {submission_id}: payment went to "
+                f"{payment_address[:16]}... which is not this validator's "
+                f"coldkey ({validator_coldkey[:16]}...). "
+                f"The recipient must burn manually."
+            )
 
         return True
 
