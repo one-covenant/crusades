@@ -506,14 +506,14 @@ class Validator(BaseNode):
                 f"{payment_address[:16]}... is not this validator's coldkey"
             )
         else:
-            try:
-                metagraph = self.chain.subtensor.metagraph(netuid)
-                burn_hotkey = metagraph.hotkeys[hparams.burn_uid]
-            except Exception as e:
+            metagraph = self.chain.metagraph
+            if metagraph is None or hparams.burn_uid >= len(metagraph.hotkeys):
                 logger.warning(
-                    f"Skipping burn for {submission_id}: could not resolve burn_uid hotkey: {e}"
+                    f"Skipping burn for {submission_id}: metagraph unavailable or "
+                    f"burn_uid {hparams.burn_uid} out of range"
                 )
                 return True
+            burn_hotkey = metagraph.hotkeys[hparams.burn_uid]
             task = asyncio.create_task(
                 self._burn_payment_alpha(
                     amount=payment.alpha_amount,
