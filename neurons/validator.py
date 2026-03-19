@@ -491,7 +491,69 @@ class Validator(BaseNode):
             f"Payment verified: {payment.alpha_amount} alpha at block "
             f"{payment.block_hash[:16]}... extrinsic {payment.extrinsic_index}"
         )
+
+        # Burn the fee alpha immediately after verification so it doesn't
+        # accumulate alongside validator emissions on the same hotkey.
+        await self._burn_payment_alpha(
+            amount=payment.alpha_amount,
+            netuid=netuid,
+            submission_id=submission_id,
+        )
+
         return True
+
+    async def _burn_payment_alpha(
+        self,
+        amount: int,
+        netuid: int,
+        submission_id: str,
+    ) -> None:
+        """Burn the submission fee alpha via the on-chain burn_alpha extrinsic.
+
+        This permanently removes the fee alpha from the subnet's circulating
+        supply.  Burning is best-effort: failures are logged but do not block
+        the submission pipeline — the fee was already verified and recorded.
+        """
+        if self.chain is None:
+            return
+
+        hparams = get_hparams()
+        try:
+            metagraph = self.chain.subtensor.metagraph(netuid)
+            burn_hotkey = metagraph.hotkeys[hparams.burn_uid]
+        except Exception as e:
+            logger.warning(f"Could not resolve burn hotkey for burn_alpha: {e}")
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+            call = self.chain.subtensor.substrate.compose_call(
+                call_module="SubtensorModule",
+                call_function="burn_alpha",
+                call_params={
+                    "hotkey": burn_hotkey,
+                    "amount": amount,
+                    "netuid": netuid,
+                },
+            )
+            success, msg = await loop.run_in_executor(
+                None,
+                lambda: self.chain.subtensor.sign_and_send_extrinsic(
+                    call=call,
+                    wallet=self.wallet,
+                    wait_for_inclusion=True,
+                    wait_for_finalization=False,
+                ),
+            )
+            if success:
+                logger.info(
+                    f"Burned {amount} fee alpha for {submission_id} "
+                    f"(hotkey={burn_hotkey[:16]}..., netuid={netuid})"
+                )
+            else:
+                logger.warning(f"burn_alpha extrinsic failed for {submission_id}: {msg}")
+        except Exception as e:
+            logger.warning(f"burn_alpha failed for {submission_id}: {e}")
 
     async def _create_submission_from_commitment(
         self,
