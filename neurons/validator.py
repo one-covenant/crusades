@@ -335,6 +335,14 @@ class Validator(BaseNode):
 
         netuid = hparams.netuid
 
+        # Resolve burn_uid hotkey (needed for both payment verification and burning).
+        try:
+            metagraph = self.chain.subtensor.metagraph(netuid)
+            burn_hotkey = metagraph.hotkeys[hparams.burn_uid]
+        except Exception as e:
+            logger.error(f"Could not resolve burn_uid hotkey: {e}")
+            return False
+
         # Use explicit payment_address if configured, otherwise derive from burn_uid
         if hparams.payment.payment_address:
             payment_address = hparams.payment.payment_address
@@ -492,13 +500,23 @@ class Validator(BaseNode):
             f"{payment.block_hash[:16]}... extrinsic {payment.extrinsic_index}"
         )
 
-        # Burn the fee alpha immediately after verification so it doesn't
-        # accumulate alongside validator emissions on the same hotkey.
-        await self._burn_payment_alpha(
-            amount=payment.alpha_amount,
-            netuid=netuid,
-            submission_id=submission_id,
-        )
+        # Fire-and-forget: burn the fee alpha in the background so the
+        # submission pipeline isn't blocked by the on-chain RPC round-trip.
+        validator_coldkey = self.wallet.coldkeypub.ss58_address
+        if payment_address == validator_coldkey:
+            asyncio.create_task(
+                self._burn_payment_alpha(
+                    amount=payment.alpha_amount,
+                    netuid=netuid,
+                    hotkey=burn_hotkey,
+                    submission_id=submission_id,
+                )
+            )
+        else:
+            logger.debug(
+                f"Skipping burn: payment_address {payment_address[:16]}... "
+                f"is not this validator's coldkey"
+            )
 
         return True
 
@@ -506,6 +524,7 @@ class Validator(BaseNode):
         self,
         amount: int,
         netuid: int,
+        hotkey: str,
         submission_id: str,
     ) -> None:
         """Burn the submission fee alpha via the on-chain burn_alpha extrinsic.
@@ -517,21 +536,13 @@ class Validator(BaseNode):
         if self.chain is None:
             return
 
-        hparams = get_hparams()
-        try:
-            metagraph = self.chain.subtensor.metagraph(netuid)
-            burn_hotkey = metagraph.hotkeys[hparams.burn_uid]
-        except Exception as e:
-            logger.warning(f"Could not resolve burn hotkey for burn_alpha: {e}")
-            return
-
         try:
             loop = asyncio.get_running_loop()
             call = self.chain.subtensor.substrate.compose_call(
                 call_module="SubtensorModule",
                 call_function="burn_alpha",
                 call_params={
-                    "hotkey": burn_hotkey,
+                    "hotkey": hotkey,
                     "amount": amount,
                     "netuid": netuid,
                 },
@@ -548,7 +559,7 @@ class Validator(BaseNode):
             if success:
                 logger.info(
                     f"Burned {amount} fee alpha for {submission_id} "
-                    f"(hotkey={burn_hotkey[:16]}..., netuid={netuid})"
+                    f"(hotkey={hotkey[:16]}..., netuid={netuid})"
                 )
             else:
                 logger.warning(f"burn_alpha extrinsic failed for {submission_id}: {msg}")
