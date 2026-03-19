@@ -556,14 +556,17 @@ class Validator(BaseNode):
                     "netuid": netuid,
                 },
             )
-            success, msg = await loop.run_in_executor(
-                None,
-                lambda: self.chain.subtensor.sign_and_send_extrinsic(
-                    call=call,
-                    wallet=self.wallet,
-                    wait_for_inclusion=True,
-                    wait_for_finalization=False,
+            success, msg = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self.chain.subtensor.sign_and_send_extrinsic(
+                        call=call,
+                        wallet=self.wallet,
+                        wait_for_inclusion=True,
+                        wait_for_finalization=False,
+                    ),
                 ),
+                timeout=60,
             )
             if success:
                 logger.info(
@@ -572,6 +575,8 @@ class Validator(BaseNode):
                 )
             else:
                 logger.warning(f"burn_alpha extrinsic failed for {submission_id}: {msg}")
+        except TimeoutError:
+            logger.warning(f"burn_alpha timed out after 60s for {submission_id}")
         except Exception as e:
             logger.warning(f"burn_alpha failed for {submission_id}: {e}")
 
@@ -1372,7 +1377,15 @@ class Validator(BaseNode):
         """Cleanup resources."""
         if self._pending_burns:
             logger.info(f"Waiting for {len(self._pending_burns)} pending burn task(s)...")
-            await asyncio.gather(*self._pending_burns, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._pending_burns, return_exceptions=True),
+                    timeout=30,
+                )
+            except TimeoutError:
+                logger.warning("Timed out waiting for pending burns — cancelling")
+                for t in self._pending_burns:
+                    t.cancel()
             self._pending_burns.clear()
         if self.affinetes_mode == "basilica" and self.affinetes_runner:
             await self.affinetes_runner.delete_basilica_deployment()
