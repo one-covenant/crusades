@@ -335,14 +335,6 @@ class Validator(BaseNode):
 
         netuid = hparams.netuid
 
-        # Resolve burn_uid hotkey (needed for both payment verification and burning).
-        try:
-            metagraph = self.chain.subtensor.metagraph(netuid)
-            burn_hotkey = metagraph.hotkeys[hparams.burn_uid]
-        except Exception as e:
-            logger.error(f"Could not resolve burn_uid hotkey: {e}")
-            return False
-
         # Use explicit payment_address if configured, otherwise derive from burn_uid
         if hparams.payment.payment_address:
             payment_address = hparams.payment.payment_address
@@ -505,7 +497,22 @@ class Validator(BaseNode):
         # We can only burn alpha that belongs to our own coldkey — the
         # burn_alpha extrinsic must be signed by the stake owner.
         validator_coldkey = self.wallet.coldkeypub.ss58_address
-        if payment_address == validator_coldkey:
+        if payment_address != validator_coldkey:
+            logger.warning(
+                f"Cannot burn fee for {submission_id}: payment went to "
+                f"{payment_address[:16]}... which is not this validator's "
+                f"coldkey ({validator_coldkey[:16]}...). "
+                f"The recipient must burn manually."
+            )
+        else:
+            try:
+                metagraph = self.chain.subtensor.metagraph(netuid)
+                burn_hotkey = metagraph.hotkeys[hparams.burn_uid]
+            except Exception as e:
+                logger.warning(
+                    f"Skipping burn for {submission_id}: could not resolve burn_uid hotkey: {e}"
+                )
+                return True
             asyncio.create_task(
                 self._burn_payment_alpha(
                     amount=payment.alpha_amount,
@@ -513,13 +520,6 @@ class Validator(BaseNode):
                     hotkey=burn_hotkey,
                     submission_id=submission_id,
                 )
-            )
-        else:
-            logger.warning(
-                f"Cannot burn fee for {submission_id}: payment went to "
-                f"{payment_address[:16]}... which is not this validator's "
-                f"coldkey ({validator_coldkey[:16]}...). "
-                f"The recipient must burn manually."
             )
 
         return True
