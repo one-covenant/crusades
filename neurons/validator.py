@@ -82,6 +82,9 @@ class Validator(BaseNode):
         # Pruned to max_evaluated_urls (from hparams) to prevent unbounded memory growth
         self.evaluated_code_urls: dict[str, tuple[int, str]] = {}
 
+        # Background burn tasks — strong references prevent GC mid-execution
+        self._pending_burns: set[asyncio.Task] = set()
+
         # Timing
         self.last_weight_set_block: int = 0
         self.last_sync_time: float = 0
@@ -513,7 +516,7 @@ class Validator(BaseNode):
                     f"Skipping burn for {submission_id}: could not resolve burn_uid hotkey: {e}"
                 )
                 return True
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._burn_payment_alpha(
                     amount=payment.alpha_amount,
                     netuid=netuid,
@@ -521,6 +524,8 @@ class Validator(BaseNode):
                     submission_id=submission_id,
                 )
             )
+            self._pending_burns.add(task)
+            task.add_done_callback(self._pending_burns.discard)
 
         return True
 
@@ -1365,6 +1370,10 @@ class Validator(BaseNode):
 
     async def cleanup(self) -> None:
         """Cleanup resources."""
+        if self._pending_burns:
+            logger.info(f"Waiting for {len(self._pending_burns)} pending burn task(s)...")
+            await asyncio.gather(*self._pending_burns, return_exceptions=True)
+            self._pending_burns.clear()
         if self.affinetes_mode == "basilica" and self.affinetes_runner:
             await self.affinetes_runner.delete_basilica_deployment()
         await self._save_state()
