@@ -799,13 +799,14 @@ asyncio.run(main())
                 "num_gpus": self.basilica_gpu_count,
             }
 
+            http_timeout = self.timeout + 120
             logger.info("[BASILICA] Sending evaluation request...")
             logger.info(f"   POST {deployment.url}/evaluate")
-            logger.info(f"   Timeout: {self.timeout + 600}s")
+            logger.info(f"   Timeout: {http_timeout}s")
 
             start_time = time.time()
 
-            async with httpx.AsyncClient(timeout=self.timeout + 600) as client:
+            async with httpx.AsyncClient(timeout=http_timeout) as client:
                 response = await client.post(
                     f"{deployment.url}/evaluate",
                     json=payload,
@@ -873,7 +874,7 @@ asyncio.run(main())
 
                 return result
 
-        except TimeoutError:
+        except (TimeoutError, httpx.TimeoutException):
             logger.error(f"[BASILICA] Timeout after {self.timeout}s!")
             return EvaluationResult.failure(
                 f"Basilica timeout after {self.timeout}s",
