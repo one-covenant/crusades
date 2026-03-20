@@ -1895,7 +1895,7 @@ class Actor:
             if _multi_gpu:
                 if not dist.is_initialized():
                     torch.cuda.set_device(_LOCAL_RANK)
-                    dist.init_process_group(backend="nccl", timeout=timedelta(seconds=600))
+                    dist.init_process_group(backend="nccl", timeout=timedelta(seconds=3600))
                     logger.info(f"Initialized process group: rank {_LOCAL_RANK}/{_WORLD_SIZE}")
 
             seq_len = sequence_length or EVAL_SEQUENCE_LENGTH
@@ -3016,7 +3016,6 @@ async def _inter_run_cleanup() -> None:
     """
     import asyncio as _aio
     import glob as _glob
-    import shutil
 
     gc.collect()
 
@@ -3027,12 +3026,11 @@ async def _inter_run_cleanup() -> None:
             except OSError:
                 pass
 
-    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "torch", "inductor")
-    if os.path.isdir(cache_dir):
-        try:
-            shutil.rmtree(cache_dir, ignore_errors=True)
-        except OSError:
-            pass
+    # NOTE: Do NOT delete ~/.cache/torch/inductor here.
+    # The inductor kernel cache must persist across runs so that
+    # torch.compile benefits from warmup compilation. Deleting it
+    # forces expensive recompilation (coordinate_descent_tuning)
+    # on every run, which can trigger NCCL timeouts on cold hardware.
 
     await _aio.sleep(10)
 
