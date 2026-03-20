@@ -960,7 +960,48 @@ asyncio.run(main())
             deployment = await client.get_async(response.instance_name)
             logger.info(f"   Basilica ID: {deployment.name}")
 
-            await deployment.wait_until_ready_async(timeout=self.timeout)
+            deploy_timeout = min(self.timeout, 900)
+            poll_interval = 10
+            elapsed = 0
+            while elapsed < deploy_timeout:
+                status = await deployment.status_async()
+                phase = getattr(status, "phase", None)
+                ready_count = status.replicas_ready
+                desired_count = status.replicas_desired
+
+                if status.is_ready:
+                    logger.info(
+                        f"   Status: ready (replicas: {ready_count}/{desired_count}), "
+                        "verifying HTTP health..."
+                    )
+                    try:
+                        async with httpx.AsyncClient(timeout=15) as hc:
+                            resp = await hc.get(f"{deployment.url}/health")
+                            if resp.status_code == 200:
+                                logger.info("   HTTP health check passed!")
+                                break
+                            logger.warning(
+                                f"   Health check returned {resp.status_code}, retrying..."
+                            )
+                    except Exception as health_err:
+                        logger.warning(f"   Health check failed: {health_err}, retrying...")
+                elif status.is_failed:
+                    raise RuntimeError(f"Deployment failed: {status.message}")
+                else:
+                    if elapsed % 30 == 0 or elapsed == 0:
+                        logger.info(
+                            f"   Waiting... phase={phase} replicas={ready_count}/{desired_count} "
+                            f"({elapsed}s elapsed)"
+                        )
+
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+            else:
+                raise TimeoutError(
+                    f"Deployment not ready after {deploy_timeout}s "
+                    f"(phase={phase}, replicas={ready_count}/{desired_count})"
+                )
+
             await deployment.refresh_async()
 
             deploy_time = time.time() - deploy_start
