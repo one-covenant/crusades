@@ -25,7 +25,7 @@ import bittensor as bt
 import torch
 
 import crusades
-from crusades.affinetes import AffinetesRunner
+from crusades.affinetes import AffinetesRunner, EvaluationResult
 from crusades.chain.commitments import (
     CodeUrlInfo,
     CommitmentReader,
@@ -782,15 +782,32 @@ class Validator(BaseNode):
 
                     logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
 
-                    result = await self.affinetes_runner.evaluate(
-                        code=miner_code,  # Pass code directly
-                        seed=seed,
-                        steps=hparams.eval_steps,
-                        batch_size=hparams.benchmark_batch_size,
-                        sequence_length=hparams.benchmark_sequence_length,
-                        data_samples=hparams.benchmark_data_samples,
-                        task_id=current_run,
-                    )
+                    hard_timeout = hparams.eval_timeout + 300
+                    try:
+                        result = await asyncio.wait_for(
+                            self.affinetes_runner.evaluate(
+                                code=miner_code,
+                                seed=seed,
+                                steps=hparams.eval_steps,
+                                batch_size=hparams.benchmark_batch_size,
+                                sequence_length=hparams.benchmark_sequence_length,
+                                data_samples=hparams.benchmark_data_samples,
+                                task_id=current_run,
+                            ),
+                            timeout=hard_timeout,
+                        )
+                    except TimeoutError:
+                        logger.error(
+                            f"Run {current_run}: hard timeout after {hard_timeout}s — "
+                            "recycling deployment"
+                        )
+                        await self.affinetes_runner.delete_basilica_deployment()
+                        result = EvaluationResult(
+                            success=False,
+                            error=f"Hard timeout after {hard_timeout}s",
+                            error_code="HARD_TIMEOUT",
+                            task_id=current_run,
+                        )
 
                     if (
                         not result.success
@@ -805,15 +822,29 @@ class Validator(BaseNode):
                         )
                         await self.affinetes_runner.delete_basilica_deployment()
                         await asyncio.sleep(10)
-                        result = await self.affinetes_runner.evaluate(
-                            code=miner_code,
-                            seed=seed,
-                            steps=hparams.eval_steps,
-                            batch_size=hparams.benchmark_batch_size,
-                            sequence_length=hparams.benchmark_sequence_length,
-                            data_samples=hparams.benchmark_data_samples,
-                            task_id=current_run,
-                        )
+                        try:
+                            result = await asyncio.wait_for(
+                                self.affinetes_runner.evaluate(
+                                    code=miner_code,
+                                    seed=seed,
+                                    steps=hparams.eval_steps,
+                                    batch_size=hparams.benchmark_batch_size,
+                                    sequence_length=hparams.benchmark_sequence_length,
+                                    data_samples=hparams.benchmark_data_samples,
+                                    task_id=current_run,
+                                ),
+                                timeout=hard_timeout,
+                            )
+                        except TimeoutError:
+                            logger.error(
+                                f"Run {current_run} retry: hard timeout after {hard_timeout}s"
+                            )
+                            result = EvaluationResult(
+                                success=False,
+                                error=f"Hard timeout after {hard_timeout}s (retry)",
+                                error_code="HARD_TIMEOUT",
+                                task_id=current_run,
+                            )
 
                     if result.success:
                         logger.info(

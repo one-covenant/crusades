@@ -119,8 +119,8 @@ FORBIDDEN_STRINGS: list[str] = [
     "methodcaller",
     # Torch internal access (even under aliases)
     "_C",
-    "_dynamo",
-    "_inductor",
+    # "_dynamo", "_inductor" — allowed: miners need torch._dynamo.config
+    # and torch._inductor.config for compile quality tuning
     # Validator env internals
     "_CACHE",
     "initial_state",
@@ -241,8 +241,6 @@ FORBIDDEN_TORCH_SYMBOL_IMPORTS: set[str] = {
     "load",
     "compile",
     "_C",
-    "_dynamo",
-    "_inductor",
 }
 
 # Backend toggles that bypass attribute-call checks if imported as bare names
@@ -253,15 +251,10 @@ FORBIDDEN_TORCH_ATTRIBUTE_ALIASES: set[str] = {
     "load",
     "compile",
     "_C",
-    "_dynamo",
-    "_inductor",
 }
 
 # torch internal config namespaces whose .config attrs must not be written
-FORBIDDEN_TORCH_CONFIG_MODULES: set[str] = {
-    "_dynamo",
-    "_inductor",
-}
+FORBIDDEN_TORCH_CONFIG_MODULES: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # Forbidden bare-name references
@@ -290,7 +283,8 @@ FORBIDDEN_NAMES: set[str] = {
     "ord",
     "input",
     "classmethod",
-    "staticmethod",
+    # "staticmethod" — allowed: miners need @staticmethod for torch.autograd.Function
+    # (custom Triton kernel backward passes)
     "property",
     "__build_class__",
 }
@@ -313,7 +307,7 @@ FORBIDDEN_BUILTINS: set[str] = {
     "breakpoint",
     "input",
     "classmethod",
-    "staticmethod",
+    # "staticmethod" — allowed: miners need @staticmethod for torch.autograd.Function
     "property",
 }
 
