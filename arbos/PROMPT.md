@@ -17,10 +17,11 @@ class InnerStepsResult:
 
 def get_strategy() -> dict:
     # dp_size * tp_size MUST equal num_gpus (4). Pick any valid topology:
-    #   {"dp_size": 4, "tp_size": 1}  — 4-way DP (FSDP preferred; DDP works but tight memory)
-    #   {"dp_size": 2, "tp_size": 2}  — mixed DP+TP, best memory for 7B
+    #   {"dp_size": 4, "tp_size": 1}  — 4-way DDP with gradient checkpointing (RECOMMENDED)
+    #   {"dp_size": 4, "tp_size": 1}  — 4-way FSDP (proven 56.5% ceiling)
+    #   {"dp_size": 2, "tp_size": 2}  — mixed DP+TP, lower MFU ceiling
     #   {"dp_size": 1, "tp_size": 4}  — 4-way TP, lowest MFU ceiling
-    return {"dp_size": 2, "tp_size": 2}
+    return {"dp_size": 4, "tp_size": 1}
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1) -> InnerStepsResult:
     ...
@@ -65,7 +66,7 @@ Three strategies satisfy `dp_size * tp_size == 4`:
 
 **Note**: Batch size is constrained to 16 by GPU memory (7B model + optimizer states + activations ≈ 60-70GB per GPU). The agent can experiment with batch sizes but anything above 16 risks OOM.
 
-**Recommendation**: Start with dp=2/tp=2 (mixed) to establish a baseline, but strongly consider dp=4/tp=1 (FSDP) if MFU is below 55%. DP=4 is the proven path from our 2-GPU work scaled up.
+**Recommendation**: Start with dp=4/tp=1 using DDP + selective gradient checkpointing + inductor/dynamo config tuning. FSDP is maxed out at 56.5% after 40+ attempts. DDP with the proven 2-GPU techniques is the most promising path to 65%.
 
 ## Overhead Budget (dp=2, tp=2 — 20 steps)
 
@@ -82,15 +83,26 @@ To reach 65% MFU (wall_time ≈ 13.9s) with dp=2/tp=2 is extremely difficult —
 
 ## Overhead Budget (dp=4, tp=1 — 20 steps)
 
-With FSDP SHARD_GRAD_OP + 4-way DP:
+### FSDP SHARD_GRAD_OP (proven ceiling: 56.5% MFU, ~85s)
 - **Theoretical compute**: ~18.0s (each GPU processes 16 × 1024 × 20 tokens through full 7B model)
-- **FSDP gradient sync**: ~2-4s (all-reduce across 4 ranks)
-- **`reduce-overhead` compile warmup**: ~8-12s (CUDA graph capture)
-- **State dict extraction**: ~3-6s (FSDP FULL_STATE_DICT gathering)
-- **Per-step overhead**: ~0.5s × 20 = ~10s
-- **Total**: ~43-52s → ~35-42% MFU baseline estimate
+- **FSDP per-layer communication**: ~15-20s (28 all-gather + 28 reduce-scatter per step × 20 steps)
+- **`compile(default)` warmup**: ~5-8s (inductor tracing, partially cached from warmup)
+- **State dict extraction**: ~5-8s (FSDP FULL_STATE_DICT gathering — expensive collective op)
+- **Per-step overhead**: ~1.5s × 20 = ~30s (optimizer, zero_grad, Python)
+- **Actual**: ~85s → 56.5% MFU (this is the observed ceiling)
 
-To reach 65% MFU (wall_time ≈ 27.7s), shave ~15-24s. This is challenging but more realistic than dp=2/tp=2. Target compile warmup and state dict overhead — these fixed costs are the biggest drag with batch=16.
+### DDP + gradient checkpointing (estimated — NOT yet tested on 4 GPUs)
+- **Theoretical compute**: ~18.0s (same per-GPU workload)
+- **Gradient recomputation**: ~5-8s (23 checkpointed layers recompute forward during backward)
+- **DDP gradient all-reduce**: ~2-3s (ONE all-reduce per step with static_graph, NOT per-layer)
+- **`compile(default)` warmup**: ~5-8s (inductor tuning should help here)
+- **State dict extraction**: ~1-2s (DDP: direct `.state_dict()` on unwrapped model, no gathering)
+- **Per-step overhead**: ~0.5s × 20 = ~10s (less Python overhead than FSDP)
+- **Estimated total**: ~42-50s → **~36-43% MFU without inductor tuning, potentially 55-65% with tuning**
+
+Key DDP savings vs FSDP: ~15-20s less communication overhead (no per-layer all-gather/reduce-scatter), ~3-6s faster state dict (no gathering). The gradient checkpointing cost (~5-8s) is partially offset by these savings.
+
+To reach 65% MFU (wall_time ≈ 27.7s), need aggressive optimization. The inductor/dynamo config tuning + CUDA graphs (reduce-overhead, which works with DDP but NOT FSDP) are the key levers.
 
 ## Verification Thresholds
 
@@ -108,13 +120,15 @@ To reach 65% MFU (wall_time ≈ 27.7s), shave ~15-24s. This is challenging but m
 Your code is scanned locally before GPU evaluation. If you hit a security violation, you'll see the exact rule in the error. Key rules:
 
 - **Forbidden modules**: os, sys, time, gc, logging, threading, subprocess, pickle, inspect, ast, and many others
-- **Forbidden names** (cannot even reference): exec, eval, compile, getattr, setattr, delattr, open, globals, locals, classmethod, staticmethod, property — **no `@property` or `@staticmethod` decorators**. Use `hasattr()` for checks and direct attribute access (`obj.attr`) instead of `getattr(obj, "attr")`.
+- **Forbidden names** (cannot even reference): exec, eval, compile, getattr, setattr, delattr, open, globals, locals, classmethod, property — **no `@property` or `@classmethod` decorators**. `@staticmethod` IS allowed (needed for `torch.autograd.Function`). Use `hasattr()` for checks and direct attribute access (`obj.attr`) instead of `getattr(obj, "attr")`.
 - **Forbidden**: `torch.backends.cudnn.benchmark = True`, `torch.backends.cudnn.deterministic = True`
 - **Forbidden**: `torch.set_grad_enabled(False)`, `torch.inference_mode()`
 - **Forbidden**: `from torch import compile` — but `torch.compile(fn)` as a direct call IS allowed
 - **Forbidden**: star imports (`from X import *`), `__dict__` access, `torch.load()`
 - **Forbidden strings**: `sliding_window`, `use_sliding_window`, `max_window_layers` — modifying these in model config reduces computation while the MFU formula still credits full work
 - **Allowed**: `torch.backends.cuda.matmul.allow_tf32 = True`, `torch.set_float32_matmul_precision('high')`
+- **Allowed**: `torch._inductor.config` and `torch._dynamo.config` writes — tuning compile quality (coordinate_descent_tuning, epilogue_fusion, shape_padding, assume_static_by_default, etc.)
+- **Allowed**: `@staticmethod` — needed for `torch.autograd.Function` custom backward passes (Triton kernels)
 - **Allowed imports**: functools, warnings, math, dataclasses, flash_attn, and torch submodules (torch.nn, torch.distributed, torch.distributed.fsdp, torch.cuda, torch.amp, torch.utils.checkpoint, etc.)
 
 ### Runtime Verification (happens AFTER your code runs)
@@ -152,7 +166,7 @@ Beyond static code scanning, the validator performs runtime checks:
 
 12. `.view(-1)` fails on non-contiguous tensors inside `torch.compile`. Use `.reshape(-1)` or `.contiguous().view(-1)` instead.
 
-13. **`torch.compile` + DDP is partially compatible**: `torch.compile(fn, fullgraph=True)` called inside a DDP-wrapped model can fail because DDP's internal `Logger.set_runtime_stats_and_log()` cannot be traced by Dynamo. Even `fullgraph=False` can fail. If using DDP, compile ONLY the forward+loss function, NOT the model object.
+13. **`torch.compile` + DDP compatibility**: Compile ONLY the forward function (not the model object). With `static_graph=True` and `optimize_ddp=True` in dynamo config, DDP + compile works well. Try `fullgraph=True` first with a try/except fallback. The `reduce-overhead` mode (CUDA graphs) WORKS with DDP (unlike FSDP where it fails).
 
 14. **`torch.compile` + monkey-patched model = 0% params changed**: If you patch `layer.forward` or `norm.forward` with lambdas/closures that call flash_attn ops, then wrap in `torch.compile(fullgraph=True)`, dynamo cannot trace the closures. With `suppress_errors=True`, it silently falls back and corrupts the autograd graph. **Solution**: patch the model and run it in EAGER mode (no compile). Compile only a SEPARATE pure function (e.g., loss computation). Or use Approach 2 (write a fused PyTorch function + compile) instead of monkey-patching.
 
@@ -165,10 +179,11 @@ Beyond static code scanning, the validator performs runtime checks:
 18. **`fullgraph=True` consistently HURTS performance** — empirically drops MFU by ~2%. Do NOT use it. Stick with `fullgraph=False` (default).
 
 19. **`torch.compile` compile modes — empirical results** (from 2-GPU runs, directionally applicable to 4-GPU):
-    - `reduce-overhead`: **best per-step performance**, uses CUDA graphs. ~10s warmup cost.
-    - `default`: lower warmup cost but slower per-step. Inductor cache persists from warmup.
+    - `reduce-overhead`: **best per-step performance**, uses CUDA graphs. ~10s warmup cost. Works with DDP, FAILS with FSDP.
+    - `default`: lower warmup cost but slower per-step. Inductor cache persists from warmup. Works with both DDP and FSDP.
     - No compile: baseline without compilation — expect ~30-40% MFU.
     - `max-autotune`: fails weight verification — DO NOT USE.
+    - **With inductor config tuning** (coordinate_descent_tuning, epilogue_fusion, shape_padding): both `default` and `reduce-overhead` generate better kernels. Always set these.
 
 20. **Mixed DP+TP: DTensor + DDP/FSDP incompatibility**: Neither FSDP nor DDP can wrap TP's DTensor parameters (both try to flatten/view params, which DTensor's sharding propagation rejects). For mixed DP+TP, you MUST manually all-reduce gradients across the DP process group after each backward pass. Use the underlying `._local_tensor` for all-reduce to avoid DTensor dispatch issues.
 
@@ -219,9 +234,9 @@ compiled_res_norm = torch.compile(fused_residual_norm_fwd, mode="default", dynam
 
 Write your own GPU kernels for maximum control. `triton` 3.5.0 is available and NOT blocked by security.
 
-**CRITICAL LIMITATION**: Custom `@triton.jit` kernels only support FORWARD pass. Backward through them fails because `torch.autograd.Function` requires `@staticmethod` which is blocked by security. For backward, use Approach 1 (flash_attn ops) or Approach 2 (torch.compile).
+Custom `@triton.jit` kernels now support BOTH forward and backward passes. `@staticmethod` is allowed, so you can implement `torch.autograd.Function` with custom forward/backward using Triton kernels.
 
-**Use custom Triton for**: loss computation, data preprocessing, or any op where you don't need gradients.
+**Use custom Triton for**: any performance-critical op — RMSNorm, rotary embeddings, fused attention, loss computation, etc.
 
 ### How to monkey-patch Qwen2 layers
 
@@ -255,23 +270,130 @@ def _patch_model(model):
 
 **CRITICAL PITFALL**: Monkey-patched lambda forwards are INCOMPATIBLE with `torch.compile(fullgraph=True)`. Dynamo cannot trace through closures that capture module weights. Always test kernel patches WITHOUT torch.compile first to verify gradients flow.
 
+## Proven 56.5% MFU DDP Submission (KEY REFERENCE — adapt for 4 GPUs)
+
+A 2-GPU DDP submission achieved 56.5% MFU on A100s. The techniques below are **proven to work** and should be adapted for 4-GPU. DDP on 4 GPUs REQUIRES gradient checkpointing for 7B to fit in memory.
+
+### torch._inductor.config tuning (CRITICAL — improves compile quality)
+```python
+try:
+    import torch._inductor.config as _ind_cfg
+    _ind_cfg.coordinate_descent_tuning = True
+    _ind_cfg.triton.unique_kernel_names = True
+    _ind_cfg.fx_graph_cache = True
+    _ind_cfg.triton.cudagraph_trees = True
+    _ind_cfg.epilogue_fusion = True
+    _ind_cfg.shape_padding = True
+except Exception:
+    pass
+```
+These settings make torch.compile generate significantly better Triton kernels. `coordinate_descent_tuning` finds optimal kernel parameters. `epilogue_fusion` fuses more operations. `shape_padding` pads tensor dimensions for better memory alignment. These work with ALL parallelism strategies (FSDP, DDP, TP).
+
+### torch._dynamo.config tuning (CRITICAL — reduces compile overhead)
+```python
+try:
+    import torch._dynamo.config as _dyn_cfg
+    _dyn_cfg.cache_size_limit = 128
+    _dyn_cfg.suppress_errors = True
+    _dyn_cfg.assume_static_by_default = True
+    _dyn_cfg.automatic_dynamic_shapes = False
+    _dyn_cfg.optimize_ddp = True
+except Exception:
+    pass
+```
+`assume_static_by_default` + `automatic_dynamic_shapes=False` eliminates dynamic shape guards, reducing compile time and enabling better optimization. `cache_size_limit=128` prevents cache eviction. `optimize_ddp=True` enables DDP-specific Dynamo optimizations.
+
+### DDP + Selective Gradient Checkpointing (fits 7B on 80GB)
+```python
+_UNCHECKPOINT_LAST_N = 5
+
+def _prepare_model(model):
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+        if hasattr(model.config, "output_hidden_states"):
+            model.config.output_hidden_states = False
+        if hasattr(model.config, "output_attentions"):
+            model.config.output_attentions = False
+
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        num_layers = len(model.model.layers)
+        checkpoint_cutoff = num_layers - _UNCHECKPOINT_LAST_N
+        for idx, layer in enumerate(model.model.layers):
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
+                layer.self_attn.layer_idx = 0
+            if hasattr(layer, "gradient_checkpointing"):
+                layer.gradient_checkpointing = idx < checkpoint_cutoff
+```
+Checkpoint first 23 layers (saves ~12-15GB activation memory), uncheckpoint last 5 (avoids recomputation overhead on final layers). Memory with DDP: 15GB model + 30GB optimizer + 15GB grads + ~5GB activations = ~65GB. Fits on 80GB with room for compile (~4GB).
+
+### DDP Configuration (proven settings)
+```python
+model = model.to(device)
+model = DDP(
+    model,
+    device_ids=[device.index],
+    gradient_as_bucket_view=True,
+    static_graph=True,
+    bucket_cap_mb=200,
+    broadcast_buffers=False,
+)
+```
+`static_graph=True` enables advanced optimizations (fuses gradient bucketing, reduces overhead). `gradient_as_bucket_view=True` avoids gradient copy. `bucket_cap_mb=200` reduces number of all-reduce calls. `broadcast_buffers=False` skips unnecessary buffer broadcast.
+
+**CRITICAL**: DDP requires `model = model.to(device)` BEFORE wrapping. FSDP handles this internally.
+
+### CUDA Memory Allocator Settings
+```python
+try:
+    torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+except Exception:
+    pass
+```
+Reduces memory fragmentation — helps avoid OOM when memory is tight (DDP + 7B).
+
+### Pinned Memory State Dict Transfer (faster GPU→CPU)
+```python
+raw_model = model.module if hasattr(model, "module") else model
+sd = raw_model.state_dict()
+pinned = {k: torch.empty_like(v, device="cpu").pin_memory() for k, v in sd.items()}
+for k, v in sd.items():
+    pinned[k].copy_(v, non_blocking=True)
+torch.cuda.synchronize(device)
+final_state = pinned
+```
+Pre-allocates pinned CPU memory and copies asynchronously. ~2-3x faster than `.detach().cpu().clone()` for large state dicts (7B = 15GB).
+
+### torch.compile with fullgraph=True + fallback chain
+```python
+def fwd_only(input_ids):
+    return model(input_ids).logits
+
+compiled_fwd = torch.compile(fwd_only, mode="default", dynamic=False, fullgraph=True)
+try:
+    logits = compiled_fwd(all_inputs[0])
+except Exception:
+    try:
+        compiled_fwd = torch.compile(fwd_only, mode="default", dynamic=False)
+        logits = compiled_fwd(all_inputs[0])
+    except Exception:
+        compiled_fwd = fwd_only
+        logits = compiled_fwd(all_inputs[0])
+```
+Try `fullgraph=True` first (generates tighter code if it works), fall back to default, then eager. Note: `fullgraph=True` + FSDP fails, but `fullgraph=True` + DDP can work with the right setup (compile the forward function, NOT the model).
+
 ## Proven Optimization Patterns (use as building blocks)
 
 1. **Flash CE loss** — faster than F.cross_entropy:
    ```python
-   try:
-       from flash_attn.losses.cross_entropy import CrossEntropyLoss as _FlashCELoss
-       _flash_ce = _FlashCELoss(ignore_index=-100)
-       _USE_FLASH_CE = True
-   except ImportError:
-       _USE_FLASH_CE = False
+   from flash_attn.losses.cross_entropy import CrossEntropyLoss as _FlashCELoss
+   _flash_ce = _FlashCELoss(ignore_index=-100)
    ```
 
 2. **Compile only the forward function** (never the model itself):
    ```python
    def _get_compiled_fwd(model):
        def fwd(input_ids): return model(input_ids).logits
-       try: return torch.compile(fwd, mode="reduce-overhead", dynamic=False)
+       try: return torch.compile(fwd, mode="default", dynamic=False, fullgraph=True)
        except Exception:
            try: return torch.compile(fwd, mode="default", dynamic=False)
            except Exception: return fwd
@@ -410,7 +532,7 @@ ALL ranks must call `full_tensor()` — it's a collective op. Rank 0 keeps the r
 ## Memory Reality (7B model)
 
 Qwen2.5-7B bf16 = ~15GB. AdamW stores exp_avg and exp_avg_sq in the same dtype as parameters (bf16), NOT fp32. Full training setup per GPU:
-- **DDP (dp=4, tp=1)**: Model 15GB + AdamW bf16 (m+v) 30GB + Gradients 15GB = **~60GB static**. With gradient checkpointing + micro_batch=1: activations ~2-5GB. **Total ~65GB** — fits but tight, no room for torch.compile (~4GB extra). Low throughput due to 16 gradient accumulation steps.
+- **DDP (dp=4, tp=1) + selective gradient checkpointing**: Model 15GB + AdamW bf16 (m+v) 30GB + Gradients 15GB + activations ~5GB (23 layers checkpointed, 5 uncheckpointed) = **~65GB**. Room for torch.compile (~4GB extra) = **~69GB** — fits! No micro-batching needed (full batch=16 per GPU). Selective checkpointing (uncheckpoint last N layers) balances memory savings vs recomputation overhead.
 - **FSDP SHARD_GRAD_OP (dp=4, tp=1)**: Full model during fwd 15GB + sharded optimizer 7.5GB + sharded grads 3.8GB + activations ~15GB = **~42GB** — good headroom. Can use larger micro-batches → higher throughput than DDP.
 - **FSDP FULL_SHARD (dp=4, tp=1)**: Shards everything including params. Peak ~30-35GB — most headroom for compile.
 - **Mixed (dp=2, tp=2)**: Model ~7.5GB/GPU + AdamW ~15GB + Grads ~7.5GB + Activations ~15GB = **~45GB** — comfortable headroom. Good balance.
@@ -433,40 +555,79 @@ Qwen2.5-7B bf16 = ~15GB. AdamW stores exp_avg and exp_avg_sq in the same dtype a
 
 ## IMPORTANT: Don't Repeat Failures
 
-If previous attempts failed or showed no improvement, DO NOT repeat the same approach with minor tweaks. The agent MUST:
-1. Read error messages carefully — they tell you exactly what went wrong
-2. Try a **fundamentally DIFFERENT** strategy or optimization direction
-3. Track what has been tried and its result — never re-try something that gave <0.5% improvement
-4. If stuck at a plateau for 3+ steps, **try kernel replacement** (flash_attn Triton ops for RMSNorm, rotary, SwiGLU) or **switch parallelism strategy entirely**
-5. Each attempt should explore something genuinely new, not a minor variation of a failed approach
-6. **Kernel-based optimization is the most underexplored direction** — most prior attempts focus on compile modes and parallelism strategies, not on replacing individual ops with fused kernels
+FSDP SHARD_GRAD_OP + torch.compile(default) is MAXED OUT at 56.5% MFU after 40+ attempts. Do NOT try more FSDP variations — switch to DDP.
+
+**Exhausted approaches (do NOT retry)**:
+- FSDP SHARD_GRAD_OP + compile(default) → 56.5% ceiling
+- FSDP + kernel patches + compile → worse (51-56%)
+- FSDP + reduce-overhead → falls back to default
+- FSDP NO_SHARD → OOM with compile, 46.9% without
+- FSDP FULL_SHARD → 55.7% (slightly worse than SHARD_GRAD_OP)
+- Mixed DP+TP → 40-41% (slow optimizer)
+- DDP WITHOUT gradient checkpointing → OOM
+- Compiling loss function → insufficient_params_changed
+
+**What to try instead**:
+1. **DDP + selective gradient checkpointing** — the most promising unexplored direction
+2. **inductor/dynamo config tuning** — never been tested, can improve compile quality
+3. **reduce-overhead mode with DDP** — CUDA graphs work with DDP (but not FSDP)
+4. **Pinned memory state dict** — faster GPU→CPU transfer
+
+## Prior Results (what has been tried and what worked)
+
+**Plateau at 56.5% MFU (~85s wall time)** with FSDP SHARD_GRAD_OP + torch.compile(default). Over 40 attempts exhausted most FSDP-based approaches. Key findings:
+- FSDP SHARD_GRAD_OP + compile(default) = **56.5% MFU** (best, ~85s) — the ceiling for this approach
+- FSDP + kernel patches + compile together = WORSE (51-56%) — compile can't trace patched lambdas
+- FSDP + reduce-overhead = falls back to default (CUDA graphs don't work with FSDP)
+- FSDP NO_SHARD = OOM with compile, 46.9% without compile
+- DDP without gradient checkpointing = **OOM** (78.98 GiB used)
+- Mixed DP+TP = 40-41% MFU (slow optimizer with TP DTensors)
+- Compiling loss function = insufficient_params_changed (68.8%)
+
+**What hasn't been tried**: DDP + selective gradient checkpointing + inductor/dynamo config tuning + pinned memory state dict. A proven 2-GPU submission achieved 56.5% with these techniques. Scaling to 4 GPUs should improve further.
 
 ## What to Try (ordered by expected impact for 4-GPU 7B)
 
-**Phase 1: Establish baseline (first 5-10 steps)**
-- Get mixed DP+TP (dp=2, tp=2) working correctly with basic optimizations
-- Add TF32, fused AdamW, batch pre-loading
-- Measure baseline MFU — expect ~45-55%
+**HIGHEST PRIORITY: DDP + gradient checkpointing + inductor tuning**
 
-**Phase 2: Optimize compile + kernels (steps 10-25)**
-- Add `torch.compile(mode="reduce-overhead")` on forward function (NOT the model)
-- Patch RMSNorm with `rms_norm_fn` (57 calls/fwd) + SwiGLU (28 calls/fwd)
-- Flash CE loss for loss computation
-- Target: 55-62% MFU
+This is the most promising unexplored path. DDP eliminates FSDP's per-layer all-gather/reduce-scatter overhead. With selective gradient checkpointing, 7B fits in memory (~65GB). Combined with inductor/dynamo config tuning, this should break past the 56.5% plateau.
 
-**Phase 3: Strategy exploration (steps 25+)**
-- If MFU plateaus below 60% with mixed, try dp=4/tp=1 with FSDP SHARD_GRAD_OP
-- If memory allows, try FSDP NO_SHARD + reduce-overhead (fastest compile)
-- Explore custom Triton kernels for remaining bottlenecks
+```
+DDP advantages over FSDP:
+- ONE gradient all-reduce per step (vs 28+ per-layer comms for FSDP)
+- static_graph=True enables graph-level optimization
+- Compatible with torch.compile + fullgraph=True (FSDP is not)
+- gradient_as_bucket_view=True eliminates gradient copy
+- Simpler state dict (no gathering needed)
+```
+
+**Phase 1: DDP + grad checkpointing baseline (first 3 steps)**
+- Use DDP with selective gradient checkpointing (uncheckpoint last 5 layers)
+- Add ALL inductor/dynamo config settings (see "Proven 56.5% MFU DDP Submission" section)
+- Add TF32, fused AdamW, batch pre-loading, flash CE loss, CUDA allocator settings
+- Use pinned memory state dict transfer
+- Compile forward with fullgraph=True, fall back to default
+- Target: 55-60% MFU (should match or beat FSDP baseline)
+
+**Phase 2: Optimize DDP compile (steps 3-10)**
+- Try `mode="reduce-overhead"` with DDP (CUDA graphs should work with DDP unlike FSDP!)
+- Tune `_UNCHECKPOINT_LAST_N` (try 3, 5, 7) to balance memory vs recomputation
+- Try `bucket_cap_mb` values (100, 200, 300)
+- Target: 60-65% MFU
+
+**Phase 3: Kernel patches + DDP (steps 10+)**
+- Add RMSNorm + SwiGLU kernel patches (run in EAGER mode, no compile on patched model)
+- Or try class-level patching which IS compile-compatible
+- Explore `mode="reduce-overhead"` if memory allows
 - Target: 65%+ MFU
 
 **Parallelism strategies** (all valid for 4 GPUs):
-- **FSDP dp=4** (`{"dp_size": 4, "tp_size": 1}`): Highest MFU ceiling. Use SHARD_GRAD_OP for 7B to avoid OOM. Proven approach from 2-GPU work.
-- **Mixed DP+TP** (`{"dp_size": 2, "tp_size": 2}`): Best memory efficiency. Manual gradient sync. Good baseline.
+- **DDP dp=4** (`{"dp_size": 4, "tp_size": 1}`): **RECOMMENDED — most promising unexplored path**. Requires selective gradient checkpointing for 7B (~65GB peak). Less communication overhead than FSDP. Compatible with torch.compile + fullgraph=True. Use static_graph=True for graph-level optimizations. Proven at 56.5% on 2 GPUs — should scale well to 4.
+- **FSDP dp=4** (`{"dp_size": 4, "tp_size": 1}`): Proven at 56.5% MFU. Use SHARD_GRAD_OP for 7B. Ceiling appears to be ~56.5% — try DDP first.
+- **Mixed DP+TP** (`{"dp_size": 2, "tp_size": 2}`): Best memory efficiency but MFU ceiling is lower (~40-41%). Only use if DDP and FSDP fail.
 - **Pure TP** (`{"dp_size": 1, "tp_size": 4}`): Lowest MFU ceiling. Only use if other strategies OOM.
-- **DDP dp=4** (`{"dp_size": 4, "tp_size": 1}`): Works but tight (~65-68 GB peak). Requires gradient checkpointing + micro_batch=1, so low throughput. Incompatible with torch.compile (extra ~4GB pushes close to OOM). Only viable without compile.
 
-**Kernel-based optimizations** (highest leverage):
+**Kernel-based optimizations** (highest leverage, use with DDP in eager mode):
 - **Triton RMS norm** (`flash_attn.ops.triton.layer_norm.rms_norm_fn`) — 57 calls per forward
 - **SwiGLU** (`flash_attn.ops.activations.swiglu`) — 28 calls per forward
 - **Flash CE loss** (`flash_attn.losses.cross_entropy.CrossEntropyLoss`)
@@ -475,12 +636,15 @@ If previous attempts failed or showed no improvement, DO NOT repeat the same app
 
 **Standard compute optimizations**:
 - TF32 matmul (`torch.backends.cuda.matmul.allow_tf32 = True`)
-- `torch.compile(fwd, mode="reduce-overhead")` on forward-only function
+- `torch.compile(fwd, mode="default", fullgraph=True)` on forward-only function (try reduce-overhead with DDP)
+- Inductor config tuning (coordinate_descent_tuning, epilogue_fusion, shape_padding)
+- Dynamo config tuning (assume_static_by_default, cache_size_limit=128)
 - Batch pre-loading with `non_blocking=True`
 - Local variable binding in hot loops
+- Pinned memory state dict transfer
 
 **Communication optimizations**:
-- For mixed DP+TP: overlap DP all-reduce with TP communication using CUDA streams
+- For DDP: `static_graph=True`, `gradient_as_bucket_view=True`, `bucket_cap_mb=200`
 - For FSDP: `backward_prefetch=BackwardPrefetch.BACKWARD_PRE`, `forward_prefetch=True`
 - NVLink between all 4 GPUs (600 GB/s bidirectional per pair) — communication is fast
 
