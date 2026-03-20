@@ -2981,6 +2981,62 @@ async def health():
     }
 
 
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and all its children via process group or /proc walk."""
+    import signal
+
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat") as f:
+                    parts = f.read().split()
+                if len(parts) > 3 and int(parts[3]) == pid:
+                    os.kill(int(entry), signal.SIGKILL)
+            except (OSError, ValueError, IndexError):
+                continue
+    except OSError:
+        pass
+
+
+async def _inter_run_cleanup() -> None:
+    """Clean up all state between torchrun invocations on the same deployment.
+
+    Addresses multiple failure modes that can cause Run N+1 to crash:
+    - Orphaned processes holding GPU memory (handled by _kill_process_tree)
+    - CUDA driver needing time to reclaim VRAM from dead processes
+    - Stale NCCL rendezvous files in /dev/shm blocking new process groups
+    - torch.compile / inductor disk caches causing recompilation issues
+    """
+    import asyncio as _aio
+    import glob as _glob
+    import shutil
+
+    gc.collect()
+
+    for pattern in ("/dev/shm/nccl-*", "/dev/shm/torch_*"):
+        for path in _glob.glob(pattern):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "torch", "inductor")
+    if os.path.isdir(cache_dir):
+        try:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        except OSError:
+            pass
+
+    await _aio.sleep(10)
+
+
 async def _evaluate_via_torchrun(request: EvaluateRequest) -> dict:
     """Spawn torchrun for multi-GPU Basilica evaluation (uvicorn is single-process)."""
     import asyncio as _aio
@@ -2989,6 +3045,7 @@ async def _evaluate_via_torchrun(request: EvaluateRequest) -> dict:
 
     params_path = None
     script_path = None
+    proc = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", dir="/tmp", delete=False) as f:
             _json.dump(request.model_dump(), f)
@@ -3038,6 +3095,7 @@ asyncio.run(main())
             script_path,
             stdout=_aio.subprocess.PIPE,
             stderr=_aio.subprocess.STDOUT,
+            preexec_fn=os.setsid,
         )
         stdout_bytes, _ = await _aio.wait_for(proc.communicate(), timeout=request.timeout + 600)
         stdout_text = stdout_bytes.decode(errors="replace")
@@ -3057,6 +3115,8 @@ asyncio.run(main())
             "wall_time_seconds": 0.0,
         }
     except TimeoutError:
+        if proc and proc.pid:
+            _kill_process_tree(proc.pid)
         return {
             "task_id": request.task_id,
             "success": False,
@@ -3068,6 +3128,8 @@ asyncio.run(main())
             "wall_time_seconds": 0.0,
         }
     except Exception as e:
+        if proc and proc.pid:
+            _kill_process_tree(proc.pid)
         return {
             "task_id": request.task_id,
             "success": False,
@@ -3079,12 +3141,17 @@ asyncio.run(main())
             "wall_time_seconds": 0.0,
         }
     finally:
+        if proc and proc.pid:
+            _kill_process_tree(proc.pid)
+
         for p in (params_path, script_path):
             if p:
                 try:
                     os.unlink(p)
                 except OSError:
                     pass
+
+        await _inter_run_cleanup()
 
 
 @app.post("/evaluate", response_model=EvaluateResponse)
