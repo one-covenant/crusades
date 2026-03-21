@@ -82,9 +82,6 @@ class Validator(BaseNode):
         # Pruned to max_evaluated_urls (from hparams) to prevent unbounded memory growth
         self.evaluated_code_urls: dict[str, tuple[int, str]] = {}
 
-        # Background burn tasks — strong references prevent GC mid-execution
-        self._pending_burns: set[asyncio.Task] = set()
-
         # Timing
         self.last_weight_set_block: int = 0
         self.last_sync_time: float = 0
@@ -494,89 +491,7 @@ class Validator(BaseNode):
             f"Payment verified: {payment.alpha_amount} alpha at block "
             f"{payment.block_hash[:16]}... extrinsic {payment.extrinsic_index}"
         )
-
-        # Fire-and-forget: burn the fee alpha in the background so the
-        # submission pipeline isn't blocked by the on-chain RPC round-trip.
-        # We can only burn alpha that belongs to our own coldkey — the
-        # burn_alpha extrinsic must be signed by the stake owner.
-        validator_coldkey = self.wallet.coldkeypub.ss58_address
-        if payment_address != validator_coldkey:
-            logger.debug(
-                f"Skipping burn for {submission_id}: payment_address "
-                f"{payment_address[:16]}... is not this validator's coldkey"
-            )
-        else:
-            metagraph = self.chain.metagraph
-            if metagraph is None or hparams.burn_uid >= len(metagraph.hotkeys):
-                logger.warning(
-                    f"Skipping burn for {submission_id}: metagraph unavailable or "
-                    f"burn_uid {hparams.burn_uid} out of range"
-                )
-                return True
-            burn_hotkey = metagraph.hotkeys[hparams.burn_uid]
-            task = asyncio.create_task(
-                self._burn_payment_alpha(
-                    amount=payment.alpha_amount,
-                    netuid=netuid,
-                    hotkey=burn_hotkey,
-                    submission_id=submission_id,
-                )
-            )
-            self._pending_burns.add(task)
-            task.add_done_callback(self._pending_burns.discard)
-
         return True
-
-    async def _burn_payment_alpha(
-        self,
-        amount: int,
-        netuid: int,
-        hotkey: str,
-        submission_id: str,
-    ) -> None:
-        """Burn the submission fee alpha via the on-chain burn_alpha extrinsic.
-
-        This permanently removes the fee alpha from the subnet's circulating
-        supply.  Burning is best-effort: failures are logged but do not block
-        the submission pipeline — the fee was already verified and recorded.
-        """
-        if self.chain is None:
-            return
-
-        try:
-            loop = asyncio.get_running_loop()
-            call = self.chain.subtensor.substrate.compose_call(
-                call_module="SubtensorModule",
-                call_function="burn_alpha",
-                call_params={
-                    "hotkey": hotkey,
-                    "amount": amount,
-                    "netuid": netuid,
-                },
-            )
-            success, msg = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    lambda: self.chain.subtensor.sign_and_send_extrinsic(
-                        call=call,
-                        wallet=self.wallet,
-                        wait_for_inclusion=True,
-                        wait_for_finalization=False,
-                    ),
-                ),
-                timeout=60,
-            )
-            if success:
-                logger.info(
-                    f"Burned {amount} fee alpha for {submission_id} "
-                    f"(hotkey={hotkey[:16]}..., netuid={netuid})"
-                )
-            else:
-                logger.warning(f"burn_alpha extrinsic failed for {submission_id}: {msg}")
-        except TimeoutError:
-            logger.warning(f"burn_alpha timed out after 60s for {submission_id}")
-        except Exception as e:
-            logger.warning(f"burn_alpha failed for {submission_id}: {e}")
 
     async def _create_submission_from_commitment(
         self,
@@ -1373,18 +1288,6 @@ class Validator(BaseNode):
 
     async def cleanup(self) -> None:
         """Cleanup resources."""
-        if self._pending_burns:
-            logger.info(f"Waiting for {len(self._pending_burns)} pending burn task(s)...")
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*self._pending_burns, return_exceptions=True),
-                    timeout=30,
-                )
-            except TimeoutError:
-                logger.warning("Timed out waiting for pending burns — cancelling")
-                for t in self._pending_burns:
-                    t.cancel()
-            self._pending_burns.clear()
         if self.affinetes_mode == "basilica" and self.affinetes_runner:
             await self.affinetes_runner.delete_basilica_deployment()
         await self._save_state()
