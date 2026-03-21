@@ -3,10 +3,10 @@
     "burn_rate": 0.95,
     "burn_uid": 1,
 
-    "evaluation_runs": 3,
+    "evaluation_runs": 2,
     "eval_steps": 20,
     "eval_timeout": 3600,
-    "min_success_rate": 0.5,
+    "min_success_rate": 0.3,
 
     "benchmark_model_name": "Qwen/Qwen2.5-7B",
     "benchmark_dataset_name": "HuggingFaceFW/fineweb",
