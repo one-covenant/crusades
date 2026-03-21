@@ -3039,10 +3039,23 @@ asyncio.run(main())
             stdout=_aio.subprocess.PIPE,
             stderr=_aio.subprocess.STDOUT,
         )
-        stdout_bytes, _ = await _aio.wait_for(proc.communicate(), timeout=request.timeout + 600)
-        stdout_text = stdout_bytes.decode(errors="replace")
 
-        for line in stdout_text.split("\n"):
+        collected_lines: list[str] = []
+
+        async def _read_and_tee():
+            assert proc.stdout is not None
+            async for raw_line in proc.stdout:
+                line = raw_line.decode(errors="replace").rstrip("\n")
+                print(line, flush=True)
+                collected_lines.append(line)
+
+        await _aio.wait_for(
+            _aio.gather(_read_and_tee(), proc.wait()),
+            timeout=request.timeout + 600,
+        )
+        stdout_text = "\n".join(collected_lines)
+
+        for line in collected_lines:
             if line.startswith("EVAL_RESULT:"):
                 return _json.loads(line[len("EVAL_RESULT:") :])
 

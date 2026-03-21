@@ -245,10 +245,6 @@ class AffinetesRunner:
         self.basilica_geo = basilica_geo
         self.basilica_spot = basilica_spot
 
-        # Basilica deployment cache (per-instance, not global)
-        self._basilica_deployment = None
-        self._basilica_deployment_time: float = 0
-
         if mode == "basilica":
             if not self.basilica_api_key:
                 logger.warning("Basilica mode: BASILICA_API_TOKEN not set")
@@ -715,13 +711,16 @@ asyncio.run(main())
         """Run evaluation remotely via Basilica SDK.
 
         Uses BasilicaClient to deploy a custom Docker image and call
-        the /evaluate endpoint for MFU evaluation.
+        the /evaluate endpoint for MFU evaluation. Each call creates
+        a fresh deployment and deletes it when done, ensuring clean
+        GPU state between runs.
 
         Flow:
-        1. Deploy image to Basilica (or reuse existing deployment)
+        1. Create fresh Basilica deployment
         2. Wait for deployment to be ready (/health endpoint)
         3. POST to /evaluate with miner's code
-        4. Return MFU results
+        4. Delete deployment (in finally block)
+        5. Return MFU results
         """
         logger.info("=" * 60)
         logger.info("[BASILICA] Starting remote GPU evaluation")
@@ -741,10 +740,14 @@ asyncio.run(main())
                 task_id=task_id,
             )
 
+        deployment = None
+        log_stream_task = None
+        start_time = time.time()
+        http_timeout = self.timeout + 120
         try:
-            # Get or create Basilica deployment (cleaned up by validator.py after all runs)
-            logger.info("[BASILICA] Acquiring deployment...")
-            deployment = await self._get_basilica_deployment()
+            # Fresh deployment per evaluation run — ensures clean GPU state
+            logger.info("[BASILICA] Creating fresh deployment for this run...")
+            deployment = await self._create_basilica_deployment()
 
             if deployment is None:
                 logger.error("[BASILICA] Failed to create deployment!")
@@ -756,9 +759,14 @@ asyncio.run(main())
             logger.info("-" * 60)
             logger.info("[BASILICA] Deployment ready!")
             logger.info(f"   URL: {deployment.url}")
-            if hasattr(deployment, "id"):
-                logger.info(f"   Deployment ID: {deployment.id}")
+            dep_name = getattr(deployment, "name", None) or getattr(deployment, "id", "unknown")
+            logger.info(f"   Deployment ID: {dep_name}")
             logger.info("-" * 60)
+
+            log_dir = Path("logs/basilica")
+            log_file = log_dir / f"{dep_name}_{int(time.time())}.log"
+            log_stream_task = asyncio.create_task(self._stream_basilica_logs(deployment, log_file))
+            logger.info(f"[BASILICA] Log streaming started → {log_file}")
 
             # DNS resolution check
             import socket
@@ -821,7 +829,6 @@ asyncio.run(main())
                 "num_gpus": self.basilica_gpu_count,
             }
 
-            http_timeout = self.timeout + 120
             logger.info("[BASILICA] Sending evaluation request...")
             logger.info(f"   POST {deployment.url}/evaluate")
             logger.info(f"   Timeout: {http_timeout}s")
@@ -941,31 +948,83 @@ asyncio.run(main())
                 f"Basilica error after {elapsed:.0f}s: {e}",
                 task_id=task_id,
             )
+        finally:
+            if log_stream_task is not None:
+                log_stream_task.cancel()
+                try:
+                    await log_stream_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if deployment is not None:
+                logger.info("[BASILICA] Cleaning up deployment after evaluation run...")
+                try:
+                    await deployment.delete_async()
+                    logger.info(
+                        f"[BASILICA] Deployment '{getattr(deployment, 'name', 'unknown')}' deleted"
+                    )
+                except Exception as del_err:
+                    logger.warning(f"[BASILICA] Failed to delete deployment: {del_err}")
 
-    async def _get_basilica_deployment(self):
-        """Get or create a Basilica deployment.
+    async def _stream_basilica_logs(self, deployment, log_path: Path, poll_interval: int = 5):
+        """Poll Basilica deployment logs every `poll_interval` seconds and
+        write them to a local file. Detects consecutive failures and writes
+        a marker so container crashes are visible."""
+        loop = asyncio.get_event_loop()
+        last_len = 0
+        consecutive_errors = 0
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "w") as f:
+                f.write(
+                    f"# Basilica logs for deployment {getattr(deployment, 'name', 'unknown')}\n"
+                )
+                f.write(f"# Started: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n")
+                f.write(f"# Poll interval: {poll_interval}s\n\n")
 
-        Reuses existing deployment if within TTL, otherwise creates new one.
-        Always cleans up stale/expired deployments before creating fresh ones.
+            while True:
+                try:
+                    raw = await loop.run_in_executor(None, deployment.logs)
+                    if raw and len(raw) > last_len:
+                        new_content = raw[last_len:]
+                        last_len = len(raw)
+                        with open(log_path, "a") as f:
+                            f.write(new_content)
+                    consecutive_errors = 0
+                except Exception as e:
+                    consecutive_errors += 1
+                    logger.debug(f"[BASILICA-LOGS] Poll error #{consecutive_errors}: {e}")
+                    if consecutive_errors >= 5:
+                        logger.warning(
+                            f"[BASILICA-LOGS] {consecutive_errors} consecutive poll"
+                            " failures — container may have crashed"
+                        )
+                        with open(log_path, "a") as f:
+                            ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+                            f.write(
+                                f"\n--- POLL FAILURE x{consecutive_errors}"
+                                f" at {ts} ---\n"
+                                f"--- Last error: {e} ---\n"
+                            )
+                await asyncio.sleep(poll_interval)
+        except asyncio.CancelledError:
+            try:
+                raw = await loop.run_in_executor(None, deployment.logs)
+                if raw and len(raw) > last_len:
+                    with open(log_path, "a") as f:
+                        f.write(raw[last_len:])
+            except Exception:
+                pass
+            with open(log_path, "a") as f:
+                f.write(f"\n# Ended: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n")
+            logger.info(f"[BASILICA-LOGS] Saved to {log_path}")
+
+    async def _create_basilica_deployment(self):
+        """Create a fresh Basilica deployment for a single evaluation run.
+
+        Each evaluation gets its own deployment to ensure clean GPU state
+        and avoid inter-run contamination (NCCL leaks, CUDA state, etc.).
+        Returns the deployment object or None on failure.
         """
-        now = time.time()
-        ttl_buffer = 300  # 5 minute buffer before TTL expires
-
-        if (
-            self._basilica_deployment is not None
-            and now - self._basilica_deployment_time < self.basilica_ttl_seconds - ttl_buffer
-        ):
-            remaining = self.basilica_ttl_seconds - (now - self._basilica_deployment_time)
-            logger.info("[BASILICA] Reusing existing deployment")
-            logger.info(f"   URL: {self._basilica_deployment.url}")
-            logger.info(f"   TTL remaining: {remaining:.0f}s ({remaining / 60:.1f} min)")
-            return self._basilica_deployment
-
-        # Delete stale cached deployment before creating a new one
-        if self._basilica_deployment is not None:
-            logger.info("[BASILICA] Deleting expired cached deployment before creating new one")
-            await self.delete_basilica_deployment()
-
         logger.info("[BASILICA] Creating NEW deployment")
         logger.info(f"   Image: {self.basilica_image}")
         logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
@@ -1066,9 +1125,6 @@ asyncio.run(main())
                 f"   TTL: {self.basilica_ttl_seconds}s (expires in {self.basilica_ttl_seconds / 60:.0f} min)"
             )
 
-            self._basilica_deployment = deployment
-            self._basilica_deployment_time = time.time()
-
             return deployment
 
         except Exception as e:
@@ -1082,26 +1138,6 @@ asyncio.run(main())
                 except Exception as del_err:
                     logger.warning(f"[BASILICA] Failed to clean up deployment: {del_err}")
             return None
-
-    async def delete_basilica_deployment(self) -> None:
-        """Delete the current Basilica deployment to free resources.
-
-        Called by validator.py in a finally block after all evaluation
-        runs for a submission complete (not between individual runs).
-        Also called internally when a cached deployment has expired.
-        """
-        if self._basilica_deployment is None:
-            return
-
-        name = getattr(self._basilica_deployment, "name", "unknown")
-        try:
-            await self._basilica_deployment.delete_async()
-            logger.info(f"[BASILICA] Deployment '{name}' deleted")
-        except Exception as e:
-            logger.warning(f"[BASILICA] Failed to delete deployment '{name}': {e}")
-
-        self._basilica_deployment = None
-        self._basilica_deployment_time = 0
 
     async def build_validator_image(self, env_path: Path | None = None) -> bool:
         """Build the validator's evaluation Docker image.

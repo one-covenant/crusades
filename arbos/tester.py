@@ -358,10 +358,56 @@ class LocalDockerTester:
 
         return cmd
 
+    def _kill_container(self, proc: subprocess.Popen, wait: int = 15):
+        """Force-kill Docker container backing *proc* and wait for exit."""
+        proc.kill()
+        try:
+            proc.wait(timeout=wait)
+        except subprocess.TimeoutExpired:
+            logger.warning("Container did not exit after SIGKILL, force-removing...")
+            try:
+                subprocess.run(
+                    ["docker", "kill", "--signal=SIGKILL", str(proc.pid)],
+                    timeout=10,
+                    capture_output=True,
+                )
+            except Exception:
+                pass
+            proc.wait(timeout=30)
+
+    def _post_run_cleanup(self):
+        """Clean up GPU state and /dev/shm after a Docker run.
+
+        Kills any leftover templar-eval containers and clears NCCL shared
+        memory segments so the next run starts with a clean slate.
+        """
+        try:
+            leftover = subprocess.run(
+                ["docker", "ps", "-q", "--filter", f"ancestor={self._image}"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            for cid in leftover.stdout.strip().split("\n"):
+                if cid:
+                    logger.warning(f"Killing leftover container {cid}")
+                    subprocess.run(["docker", "kill", cid], capture_output=True, timeout=10)
+        except Exception as e:
+            logger.debug(f"Container cleanup error: {e}")
+
+        import glob
+
+        for shm in glob.glob("/dev/shm/nccl-*"):
+            try:
+                os.unlink(shm)
+            except OSError:
+                pass
+
     def evaluate(self, code: str) -> EvalResult:
         payload = self._build_payload(code)
 
         tmp_files: list[str] = []
+        proc = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".py", delete=False, prefix="arbos_code_"
@@ -398,7 +444,7 @@ class LocalDockerTester:
             try:
                 for line in proc.stdout:
                     if time.monotonic() > deadline:
-                        proc.kill()
+                        self._kill_container(proc)
                         raise subprocess.TimeoutExpired(cmd, timeout)
                     line = line.rstrip()
                     if line.startswith("EVAL_RESULT:"):
@@ -406,8 +452,6 @@ class LocalDockerTester:
                     else:
                         logger.info(f"[docker] {line}")
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
                 return EvalResult(
                     success=False,
                     error=f"Docker evaluation timed out after {timeout}s",
@@ -433,7 +477,8 @@ class LocalDockerTester:
             )
 
         except subprocess.TimeoutExpired:
-            proc.kill()
+            if proc is not None:
+                self._kill_container(proc)
             return EvalResult(
                 success=False, error=f"Docker evaluation timed out after {self._eval_timeout}s"
             )
@@ -441,6 +486,7 @@ class LocalDockerTester:
             return EvalResult(success=False, error=str(e))
 
         finally:
+            self._post_run_cleanup()
             for p in tmp_files:
                 try:
                     os.unlink(p)
@@ -448,5 +494,5 @@ class LocalDockerTester:
                     pass
 
     def cleanup(self):
-        """No-op — container is removed after each run."""
-        pass
+        """Kill any leftover containers and clean shared memory."""
+        self._post_run_cleanup()
