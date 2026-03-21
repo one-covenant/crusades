@@ -25,7 +25,7 @@ def resolve_hotkey_for_uid(subtensor: bt.subtensor, netuid: int, uid: int) -> st
     """Get the hotkey SS58 address for a given UID on a subnet."""
     try:
         metagraph = subtensor.metagraph(netuid=netuid)
-        if uid < len(metagraph.hotkeys):
+        if 0 <= uid < len(metagraph.hotkeys):
             return metagraph.hotkeys[uid]
     except Exception as e:
         print(f"  ERROR resolving hotkey for UID {uid}: {e}")
@@ -47,21 +47,15 @@ Examples:
     )
     parser.add_argument("--network", type=str, required=True, help="Network: finney, local, test")
     parser.add_argument("--netuid", type=int, required=True, help="Subnet UID")
-    parser.add_argument(
-        "--burn-uid", type=int, help="UID to resolve hotkey from (mutually exclusive with --hotkey)"
-    )
-    parser.add_argument(
-        "--hotkey", type=str, help="Hotkey SS58 to burn on (mutually exclusive with --burn-uid)"
-    )
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--burn-uid", type=int, help="UID to resolve hotkey from")
+    target.add_argument("--hotkey", type=str, help="Hotkey SS58 to burn on")
     parser.add_argument("--wallet-name", default="default", help="Wallet name (default: 'default')")
     parser.add_argument(
         "--wallet-hotkey", default="default", help="Wallet hotkey name (default: 'default')"
     )
     parser.add_argument("--wallet-path", default="~/.bittensor/wallets", help="Wallet path")
     args = parser.parse_args()
-
-    if not args.hotkey and args.burn_uid is None:
-        parser.error("Either --hotkey or --burn-uid must be provided")
 
     if args.amount <= 0:
         print("ERROR: --amount must be positive")
