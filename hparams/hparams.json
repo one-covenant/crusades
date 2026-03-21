@@ -1,12 +1,12 @@
 {
     "netuid": 3,
-    "burn_rate": 1.0,
+    "burn_rate": 0.95,
     "burn_uid": 1,
 
-    "evaluation_runs": 3,
+    "evaluation_runs": 2,
     "eval_steps": 20,
     "eval_timeout": 3600,
-    "min_success_rate": 0.5,
+    "min_success_rate": 0.3,
 
     "benchmark_model_name": "Qwen/Qwen2.5-7B",
     "benchmark_dataset_name": "HuggingFaceFW/fineweb",
@@ -48,7 +48,7 @@
     "mfu": {
         "gpu_peak_tflops": 312.0,
         "max_plausible_mfu": 75.0,
-        "min_mfu": 45.0
+        "min_mfu": 50.0
     },
 
     "adaptive_threshold": {
