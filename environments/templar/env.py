@@ -2843,6 +2843,14 @@ class Actor:
 
         except Exception as e:
             logger.error(f"Evaluation failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            if _multi_gpu:
+                # In multi-GPU mode, other ranks are blocked in NCCL collectives
+                # (allreduce, barrier) waiting for this rank. Graceful cleanup is
+                # impossible — the finally block's dist.barrier() would deadlock.
+                # Kill immediately so torchrun propagates the failure via SIGTERM.
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
             return {
                 "task_id": task_id,
                 "mfu": 0.0,
