@@ -769,124 +769,76 @@ class Validator(BaseNode):
             else:
                 logger.info(f"   Code hash verified: {actual_hash}")
 
-            # Run evaluations — wrapped in try/finally so the Basilica deployment
-            # is always deleted even if an unexpected exception occurs mid-eval.
+            # Run evaluations — each run gets a fresh Basilica deployment
+            # (created and destroyed inside runner._evaluate_basilica).
             fatal_error = False
-            try:
-                for run_idx in range(runs_remaining):
-                    if run_idx > 0:
-                        await asyncio.sleep(60)
+            for run_idx in range(runs_remaining):
+                current_run = len(my_evals) + run_idx + 1
+                seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}:{secrets.token_hex(16)}"
 
-                    current_run = len(my_evals) + run_idx + 1
-                    seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}:{secrets.token_hex(16)}"
+                logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
 
-                    logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
-
-                    hard_timeout = hparams.eval_timeout + 300
-                    try:
-                        result = await asyncio.wait_for(
-                            self.affinetes_runner.evaluate(
-                                code=miner_code,
-                                seed=seed,
-                                steps=hparams.eval_steps,
-                                batch_size=hparams.benchmark_batch_size,
-                                sequence_length=hparams.benchmark_sequence_length,
-                                data_samples=hparams.benchmark_data_samples,
-                                task_id=current_run,
-                            ),
-                            timeout=hard_timeout,
-                        )
-                    except TimeoutError:
-                        logger.error(
-                            f"Run {current_run}: hard timeout after {hard_timeout}s — "
-                            "recycling deployment"
-                        )
-                        await self.affinetes_runner.delete_basilica_deployment()
-                        result = EvaluationResult(
-                            success=False,
-                            error=f"Hard timeout after {hard_timeout}s",
-                            error_code="HARD_TIMEOUT",
+                hard_timeout = hparams.eval_timeout + 3000
+                try:
+                    result = await asyncio.wait_for(
+                        self.affinetes_runner.evaluate(
+                            code=miner_code,
+                            seed=seed,
+                            steps=hparams.eval_steps,
+                            batch_size=hparams.benchmark_batch_size,
+                            sequence_length=hparams.benchmark_sequence_length,
+                            data_samples=hparams.benchmark_data_samples,
                             task_id=current_run,
-                        )
-
-                    if (
-                        not result.success
-                        and (
-                            result.error_code == "EADDRINUSE"
-                            or (result.error and "EADDRINUSE" in result.error)
-                        )
-                        and self.affinetes_mode == "basilica"
-                    ):
-                        logger.warning(
-                            f"Run {current_run}: EADDRINUSE — recycling deployment and retrying once"
-                        )
-                        await self.affinetes_runner.delete_basilica_deployment()
-                        await asyncio.sleep(10)
-                        try:
-                            result = await asyncio.wait_for(
-                                self.affinetes_runner.evaluate(
-                                    code=miner_code,
-                                    seed=seed,
-                                    steps=hparams.eval_steps,
-                                    batch_size=hparams.benchmark_batch_size,
-                                    sequence_length=hparams.benchmark_sequence_length,
-                                    data_samples=hparams.benchmark_data_samples,
-                                    task_id=current_run,
-                                ),
-                                timeout=hard_timeout,
-                            )
-                        except TimeoutError:
-                            logger.error(
-                                f"Run {current_run} retry: hard timeout after {hard_timeout}s"
-                            )
-                            result = EvaluationResult(
-                                success=False,
-                                error=f"Hard timeout after {hard_timeout}s (retry)",
-                                error_code="HARD_TIMEOUT",
-                                task_id=current_run,
-                            )
-
-                    if result.success:
-                        logger.info(
-                            f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}"
-                        )
-                    else:
-                        logger.warning(f"Run {current_run} FAILED: {result.error}")
-
-                    evaluation = EvaluationModel(
-                        submission_id=submission.submission_id,
-                        evaluator_hotkey=self.hotkey,
-                        mfu=result.mfu,  # MFU is primary metric
-                        tokens_per_second=result.tps,
-                        total_tokens=result.total_tokens,
-                        wall_time_seconds=result.wall_time_seconds,
-                        success=result.success,
-                        error=result.error,
+                        ),
+                        timeout=hard_timeout,
                     )
-                    await self.db.save_evaluation(evaluation)
-                    self._cleanup_memory()
+                except TimeoutError:
+                    logger.error(f"Run {current_run}: hard timeout after {hard_timeout}s")
+                    result = EvaluationResult(
+                        success=False,
+                        error=f"Hard timeout after {hard_timeout}s",
+                        error_code="HARD_TIMEOUT",
+                        task_id=current_run,
+                    )
 
-                    if result.is_fatal():
-                        logger.warning(
-                            f"Fatal error detected ({result.error_code}), skipping remaining runs"
-                        )
-                        fatal_error = True
-                        break
+                if result.success:
+                    logger.info(
+                        f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}"
+                    )
+                else:
+                    logger.warning(f"Run {current_run} FAILED: {result.error}")
 
-                # Persist state (URL already recorded during commitment processing)
-                await self._save_state()
-
-                # Store miner's code in database
-                await self.db.update_submission_code(submission.submission_id, miner_code)
-                logger.info(f"Stored code for {submission.submission_id} in database")
-
-                # Finalize submission (pass fatal_error to skip unnecessary checks)
-                await self._finalize_submission(
-                    submission.submission_id, num_runs, fatal_error=fatal_error
+                evaluation = EvaluationModel(
+                    submission_id=submission.submission_id,
+                    evaluator_hotkey=self.hotkey,
+                    mfu=result.mfu,  # MFU is primary metric
+                    tokens_per_second=result.tps,
+                    total_tokens=result.total_tokens,
+                    wall_time_seconds=result.wall_time_seconds,
+                    success=result.success,
+                    error=result.error,
                 )
-            finally:
-                if self.affinetes_mode == "basilica":
-                    await self.affinetes_runner.delete_basilica_deployment()
+                await self.db.save_evaluation(evaluation)
+                self._cleanup_memory()
+
+                if result.is_fatal():
+                    logger.warning(
+                        f"Fatal error detected ({result.error_code}), skipping remaining runs"
+                    )
+                    fatal_error = True
+                    break
+
+            # Persist state (URL already recorded during commitment processing)
+            await self._save_state()
+
+            # Store miner's code in database
+            await self.db.update_submission_code(submission.submission_id, miner_code)
+            logger.info(f"Stored code for {submission.submission_id} in database")
+
+            # Finalize submission (pass fatal_error to skip unnecessary checks)
+            await self._finalize_submission(
+                submission.submission_id, num_runs, fatal_error=fatal_error
+            )
 
     async def _finalize_submission(
         self, submission_id: str, num_runs: int, fatal_error: bool = False
@@ -1288,8 +1240,6 @@ class Validator(BaseNode):
 
     async def cleanup(self) -> None:
         """Cleanup resources."""
-        if self.affinetes_mode == "basilica" and self.affinetes_runner:
-            await self.affinetes_runner.delete_basilica_deployment()
         await self._save_state()
         await super().cleanup()
         if self.db:

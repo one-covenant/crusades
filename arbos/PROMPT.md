@@ -2,6 +2,34 @@ You are an elite GPU performance engineer. Your single goal: maximize MFU (Model
 
 MFU = actual_tflops / (312.0 per GPU × num_gpus) × 100. Target: **65%+ MFU**. Every 0.1% counts.
 
+**Current best: ~54% MFU median (59.37% peak outlier)** with DDP dp=4 + HF gradient checkpointing (ALL 28 layers) + torch.compile(default) + inductor/dynamo tuning. Median wall time ~88s. The 59.37% in one run was a torch.compile autotuning lucky outlier — 5 other passing runs all clustered at 53.9-54.9%. Target 65% requires ~73.7s — need to save **~14s from the realistic baseline**.
+
+**10-run evaluation results** (submission v17_commit_44397_0):
+| Run | Status | MFU | Wall time |
+|---|---|---|---|
+| 1 | PASSED | 59.37% | 80.83s | ← outlier (torch.compile got lucky kernels)
+| 2 | PASSED | 54.85% | 87.49s |
+| 3 | **FAILED** | OOM | — | ← rank 3, CUDA OOM during DDP._rebuild_buckets()
+| 4 | **FAILED** | OOM | — | ← rank 0
+| 5 | PASSED | 53.96% | 88.94s |
+| 6 | PASSED | 54.26% | 88.45s |
+| 7 | PASSED | 53.90% | 89.03s |
+| 8 | PASSED | 54.06% | 88.78s |
+| 9 | **FAILED** | OOM | — | ← rank 1
+
+**Why Run 1 was an outlier**: torch.compile's inductor autotuning with `coordinate_descent_tuning=True` is non-deterministic — it tries different Triton kernel configurations and picks winners from microbenchmarks. Run 1 got lucky kernel selections. Also, Run 1's deployment was a cold start (1052s provisioning vs ~30s for later runs), likely getting a fresh node with zero memory fragmentation.
+
+**THE MAIN BOTTLENECKS ARE**:
+1. **Gradient checkpointing recomputation** (~6-9s): With all 28 layers checkpointed, backward recomputes every layer's forward. The MFU formula does NOT account for this — eliminating it directly improves MFU.
+2. **torch.compile non-determinism** (~8s variance): Autotuning produces wildly different kernel quality across runs, causing 54-59% MFU spread.
+3. **Memory pressure** (33% OOM rate): ~78-79GB/80GB peak, with only ~1GB headroom. torch.compile autotuning allocates variable scratch memory that randomly tips into OOM.
+
+**The solution: micro-batching (batch=8×2 with gradient accumulation)** reduces peak activation memory to ~10GB, making total ~74GB with 6GB headroom on 80GB A100. This fixes OOM AND enables removing checkpointing to save ~6-9s.
+
+**DDP OOM note**: DDP with full batch=16 + ALL layers checkpointed uses ~78-79GB/80GB (confirmed by Basilica OOM logs: "77.77 GiB allocated by PyTorch, 220.81 MiB free"), causing **~33% non-deterministic OOM** from torch.compile autotuning scratch allocations. The OOM happens at `DDP._rebuild_buckets()` — varying ranks fail each time (rank 3, 0, 1), confirming it's memory variance not a specific GPU issue. With micro-batching (batch=8×2) and NO checkpointing, peak memory drops to ~74GB — much more reliable.
+
+**MFU note**: The formula uses 6× FLOPs per param per token (2× forward + 4× backward). Gradient checkpointing adds recomputation (~33% more FLOPs) but the formula does NOT account for this — so MFU is conservative for checkpointed runs. Reducing checkpointing (fewer recomputed layers) directly improves MFU because the denominator stays the same but wall time decreases.
+
 ## train.py Contract
 
 ```python
@@ -66,7 +94,14 @@ Three strategies satisfy `dp_size * tp_size == 4`:
 
 **Note**: Batch size is constrained to 16 by GPU memory (7B model + optimizer states + activations ≈ 60-70GB per GPU). The agent can experiment with batch sizes but anything above 16 risks OOM.
 
-**Recommendation**: Start with dp=4/tp=1 using DDP + selective gradient checkpointing + inductor/dynamo config tuning. FSDP is maxed out at 56.5% after 40+ attempts. DDP with the proven 2-GPU techniques is the most promising path to 65%.
+**Recommendation**: Use dp=4/tp=1 with DDP. Follow the **incremental ladder** in "What to Try Next":
+- **Step A**: Add micro-batching (batch=8×2) while KEEPING checkpointing → stable low-memory base (~67GB, 13GB headroom)
+- **Step B**: Gradually remove checkpointing from last 7 layers → ~60-61% MFU
+- **Step C**: Remove ALL checkpointing → ~62-65% MFU (74GB, 6GB headroom)
+- **Step D**: If OOM, replace DDP with manual gradient sync → saves ~1GB
+- **Step E**: Additional optimizations (reduce-overhead compile, fused kernels) → 65%+
+
+**Make ONE change at a time. Verify it works. Then build on it.**
 
 ## Overhead Budget (dp=2, tp=2 — 20 steps)
 
@@ -91,18 +126,30 @@ To reach 65% MFU (wall_time ≈ 13.9s) with dp=2/tp=2 is extremely difficult —
 - **Per-step overhead**: ~1.5s × 20 = ~30s (optimizer, zero_grad, Python)
 - **Actual**: ~85s → 56.5% MFU (this is the observed ceiling)
 
-### DDP + gradient checkpointing (estimated — NOT yet tested on 4 GPUs)
+### DDP + ALL layers checkpointed (MEASURED — 10-run evaluation)
 - **Theoretical compute**: ~18.0s (same per-GPU workload)
-- **Gradient recomputation**: ~5-8s (23 checkpointed layers recompute forward during backward)
-- **DDP gradient all-reduce**: ~2-3s (ONE all-reduce per step with static_graph, NOT per-layer)
-- **`compile(default)` warmup**: ~5-8s (inductor tuning should help here)
-- **State dict extraction**: ~1-2s (DDP: direct `.state_dict()` on unwrapped model, no gathering)
-- **Per-step overhead**: ~0.5s × 20 = ~10s (less Python overhead than FSDP)
-- **Estimated total**: ~42-50s → **~36-43% MFU without inductor tuning, potentially 55-65% with tuning**
+- **Gradient recomputation**: ~6-9s (ALL 28 layers recompute forward during backward — THIS IS THE MAIN TARGET)
+- **DDP gradient all-reduce**: ~3s (bucketed with static_graph=True, bucket_cap_mb=150)
+- **`compile(default)` warmup**: ~5-8s (inductor cache persists from warmup, amortized over 20 steps)
+- **State dict extraction**: ~3s (DDP: direct `.state_dict()` + pinned memory async copy)
+- **Per-step overhead**: ~0.75s × 20 = ~15s (optimizer step, zero_grad, Python)
+- **torch.compile autotuning variance**: ~8s (80.83s best vs 89.03s worst — non-deterministic kernel selection)
+- **Actual median**: ~88s → **~54% MFU** (6 passing runs out of 9, 3 OOM failures)
+- **Actual best (outlier)**: ~81s → **59.37% MFU** (1 lucky autotuning run — NOT reproducible)
 
-Key DDP savings vs FSDP: ~15-20s less communication overhead (no per-layer all-gather/reduce-scatter), ~3-6s faster state dict (no gathering). The gradient checkpointing cost (~5-8s) is partially offset by these savings.
+### DDP + micro-batching + NO checkpointing (UNTESTED — estimated 63-66% MFU)
+- **Theoretical compute**: ~18.0s (same total compute, split across 2 micro-batches)
+- **Gradient recomputation**: ~0s (NO CHECKPOINTING — the key improvement)
+- **DDP gradient all-reduce**: ~3s (same — sync only on last micro-batch via no_sync)
+- **Micro-batch overhead**: ~1-2s extra (2× Python loops, no_sync context per step)
+- **`compile(default)` warmup**: ~5-8s
+- **State dict extraction**: ~3s
+- **Per-step overhead**: ~0.75s × 20 = ~15s
+- **Estimated total**: ~73-76s → **~63-66% MFU** — achievable!
 
-To reach 65% MFU (wall_time ≈ 27.7s), need aggressive optimization. The inductor/dynamo config tuning + CUDA graphs (reduce-overhead, which works with DDP but NOT FSDP) are the key levers.
+Key: eliminating recomputation saves ~6-9s. Micro-batching costs only ~1-2s extra. Net improvement: ~5-7s.
+
+To reach 65% MFU (wall_time ≈ 73.7s), the primary lever is **eliminating gradient checkpointing** via micro-batching. Secondary levers: fused kernels, reducing per-step optimizer overhead.
 
 ## Verification Thresholds
 
@@ -166,7 +213,7 @@ Beyond static code scanning, the validator performs runtime checks:
 
 12. `.view(-1)` fails on non-contiguous tensors inside `torch.compile`. Use `.reshape(-1)` or `.contiguous().view(-1)` instead.
 
-13. **`torch.compile` + DDP compatibility**: Compile ONLY the forward function (not the model object). With `static_graph=True` and `optimize_ddp=True` in dynamo config, DDP + compile works well. Try `fullgraph=True` first with a try/except fallback. The `reduce-overhead` mode (CUDA graphs) WORKS with DDP (unlike FSDP where it fails).
+13. **`torch.compile` + DDP compatibility**: Compile ONLY the forward function (not the model object). With `static_graph=True` and `optimize_ddp=True` in dynamo config, DDP + compile works well. Do NOT use `fullgraph=True` — empirically hurts MFU by ~2% (see pitfall #18). The `reduce-overhead` mode (CUDA graphs) theoretically WORKS with DDP (unlike FSDP) but causes OOM on 7B — the CUDA graph workspace needs ~18.5 GB extra per GPU, which exceeds the ~11 GB headroom with DDP + checkpointing.
 
 14. **`torch.compile` + monkey-patched model = 0% params changed**: If you patch `layer.forward` or `norm.forward` with lambdas/closures that call flash_attn ops, then wrap in `torch.compile(fullgraph=True)`, dynamo cannot trace the closures. With `suppress_errors=True`, it silently falls back and corrupts the autograd graph. **Solution**: patch the model and run it in EAGER mode (no compile). Compile only a SEPARATE pure function (e.g., loss computation). Or use Approach 2 (write a fused PyTorch function + compile) instead of monkey-patching.
 
@@ -178,12 +225,13 @@ Beyond static code scanning, the validator performs runtime checks:
 
 18. **`fullgraph=True` consistently HURTS performance** — empirically drops MFU by ~2%. Do NOT use it. Stick with `fullgraph=False` (default).
 
-19. **`torch.compile` compile modes — empirical results** (from 2-GPU runs, directionally applicable to 4-GPU):
-    - `reduce-overhead`: **best per-step performance**, uses CUDA graphs. ~10s warmup cost. Works with DDP, FAILS with FSDP.
-    - `default`: lower warmup cost but slower per-step. Inductor cache persists from warmup. Works with both DDP and FSDP.
-    - No compile: baseline without compilation — expect ~30-40% MFU.
+19. **`torch.compile` compile modes — empirical results** (from 4-GPU DDP runs):
+    - `reduce-overhead`: OOM on 7B with DDP + gradient checkpointing — CUDA graph workspace (~18.5 GB) exceeds headroom. **Might work with micro-batching + no checkpointing** (~74GB total, ~6GB headroom — tight but possible if CUDA graph workspace is smaller without checkpointing). Worth testing as it could significantly improve per-step speed.
+    - `default`: **current best practical mode**. Lower warmup cost, inductor cache persists from warmup. Works with both DDP and FSDP. Current best (59.1%) uses this.
+    - No compile: baseline without compilation — expect ~30-40% MFU. But combined with flash_attn kernel patches in eager mode, could reach ~50-55%.
     - `max-autotune`: fails weight verification — DO NOT USE.
-    - **With inductor config tuning** (coordinate_descent_tuning, epilogue_fusion, shape_padding): both `default` and `reduce-overhead` generate better kernels. Always set these.
+    - `max-autotune-no-cudagraphs`: crashes in this setup — DO NOT USE.
+    - **With inductor config tuning** (coordinate_descent_tuning, epilogue_fusion, shape_padding): `default` mode generates significantly better kernels. Always set these.
 
 20. **Mixed DP+TP: DTensor + DDP/FSDP incompatibility**: Neither FSDP nor DDP can wrap TP's DTensor parameters (both try to flatten/view params, which DTensor's sharding propagation rejects). For mixed DP+TP, you MUST manually all-reduce gradients across the DP process group after each backward pass. Use the underlying `._local_tensor` for all-reduce to avoid DTensor dispatch issues.
 
@@ -192,6 +240,18 @@ Beyond static code scanning, the validator performs runtime checks:
 22. **TP state dict: DTensor → full_tensor()**: When using TP, parameters become DTensors. You MUST call `.full_tensor()` on each parameter to get the unsharded tensor before building `final_state`. This is a **collective operation** — ALL ranks in the TP group must call it. Rank 0 only won't work.
 
 23. **7B model memory**: Qwen2.5-7B at bf16 ≈ 15GB. Full training per GPU: model 15GB + AdamW fp32 states 30GB + gradients 15GB + activations ~15GB = **~75GB on 80GB**. Very tight with single-GPU or DP-only. Consider:
+
+24. **Do NOT compile forward+loss together** — Flash CE or F.cross_entropy inside the compiled function corrupts the autograd graph. The agent saw loss 6.25 vs expected 3.21 (loss_mismatch). Keep loss computation OUTSIDE the compiled function.
+
+25. **Kernel patches (RMSNorm, SwiGLU) + torch.compile = WORSE performance** — Monkey-patching with lambdas causes graph breaks. The agent measured 56.95% vs 58.97% baseline — a 2% regression. nn.Module subclass approach hits a Triton `_hash_lock` bug (`TypeError: 'NoneType' object does not support the context manager protocol` in `MultiKernelCall.load_cache()`). Kernel patches only help in EAGER mode, but eager mode caps at ~40-50% MFU. Until a compile-compatible kernel pattern is found, avoid kernel patches.
+
+26. **Do NOT precompute or explicitly pass `position_ids`** — Changing the compiled function's signature breaks gradient checkpointing and torch.compile. Use the model's default behavior.
+
+27. **`torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)` does NOT help** — Model is already loaded in bf16. The agent measured 58.72% with autocast vs 58.97% without. The autocast overhead slightly hurts.
+
+28. **`suppress_errors=False` in dynamo config = crash** — Dynamo raises on any trace issue. Always keep `suppress_errors=True`.
+
+29. **`benchmark_kernel=True` in inductor config does NOT help** — Agent measured 58.75% vs 58.97% baseline. Skip it.
     - FSDP SHARD_GRAD_OP to shard optimizer states and gradients across ranks
     - TP to split model parameters across 2+ GPUs (reduces per-GPU memory)
     - Mixed DP+TP: TP splits model, DP increases throughput
@@ -270,9 +330,9 @@ def _patch_model(model):
 
 **CRITICAL PITFALL**: Monkey-patched lambda forwards are INCOMPATIBLE with `torch.compile(fullgraph=True)`. Dynamo cannot trace through closures that capture module weights. Always test kernel patches WITHOUT torch.compile first to verify gradients flow.
 
-## Proven 56.5% MFU DDP Submission (KEY REFERENCE — adapt for 4 GPUs)
+## Proven ~54% MFU DDP Submission (4 GPUs — CURRENT BEST)
 
-A 2-GPU DDP submission achieved 56.5% MFU on A100s. The techniques below are **proven to work** and should be adapted for 4-GPU. DDP on 4 GPUs REQUIRES gradient checkpointing for 7B to fit in memory.
+DDP dp=4 with HF gradient checkpointing (ALL 28 layers) + torch.compile(default) + inductor/dynamo tuning achieves **~54% median MFU** (59.37% peak outlier) on 4x A100. Median wall time ~88s with **33% OOM failure rate**. The techniques below are the current baseline to beat.
 
 ### torch._inductor.config tuning (CRITICAL — improves compile quality)
 ```python
@@ -303,10 +363,8 @@ except Exception:
 ```
 `assume_static_by_default` + `automatic_dynamic_shapes=False` eliminates dynamic shape guards, reducing compile time and enabling better optimization. `cache_size_limit=128` prevents cache eviction. `optimize_ddp=True` enables DDP-specific Dynamo optimizations.
 
-### DDP + Selective Gradient Checkpointing (fits 7B on 80GB)
+### DDP + Full Gradient Checkpointing (current — fits 7B on 80GB but wastes ~6-9s on recomputation AND has 33% OOM rate)
 ```python
-_UNCHECKPOINT_LAST_N = 5
-
 def _prepare_model(model):
     if hasattr(model, "config"):
         model.config.use_cache = False
@@ -316,17 +374,23 @@ def _prepare_model(model):
             model.config.output_attentions = False
 
     if hasattr(model, "model") and hasattr(model.model, "layers"):
-        num_layers = len(model.model.layers)
-        checkpoint_cutoff = num_layers - _UNCHECKPOINT_LAST_N
-        for idx, layer in enumerate(model.model.layers):
+        for layer in model.model.layers:
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
                 layer.self_attn.layer_idx = 0
-            if hasattr(layer, "gradient_checkpointing"):
-                layer.gradient_checkpointing = idx < checkpoint_cutoff
-```
-Checkpoint first 23 layers (saves ~12-15GB activation memory), uncheckpoint last 5 (avoids recomputation overhead on final layers). Memory with DDP: 15GB model + 30GB optimizer + 15GB grads + ~5GB activations = ~65GB. Fits on 80GB with room for compile (~4GB).
 
-### DDP Configuration (proven settings)
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": False,
+                "preserve_rng_state": False,
+            }
+        )
+```
+ALL 28 layers are checkpointed. Theoretical memory: 15GB model + 30GB optimizer + 15GB grads + ~5GB activations (checkpointed) + ~4GB compile = ~69GB. But **observed peak is ~78-79GB** due to torch.compile autotuning spikes, leaving only ~1GB headroom. This causes **33% OOM rate** (3/9 runs failed in 10-run evaluation).
+
+**WARNING**: Selective uncheckpointing (setting `layer.gradient_checkpointing = False` per-layer) is UNRELIABLE — it crashes or OOMs non-deterministically (tested with UNCHECKPOINT_LAST_N = 1, 2, 3, 5 — all failed). Do NOT attempt selective uncheckpointing via the HF attribute. To reduce checkpointing, use **micro-batching to eliminate it entirely** (see "What to Try Next").
+
+### DDP Configuration (proven settings — ~54% median MFU)
 ```python
 model = model.to(device)
 model = DDP(
@@ -334,11 +398,11 @@ model = DDP(
     device_ids=[device.index],
     gradient_as_bucket_view=True,
     static_graph=True,
-    bucket_cap_mb=200,
+    bucket_cap_mb=150,
     broadcast_buffers=False,
 )
 ```
-`static_graph=True` enables advanced optimizations (fuses gradient bucketing, reduces overhead). `gradient_as_bucket_view=True` avoids gradient copy. `bucket_cap_mb=200` reduces number of all-reduce calls. `broadcast_buffers=False` skips unnecessary buffer broadcast.
+`static_graph=True` enables advanced optimizations (fuses gradient bucketing, reduces overhead). `gradient_as_bucket_view=True` avoids gradient copy. `bucket_cap_mb=150` is empirically optimal (tested 100, 150, 200 — 150 was best). `broadcast_buffers=False` skips unnecessary buffer broadcast.
 
 **CRITICAL**: DDP requires `model = model.to(device)` BEFORE wrapping. FSDP handles this internally.
 
@@ -363,23 +427,14 @@ final_state = pinned
 ```
 Pre-allocates pinned CPU memory and copies asynchronously. ~2-3x faster than `.detach().cpu().clone()` for large state dicts (7B = 15GB).
 
-### torch.compile with fullgraph=True + fallback chain
+### torch.compile (proven pattern — do NOT use fullgraph=True)
 ```python
 def fwd_only(input_ids):
     return model(input_ids).logits
 
-compiled_fwd = torch.compile(fwd_only, mode="default", dynamic=False, fullgraph=True)
-try:
-    logits = compiled_fwd(all_inputs[0])
-except Exception:
-    try:
-        compiled_fwd = torch.compile(fwd_only, mode="default", dynamic=False)
-        logits = compiled_fwd(all_inputs[0])
-    except Exception:
-        compiled_fwd = fwd_only
-        logits = compiled_fwd(all_inputs[0])
+compiled_fwd = torch.compile(fwd_only, mode="default", dynamic=False)
 ```
-Try `fullgraph=True` first (generates tighter code if it works), fall back to default, then eager. Note: `fullgraph=True` + FSDP fails, but `fullgraph=True` + DDP can work with the right setup (compile the forward function, NOT the model).
+Use `mode="default"` with `fullgraph=False` (the default). `fullgraph=True` empirically hurts MFU by ~2%. `reduce-overhead` causes OOM on 7B DDP. The inductor kernel cache persists from warmup, so `default` mode benefits from pre-compilation.
 
 ## Proven Optimization Patterns (use as building blocks)
 
@@ -389,14 +444,12 @@ Try `fullgraph=True` first (generates tighter code if it works), fall back to de
    _flash_ce = _FlashCELoss(ignore_index=-100)
    ```
 
-2. **Compile only the forward function** (never the model itself):
+2. **Compile only the forward function** (never the model itself, never use fullgraph=True):
    ```python
    def _get_compiled_fwd(model):
        def fwd(input_ids): return model(input_ids).logits
-       try: return torch.compile(fwd, mode="default", dynamic=False, fullgraph=True)
-       except Exception:
-           try: return torch.compile(fwd, mode="default", dynamic=False)
-           except Exception: return fwd
+       try: return torch.compile(fwd, mode="default", dynamic=False)
+       except Exception: return fwd
    ```
 
 3. **Fused AdamW**: `torch.optim.AdamW(..., fused=True)` — always set fused=True on CUDA.
@@ -532,13 +585,18 @@ ALL ranks must call `full_tensor()` — it's a collective op. Rank 0 keeps the r
 ## Memory Reality (7B model)
 
 Qwen2.5-7B bf16 = ~15GB. AdamW stores exp_avg and exp_avg_sq in the same dtype as parameters (bf16), NOT fp32. Full training setup per GPU:
-- **DDP (dp=4, tp=1) + selective gradient checkpointing**: Model 15GB + AdamW bf16 (m+v) 30GB + Gradients 15GB + activations ~5GB (23 layers checkpointed, 5 uncheckpointed) = **~65GB**. Room for torch.compile (~4GB extra) = **~69GB** — fits! No micro-batching needed (full batch=16 per GPU). Selective checkpointing (uncheckpoint last N layers) balances memory savings vs recomputation overhead.
-- **FSDP SHARD_GRAD_OP (dp=4, tp=1)**: Full model during fwd 15GB + sharded optimizer 7.5GB + sharded grads 3.8GB + activations ~15GB = **~42GB** — good headroom. Can use larger micro-batches → higher throughput than DDP.
-- **FSDP FULL_SHARD (dp=4, tp=1)**: Shards everything including params. Peak ~30-35GB — most headroom for compile.
-- **Mixed (dp=2, tp=2)**: Model ~7.5GB/GPU + AdamW ~15GB + Grads ~7.5GB + Activations ~15GB = **~45GB** — comfortable headroom. Good balance.
-- **Pure TP (dp=1, tp=4)**: Model ~3.75GB/GPU + states ~7.5GB + Grads ~3.75GB + Activations ~15GB = **~30GB** — lots of headroom but low MFU ceiling.
+- **DDP + full batch=16 + ALL checkpointed** (current ~54% median): Model 15GB + AdamW 30GB + Gradients 15GB + activations ~5GB (all checkpointed) + compile ~4GB = **~69GB theoretical**. But observed peak is **~78-79GB** due to torch.compile autotuning spikes — only 1-2GB headroom, **OOMs ~33%** (confirmed: 3/9 failures in 10-run eval, OOM log shows "77.77 GiB allocated, 220.81 MiB free").
+- **DDP + micro-batch=8×2 + NO checkpointing** (RECOMMENDED next step): Model 15GB + AdamW 30GB + Gradients 15GB + activations ~10GB (batch=8, NO checkpointing) + compile ~4GB = **~74GB**. 6GB headroom — reliable. **Eliminates ~6-9s of recomputation.**
+- **DDP + micro-batch=4×4 + NO checkpointing** (safest): Model 15GB + AdamW 30GB + Gradients 15GB + activations ~5GB (batch=4) + compile ~4GB = **~69GB**. 11GB headroom — very reliable. But 4× micro-batches add more Python loop overhead.
+- **FSDP SHARD_GRAD_OP (dp=4, tp=1)**: Full model during fwd 15GB + sharded optimizer 7.5GB + sharded grads 3.8GB + activations ~15GB = **~42GB** — good headroom but 56.9% MFU ceiling.
+- **Mixed (dp=2, tp=2)**: 40-41% MFU ceiling — not recommended.
+- **Pure TP (dp=1, tp=4)**: ~30% MFU ceiling — not recommended.
 
-**Important**: DDP has the tightest memory budget — avoid torch.compile with DDP on 7B. FSDP SHARD_GRAD_OP or FULL_SHARD are preferred for dp=4 as they leave more headroom for optimizations.
+**DDP memory profiles**:
+- **DDP + full batch=16 + all checkpointed** (current): ~78-79GB — only 1-2GB headroom, OOMs ~33% from torch.compile autotuning
+- **DDP + micro-batch=8×2 + NO checkpointing** (RECOMMENDED): ~74GB — 6GB headroom, reliable
+- **DDP + micro-batch=4×4 + NO checkpointing** (safest): ~69GB — 11GB headroom, very reliable
+- **FSDP SHARD_GRAD_OP**: ~42GB — most headroom but 56.9% ceiling
 
 ## FSDP Communication Overlap (for DP strategies)
 
@@ -555,98 +613,261 @@ Qwen2.5-7B bf16 = ~15GB. AdamW stores exp_avg and exp_avg_sq in the same dtype a
 
 ## IMPORTANT: Don't Repeat Failures
 
-FSDP SHARD_GRAD_OP + torch.compile(default) is MAXED OUT at 56.5% MFU after 40+ attempts. Do NOT try more FSDP variations — switch to DDP.
+Current realistic performance is **~54% MFU median** (59.37% peak outlier) with DDP dp=4 + ALL 28 layers checkpointed + compile(default) + inductor/dynamo tuning. **33% OOM failure rate.** Target is **65%**. The ~11% gap comes from: gradient checkpointing recomputation (~6-9s), torch.compile autotuning variance (~8s), and memory pressure forcing conservative settings.
 
-**Exhausted approaches (do NOT retry)**:
-- FSDP SHARD_GRAD_OP + compile(default) → 56.5% ceiling
+**Exhausted approaches (do NOT retry — tested extensively across 44+ agent steps)**:
+
+### DDP with full checkpointing (realistic ceiling: ~54% median — EXHAUSTED)
+The DDP + all-checkpointed + compile(default) configuration has been optimized to its limit. The 10-run Basilica evaluation confirms: 6/9 passing runs at 53.9-54.9%, one 59.37% outlier from lucky autotuning, 3/9 OOM failures. This is NOT a viable path to 65%.
+- DDP + all 28 layers checkpointed + compile(default) → **~54% median** (59.37% lucky outlier, NOT reproducible)
+- DDP + selective uncheckpointing (UNCHECKPOINT_LAST_N = 1,2,3,5) → OOM or crash every time
+- DDP + `torch.cuda.empty_cache()` before compile → noise, not improvement
+- DDP + removing flash CE → OOM (flash CE is more memory-efficient — keep it)
+- DDP + `max_split_size_mb` allocator setting → crash
+- DDP + various inductor/dynamo config tweaks → all within noise
+- DDP + pre-allocated pinned buffers for state dict → crash
+- DDP + `inline_inbuilt_nn_modules` → crash or no improvement
+
+### DDP approaches that FAILED earlier
+- DDP with full batch=16 + NO checkpointing → OOM (~95GB needed)
+- DDP + micro-batching (batch=8×2) + UNCHECKPOINT_LAST_N=5 → OOM (76.7 GiB — used selective uncheckpointing, NOT the no-checkpointing approach)
+- DDP + compile(`reduce-overhead`) → OOM (~18.5 GB CUDA graph workspace)
+- DDP + kernel patches (RMSNorm + SwiGLU) + compile → **56.95%** (WORSE — graph breaks from lambdas)
+- DDP + nn.Module subclass kernel patches + compile → crash (Triton `_hash_lock` bug)
+- DDP + compile forward+loss together → loss_mismatch (6.25 vs 3.21)
+- DDP + `return_dict=False` → crash (HF checkpointing expects CausalLMOutputWithPast)
+- DDP + `fullgraph=True` → ~2% worse than `fullgraph=False`
+- DDP + `max_autotune` inductor → crash
+- DDP + explicit `position_ids` → crash (breaks checkpointing/compile)
+- DDP + `torch.amp.autocast(bf16)` → 58.72% (slightly worse)
+- DDP + `benchmark_kernel=True` → 58.75% (marginally worse)
+- DDP + `bucket_cap_mb=100` → 58.75% (worse than 150)
+- DDP + `bucket_cap_mb=200` → 58.84% (worse than 150)
+- DDP + custom forward with manual checkpointing → crash (accessed model.model through DDP wrapper incorrectly)
+
+### FSDP approaches (ceiling: 56.9%, exhausted)
+- FSDP SHARD_GRAD_OP + compile(default) → 56.9% ceiling (tested extensively)
+- FSDP + selective uncheckpointing (last 8) + prefetch → 56.9%
 - FSDP + kernel patches + compile → worse (51-56%)
 - FSDP + reduce-overhead → falls back to default
 - FSDP NO_SHARD → OOM with compile, 46.9% without
-- FSDP FULL_SHARD → 55.7% (slightly worse than SHARD_GRAD_OP)
-- Mixed DP+TP → 40-41% (slow optimizer)
-- DDP WITHOUT gradient checkpointing → OOM
-- Compiling loss function → insufficient_params_changed
+- FSDP FULL_SHARD → 55.7%
+- Mixed DP+TP → 40-41%
 
-**What to try instead**:
-1. **DDP + selective gradient checkpointing** — the most promising unexplored direction
-2. **inductor/dynamo config tuning** — never been tested, can improve compile quality
-3. **reduce-overhead mode with DDP** — CUDA graphs work with DDP (but not FSDP)
-4. **Pinned memory state dict** — faster GPU→CPU transfer
+### Key learnings from 44 steps
+- DDP + compile(default) is ~2.5% better than FSDP (59.1% vs 56.9%)
+- `bucket_cap_mb=150` is optimal (tested 100, 125, 150, 175, 200)
+- `static_graph=True` + `cudagraph_trees=True` gave the best incremental gain
+- Kernel patches + compile = ALWAYS worse (graph breaks outweigh kernel gains)
+- `reduce-overhead` = ALWAYS OOM on 7B DDP (18.5 GB CUDA graph workspace)
+- `fullgraph=True` = ALWAYS ~2% worse
+- Selective per-layer uncheckpointing via HF attribute = UNRELIABLE (crashes non-deterministically)
+- The ~50% crash rate on DDP is from tight memory (79/80GB) — micro-batching to reduce activation memory is the solution
+- Flash CE is critical — more memory efficient than F.cross_entropy, removing it caused OOM
 
-## Prior Results (what has been tried and what worked)
+## What to Try Next — INCREMENTAL LADDER (follow steps in order!)
 
-**Plateau at 56.5% MFU (~85s wall time)** with FSDP SHARD_GRAD_OP + torch.compile(default). Over 40 attempts exhausted most FSDP-based approaches. Key findings:
-- FSDP SHARD_GRAD_OP + compile(default) = **56.5% MFU** (best, ~85s) — the ceiling for this approach
-- FSDP + kernel patches + compile together = WORSE (51-56%) — compile can't trace patched lambdas
-- FSDP + reduce-overhead = falls back to default (CUDA graphs don't work with FSDP)
-- FSDP NO_SHARD = OOM with compile, 46.9% without compile
-- DDP without gradient checkpointing = **OOM** (78.98 GiB used)
-- Mixed DP+TP = 40-41% MFU (slow optimizer with TP DTensors)
-- Compiling loss function = insufficient_params_changed (68.8%)
+You are at **59.1% MFU** with DDP + all layers checkpointed. Target is **65%** (wall_time ≤ 73.7s, currently ~82s). Need to save **~8s**. The recomputation from gradient checkpointing costs ~6-9s — eliminating it gets you there.
 
-**What hasn't been tried**: DDP + selective gradient checkpointing + inductor/dynamo config tuning + pinned memory state dict. A proven 2-GPU submission achieved 56.5% with these techniques. Scaling to 4 GPUs should improve further.
+**IMPORTANT**: Do NOT keep tweaking the current DDP+full-checkpointing code — it has been optimized to its ceiling over 44 steps. Every config knob has been turned. You need a **structurally different approach**: micro-batching to reduce memory, then gradually remove checkpointing.
 
-## What to Try (ordered by expected impact for 4-GPU 7B)
+**STRATEGY — INCREMENTAL ONLY**: Make ONE change at a time. Verify it works (successful eval, reasonable MFU). Then build on it. Do NOT skip steps or combine multiple untested changes. Each step below builds on the previous one's success. If a step fails, debug it or try the fallback before moving on. **The fastest path to 65% is NOT one giant leap — it's 3-4 small, verified steps.**
 
-**HIGHEST PRIORITY: DDP + gradient checkpointing + inductor tuning**
+---
 
-This is the most promising unexplored path. DDP eliminates FSDP's per-layer all-gather/reduce-scatter overhead. With selective gradient checkpointing, 7B fits in memory (~65GB). Combined with inductor/dynamo config tuning, this should break past the 56.5% plateau.
+### Step A: DDP + micro-batching (batch=8×2) + KEEP full checkpointing (~59% MFU, but MORE RELIABLE)
 
+**Goal**: Establish that micro-batching works correctly without changing MFU. This gives you a STABLE, LOWER-MEMORY baseline to build on.
+
+**What to change**: Split each batch of 16 into 2 micro-batches of 8. Use `model.no_sync()` on the first micro-batch. KEEP gradient_checkpointing_enable() — do NOT remove checkpointing yet.
+
+**Memory**: With checkpointing + batch=8 micro-batches: 15 (model) + 30 (optimizer) + 15 (gradients) + ~3GB (activations, checkpointed, batch=8) + 4 (compile) = **~67GB — 13GB headroom!** Much safer than the current 1GB headroom.
+
+**Expected MFU**: ~52-55% (similar to current median ~54% — micro-batching adds ~1-2s overhead from 2× loops, but the lower memory means **zero OOM crashes** vs current 33% failure rate)
+
+```python
+_NUM_MICRO = 2
+
+# Pre-split batches into micro-batches
+micro_inputs = []
+micro_labels = []
+for _ in range(num_steps):
+    batch = next(data_iterator).to(device, dtype=torch.long, non_blocking=True)
+    inp = batch[:, :-1].contiguous()
+    lbl = batch[:, 1:].contiguous()
+    micro_bs = inp.shape[0] // _NUM_MICRO
+    step_inp = [inp[i*micro_bs:(i+1)*micro_bs] for i in range(_NUM_MICRO)]
+    step_lbl = [lbl[i*micro_bs:(i+1)*micro_bs].reshape(-1) for i in range(_NUM_MICRO)]
+    micro_inputs.append(step_inp)
+    micro_labels.append(step_lbl)
+torch.cuda.synchronize(device)
+
+inv_micro = 1.0 / _NUM_MICRO
+
+# Training loop with gradient accumulation
+for step in range(num_steps):
+    # Micro-batch 1: accumulate gradients, skip DDP sync
+    with model.no_sync():
+        logits = run_fwd(micro_inputs[step][0])
+        loss = loss_fn(logits, micro_labels[step][0]) * inv_micro
+        loss.backward()
+    # Micro-batch 2: accumulate gradients, trigger DDP sync
+    logits = run_fwd(micro_inputs[step][1])
+    loss = loss_fn(logits, micro_labels[step][1]) * inv_micro
+    loss.backward()
+    opt_step()
+    opt_zero(set_to_none=True)
 ```
-DDP advantages over FSDP:
-- ONE gradient all-reduce per step (vs 28+ per-layer comms for FSDP)
-- static_graph=True enables graph-level optimization
-- Compatible with torch.compile + fullgraph=True (FSDP is not)
-- gradient_as_bucket_view=True eliminates gradient copy
-- Simpler state dict (no gathering needed)
+
+**Token counting**: `total_tokens = num_steps * batch_size * (seq_len + 1)` where `batch_size` = original full batch (16), NOT micro-batch. Each micro-batch is half, but there are 2 per step.
+
+**CRITICAL**: The previous micro-batch attempt (arbos Step 1) OOMed because it ALSO changed to selective uncheckpointing simultaneously. Do NOT change checkpointing in this step — ONLY add micro-batching. Keep `gradient_checkpointing_enable()` active.
+
+**If this step succeeds** → you now have a stable base with 13GB headroom. Proceed to Step B.
+**If this step OOMs** → something is wrong with the micro-batch implementation. Debug before proceeding.
+
+---
+
+### Step B: Remove checkpointing from LAST 7 layers (~60-61% MFU)
+
+**Goal**: Now that micro-batching is working and stable, start GRADUALLY removing checkpointing. Each uncheckpointed layer saves ~0.3s of recomputation per step (× 20 steps = 6s per layer) but costs ~1.2GB of activation memory (at batch=8).
+
+**What to change**: After calling `gradient_checkpointing_enable()`, set the last 7 layers to NOT checkpoint:
+```python
+if hasattr(model, "model") and hasattr(model.model, "layers"):
+    num_layers = len(model.model.layers)
+    for idx, layer in enumerate(model.model.layers):
+        if hasattr(layer, "gradient_checkpointing"):
+            layer.gradient_checkpointing = idx < (num_layers - 7)
 ```
 
-**Phase 1: DDP + grad checkpointing baseline (first 3 steps)**
-- Use DDP with selective gradient checkpointing (uncheckpoint last 5 layers)
-- Add ALL inductor/dynamo config settings (see "Proven 56.5% MFU DDP Submission" section)
-- Add TF32, fused AdamW, batch pre-loading, flash CE loss, CUDA allocator settings
-- Use pinned memory state dict transfer
-- Compile forward with fullgraph=True, fall back to default
-- Target: 55-60% MFU (should match or beat FSDP baseline)
+**Memory**: 67GB base + 7 × ~1.2GB (uncheckpointed layers at batch=8) = **~75GB — 5GB headroom**. Still safe.
 
-**Phase 2: Optimize DDP compile (steps 3-10)**
-- Try `mode="reduce-overhead"` with DDP (CUDA graphs should work with DDP unlike FSDP!)
-- Tune `_UNCHECKPOINT_LAST_N` (try 3, 5, 7) to balance memory vs recomputation
-- Try `bucket_cap_mb` values (100, 200, 300)
-- Target: 60-65% MFU
+**Time savings**: 7 fewer layers recomputed per backward × 2 micro-batches × 20 steps × ~0.015s = **~4.2s saved**
 
-**Phase 3: Kernel patches + DDP (steps 10+)**
-- Add RMSNorm + SwiGLU kernel patches (run in EAGER mode, no compile on patched model)
-- Or try class-level patching which IS compile-compatible
-- Explore `mode="reduce-overhead"` if memory allows
-- Target: 65%+ MFU
+**Expected MFU**: ~60-61% (wall time ~78s → save ~4s from reduced recomputation)
 
-**Parallelism strategies** (all valid for 4 GPUs):
-- **DDP dp=4** (`{"dp_size": 4, "tp_size": 1}`): **RECOMMENDED — most promising unexplored path**. Requires selective gradient checkpointing for 7B (~65GB peak). Less communication overhead than FSDP. Compatible with torch.compile + fullgraph=True. Use static_graph=True for graph-level optimizations. Proven at 56.5% on 2 GPUs — should scale well to 4.
-- **FSDP dp=4** (`{"dp_size": 4, "tp_size": 1}`): Proven at 56.5% MFU. Use SHARD_GRAD_OP for 7B. Ceiling appears to be ~56.5% — try DDP first.
-- **Mixed DP+TP** (`{"dp_size": 2, "tp_size": 2}`): Best memory efficiency but MFU ceiling is lower (~40-41%). Only use if DDP and FSDP fail.
-- **Pure TP** (`{"dp_size": 1, "tp_size": 4}`): Lowest MFU ceiling. Only use if other strategies OOM.
+**WARNING**: Selective uncheckpointing via the HF `layer.gradient_checkpointing` attribute crashed in the PREVIOUS run (Steps 5-6) with full batch=16. But those crashes were at full batch size (3GB/layer). With batch=8 micro-batches (1.2GB/layer), memory is much more forgiving. If it still crashes, the attribute approach is broken — skip to Step B-alt.
 
-**Kernel-based optimizations** (highest leverage, use with DDP in eager mode):
-- **Triton RMS norm** (`flash_attn.ops.triton.layer_norm.rms_norm_fn`) — 57 calls per forward
-- **SwiGLU** (`flash_attn.ops.activations.swiglu`) — 28 calls per forward
-- **Flash CE loss** (`flash_attn.losses.cross_entropy.CrossEntropyLoss`)
-- **Triton rotary** (`flash_attn.ops.triton.rotary.apply_rotary`)
-- Fused AdamW (`fused=True`) — single CUDA kernel for optimizer step
+**Step B-alt (if per-layer attribute doesn't work)**: Skip `gradient_checkpointing_enable()` entirely and use `torch.utils.checkpoint.checkpoint()` manually on groups of layers:
+```python
+from torch.utils.checkpoint import checkpoint as torch_ckpt
 
-**Standard compute optimizations**:
-- TF32 matmul (`torch.backends.cuda.matmul.allow_tf32 = True`)
-- `torch.compile(fwd, mode="default", fullgraph=True)` on forward-only function (try reduce-overhead with DDP)
-- Inductor config tuning (coordinate_descent_tuning, epilogue_fusion, shape_padding)
-- Dynamo config tuning (assume_static_by_default, cache_size_limit=128)
-- Batch pre-loading with `non_blocking=True`
-- Local variable binding in hot loops
+# Checkpoint first 21 layers in 3 groups of 7, leave last 7 uncheckpointed
+# This requires a custom forward — see "Custom training loop" in Tier 3
+```
+
+**If this step succeeds** → proceed to Step C.
+**If this step OOMs** → reduce to 4 uncheckpointed layers and retry.
+**If this step crashes (exit code 1)** → the per-layer attribute is broken, try Step B-alt or skip to Step C directly.
+
+---
+
+### Step C: Remove ALL checkpointing (~62-65% MFU)
+
+**Goal**: Now eliminate checkpointing entirely. This is the big MFU jump.
+
+**What to change**: Do NOT call `gradient_checkpointing_enable()` at all. Keep micro-batching (batch=8×2).
+
+**Memory** (per GPU, NO checkpointing):
+- Model: 15GB
+- AdamW bf16 states (m + v): 30GB
+- Gradients: 15GB
+- Activations (batch=8, 28 layers, no checkpointing): ~10GB
+- torch.compile overhead: ~4GB
+- **Total: ~74GB — 6GB headroom on 80GB**
+
+**Time savings**: ALL recomputation eliminated (~6-9s saved vs current). Micro-batch overhead (~1-2s) partially offsets.
+
+**Expected MFU**: **~62-65%** (wall_time ~73-77s)
+
+**CRITICAL**: Do NOT call `gradient_checkpointing_enable()`. Do NOT use selective uncheckpointing. Just skip checkpointing entirely.
+
+**If this OOMs**: The 6GB headroom is tight with torch.compile variance. Fallbacks:
+1. Add `torch.cuda.empty_cache()` before and after compile
+2. Try batch=4×4 instead (5GB activations → 11GB headroom, but more loop overhead)
+3. Try without torch.compile (saves ~4GB, but loses compile speedup)
+4. Replace DDP with manual gradient sync (saves ~1GB from DDP buckets — see Step D)
+
+---
+
+### Step D: If DDP still OOMs — replace with manual gradient sync
+
+**Goal**: Save ~1GB by removing DDP's bucket pre-allocation. Only try this if Step C OOMs.
+
+**What to change**: Remove DDP wrapper entirely. After each step's backward, manually all-reduce gradients:
+
+```python
+model = model.to(device)
+# NO DDP wrapping
+# Compile the unwrapped model's forward directly
+def fwd_fn(input_ids):
+    return model(input_ids).logits
+compiled_fwd = torch.compile(fwd_fn, mode="default", dynamic=False)
+
+# After backward (inside the step loop), sync gradients:
+for p in model.parameters():
+    if p.grad is not None:
+        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+```
+
+**Note**: Per-parameter all-reduce is slower than DDP's bucketed approach (~2-3s vs ~1s per step). Accept this cost — the memory savings from no DDP + no checkpointing should still net positive.
+
+**Note**: Without DDP, `model.no_sync()` is not available — skip the no_sync context. Just do 2× forward+backward and then all-reduce once. Gradients accumulate naturally.
+
+**Memory**: ~73GB (saves ~1GB from no DDP bucket buffers)
+
+---
+
+### Step E: Optimize beyond 63% — additional speedups to reach 65%+
+
+Once micro-batching + no checkpointing is working (Steps A-C or A-D), apply these incremental optimizations:
+
+1. **Try `torch.compile` with `mode="reduce-overhead"`** — With no checkpointing and batch=8, total memory is ~74GB. CUDA graphs workspace for reduce-overhead was ~18.5GB with full checkpointing, but may be smaller without it. If it fits, reduce-overhead gives faster per-step execution. **Test carefully — revert if OOM.**
+
+2. **torch.autograd.Function with Triton kernels** — compile-compatible fused ops
+
+   Previous kernel patch attempts failed because lambda monkey-patching caused graph breaks with torch.compile, and nn.Module subclass hit a Triton `_hash_lock` bug.
+
+   `torch.autograd.Function` with `@staticmethod` forward/backward is different — it registers a custom op that dynamo CAN trace through. Write fused RMSNorm as:
+
+   ```python
+   class FusedRMSNorm(torch.autograd.Function):
+       @staticmethod
+       def forward(ctx, x, weight, eps):
+           from flash_attn.ops.triton.layer_norm import rms_norm_fn
+           output = rms_norm_fn(x, weight, None, eps=eps)
+           ctx.save_for_backward(x, weight)
+           ctx.eps = eps
+           return output
+
+       @staticmethod
+       def backward(ctx, grad_output):
+           x, weight = ctx.saved_tensors
+           # ... custom backward using Triton kernels
+   ```
+
+   Then patch norms: `norm.forward = lambda x: FusedRMSNorm.apply(x, norm.weight, norm.variance_epsilon)`
+   This MIGHT be compile-compatible since autograd.Function is a known op to dynamo. Test carefully.
+
+3. **Overlap state dict with last training step** — Save ~1-2s. Start pinned memory allocation before the last optimizer step.
+
+4. **Try `foreach=True` on AdamW** — Multi-tensor optimizer processes all params in one kernel launch. May reduce per-step optimizer overhead.
+
+5. **Skip torch.compile + use flash_attn kernel patches in eager mode** — Only if compile keeps causing OOM or overhead. Without compile: save ~4GB memory + ~5-8s warmup. With flash_attn Triton kernels (RMSNorm, SwiGLU, rotary, flash CE) in eager mode, per-step speed may be competitive. Monkey-patching works fine in eager mode (it only breaks compile).
+
+6. **Custom training loop bypassing HF model.forward()** — Maximum control. Write a forward that directly calls layer components, skipping HF's attention mask/position/cache logic.
+
+### What's already optimal (do NOT change)
+- `torch.compile(fwd, mode="default", dynamic=False)` — best compile mode
+- Inductor config (coordinate_descent_tuning, epilogue_fusion, shape_padding, cudagraph_trees, fx_graph_cache)
+- Dynamo config (cache_size_limit=128, suppress_errors=True, assume_static_by_default, optimize_ddp=True)
+- Flash CE loss, fused AdamW, TF32, batch pre-loading with non_blocking=True
+- `expandable_segments:True` CUDA allocator
+- `layer_idx = 0` fix for all layers (prevents dynamo recompilation)
 - Pinned memory state dict transfer
-
-**Communication optimizations**:
-- For DDP: `static_graph=True`, `gradient_as_bucket_view=True`, `bucket_cap_mb=200`
-- For FSDP: `backward_prefetch=BackwardPrefetch.BACKWARD_PRE`, `forward_prefetch=True`
-- NVLink between all 4 GPUs (600 GB/s bidirectional per pair) — communication is fast
+- `torch.cuda.empty_cache()` before compile
+- `bucket_cap_mb=150`, `static_graph=True`, `gradient_as_bucket_view=True`, `broadcast_buffers=False`
 
 ## Response Format
 
