@@ -33,25 +33,31 @@ def load_hparams():
         return json.load(f)
 
 
-def setup_model(model_name: str, output_dir: Path):
-    """Download and cache the benchmark model."""
+def setup_model(model_name: str, output_dir: Path, tokenizer_name: str | None = None):
+    """Download and cache the benchmark model and tokenizer."""
     print(f"Downloading model: {model_name}")
     print(f"   Output: {output_dir}")
 
-    # Download tokenizer
-    print("   Downloading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tok_source = tokenizer_name or model_name
+    print(f"   Downloading tokenizer ({tok_source})...")
+    tokenizer = AutoTokenizer.from_pretrained(tok_source, trust_remote_code=True)
     tokenizer.save_pretrained(output_dir)
 
-    # Download model
     print("   Downloading model (this may take a while)...")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
-    model.save_pretrained(output_dir)
 
+    if tokenizer_name and tokenizer_name != model_name:
+        new_vocab = len(tokenizer)
+        old_vocab = model.config.vocab_size
+        if new_vocab != old_vocab:
+            print(f"   Resizing embeddings: {old_vocab} → {new_vocab}")
+            model.resize_token_embeddings(new_vocab)
+
+    model.save_pretrained(output_dir)
     print(f"   Model saved to: {output_dir}")
 
 
@@ -62,18 +68,20 @@ def setup_data(
     sequence_length: int,
     seed: int,
     output_path: Path,
+    tokenizer_name: str | None = None,
 ):
     """Download and tokenize benchmark data."""
+    tok_source = tokenizer_name or model_name
     print("Setting up benchmark data:")
     print(f"   Dataset: {dataset_name}")
+    print(f"   Tokenizer: {tok_source}")
     print(f"   Samples: {num_samples:,}")
     print(f"   Sequence length: {sequence_length}")
     print(f"   Seed: {seed}")
     print(f"   Output: {output_path}")
 
-    # Load tokenizer
-    print("   Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    print(f"   Loading tokenizer ({tok_source})...")
+    tokenizer = AutoTokenizer.from_pretrained(tok_source, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -130,6 +138,7 @@ def main():
     # Load config
     hparams = load_hparams()
     model_name = hparams.get("benchmark_model_name", "Qwen/Qwen2.5-3B")
+    tokenizer_name = hparams.get("benchmark_tokenizer_name", "") or None
     dataset_name = hparams.get("benchmark_dataset_name", "HuggingFaceFW/fineweb")
     num_samples = hparams.get("benchmark_data_samples", 10000)
     sequence_length = hparams.get("benchmark_sequence_length", 1024)
@@ -137,6 +146,7 @@ def main():
 
     print("Configuration from hparams.json:")
     print(f"   Model: {model_name}")
+    print(f"   Tokenizer: {tokenizer_name or model_name}")
     print(f"   Dataset: {dataset_name}")
     print(f"   Samples: {num_samples:,}")
     print(f"   Sequence length: {sequence_length}")
@@ -154,7 +164,7 @@ def main():
         print("   Delete it to re-download")
     else:
         model_dir.mkdir(parents=True, exist_ok=True)
-        setup_model(model_name, model_dir)
+        setup_model(model_name, model_dir, tokenizer_name=tokenizer_name)
     print()
 
     # Setup data
@@ -162,7 +172,15 @@ def main():
         print(f"Data already exists at {data_path}")
         print("   Delete it to regenerate")
     else:
-        setup_data(model_name, dataset_name, num_samples, sequence_length, seed, data_path)
+        setup_data(
+            model_name,
+            dataset_name,
+            num_samples,
+            sequence_length,
+            seed,
+            data_path,
+            tokenizer_name=tokenizer_name,
+        )
     print()
 
     print("=" * 60)
