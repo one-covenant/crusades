@@ -1,10 +1,10 @@
 # Reference: Mixed DP+TP (Data Parallel + Tensor Parallel) strategy
 #
-# Topology: dp_size=2, tp_size=2 (requires 4 GPUs)
+# Topology: dp_size=2, tp_size=2, pp_size=1 (requires 4 GPUs)
 #   - 2D mesh: ranks [0,1] form TP group 0, ranks [2,3] form TP group 1
 #   - Each TP group gets different data (data-parallel across DP dim)
 #   - Within each TP group, tensors are sharded (tensor-parallel)
-#   - Equivalent to: get_strategy() -> {"dp_size": 2, "tp_size": 2}
+#   - Equivalent to: get_strategy() -> {"dp_size": 2, "tp_size": 2, "pp_size": 1}
 #
 # Neither FSDP nor DDP can wrap TP's DTensor parameters (both try to
 # flatten/view params, which DTensor's sharding propagation rejects).
@@ -12,7 +12,7 @@
 # after each backward pass.
 #
 # Requirements for verification:
-#   - get_strategy() returning {"dp_size": 2, "tp_size": 2}
+#   - get_strategy() returning {"dp_size": 2, "tp_size": 2, "pp_size": 1}
 #   - Return InnerStepsResult with final_logits, total_tokens, final_loss
 #   - Must return final_state: gathered full tensors from DTensor shards
 
@@ -38,7 +38,7 @@ class InnerStepsResult:
 
 
 def get_strategy():
-    return {"dp_size": 2, "tp_size": 2}
+    return {"dp_size": 2, "tp_size": 2, "pp_size": 1}
 
 
 def _apply_tp(model, tp_mesh):
@@ -109,11 +109,12 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         model.config.use_cache = False
 
     strategy = get_strategy()
-    expected_gpus = strategy["dp_size"] * strategy["tp_size"]
+    expected_gpus = strategy["dp_size"] * strategy["tp_size"] * strategy.get("pp_size", 1)
     if num_gpus != expected_gpus:
         raise ValueError(
             f"get_strategy() requires {expected_gpus} GPUs "
-            f"(dp_size={strategy['dp_size']} * tp_size={strategy['tp_size']}), "
+            f"(dp_size={strategy['dp_size']} * tp_size={strategy['tp_size']} "
+            f"* pp_size={strategy.get('pp_size', 1)}), "
             f"but num_gpus={num_gpus}"
         )
 
