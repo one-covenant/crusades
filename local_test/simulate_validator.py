@@ -48,9 +48,10 @@ same Docker container.
 
    Strategies for 4 GPUs:
    - train_mixed.py: dp_size=2, tp_size=2 (mixed DP+TP)
-   - train_ddp.py:   dp_size=4, tp_size=1 (4-way DDP) — update get_strategy()
-   - train_fsdp.py:  dp_size=4, tp_size=1 (4-way FSDP) — update get_strategy()
-   - train_tp.py:    dp_size=1, tp_size=4 (4-way TP) — update get_strategy()
+   - train_ddp.py:   dp_size=4, tp_size=1 (4-way DDP)
+   - train_fsdp.py:  dp_size=4, tp_size=1 (4-way FSDP)
+   - train_tp.py:    dp_size=1, tp_size=4 (4-way TP)
+   - train_pp.py:    dp_size=2, tp_size=1, pp_size=2 (2-way DP + 2-stage PP)
 """
 
 import asyncio

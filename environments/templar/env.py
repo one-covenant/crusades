@@ -198,6 +198,7 @@ class ParallelismConfig:
 
     dp_size: int
     tp_size: int
+    pp_size: int = 1
 
 
 def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismConfig | None:
@@ -207,8 +208,10 @@ def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismC
 
     - **Legacy string**: ``return "ddp"`` / ``"fsdp"`` / ``"tp"`` — converted
       to ``ParallelismConfig`` using *num_gpus*.
-    - **Dict literal**: ``return {"dp_size": 2, "tp_size": 2}`` — parsed
+    - **Dict literal**: ``return {"dp_size": 2, "tp_size": 2}`` or
+      ``return {"dp_size": 2, "tp_size": 1, "pp_size": 2}`` — parsed
       directly.  Only simple ``ast.Constant`` keys/values are accepted.
+      ``pp_size`` defaults to 1 when omitted.
 
     Returns ``None`` when the function is absent, unparseable, or contains
     non-literal expressions.
@@ -247,8 +250,9 @@ def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismC
                 if "dp_size" in d and "tp_size" in d:
                     dp = d["dp_size"]
                     tp = d["tp_size"]
-                    if dp >= 1 and tp >= 1:
-                        return ParallelismConfig(dp_size=dp, tp_size=tp)
+                    pp = d.get("pp_size", 1)
+                    if dp >= 1 and tp >= 1 and pp >= 1:
+                        return ParallelismConfig(dp_size=dp, tp_size=tp, pp_size=pp)
 
     return None
 
@@ -351,6 +355,36 @@ def _check_backend_state() -> list[str]:
     return violations
 
 
+def _get_hparams_tokenizer_name() -> str | None:
+    """Read benchmark_tokenizer_name from hparams.json if available.
+
+    Returns the tokenizer name if configured and non-empty, else None
+    (caller should fall back to the model name).
+    """
+    cached = _CACHE.get("_hparams_tokenizer_name_resolved")
+    if cached is not None:
+        return cached or None
+
+    for path in ("/app/hparams.json", "/app/hparams/hparams.json"):
+        p = Path(path)
+        if p.exists():
+            try:
+                import json
+
+                with open(p) as f:
+                    cfg = json.load(f)
+                name = cfg.get("benchmark_tokenizer_name", "")
+                _CACHE["_hparams_tokenizer_name_resolved"] = name
+                if name:
+                    logger.info(f"Using tokenizer from hparams: {name}")
+                    return name
+            except Exception:
+                pass
+
+    _CACHE["_hparams_tokenizer_name_resolved"] = ""
+    return None
+
+
 def _load_hf_dataset(
     dataset_name: str,
     model_name: str,
@@ -364,9 +398,12 @@ def _load_hf_dataset(
     When running with --network none, uses pre-cached dataset from Docker image.
     The validator seed is used to shuffle the cached data.
 
+    If ``benchmark_tokenizer_name`` is set in hparams.json, that tokenizer is
+    used instead of the model's own tokenizer.
+
     Args:
         dataset_name: HuggingFace dataset name
-        model_name: Model name for tokenizer
+        model_name: Fallback model name for tokenizer (overridden by hparams)
         num_samples: Number of samples to load
         sequence_length: Sequence length
         split: Dataset split
@@ -390,15 +427,19 @@ def _load_hf_dataset(
 
     logger.info(f"Loading dataset: {dataset_name} (samples={num_samples})")
 
+    # Use separate tokenizer when configured in hparams
+    tokenizer_name = _get_hparams_tokenizer_name() or model_name
+
     # Cache tokenizer to avoid reloading every eval (HF tokenizers leak via Rust FFI)
-    if _CACHE.get("tokenizer") is not None and _CACHE.get("tokenizer_model") == model_name:
+    if _CACHE.get("tokenizer") is not None and _CACHE.get("tokenizer_model") == tokenizer_name:
         tokenizer = _CACHE["tokenizer"]
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         _CACHE["tokenizer"] = tokenizer
-        _CACHE["tokenizer_model"] = model_name
+        _CACHE["tokenizer_model"] = tokenizer_name
+        logger.info(f"Loaded tokenizer: {tokenizer_name} (vocab_size={len(tokenizer)})")
 
     # Check for cached dataset (enables --network none operation)
     cached_path = os.getenv("CACHED_DATASET_PATH", "/home/appuser/.cache/templar/dataset.json")
@@ -407,7 +448,7 @@ def _load_hf_dataset(
         # Tokenize ALL samples once and cache the full tensor.
         # Subsequent evals just shuffle indices (fast) instead of
         # re-tokenizing 10k samples (slow + leaks memory).
-        cache_key = f"tokenized_{cached_path}_{sequence_length}"
+        cache_key = f"tokenized_{cached_path}_{sequence_length}_{tokenizer_name}"
         all_tokenized = _CACHE.get(cache_key)
 
         if all_tokenized is None:
@@ -1167,6 +1208,9 @@ def _calculate_mfu(
 
     where dp_size is the data-parallel dimension of the miner's topology
     (dp_size=num_gpus for pure DDP, dp_size=1 for pure TP, mixed for hybrid).
+    Pipeline parallelism (pp_size) does not multiply unique tokens — all PP
+    stages process the same data.  PP bubble overhead naturally reduces MFU
+    because the same total FLOPs take longer wall time.
 
     Total useful FLOPs = 6 * params * total_unique_tokens (forward + backward).
     Total system peak  = peak_per_gpu * num_gpus * wall_time.
@@ -1285,22 +1329,50 @@ def _verify_params_changed(
 
 
 def _get_cached_model(model_path: str, use_random_init: bool = False):
-    """Get model from cache or load it."""
+    """Get model from cache or load it.
+
+    When ``benchmark_tokenizer_name`` in hparams.json differs from the model,
+    the embedding and lm_head layers are resized to match the new vocab.
+    """
+    tokenizer_name = _get_hparams_tokenizer_name()
+    cache_tok = _CACHE.get("model_tokenizer")
+
     cached = _CACHE.get("model")
     cached_path = _CACHE.get("model_path")
     cached_random_init = _CACHE.get("use_random_init")
 
-    # Cache hit only if path AND init mode match
-    if cached is not None and cached_path == model_path and cached_random_init == use_random_init:
+    # Cache hit only if path, init mode, AND tokenizer match
+    if (
+        cached is not None
+        and cached_path == model_path
+        and cached_random_init == use_random_init
+        and cache_tok == tokenizer_name
+    ):
         if _CACHE.get("initial_state"):
             cached.load_state_dict(_CACHE["initial_state"])
             cached.to(torch.device(f"cuda:{_LOCAL_RANK}"))
         return cached
 
     model = _load_model(model_path, use_random_init=use_random_init)
+
+    # Resize embeddings when using a different tokenizer
+    if tokenizer_name and tokenizer_name != model_path:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+        new_vocab = len(tok)
+        old_vocab = model.config.vocab_size
+        if new_vocab != old_vocab:
+            logger.info(
+                f"Resizing model embeddings: {old_vocab} → {new_vocab} "
+                f"(tokenizer: {tokenizer_name})"
+            )
+            model.resize_token_embeddings(new_vocab)
+
     _CACHE["model"] = model
     _CACHE["model_path"] = model_path
     _CACHE["use_random_init"] = use_random_init
+    _CACHE["model_tokenizer"] = tokenizer_name
     _CACHE["initial_state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     return model
 
@@ -1838,14 +1910,17 @@ class Actor:
                     "success": False,
                     "error": (
                         "Multi-GPU evaluation requires get_strategy() in train.py "
-                        'returning "ddp"/"fsdp"/"tp" or {"dp_size": N, "tp_size": M}'
+                        'returning "ddp"/"fsdp"/"tp" or '
+                        '{"dp_size": N, "tp_size": M} or '
+                        '{"dp_size": N, "tp_size": M, "pp_size": P}'
                     ),
                     "seed": seed,
                     "code": code,
                 }
             par_config = ParallelismConfig(dp_size=1, tp_size=1)
 
-        if par_config.dp_size * par_config.tp_size != num_gpus:
+        total_par = par_config.dp_size * par_config.tp_size * par_config.pp_size
+        if total_par != num_gpus:
             return {
                 "task_id": task_id,
                 "mfu": 0.0,
@@ -1855,17 +1930,19 @@ class Actor:
                 "success": False,
                 "error": (
                     f"dp_size({par_config.dp_size}) * tp_size({par_config.tp_size}) "
-                    f"= {par_config.dp_size * par_config.tp_size} != num_gpus({num_gpus})"
+                    f"* pp_size({par_config.pp_size}) "
+                    f"= {total_par} != num_gpus({num_gpus})"
                 ),
                 "seed": seed,
                 "code": code,
             }
 
         logger.info(
-            f"Miner parallelism: dp_size={par_config.dp_size}, tp_size={par_config.tp_size}"
+            f"Miner parallelism: dp_size={par_config.dp_size}, "
+            f"tp_size={par_config.tp_size}, pp_size={par_config.pp_size}"
         )
 
-        data_rank = _LOCAL_RANK // par_config.tp_size if _multi_gpu else 0
+        data_rank = _LOCAL_RANK // (par_config.tp_size * par_config.pp_size) if _multi_gpu else 0
         data_world = par_config.dp_size if _multi_gpu else 1
 
         try:
@@ -1910,8 +1987,8 @@ class Actor:
             # Multi-GPU: always FSDP FULL_SHARD (scales to any model size,
             # all ranks participate regardless of miner strategy).
             # Data distribution matches the miner's declared topology:
-            # ranks in the same TP group share data, different DP groups
-            # get different data.  dp_size/tp_size drive the formula.
+            # ranks in the same TP/PP group share data, different DP groups
+            # get different data.  dp_size/tp_size/pp_size drive the formula.
             reference: InnerStepsResult | None = None
             reference_final_state: dict | None = None
             ref_fsdp: torch.nn.Module | None = None
@@ -2795,7 +2872,11 @@ class Actor:
             # Diagnostics
             diagnostics = {
                 "verification": verify_details,
-                "strategy": {"dp_size": par_config.dp_size, "tp_size": par_config.tp_size},
+                "strategy": {
+                    "dp_size": par_config.dp_size,
+                    "tp_size": par_config.tp_size,
+                    "pp_size": par_config.pp_size,
+                },
                 "reference_loss": reference.final_loss,
                 "candidate_loss": parsed.final_loss,
                 "expected_tokens": expected_tokens,

@@ -1,11 +1,11 @@
 # Reference: TP (Tensor Parallel) strategy
 #
-# Topology: dp_size=1, tp_size=num_gpus
+# Topology: dp_size=1, tp_size=num_gpus, pp_size=1
 #   - All ranks receive the same data (NOT data-parallel)
-#   - Equivalent to: get_strategy() -> {"dp_size": 1, "tp_size": num_gpus}
+#   - Equivalent to: get_strategy() -> {"dp_size": 1, "tp_size": num_gpus, "pp_size": 1}
 #
 # Requirements for verification:
-#   - get_strategy() returning "tp" or {"dp_size": 1, "tp_size": N}
+#   - get_strategy() returning {"dp_size": 1, "tp_size": N, "pp_size": 1}
 #   - Return InnerStepsResult with final_logits, total_tokens, final_loss
 #   - Must return final_state: gathered full tensors from DTensor shards
 #     TP replaces params with DTensors so validator cannot read weights directly
@@ -32,8 +32,7 @@ class InnerStepsResult:
 
 def get_strategy():
     # Pure tensor-parallel: all GPUs get the same data.
-    # Use "tp" for any GPU count, or a dict for a fixed topology.
-    return {"dp_size": 1, "tp_size": 4}
+    return {"dp_size": 1, "tp_size": 4, "pp_size": 1}
 
 
 def _apply_tp(model, device_mesh):
