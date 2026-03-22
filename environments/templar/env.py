@@ -1261,6 +1261,9 @@ def _calculate_mfu(
 
     where dp_size is the data-parallel dimension of the miner's topology
     (dp_size=num_gpus for pure DDP, dp_size=1 for pure TP, mixed for hybrid).
+    Pipeline parallelism (pp_size) does not multiply unique tokens — all PP
+    stages process the same data.  PP bubble overhead naturally reduces MFU
+    because the same total FLOPs take longer wall time.
 
     Total useful FLOPs = 6 * params * total_unique_tokens (forward + backward).
     Total system peak  = peak_per_gpu * num_gpus * wall_time.
@@ -2021,8 +2024,8 @@ class Actor:
             # Multi-GPU: always FSDP FULL_SHARD (scales to any model size,
             # all ranks participate regardless of miner strategy).
             # Data distribution matches the miner's declared topology:
-            # ranks in the same TP group share data, different DP groups
-            # get different data.  dp_size/tp_size drive the formula.
+            # ranks in the same TP/PP group share data, different DP groups
+            # get different data.  dp_size/tp_size/pp_size drive the formula.
             reference: InnerStepsResult | None = None
             reference_final_state: dict | None = None
             ref_fsdp: torch.nn.Module | None = None

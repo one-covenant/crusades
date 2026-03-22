@@ -17,6 +17,9 @@
 #   - get_strategy() returning {"dp_size": 2, "tp_size": 1, "pp_size": 2}
 #   - Return InnerStepsResult with final_logits, total_tokens, final_loss
 #   - Must return final_state: gathered full model state on rank 0
+#   - Rank 0 (first stage) must have valid 3-D logits and positive loss;
+#     the last stage sends these back after training since only rank 0
+#     is verified by the validator.
 
 from dataclasses import dataclass
 
@@ -157,12 +160,23 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
         total_tokens += batch.numel()
 
-    if is_last_stage and final_logits is None:
-        final_logits = torch.zeros(1, device=device)
-
-    if not is_last_stage:
-        final_logits = torch.zeros(1, device=device)
-        final_loss = 0.0
+    # ── Send logits & loss from last stage → first stage ─────────────
+    # The validator only verifies rank 0's InnerStepsResult.  Rank 0 is
+    # the first pipeline stage and never computes loss/logits, so the
+    # last stage must send them back.
+    if is_last_stage:
+        if final_logits is None:
+            final_logits = torch.zeros(1, device=device)
+        loss_t = torch.tensor([final_loss], device=device, dtype=torch.float64)
+        dist.send(loss_t, dst=pp_peer)
+        dist.send(final_logits.contiguous(), dst=pp_peer)
+    elif is_first_stage:
+        vocab_size = model.config.vocab_size
+        loss_t = torch.zeros(1, device=device, dtype=torch.float64)
+        dist.recv(loss_t, src=pp_peer)
+        final_loss = loss_t.item()
+        final_logits = torch.zeros(bs, seq_len, vocab_size, device=device, dtype=torch.bfloat16)
+        dist.recv(final_logits, src=pp_peer)
 
     full_state = _gather_pp_state(
         model, all_layers, my_layer_indices, n_layers, pp_rank, pp_peer, is_first_stage, rank
