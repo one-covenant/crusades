@@ -201,6 +201,7 @@ class ParallelismConfig:
 
     dp_size: int
     tp_size: int
+    pp_size: int = 1
 
 
 def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismConfig | None:
@@ -210,8 +211,10 @@ def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismC
 
     - **Legacy string**: ``return "ddp"`` / ``"fsdp"`` / ``"tp"`` — converted
       to ``ParallelismConfig`` using *num_gpus*.
-    - **Dict literal**: ``return {"dp_size": 2, "tp_size": 2}`` — parsed
+    - **Dict literal**: ``return {"dp_size": 2, "tp_size": 2}`` or
+      ``return {"dp_size": 2, "tp_size": 1, "pp_size": 2}`` — parsed
       directly.  Only simple ``ast.Constant`` keys/values are accepted.
+      ``pp_size`` defaults to 1 when omitted.
 
     Returns ``None`` when the function is absent, unparseable, or contains
     non-literal expressions.
@@ -250,8 +253,9 @@ def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismC
                 if "dp_size" in d and "tp_size" in d:
                     dp = d["dp_size"]
                     tp = d["tp_size"]
-                    if dp >= 1 and tp >= 1:
-                        return ParallelismConfig(dp_size=dp, tp_size=tp)
+                    pp = d.get("pp_size", 1)
+                    if dp >= 1 and tp >= 1 and pp >= 1:
+                        return ParallelismConfig(dp_size=dp, tp_size=tp, pp_size=pp)
 
     return None
 
@@ -1940,14 +1944,17 @@ class Actor:
                     "success": False,
                     "error": (
                         "Multi-GPU evaluation requires get_strategy() in train.py "
-                        'returning "ddp"/"fsdp"/"tp" or {"dp_size": N, "tp_size": M}'
+                        'returning "ddp"/"fsdp"/"tp" or '
+                        '{"dp_size": N, "tp_size": M} or '
+                        '{"dp_size": N, "tp_size": M, "pp_size": P}'
                     ),
                     "seed": seed,
                     "code": code,
                 }
             par_config = ParallelismConfig(dp_size=1, tp_size=1)
 
-        if par_config.dp_size * par_config.tp_size != num_gpus:
+        total_par = par_config.dp_size * par_config.tp_size * par_config.pp_size
+        if total_par != num_gpus:
             return {
                 "task_id": task_id,
                 "mfu": 0.0,
@@ -1957,17 +1964,19 @@ class Actor:
                 "success": False,
                 "error": (
                     f"dp_size({par_config.dp_size}) * tp_size({par_config.tp_size}) "
-                    f"= {par_config.dp_size * par_config.tp_size} != num_gpus({num_gpus})"
+                    f"* pp_size({par_config.pp_size}) "
+                    f"= {total_par} != num_gpus({num_gpus})"
                 ),
                 "seed": seed,
                 "code": code,
             }
 
         logger.info(
-            f"Miner parallelism: dp_size={par_config.dp_size}, tp_size={par_config.tp_size}"
+            f"Miner parallelism: dp_size={par_config.dp_size}, "
+            f"tp_size={par_config.tp_size}, pp_size={par_config.pp_size}"
         )
 
-        data_rank = _LOCAL_RANK // par_config.tp_size if _multi_gpu else 0
+        data_rank = _LOCAL_RANK // (par_config.tp_size * par_config.pp_size) if _multi_gpu else 0
         data_world = par_config.dp_size if _multi_gpu else 1
 
         try:
@@ -2942,7 +2951,11 @@ class Actor:
             # Diagnostics
             diagnostics = {
                 "verification": verify_details,
-                "strategy": {"dp_size": par_config.dp_size, "tp_size": par_config.tp_size},
+                "strategy": {
+                    "dp_size": par_config.dp_size,
+                    "tp_size": par_config.tp_size,
+                    "pp_size": par_config.pp_size,
+                },
                 "reference_loss": reference.final_loss,
                 "candidate_loss": parsed.final_loss,
                 "expected_tokens": expected_tokens,

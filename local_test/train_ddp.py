@@ -1,8 +1,8 @@
 # Reference: DDP (Distributed Data Parallel) strategy
 #
-# Topology: dp_size=num_gpus, tp_size=1
+# Topology: dp_size=num_gpus, tp_size=1, pp_size=1
 #   - Each rank processes different data (data-parallel)
-#   - Equivalent to: get_strategy() -> {"dp_size": num_gpus, "tp_size": 1}
+#   - Equivalent to: get_strategy() -> {"dp_size": num_gpus, "tp_size": 1, "pp_size": 1}
 #
 # DDP replicates the full model per GPU.  With large-vocab tokenizers (262K)
 # the resized model is ~8.4B params.  Memory breakdown per GPU:
@@ -12,7 +12,7 @@
 #   Total static: ~67 GB — fits on A100 80 GB with micro-batch=1 + grad ckpt.
 #
 # Requirements for verification:
-#   - get_strategy() returning "ddp" or {"dp_size": N, "tp_size": 1}
+#   - get_strategy() returning {"dp_size": N, "tp_size": 1, "pp_size": 1}
 #   - Return InnerStepsResult with final_logits, total_tokens, final_loss
 #   - Must return final_state with full model state_dict for weight verification
 
@@ -32,7 +32,7 @@ class InnerStepsResult:
 
 
 def get_strategy():
-    return {"dp_size": 4, "tp_size": 1}
+    return {"dp_size": 4, "tp_size": 1, "pp_size": 1}
 
 
 MICRO_BATCH_SIZE = 1

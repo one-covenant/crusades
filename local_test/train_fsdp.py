@@ -1,11 +1,11 @@
 # Reference: FSDP (Fully Sharded Data Parallel) strategy
 #
-# Topology: dp_size=num_gpus, tp_size=1
+# Topology: dp_size=num_gpus, tp_size=1, pp_size=1
 #   - Each rank processes different data (data-parallel)
-#   - Equivalent to: get_strategy() -> {"dp_size": num_gpus, "tp_size": 1}
+#   - Equivalent to: get_strategy() -> {"dp_size": num_gpus, "tp_size": 1, "pp_size": 1}
 #
 # Requirements for verification:
-#   - get_strategy() returning "fsdp" or {"dp_size": N, "tp_size": 1}
+#   - get_strategy() returning {"dp_size": N, "tp_size": 1, "pp_size": 1}
 #   - Return InnerStepsResult with final_logits, total_tokens, final_loss
 #   - Must return final_state: gathered full state dict for weight verification
 #     FSDP flattens params so validator cannot read weights directly
@@ -36,7 +36,7 @@ class InnerStepsResult:
 
 
 def get_strategy():
-    return {"dp_size": 4, "tp_size": 1}
+    return {"dp_size": 4, "tp_size": 1, "pp_size": 1}
 
 
 def _get_wrap_policy(model):

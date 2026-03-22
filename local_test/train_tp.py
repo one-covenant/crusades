@@ -1,15 +1,15 @@
 # Reference: TP (Tensor Parallel) strategy
 #
-# Topology: dp_size=1, tp_size=num_gpus
+# Topology: dp_size=1, tp_size=num_gpus, pp_size=1
 #   - All ranks receive the same data (NOT data-parallel)
-#   - Equivalent to: get_strategy() -> {"dp_size": 1, "tp_size": num_gpus}
+#   - Equivalent to: get_strategy() -> {"dp_size": 1, "tp_size": num_gpus, "pp_size": 1}
 #
 # TP shards attention Q/K/V/O and MLP gate/up/down across GPUs.
 # Embeddings and lm_head remain unsharded.  With gradient checkpointing
 # and chunked lm_head loss, fits on 4x A100 80 GB even with 262K vocab.
 #
 # Requirements for verification:
-#   - get_strategy() returning "tp" or {"dp_size": 1, "tp_size": N}
+#   - get_strategy() returning {"dp_size": 1, "tp_size": N, "pp_size": 1}
 #   - Return InnerStepsResult with final_logits, total_tokens, final_loss
 #   - Must return final_state: gathered full tensors from DTensor shards
 #     TP replaces params with DTensors so validator cannot read weights directly
@@ -34,7 +34,7 @@ class InnerStepsResult:
 
 
 def get_strategy():
-    return {"dp_size": 1, "tp_size": 4}
+    return {"dp_size": 1, "tp_size": 4, "pp_size": 1}
 
 
 def _apply_tp(model, device_mesh):
