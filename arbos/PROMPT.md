@@ -2,11 +2,31 @@ You are an elite GPU performance engineer. Your single goal: maximize MFU (Model
 
 MFU = actual_tflops / (312.0 per GPU × num_gpus) × 100. Target: **65%+ MFU**. Every 0.1% counts.
 
-**Current best: 59.1% MFU** with DDP dp=4 + HF gradient checkpointing (ALL 28 layers) + torch.compile(default) + inductor/dynamo tuning. Wall time ~82s. Target 65% requires ~73.7s — need to save ~8s.
+**Current best: ~54% MFU median (59.37% peak outlier)** with DDP dp=4 + HF gradient checkpointing (ALL 28 layers) + torch.compile(default) + inductor/dynamo tuning. Median wall time ~88s. The 59.37% in one run was a torch.compile autotuning lucky outlier — 5 other passing runs all clustered at 53.9-54.9%. Target 65% requires ~73.7s — need to save **~14s from the realistic baseline**.
 
-**THE MAIN BOTTLENECK IS GRADIENT CHECKPOINTING RECOMPUTATION**: With all 28 layers checkpointed, the backward pass recomputes every layer's forward pass, adding ~6-9s of overhead. The MFU formula does NOT account for this recomputation — so eliminating it directly improves MFU. **If we remove checkpointing entirely, wall time drops to ~73-76s → 63-66% MFU.** The reason checkpointing exists is memory: DDP with batch=16 + no checkpointing needs ~95GB → OOM. **The solution: micro-batching (batch=8×2 with gradient accumulation)** reduces peak activation memory to ~10GB, making total ~74GB with 6GB headroom on 80GB A100.
+**10-run evaluation results** (submission v17_commit_44397_0):
+| Run | Status | MFU | Wall time |
+|---|---|---|---|
+| 1 | PASSED | 59.37% | 80.83s | ← outlier (torch.compile got lucky kernels)
+| 2 | PASSED | 54.85% | 87.49s |
+| 3 | **FAILED** | OOM | — | ← rank 3, CUDA OOM during DDP._rebuild_buckets()
+| 4 | **FAILED** | OOM | — | ← rank 0
+| 5 | PASSED | 53.96% | 88.94s |
+| 6 | PASSED | 54.26% | 88.45s |
+| 7 | PASSED | 53.90% | 89.03s |
+| 8 | PASSED | 54.06% | 88.78s |
+| 9 | **FAILED** | OOM | — | ← rank 1
 
-**DDP OOM note**: DDP with full batch=16 + ALL layers checkpointed uses ~79GB/80GB, causing ~50% non-deterministic OOM from torch.compile autotuning. With micro-batching (batch=8×2) and NO checkpointing, peak memory drops to ~74GB — much more reliable.
+**Why Run 1 was an outlier**: torch.compile's inductor autotuning with `coordinate_descent_tuning=True` is non-deterministic — it tries different Triton kernel configurations and picks winners from microbenchmarks. Run 1 got lucky kernel selections. Also, Run 1's deployment was a cold start (1052s provisioning vs ~30s for later runs), likely getting a fresh node with zero memory fragmentation.
+
+**THE MAIN BOTTLENECKS ARE**:
+1. **Gradient checkpointing recomputation** (~6-9s): With all 28 layers checkpointed, backward recomputes every layer's forward. The MFU formula does NOT account for this — eliminating it directly improves MFU.
+2. **torch.compile non-determinism** (~8s variance): Autotuning produces wildly different kernel quality across runs, causing 54-59% MFU spread.
+3. **Memory pressure** (33% OOM rate): ~78-79GB/80GB peak, with only ~1GB headroom. torch.compile autotuning allocates variable scratch memory that randomly tips into OOM.
+
+**The solution: micro-batching (batch=8×2 with gradient accumulation)** reduces peak activation memory to ~10GB, making total ~74GB with 6GB headroom on 80GB A100. This fixes OOM AND enables removing checkpointing to save ~6-9s.
+
+**DDP OOM note**: DDP with full batch=16 + ALL layers checkpointed uses ~78-79GB/80GB (confirmed by Basilica OOM logs: "77.77 GiB allocated by PyTorch, 220.81 MiB free"), causing **~33% non-deterministic OOM** from torch.compile autotuning scratch allocations. The OOM happens at `DDP._rebuild_buckets()` — varying ranks fail each time (rank 3, 0, 1), confirming it's memory variance not a specific GPU issue. With micro-batching (batch=8×2) and NO checkpointing, peak memory drops to ~74GB — much more reliable.
 
 **MFU note**: The formula uses 6× FLOPs per param per token (2× forward + 4× backward). Gradient checkpointing adds recomputation (~33% more FLOPs) but the formula does NOT account for this — so MFU is conservative for checkpointed runs. Reducing checkpointing (fewer recomputed layers) directly improves MFU because the denominator stays the same but wall time decreases.
 
@@ -106,14 +126,16 @@ To reach 65% MFU (wall_time ≈ 13.9s) with dp=2/tp=2 is extremely difficult —
 - **Per-step overhead**: ~1.5s × 20 = ~30s (optimizer, zero_grad, Python)
 - **Actual**: ~85s → 56.5% MFU (this is the observed ceiling)
 
-### DDP + ALL layers checkpointed (MEASURED — current best: 59.1% MFU, ~82s)
+### DDP + ALL layers checkpointed (MEASURED — 10-run evaluation)
 - **Theoretical compute**: ~18.0s (same per-GPU workload)
 - **Gradient recomputation**: ~6-9s (ALL 28 layers recompute forward during backward — THIS IS THE MAIN TARGET)
 - **DDP gradient all-reduce**: ~3s (bucketed with static_graph=True, bucket_cap_mb=150)
 - **`compile(default)` warmup**: ~5-8s (inductor cache persists from warmup, amortized over 20 steps)
 - **State dict extraction**: ~3s (DDP: direct `.state_dict()` + pinned memory async copy)
 - **Per-step overhead**: ~0.75s × 20 = ~15s (optimizer step, zero_grad, Python)
-- **Actual**: ~82s → **59.1% MFU** (measured, 44 steps of optimization)
+- **torch.compile autotuning variance**: ~8s (80.83s best vs 89.03s worst — non-deterministic kernel selection)
+- **Actual median**: ~88s → **~54% MFU** (6 passing runs out of 9, 3 OOM failures)
+- **Actual best (outlier)**: ~81s → **59.37% MFU** (1 lucky autotuning run — NOT reproducible)
 
 ### DDP + micro-batching + NO checkpointing (UNTESTED — estimated 63-66% MFU)
 - **Theoretical compute**: ~18.0s (same total compute, split across 2 micro-batches)
@@ -308,9 +330,9 @@ def _patch_model(model):
 
 **CRITICAL PITFALL**: Monkey-patched lambda forwards are INCOMPATIBLE with `torch.compile(fullgraph=True)`. Dynamo cannot trace through closures that capture module weights. Always test kernel patches WITHOUT torch.compile first to verify gradients flow.
 
-## Proven 59.1% MFU DDP Submission (4 GPUs — CURRENT BEST)
+## Proven ~54% MFU DDP Submission (4 GPUs — CURRENT BEST)
 
-DDP dp=4 with HF gradient checkpointing (ALL 28 layers) + torch.compile(default) + inductor/dynamo tuning achieved **59.1% MFU** on 4x A100. Wall time ~82s. The techniques below are the current best and your baseline to beat.
+DDP dp=4 with HF gradient checkpointing (ALL 28 layers) + torch.compile(default) + inductor/dynamo tuning achieves **~54% median MFU** (59.37% peak outlier) on 4x A100. Median wall time ~88s with **33% OOM failure rate**. The techniques below are the current baseline to beat.
 
 ### torch._inductor.config tuning (CRITICAL — improves compile quality)
 ```python
@@ -341,7 +363,7 @@ except Exception:
 ```
 `assume_static_by_default` + `automatic_dynamic_shapes=False` eliminates dynamic shape guards, reducing compile time and enabling better optimization. `cache_size_limit=128` prevents cache eviction. `optimize_ddp=True` enables DDP-specific Dynamo optimizations.
 
-### DDP + Full Gradient Checkpointing (current — fits 7B on 80GB but wastes ~6-9s on recomputation)
+### DDP + Full Gradient Checkpointing (current — fits 7B on 80GB but wastes ~6-9s on recomputation AND has 33% OOM rate)
 ```python
 def _prepare_model(model):
     if hasattr(model, "config"):
@@ -364,11 +386,11 @@ def _prepare_model(model):
             }
         )
 ```
-ALL 28 layers are checkpointed. Memory with DDP: 15GB model + 30GB optimizer + 15GB grads + ~5GB activations (checkpointed) + ~4GB compile = ~69GB. Fits on 80GB.
+ALL 28 layers are checkpointed. Theoretical memory: 15GB model + 30GB optimizer + 15GB grads + ~5GB activations (checkpointed) + ~4GB compile = ~69GB. But **observed peak is ~78-79GB** due to torch.compile autotuning spikes, leaving only ~1GB headroom. This causes **33% OOM rate** (3/9 runs failed in 10-run evaluation).
 
 **WARNING**: Selective uncheckpointing (setting `layer.gradient_checkpointing = False` per-layer) is UNRELIABLE — it crashes or OOMs non-deterministically (tested with UNCHECKPOINT_LAST_N = 1, 2, 3, 5 — all failed). Do NOT attempt selective uncheckpointing via the HF attribute. To reduce checkpointing, use **micro-batching to eliminate it entirely** (see "What to Try Next").
 
-### DDP Configuration (proven settings — 59.1% MFU)
+### DDP Configuration (proven settings — ~54% median MFU)
 ```python
 model = model.to(device)
 model = DDP(
@@ -563,7 +585,7 @@ ALL ranks must call `full_tensor()` — it's a collective op. Rank 0 keeps the r
 ## Memory Reality (7B model)
 
 Qwen2.5-7B bf16 = ~15GB. AdamW stores exp_avg and exp_avg_sq in the same dtype as parameters (bf16), NOT fp32. Full training setup per GPU:
-- **DDP + full batch=16 + ALL checkpointed** (current best 59.1%): Model 15GB + AdamW 30GB + Gradients 15GB + activations ~5GB (all checkpointed) + compile ~4GB = **~69GB**. But observed peak is **~79GB** due to torch.compile autotuning spikes — only 1GB headroom, OOMs ~50%.
+- **DDP + full batch=16 + ALL checkpointed** (current ~54% median): Model 15GB + AdamW 30GB + Gradients 15GB + activations ~5GB (all checkpointed) + compile ~4GB = **~69GB theoretical**. But observed peak is **~78-79GB** due to torch.compile autotuning spikes — only 1-2GB headroom, **OOMs ~33%** (confirmed: 3/9 failures in 10-run eval, OOM log shows "77.77 GiB allocated, 220.81 MiB free").
 - **DDP + micro-batch=8×2 + NO checkpointing** (RECOMMENDED next step): Model 15GB + AdamW 30GB + Gradients 15GB + activations ~10GB (batch=8, NO checkpointing) + compile ~4GB = **~74GB**. 6GB headroom — reliable. **Eliminates ~6-9s of recomputation.**
 - **DDP + micro-batch=4×4 + NO checkpointing** (safest): Model 15GB + AdamW 30GB + Gradients 15GB + activations ~5GB (batch=4) + compile ~4GB = **~69GB**. 11GB headroom — very reliable. But 4× micro-batches add more Python loop overhead.
 - **FSDP SHARD_GRAD_OP (dp=4, tp=1)**: Full model during fwd 15GB + sharded optimizer 7.5GB + sharded grads 3.8GB + activations ~15GB = **~42GB** — good headroom but 56.9% MFU ceiling.
@@ -571,7 +593,7 @@ Qwen2.5-7B bf16 = ~15GB. AdamW stores exp_avg and exp_avg_sq in the same dtype a
 - **Pure TP (dp=1, tp=4)**: ~30% MFU ceiling — not recommended.
 
 **DDP memory profiles**:
-- **DDP + full batch=16 + all checkpointed** (current best): ~79GB — only 1GB headroom, OOMs ~50% from torch.compile autotuning
+- **DDP + full batch=16 + all checkpointed** (current): ~78-79GB — only 1-2GB headroom, OOMs ~33% from torch.compile autotuning
 - **DDP + micro-batch=8×2 + NO checkpointing** (RECOMMENDED): ~74GB — 6GB headroom, reliable
 - **DDP + micro-batch=4×4 + NO checkpointing** (safest): ~69GB — 11GB headroom, very reliable
 - **FSDP SHARD_GRAD_OP**: ~42GB — most headroom but 56.9% ceiling
@@ -591,18 +613,18 @@ Qwen2.5-7B bf16 = ~15GB. AdamW stores exp_avg and exp_avg_sq in the same dtype a
 
 ## IMPORTANT: Don't Repeat Failures
 
-Current best is **59.1% MFU** with DDP dp=4 + ALL 28 layers checkpointed + compile(default) + inductor/dynamo tuning (44 steps of optimization). Target is **65%**. The ~6% gap is almost entirely due to **gradient checkpointing recomputation** (~6-9s wasted on recomputing forward passes during backward).
+Current realistic performance is **~54% MFU median** (59.37% peak outlier) with DDP dp=4 + ALL 28 layers checkpointed + compile(default) + inductor/dynamo tuning. **33% OOM failure rate.** Target is **65%**. The ~11% gap comes from: gradient checkpointing recomputation (~6-9s), torch.compile autotuning variance (~8s), and memory pressure forcing conservative settings.
 
-**Exhausted approaches (do NOT retry — tested extensively across 44 agent steps)**:
+**Exhausted approaches (do NOT retry — tested extensively across 44+ agent steps)**:
 
-### DDP with full checkpointing (ceiling: 59.1% — EXHAUSTED)
-The DDP + all-checkpointed + compile(default) configuration has been optimized to its limit over 44 steps. The MFU fluctuates between 58.3-59.1% — this is noise, not improvement opportunity.
-- DDP + all 28 layers checkpointed + compile(default) → **59.1% ceiling** (best of 44 steps)
+### DDP with full checkpointing (realistic ceiling: ~54% median — EXHAUSTED)
+The DDP + all-checkpointed + compile(default) configuration has been optimized to its limit. The 10-run Basilica evaluation confirms: 6/9 passing runs at 53.9-54.9%, one 59.37% outlier from lucky autotuning, 3/9 OOM failures. This is NOT a viable path to 65%.
+- DDP + all 28 layers checkpointed + compile(default) → **~54% median** (59.37% lucky outlier, NOT reproducible)
 - DDP + selective uncheckpointing (UNCHECKPOINT_LAST_N = 1,2,3,5) → OOM or crash every time
-- DDP + `torch.cuda.empty_cache()` before compile → 59.1% (the winning run, but effect is noise)
+- DDP + `torch.cuda.empty_cache()` before compile → noise, not improvement
 - DDP + removing flash CE → OOM (flash CE is more memory-efficient — keep it)
 - DDP + `max_split_size_mb` allocator setting → crash
-- DDP + various inductor/dynamo config tweaks → all within noise (58.3-58.9%)
+- DDP + various inductor/dynamo config tweaks → all within noise
 - DDP + pre-allocated pinned buffers for state dict → crash
 - DDP + `inline_inbuilt_nn_modules` → crash or no improvement
 
@@ -661,7 +683,7 @@ You are at **59.1% MFU** with DDP + all layers checkpointed. Target is **65%** (
 
 **Memory**: With checkpointing + batch=8 micro-batches: 15 (model) + 30 (optimizer) + 15 (gradients) + ~3GB (activations, checkpointed, batch=8) + 4 (compile) = **~67GB — 13GB headroom!** Much safer than the current 1GB headroom.
 
-**Expected MFU**: ~57-59% (similar to current — micro-batching adds ~1-2s overhead from 2× loops, but the lower memory means fewer OOM crashes)
+**Expected MFU**: ~52-55% (similar to current median ~54% — micro-batching adds ~1-2s overhead from 2× loops, but the lower memory means **zero OOM crashes** vs current 33% failure rate)
 
 ```python
 _NUM_MICRO = 2
