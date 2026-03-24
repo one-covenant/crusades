@@ -769,7 +769,7 @@ asyncio.run(main())
                 "min_gpu_memory_gb": self.basilica_min_gpu_memory_gb,
                 "cpu": self.basilica_cpu,
                 "memory": self.basilica_memory,
-                "timeout": 900,
+                "timeout": 1800,
             }
             if self.basilica_interconnect:
                 deploy_kwargs["interconnect"] = self.basilica_interconnect
