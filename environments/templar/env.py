@@ -15,6 +15,7 @@ Flow:
 """
 
 import ast
+import asyncio
 import gc
 import hashlib
 import importlib.util
@@ -2989,11 +2990,43 @@ async def health():
     }
 
 
+_current_torchrun: asyncio.subprocess.Process | None = None
+
+
+def _kill_torchrun_group(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL a torchrun process and its entire process group."""
+    import signal
+
+    if proc.returncode is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGKILL)
+        logger.warning(f"Killed torchrun process group (pgid={pgid})")
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
 async def _evaluate_via_torchrun(request: EvaluateRequest) -> dict:
     """Spawn torchrun for multi-GPU Basilica evaluation (uvicorn is single-process)."""
+    global _current_torchrun
     import asyncio as _aio
     import json as _json
     import tempfile
+
+    if _current_torchrun is not None and _current_torchrun.returncode is None:
+        logger.warning(
+            f"Killing stale torchrun (pid={_current_torchrun.pid}) before new evaluation"
+        )
+        _kill_torchrun_group(_current_torchrun)
+        try:
+            await _aio.wait_for(_current_torchrun.wait(), timeout=5)
+        except TimeoutError:
+            pass
+    _current_torchrun = None
 
     params_path = None
     script_path = None
@@ -3039,14 +3072,19 @@ asyncio.run(main())
             f.write(eval_script)
             script_path = f.name
 
+        master_port = 29500 + random.randint(0, 10000)
         proc = await _aio.create_subprocess_exec(
             "torchrun",
             "--nproc_per_node",
             str(request.num_gpus),
+            "--master_port",
+            str(master_port),
             script_path,
             stdout=_aio.subprocess.PIPE,
             stderr=_aio.subprocess.STDOUT,
+            start_new_session=True,
         )
+        _current_torchrun = proc
 
         collected_lines: list[str] = []
 
@@ -3078,6 +3116,8 @@ asyncio.run(main())
             "wall_time_seconds": 0.0,
         }
     except TimeoutError:
+        if _current_torchrun is not None:
+            _kill_torchrun_group(_current_torchrun)
         return {
             "task_id": request.task_id,
             "success": False,
@@ -3089,6 +3129,8 @@ asyncio.run(main())
             "wall_time_seconds": 0.0,
         }
     except Exception as e:
+        if _current_torchrun is not None:
+            _kill_torchrun_group(_current_torchrun)
         return {
             "task_id": request.task_id,
             "success": False,
