@@ -718,8 +718,9 @@ asyncio.run(main())
 
         Flow:
         1. deploy_async: create deployment, wait until DNS + HTTP ready
-        2. POST /evaluate with retry + exponential backoff on 502
-        3. Delete deployment (in finally block)
+        2. POST /evaluate → get job_id back (instant, no proxy timeout)
+        3. Poll GET /eval-status/{job_id} every 30s until done
+        4. Delete deployment (in finally block)
         """
         logger.info("=" * 60)
         logger.info("[BASILICA] Starting remote GPU evaluation")
