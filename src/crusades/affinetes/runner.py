@@ -815,33 +815,124 @@ asyncio.run(main())
                 "num_gpus": self.basilica_gpu_count,
             }
 
-            logger.info("[BASILICA] Sending evaluation request...")
+            logger.info("[BASILICA] Sending evaluation request (async)...")
             logger.info(f"   POST {deployment.url}/evaluate")
-            logger.info(f"   Timeout: {http_timeout}s")
+            logger.info(f"   Timeout budget: {http_timeout}s")
             logger.info(f"   Payload size: {len(str(payload))} chars")
 
             post_start = time.time()
-            response = await self._post_with_retry(
-                url=f"{deployment.url}/evaluate",
-                payload=payload,
-                timeout=http_timeout,
-                post_start=post_start,
-            )
 
-            elapsed = time.time() - post_start
-            logger.info(f"[BASILICA] Response received in {elapsed:.1f}s")
-            logger.info(f"   Status code: {response.status_code}")
+            # ── Step 1: Submit job (returns 202 + job_id immediately) ──
+            async with httpx.AsyncClient(timeout=60) as submit_client:
+                submit_resp = await submit_client.post(f"{deployment.url}/evaluate", json=payload)
 
-            if response.status_code != 200:
-                error_text = response.text[:500]
-                logger.error("[BASILICA] Evaluation failed!")
+            if submit_resp.status_code not in (200, 202):
+                error_text = submit_resp.text[:500]
+                logger.error(f"[BASILICA] Job submission failed: {submit_resp.status_code}")
                 logger.error(f"   Error: {error_text}")
                 return EvaluationResult.failure(
-                    f"Basilica /evaluate error: {response.status_code} - {error_text}",
+                    f"Basilica /evaluate submission error: {submit_resp.status_code} - {error_text}",
                     task_id=task_id,
                 )
 
-            result_data = response.json()
+            submit_data = submit_resp.json()
+            job_id = submit_data.get("job_id")
+            if not job_id:
+                return EvaluationResult.failure(
+                    f"Basilica /evaluate did not return job_id: {submit_data}",
+                    task_id=task_id,
+                )
+
+            logger.info(f"[BASILICA] Job accepted: {job_id}")
+
+            # ── Step 2: Poll /eval-status/{job_id} until done ──
+            poll_url = f"{deployment.url}/eval-status/{job_id}"
+            poll_interval = 30
+            max_consecutive_errors = 10
+            consecutive_errors = 0
+
+            while True:
+                elapsed = time.time() - post_start
+                if elapsed >= http_timeout:
+                    logger.error(
+                        f"[BASILICA] Polling timeout after {elapsed:.0f}s (budget: {http_timeout}s)"
+                    )
+                    return EvaluationResult.failure(
+                        f"Basilica evaluation timed out after {elapsed:.0f}s (polling)",
+                        task_id=task_id,
+                    )
+
+                await asyncio.sleep(poll_interval)
+                elapsed = time.time() - post_start
+
+                try:
+                    async with httpx.AsyncClient(timeout=30) as poll_client:
+                        poll_resp = await poll_client.get(poll_url)
+
+                    consecutive_errors = 0
+
+                    if poll_resp.status_code == 404:
+                        logger.warning(
+                            f"[BASILICA] Job {job_id} not found (404) — "
+                            f"container may have restarted"
+                        )
+                        return EvaluationResult.failure(
+                            f"Basilica job {job_id} lost (404 on poll)",
+                            task_id=task_id,
+                        )
+
+                    if poll_resp.status_code != 200:
+                        logger.warning(
+                            f"[BASILICA] Poll got {poll_resp.status_code}, "
+                            f"will retry in {poll_interval}s ({elapsed:.0f}s elapsed)"
+                        )
+                        continue
+
+                    poll_data = poll_resp.json()
+                    status = poll_data.get("status")
+
+                    if status == "pending":
+                        logger.info(
+                            f"   [POLLING] Evaluation in progress... {elapsed:.0f}s elapsed"
+                        )
+                        continue
+
+                    if status in ("done", "failed"):
+                        result_data = poll_data.get("result")
+                        if result_data is None:
+                            return EvaluationResult.failure(
+                                f"Basilica job {job_id} status={status} but no result",
+                                task_id=task_id,
+                            )
+                        logger.info(
+                            f"[BASILICA] Job {job_id} completed with status={status} "
+                            f"in {elapsed:.1f}s"
+                        )
+                        break
+
+                    logger.warning(
+                        f"[BASILICA] Unknown poll status: {status}, will retry in {poll_interval}s"
+                    )
+
+                except (
+                    httpx.TimeoutException,
+                    httpx.ConnectError,
+                    httpx.RemoteProtocolError,
+                ) as poll_err:
+                    consecutive_errors += 1
+                    logger.warning(
+                        f"[BASILICA] Poll error ({consecutive_errors}/{max_consecutive_errors}): "
+                        f"{type(poll_err).__name__}: {poll_err}"
+                    )
+                    if consecutive_errors >= max_consecutive_errors:
+                        return EvaluationResult.failure(
+                            f"Basilica polling failed {max_consecutive_errors} times: {poll_err}",
+                            task_id=task_id,
+                        )
+                    continue
+
+            elapsed = time.time() - post_start
+            logger.info(f"[BASILICA] Evaluation result received in {elapsed:.1f}s")
             if not isinstance(result_data, dict):
                 return EvaluationResult.failure(
                     f"Basilica returned non-object response: {type(result_data).__name__}",
@@ -954,61 +1045,6 @@ asyncio.run(main())
                     )
                 except Exception as del_err:
                     logger.warning(f"[BASILICA] Failed to delete deployment: {del_err}")
-
-    async def _post_with_retry(
-        self,
-        url: str,
-        payload: dict,
-        timeout: float,
-        post_start: float,
-        max_retries: int = 3,
-        backoff_base: float = 60.0,
-    ) -> httpx.Response:
-        """POST with exponential backoff retry on 502/503/504 errors.
-
-        Uses a 60s base backoff (60s, 120s, 240s) to avoid re-sending
-        requests while a long evaluation is still running inside the
-        container.  Each retry gets a fresh httpx client to avoid stale
-        connections.
-        """
-        last_response = None
-        for attempt in range(max_retries + 1):
-            if attempt > 0:
-                wait = backoff_base * (2 ** (attempt - 1))
-                elapsed = time.time() - post_start
-                if elapsed + wait >= timeout:
-                    logger.warning(
-                        f"[BASILICA] Skipping retry {attempt}/{max_retries}: "
-                        f"would exceed timeout ({elapsed:.0f}s elapsed, {wait:.0f}s backoff, "
-                        f"{timeout:.0f}s limit)"
-                    )
-                    break
-                logger.warning(
-                    f"[BASILICA] Retry {attempt}/{max_retries} after {wait:.0f}s backoff "
-                    f"({elapsed:.0f}s elapsed so far)..."
-                )
-                await asyncio.sleep(wait)
-
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                post_task = asyncio.create_task(client.post(url, json=payload))
-                while not post_task.done():
-                    await asyncio.sleep(60)
-                    if not post_task.done():
-                        elapsed = time.time() - post_start
-                        logger.info(
-                            f"   [WAITING] Evaluation in progress... {elapsed:.0f}s elapsed"
-                        )
-                last_response = await post_task
-
-            if last_response.status_code not in (502, 503, 504):
-                return last_response
-
-            logger.warning(
-                f"[BASILICA] Got {last_response.status_code} on attempt {attempt + 1} "
-                f"(elapsed: {time.time() - post_start:.0f}s)"
-            )
-
-        return last_response
 
     async def _stream_basilica_logs(self, deployment, log_path: Path, poll_interval: int = 5):
         """Poll Basilica deployment logs every `poll_interval` seconds and

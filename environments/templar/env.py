@@ -26,6 +26,7 @@ import random
 import sys
 import time
 import traceback
+import uuid as _uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from crusades.core.security_defs import (
@@ -2923,6 +2925,13 @@ class Actor:
 
 app = FastAPI(title="Templar MFU Evaluation", version="2.0.0")
 
+# ---------------------------------------------------------------------------
+# In-memory jobs table for async evaluation
+# ---------------------------------------------------------------------------
+# Maps job_id -> {"status": "pending"|"done"|"failed", "result": dict|None}
+_jobs: dict[str, dict] = {}
+_jobs_lock = asyncio.Lock()
+
 # Global actor instance (reused for efficiency)
 _actor: Actor | None = None
 
@@ -3188,39 +3197,100 @@ asyncio.run(main())
                     pass
 
 
-@app.post("/evaluate", response_model=EvaluateResponse)
-async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
-    """Evaluate miner's code. Spawns torchrun when num_gpus > 1."""
+async def _run_evaluation(request: EvaluateRequest) -> dict:
+    """Run the actual evaluation (sync helper used by background task)."""
     if request.num_gpus > 1:
-        result = await _evaluate_via_torchrun(request)
-    else:
-        actor = get_actor()
-        result = await actor.evaluate(
-            task_id=request.task_id,
-            seed=request.seed,
-            model_url=request.model_url,
-            data_url=request.data_url,
-            steps=request.steps,
-            batch_size=request.batch_size,
-            timeout=request.timeout,
-            sequence_length=request.sequence_length,
-            data_samples=request.data_samples,
-            code=request.code,
-            max_loss_difference=request.max_loss_difference,
-            use_random_init=request.use_random_init,
-            min_trainable_params_ratio=request.min_trainable_params_ratio,
-            min_params_changed_ratio=request.min_params_changed_ratio,
-            weight_relative_error_max=request.weight_relative_error_max,
-            timer_divergence_threshold=request.timer_divergence_threshold,
-            gpu_peak_tflops=request.gpu_peak_tflops,
-            max_plausible_mfu=request.max_plausible_mfu,
-            min_mfu=request.min_mfu,
-            require_cuda_timing=True,
-            num_gpus=request.num_gpus,
-        )
+        return await _evaluate_via_torchrun(request)
 
-    return EvaluateResponse(
-        task_id=result.get("task_id", request.task_id),
+    actor = get_actor()
+    return await actor.evaluate(
+        task_id=request.task_id,
+        seed=request.seed,
+        model_url=request.model_url,
+        data_url=request.data_url,
+        steps=request.steps,
+        batch_size=request.batch_size,
+        timeout=request.timeout,
+        sequence_length=request.sequence_length,
+        data_samples=request.data_samples,
+        code=request.code,
+        max_loss_difference=request.max_loss_difference,
+        use_random_init=request.use_random_init,
+        min_trainable_params_ratio=request.min_trainable_params_ratio,
+        min_params_changed_ratio=request.min_params_changed_ratio,
+        weight_relative_error_max=request.weight_relative_error_max,
+        timer_divergence_threshold=request.timer_divergence_threshold,
+        gpu_peak_tflops=request.gpu_peak_tflops,
+        max_plausible_mfu=request.max_plausible_mfu,
+        min_mfu=request.min_mfu,
+        require_cuda_timing=True,
+        num_gpus=request.num_gpus,
+    )
+
+
+async def _evaluation_background(job_id: str, request: EvaluateRequest) -> None:
+    """Background coroutine: runs evaluation and stores result in _jobs."""
+    try:
+        result = await _run_evaluation(request)
+        async with _jobs_lock:
+            _jobs[job_id] = {"status": "done", "result": result}
+        logger.info(f"[JOB {job_id}] Evaluation finished successfully")
+    except Exception as exc:
+        error_result = {
+            "task_id": request.task_id,
+            "success": False,
+            "error": f"Background evaluation failed: {exc}",
+            "seed": request.seed,
+            "mfu": 0.0,
+            "tps": 0.0,
+            "total_tokens": 0,
+            "wall_time_seconds": 0.0,
+        }
+        async with _jobs_lock:
+            _jobs[job_id] = {"status": "failed", "result": error_result}
+        logger.error(f"[JOB {job_id}] Evaluation failed: {exc}")
+
+
+@app.post("/evaluate")
+async def evaluate(request: EvaluateRequest):
+    """Accept evaluation request, start in background, return job_id immediately.
+
+    Returns HTTP 202 with {"job_id": "..."} so the caller can poll
+    GET /eval-status/{job_id} for results. This avoids proxy timeouts
+    on long-running evaluations.
+    """
+    job_id = _uuid.uuid4().hex
+    async with _jobs_lock:
+        _jobs[job_id] = {"status": "pending", "result": None}
+    asyncio.create_task(_evaluation_background(job_id, request))
+    logger.info(
+        f"[JOB {job_id}] Evaluation accepted (task_id={request.task_id}, "
+        f"num_gpus={request.num_gpus})"
+    )
+    return JSONResponse(status_code=202, content={"job_id": job_id})
+
+
+@app.get("/eval-status/{job_id}")
+async def eval_status(job_id: str):
+    """Poll for evaluation result.
+
+    Returns:
+        - 200 {"status": "pending"}              while evaluation is running
+        - 200 {"status": "done", "result": {...}} when evaluation is complete
+        - 200 {"status": "failed", "result": {...}} on evaluation error
+        - 404 {"error": "unknown job_id"}         if job_id is not found
+    """
+    async with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "unknown job_id"})
+
+    if job["status"] == "pending":
+        return {"status": "pending"}
+
+    result = job["result"]
+    response = EvaluateResponse(
+        task_id=result.get("task_id", 0),
         mfu=result.get("mfu", 0.0),
         tps=result.get("tps", 0.0),
         total_tokens=result.get("total_tokens", 0),
@@ -3228,9 +3298,13 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         success=result.get("success", False),
         error=result.get("error"),
         error_code=result.get("error_code"),
-        seed=result.get("seed", request.seed),
+        seed=result.get("seed", ""),
         diagnostics=result.get("diagnostics", {}),
     )
+    # Clean up to avoid unbounded memory growth
+    async with _jobs_lock:
+        _jobs.pop(job_id, None)
+    return {"status": job["status"], "result": response.model_dump()}
 
 
 # Entry point when running directly (for local testing)
