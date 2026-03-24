@@ -742,7 +742,7 @@ asyncio.run(main())
         deployment = None
         log_stream_task = None
         start_time = time.time()
-        http_timeout = self.timeout + 120
+        http_timeout = max(self.timeout + 600, 1800)
         deploy_name = f"templar-eval-{uuid.uuid4().hex[:8]}"
         try:
             logger.info("[BASILICA] Creating fresh deployment for this run...")
@@ -962,15 +962,30 @@ asyncio.run(main())
         timeout: float,
         post_start: float,
         max_retries: int = 3,
-        backoff_base: float = 10.0,
+        backoff_base: float = 60.0,
     ) -> httpx.Response:
-        """POST with exponential backoff retry on 502/503/504 errors."""
+        """POST with exponential backoff retry on 502/503/504 errors.
+
+        Uses a 60s base backoff (60s, 120s, 240s) to avoid re-sending
+        requests while a long evaluation is still running inside the
+        container.  Each retry gets a fresh httpx client to avoid stale
+        connections.
+        """
         last_response = None
         for attempt in range(max_retries + 1):
             if attempt > 0:
                 wait = backoff_base * (2 ** (attempt - 1))
+                elapsed = time.time() - post_start
+                if elapsed + wait >= timeout:
+                    logger.warning(
+                        f"[BASILICA] Skipping retry {attempt}/{max_retries}: "
+                        f"would exceed timeout ({elapsed:.0f}s elapsed, {wait:.0f}s backoff, "
+                        f"{timeout:.0f}s limit)"
+                    )
+                    break
                 logger.warning(
-                    f"[BASILICA] Retry {attempt}/{max_retries} after {wait:.0f}s backoff..."
+                    f"[BASILICA] Retry {attempt}/{max_retries} after {wait:.0f}s backoff "
+                    f"({elapsed:.0f}s elapsed so far)..."
                 )
                 await asyncio.sleep(wait)
 
@@ -988,7 +1003,10 @@ asyncio.run(main())
             if last_response.status_code not in (502, 503, 504):
                 return last_response
 
-            logger.warning(f"[BASILICA] Got {last_response.status_code} on attempt {attempt + 1}")
+            logger.warning(
+                f"[BASILICA] Got {last_response.status_code} on attempt {attempt + 1} "
+                f"(elapsed: {time.time() - post_start:.0f}s)"
+            )
 
         return last_response
 
