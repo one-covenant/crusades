@@ -2993,21 +2993,58 @@ async def health():
 _current_torchrun: asyncio.subprocess.Process | None = None
 
 
+def _get_descendant_pids(pid: int) -> list[int]:
+    """Recursively collect all descendant PIDs via /proc before killing."""
+    descendants: list[int] = []
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            child_pids = [int(p) for p in f.read().split()]
+        for cpid in child_pids:
+            descendants.append(cpid)
+            descendants.extend(_get_descendant_pids(cpid))
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, OSError):
+        pass
+    return descendants
+
+
 def _kill_torchrun_group(proc: asyncio.subprocess.Process) -> None:
-    """SIGKILL a torchrun process and its entire process group."""
+    """SIGKILL a torchrun process, its process group, AND all descendants.
+
+    torchrun's elastic agent may spawn workers in a different process group
+    than the launcher, so os.killpg alone is insufficient.  We walk
+    /proc/<pid>/children first (before any kill) to collect every descendant,
+    then kill the process group *and* each descendant individually.
+    """
     import signal
 
     if proc.returncode is not None:
         return
+
+    pid = proc.pid
+
+    desc_pids = _get_descendant_pids(pid)
+
     try:
-        pgid = os.getpgid(proc.pid)
+        pgid = os.getpgid(pid)
         os.killpg(pgid, signal.SIGKILL)
         logger.warning(f"Killed torchrun process group (pgid={pgid})")
     except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+    killed_extra = 0
+    for dpid in desc_pids:
         try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
+            os.kill(dpid, signal.SIGKILL)
+            killed_extra += 1
+        except (ProcessLookupError, PermissionError, OSError):
             pass
+    if killed_extra:
+        logger.warning(f"Also killed {killed_extra} descendant processes of torchrun (pid={pid})")
+
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
 
 
 async def _evaluate_via_torchrun(request: EvaluateRequest) -> dict:
@@ -3023,9 +3060,10 @@ async def _evaluate_via_torchrun(request: EvaluateRequest) -> dict:
         )
         _kill_torchrun_group(_current_torchrun)
         try:
-            await _aio.wait_for(_current_torchrun.wait(), timeout=5)
+            await _aio.wait_for(_current_torchrun.wait(), timeout=10)
         except TimeoutError:
-            pass
+            logger.warning("Stale torchrun launcher did not exit within 10s after kill")
+        await _aio.sleep(3)
     _current_torchrun = None
 
     params_path = None
