@@ -3063,7 +3063,7 @@ async def _evaluate_via_torchrun(request: EvaluateRequest) -> dict:
             await _aio.wait_for(_current_torchrun.wait(), timeout=10)
         except TimeoutError:
             logger.warning("Stale torchrun launcher did not exit within 10s after kill")
-        await _aio.sleep(3)
+        await _aio.sleep(30)
     _current_torchrun = None
 
     params_path = None
