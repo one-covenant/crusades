@@ -13,8 +13,6 @@ same Docker container.
     # Using GPUs 4,5,6,7 (adjust --gpus flag for your device IDs):
     docker run --gpus '"device=4,5,6,7"' -it --rm \
         --ipc=host \
-        --memory=400g \
-        --shm-size=64g \
         --ulimit memlock=-1:-1 \
         -e NCCL_P2P_LEVEL=NVL \
         -e NCCL_SHM_USE_CUDA_MEMCPY=1 \
@@ -33,8 +31,6 @@ same Docker container.
     # Using all GPUs (if only 4 available):
     docker run --gpus 4 -it --rm \
         --ipc=host \
-        --memory=400g \
-        --shm-size=64g \
         --ulimit memlock=-1:-1 \
         -e NCCL_P2P_LEVEL=NVL \
         -e NCCL_SHM_USE_CUDA_MEMCPY=1 \

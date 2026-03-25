@@ -264,6 +264,7 @@ class LocalDockerTester:
         self._num_gpus = num_gpus or self._docker_cfg.get("num_gpus", 2)
         self._gpu_devices = gpu_devices
         self._eval_timeout = hparams.get("eval_timeout", 3600)
+        self._session_id = f"arbos-{uuid.uuid4().hex[:12]}"
 
         if project_root is None:
             project_root = Path(__file__).parent.parent
@@ -309,6 +310,8 @@ class LocalDockerTester:
             "docker",
             "run",
             "--rm",
+            "--label",
+            f"arbos.session={self._session_id}",
             "--gpus",
             gpu_flag,
             "--ipc=host",
@@ -378,12 +381,19 @@ class LocalDockerTester:
     def _post_run_cleanup(self):
         """Clean up GPU state and /dev/shm after a Docker run.
 
-        Kills any leftover templar-eval containers and clears NCCL shared
-        memory segments so the next run starts with a clean slate.
+        Only kills containers started by THIS arbos session (identified by
+        the ``arbos.session`` label) so manually launched test containers
+        and other arbos instances are not affected.
         """
         try:
             leftover = subprocess.run(
-                ["docker", "ps", "-q", "--filter", f"ancestor={self._image}"],
+                [
+                    "docker",
+                    "ps",
+                    "-q",
+                    "--filter",
+                    f"label=arbos.session={self._session_id}",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=10,
