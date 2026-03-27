@@ -25,7 +25,7 @@ import bittensor as bt
 import torch
 
 import crusades
-from crusades.affinetes import AffinetesRunner, EvaluationResult
+from crusades.affinetes import AffinetesRunner, BasilicaDeploymentContext, EvaluationResult
 from crusades.chain.commitments import (
     CodeUrlInfo,
     CommitmentReader,
@@ -769,64 +769,111 @@ class Validator(BaseNode):
             else:
                 logger.info(f"   Code hash verified: {actual_hash}")
 
-            # Run evaluations — each run gets a fresh Basilica deployment
-            # (created and destroyed inside runner._evaluate_basilica).
+            # Run evaluations — one Basilica deployment per miner, N runs on it.
+            # Each /evaluate call spawns a fresh torchrun subprocess inside the
+            # container so GPU state is fully clean between runs.  The
+            # deployment is destroyed after all runs (or on failure).
             fatal_error = False
-            for run_idx in range(runs_remaining):
-                current_run = len(my_evals) + run_idx + 1
-                seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}:{secrets.token_hex(16)}"
+            deployment_ctx: BasilicaDeploymentContext | None = None
+            use_shared_deployment = self.affinetes_runner.mode == "basilica" and runs_remaining > 1
 
-                logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
-
-                hard_timeout = hparams.eval_timeout + 3000
-                try:
-                    result = await asyncio.wait_for(
-                        self.affinetes_runner.evaluate(
-                            code=miner_code,
-                            seed=seed,
-                            steps=hparams.eval_steps,
-                            batch_size=hparams.benchmark_batch_size,
-                            sequence_length=hparams.benchmark_sequence_length,
-                            data_samples=hparams.benchmark_data_samples,
-                            task_id=current_run,
-                        ),
-                        timeout=hard_timeout,
-                    )
-                except TimeoutError:
-                    logger.error(f"Run {current_run}: hard timeout after {hard_timeout}s")
-                    result = EvaluationResult(
-                        success=False,
-                        error=f"Hard timeout after {hard_timeout}s",
-                        error_code="HARD_TIMEOUT",
-                        task_id=current_run,
-                    )
-
-                if result.success:
+            try:
+                if use_shared_deployment:
                     logger.info(
-                        f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}"
+                        f"[BASILICA] Creating shared deployment for {runs_remaining} "
+                        f"evaluation runs of {submission.submission_id}"
                     )
-                else:
-                    logger.warning(f"Run {current_run} FAILED: {result.error}")
+                    try:
+                        deployment_ctx = await self.affinetes_runner.create_basilica_deployment()
+                        logger.info(
+                            f"[BASILICA] Shared deployment '{deployment_ctx.name}' ready "
+                            f"— will run {runs_remaining} evals on same GPUs"
+                        )
+                    except Exception as deploy_err:
+                        logger.error(f"[BASILICA] Failed to create shared deployment: {deploy_err}")
+                        logger.info("[BASILICA] Falling back to per-run deployments")
+                        deployment_ctx = None
+                        use_shared_deployment = False
 
-                evaluation = EvaluationModel(
-                    submission_id=submission.submission_id,
-                    evaluator_hotkey=self.hotkey,
-                    mfu=result.mfu,  # MFU is primary metric
-                    tokens_per_second=result.tps,
-                    total_tokens=result.total_tokens,
-                    wall_time_seconds=result.wall_time_seconds,
-                    success=result.success,
-                    error=result.error,
-                )
-                await self.db.save_evaluation(evaluation)
-                self._cleanup_memory()
+                for run_idx in range(runs_remaining):
+                    current_run = len(my_evals) + run_idx + 1
+                    seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}:{secrets.token_hex(16)}"
 
-                if result.is_fatal():
-                    logger.warning(
-                        f"Fatal error detected ({result.error_code}), skipping remaining runs"
+                    logger.info(f"Evaluation run {current_run}/{num_runs} (seed: {seed})")
+
+                    hard_timeout = hparams.eval_timeout + 3000
+                    try:
+                        if deployment_ctx is not None:
+                            result = await asyncio.wait_for(
+                                self.affinetes_runner.evaluate_on_deployment(
+                                    ctx=deployment_ctx,
+                                    code=miner_code,
+                                    seed=seed,
+                                    steps=hparams.eval_steps,
+                                    batch_size=hparams.benchmark_batch_size,
+                                    sequence_length=hparams.benchmark_sequence_length,
+                                    data_samples=hparams.benchmark_data_samples,
+                                    task_id=current_run,
+                                ),
+                                timeout=hard_timeout,
+                            )
+                        else:
+                            result = await asyncio.wait_for(
+                                self.affinetes_runner.evaluate(
+                                    code=miner_code,
+                                    seed=seed,
+                                    steps=hparams.eval_steps,
+                                    batch_size=hparams.benchmark_batch_size,
+                                    sequence_length=hparams.benchmark_sequence_length,
+                                    data_samples=hparams.benchmark_data_samples,
+                                    task_id=current_run,
+                                ),
+                                timeout=hard_timeout,
+                            )
+                    except TimeoutError:
+                        logger.error(f"Run {current_run}: hard timeout after {hard_timeout}s")
+                        result = EvaluationResult(
+                            success=False,
+                            error=f"Hard timeout after {hard_timeout}s",
+                            error_code="HARD_TIMEOUT",
+                            task_id=current_run,
+                        )
+
+                    if result.success:
+                        logger.info(
+                            f"Run {current_run} PASSED: MFU={result.mfu:.2f}% TPS={result.tps:,.2f}"
+                        )
+                    else:
+                        logger.warning(f"Run {current_run} FAILED: {result.error}")
+
+                    evaluation = EvaluationModel(
+                        submission_id=submission.submission_id,
+                        evaluator_hotkey=self.hotkey,
+                        mfu=result.mfu,
+                        tokens_per_second=result.tps,
+                        total_tokens=result.total_tokens,
+                        wall_time_seconds=result.wall_time_seconds,
+                        success=result.success,
+                        error=result.error,
                     )
-                    fatal_error = True
-                    break
+                    await self.db.save_evaluation(evaluation)
+                    self._cleanup_memory()
+
+                    if result.is_fatal():
+                        logger.warning(
+                            f"Fatal error detected ({result.error_code}), skipping remaining runs"
+                        )
+                        fatal_error = True
+                        break
+
+            finally:
+                if deployment_ctx is not None:
+                    logger.info(
+                        f"[BASILICA] Tearing down shared deployment '{deployment_ctx.name}' "
+                        f"after evaluation of {submission.submission_id}"
+                    )
+                    await self.affinetes_runner.destroy_basilica_deployment(deployment_ctx)
+                    deployment_ctx = None
 
             # Persist state (URL already recorded during commitment processing)
             await self._save_state()
