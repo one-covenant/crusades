@@ -34,7 +34,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -2962,11 +2962,36 @@ class Actor:
 app = FastAPI(title="Templar MFU Evaluation", version="2.0.0")
 
 # ---------------------------------------------------------------------------
+# Bearer-token auth — blocks rogue requests from other Basilica tenants
+# ---------------------------------------------------------------------------
+_AUTH_TOKEN: str | None = os.environ.get("EVAL_AUTH_TOKEN")
+if _AUTH_TOKEN:
+    logger.info("Auth token configured — /evaluate and /eval-status require Bearer token")
+else:
+    logger.warning("No EVAL_AUTH_TOKEN set — endpoints are open (local/dev mode)")
+
+
+async def _verify_auth(request: Request) -> None:
+    """FastAPI dependency — rejects unauthenticated requests before body parsing."""
+    if not _AUTH_TOKEN:
+        return
+    auth = request.headers.get("authorization", "")
+    if auth == f"Bearer {_AUTH_TOKEN}":
+        return
+    logger.warning(
+        f"Rejected unauthenticated request: {request.method} {request.url.path} "
+        f"from {request.client.host if request.client else 'unknown'}"
+    )
+    raise HTTPException(status_code=401, detail="unauthorized")
+
+
+# ---------------------------------------------------------------------------
 # In-memory jobs table for async evaluation
 # ---------------------------------------------------------------------------
 # Maps job_id -> {"status": "pending"|"done"|"failed", "result": dict|None}
 _jobs: dict[str, dict] = {}
 _jobs_lock = asyncio.Lock()
+_background_tasks: set[asyncio.Task] = set()
 
 # Global actor instance (reused for efficiency)
 _actor: Actor | None = None
@@ -3287,8 +3312,8 @@ async def _evaluation_background(job_id: str, request: EvaluateRequest) -> None:
         logger.error(f"[JOB {job_id}] Evaluation failed: {exc}")
 
 
-@app.post("/evaluate")
-async def evaluate(request: EvaluateRequest):
+@app.post("/evaluate", dependencies=[Depends(_verify_auth)])
+async def evaluate(body: EvaluateRequest):
     """Accept evaluation request, start in background, return job_id immediately.
 
     Returns HTTP 202 with {"job_id": "..."} so the caller can poll
@@ -3298,15 +3323,16 @@ async def evaluate(request: EvaluateRequest):
     job_id = _uuid.uuid4().hex
     async with _jobs_lock:
         _jobs[job_id] = {"status": "pending", "result": None}
-    asyncio.create_task(_evaluation_background(job_id, request))
+    task = asyncio.create_task(_evaluation_background(job_id, body))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     logger.info(
-        f"[JOB {job_id}] Evaluation accepted (task_id={request.task_id}, "
-        f"num_gpus={request.num_gpus})"
+        f"[JOB {job_id}] Evaluation accepted (task_id={body.task_id}, num_gpus={body.num_gpus})"
     )
     return JSONResponse(status_code=202, content={"job_id": job_id})
 
 
-@app.get("/eval-status/{job_id}")
+@app.get("/eval-status/{job_id}", dependencies=[Depends(_verify_auth)])
 async def eval_status(job_id: str):
     """Poll for evaluation result.
 

@@ -758,6 +758,7 @@ asyncio.run(main())
             )
             logger.info(f"   Deployment name: {deploy_name}")
 
+            auth_token = secrets.token_urlsafe(32)
             client = BasilicaClient()
             deploy_kwargs = {
                 "name": deploy_name,
@@ -770,6 +771,7 @@ asyncio.run(main())
                 "cpu": self.basilica_cpu,
                 "memory": self.basilica_memory,
                 "timeout": 1800,
+                "env": {"EVAL_AUTH_TOKEN": auth_token},
             }
             if self.basilica_interconnect:
                 deploy_kwargs["interconnect"] = self.basilica_interconnect
@@ -824,7 +826,8 @@ asyncio.run(main())
             post_start = time.time()
 
             # ── Step 1: Submit job (returns 202 + job_id immediately) ──
-            async with httpx.AsyncClient(timeout=60) as submit_client:
+            auth_headers = {"Authorization": f"Bearer {auth_token}"}
+            async with httpx.AsyncClient(timeout=60, headers=auth_headers) as submit_client:
                 submit_resp = await submit_client.post(f"{deployment.url}/evaluate", json=payload)
 
             if submit_resp.status_code not in (200, 202):
@@ -852,7 +855,7 @@ asyncio.run(main())
             consecutive_errors = 0
             poll_timeout = httpx.Timeout(connect=10, read=60, write=10, pool=10)
 
-            async with httpx.AsyncClient(timeout=poll_timeout) as poll_client:
+            async with httpx.AsyncClient(timeout=poll_timeout, headers=auth_headers) as poll_client:
                 while True:
                     elapsed = time.time() - post_start
                     if elapsed >= http_timeout:
