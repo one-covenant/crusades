@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import subprocess
 import tempfile
 import time
@@ -176,6 +177,8 @@ class BasilicaTester:
             logger.info(f"  TTL: {self._ttl}s ({self._ttl / 60:.0f} min)")
             logger.info(f"  Name: {deploy_name}")
 
+            auth_token = secrets.token_urlsafe(32)
+            logger.info("Auth token generated for this deployment (EVAL_AUTH_TOKEN set)")
             client = BasilicaClient()
             deploy_kwargs = {
                 "name": deploy_name,
@@ -188,6 +191,7 @@ class BasilicaTester:
                 "cpu": bc.get("cpu", "24"),
                 "memory": bc.get("memory", "480Gi"),
                 "timeout": 1800,
+                "env": {"EVAL_AUTH_TOKEN": auth_token},
             }
             if bc.get("interconnect"):
                 deploy_kwargs["interconnect"] = bc["interconnect"]
@@ -219,7 +223,8 @@ class BasilicaTester:
             logger.info(f"  Timeout budget: {http_timeout}s")
             eval_start = time.time()
 
-            async with httpx.AsyncClient(timeout=60) as submit_client:
+            auth_headers = {"Authorization": f"Bearer {auth_token}"}
+            async with httpx.AsyncClient(timeout=60, headers=auth_headers) as submit_client:
                 submit_resp = await submit_client.post(f"{deployment.url}/evaluate", json=payload)
 
             if submit_resp.status_code not in (200, 202):
@@ -245,7 +250,7 @@ class BasilicaTester:
             consecutive_errors = 0
             poll_timeout = httpx.Timeout(connect=10, read=60, write=10, pool=10)
 
-            async with httpx.AsyncClient(timeout=poll_timeout) as poll_client:
+            async with httpx.AsyncClient(timeout=poll_timeout, headers=auth_headers) as poll_client:
                 while True:
                     elapsed = time.time() - eval_start
                     if elapsed >= http_timeout:
