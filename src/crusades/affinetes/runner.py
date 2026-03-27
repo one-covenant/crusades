@@ -759,6 +759,7 @@ asyncio.run(main())
             logger.info(f"   Deployment name: {deploy_name}")
 
             auth_token = secrets.token_urlsafe(32)
+            logger.info("[BASILICA] Auth token generated for this deployment (EVAL_AUTH_TOKEN set)")
             client = BasilicaClient()
             deploy_kwargs = {
                 "name": deploy_name,
