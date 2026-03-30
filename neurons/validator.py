@@ -38,6 +38,7 @@ from crusades.chain.payment import (
 )
 from crusades.chain.weights import WeightSetter
 from crusades.config import get_config, get_hparams
+from crusades.core.exploit_detector import check_code_for_exploits
 from crusades.core.protocols import SubmissionStatus
 from crusades.logging import setup_loki_logger
 from crusades.storage.database import Database, get_database
@@ -768,6 +769,22 @@ class Validator(BaseNode):
                 continue
             else:
                 logger.info(f"   Code hash verified: {actual_hash}")
+
+            # LLM-based exploit detection (fail-open: never blocks on errors)
+            is_safe, exploit_reason = await check_code_for_exploits(miner_code)
+            if not is_safe:
+                logger.error(
+                    f"   EXPLOIT DETECTED by LLM for {submission.submission_id}: {exploit_reason}"
+                )
+                await self.db.update_submission_code(submission.submission_id, miner_code)
+                await self.db.update_submission_status(
+                    submission.submission_id,
+                    SubmissionStatus.FAILED_EVALUATION,
+                    error_message=f"Exploit detected: {exploit_reason}",
+                )
+                await self._save_state()
+                continue
+            logger.info(f"   Exploit check: {exploit_reason}")
 
             # Run evaluations — one Basilica deployment per miner, N runs on it.
             # Each /evaluate call spawns a fresh torchrun subprocess inside the
