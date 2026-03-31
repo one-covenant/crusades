@@ -1,5 +1,5 @@
 # Usage: docker build --network=host -f environments/templar/Dockerfile -t templar-eval:latest .
-# Run from repo root so hparams.json is accessible
+# Run from repo root so hparams.json and tokenizers/ are accessible
 
 FROM pytorch/pytorch:2.9.0-cuda12.6-cudnn9-runtime
 
@@ -19,16 +19,26 @@ RUN pip install --no-cache-dir --user \
     "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu126torch2.9-cp311-cp311-linux_x86_64.whl"
 
 COPY --chown=appuser:appuser hparams/hparams.json /app/
+COPY --chown=appuser:appuser tokenizers/ /app/tokenizers/
 
 RUN python -c "\
-import json; \
+import json, os; \
 cfg = json.load(open('/app/hparams.json')); \
 model = cfg['benchmark_model_name']; \
+tokenizer_name = cfg.get('benchmark_tokenizer_name', ''); \
 from transformers import AutoModelForCausalLM, AutoTokenizer; \
 print(f'Downloading model: {model}'); \
 AutoModelForCausalLM.from_pretrained(model, torch_dtype='auto', trust_remote_code=True); \
 AutoTokenizer.from_pretrained(model, trust_remote_code=True); \
-print('Model cached')"
+if tokenizer_name and tokenizer_name != model: \
+    local_path = f'/app/tokenizers/{tokenizer_name}'; \
+    if os.path.isdir(local_path): \
+        print(f'Verifying local tokenizer: {local_path}'); \
+        AutoTokenizer.from_pretrained(local_path, trust_remote_code=True); \
+    else: \
+        print(f'Downloading tokenizer: {tokenizer_name}'); \
+        AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True); \
+print('Cached')"
 
 COPY --chown=appuser:appuser environments/templar/cache_dataset.py /app/
 RUN python -c "\

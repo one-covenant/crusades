@@ -9,6 +9,7 @@
     "min_success_rate": 0.3,
 
     "benchmark_model_name": "Qwen/Qwen2.5-7B",
+    "benchmark_tokenizer_name": "google/gemma-3-27b-it",
     "benchmark_dataset_name": "HuggingFaceFW/fineweb",
     "benchmark_dataset_split": "train",
     "benchmark_data_samples": 10000,
