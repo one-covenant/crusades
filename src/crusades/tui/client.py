@@ -398,10 +398,10 @@ class DatabaseClient:
         )
         eval_count = evals["count"] if evals else 0
 
-        # Current evaluation (most recent evaluating submission)
+        # Current evaluation (oldest evaluating submission = the one being processed)
         current = self._query_one(
-            f"SELECT submission_id FROM submissions s WHERE status = 'evaluating'{vf} "
-            f"ORDER BY created_at DESC LIMIT 1"
+            f"SELECT submission_id, miner_uid FROM submissions s WHERE status = 'evaluating'{vf} "
+            f"ORDER BY created_at ASC LIMIT 1"
         )
 
         # Queue stats
@@ -438,7 +438,12 @@ class DatabaseClient:
         return {
             "status": "running" if current else "idle",
             "evaluations_completed_1h": eval_count,
-            "current_evaluation": current["submission_id"] if current else None,
+            "current_evaluation": {
+                "submission_id": current["submission_id"],
+                "miner_uid": current["miner_uid"],
+            }
+            if current
+            else None,
             "uptime": uptime,
             "queued_count": queue["queued_count"],
             "running_count": queue["running_count"],

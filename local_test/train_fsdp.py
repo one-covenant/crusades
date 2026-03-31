@@ -16,7 +16,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.distributed.fsdp import (
     FullStateDictConfig,
     MixedPrecision,
@@ -36,8 +35,6 @@ class InnerStepsResult:
 
 
 def get_strategy():
-    # Pure data-parallel (sharded): every GPU gets different data.
-    # Use "fsdp" for any GPU count, or a dict for a fixed topology.
     return {"dp_size": 4, "tp_size": 1}
 
 
@@ -61,9 +58,31 @@ def _get_wrap_policy(model):
     )
 
 
+def _chunked_cross_entropy(logits, labels, chunk_size=4096):
+    """Compute cross-entropy in chunks to avoid materializing full vocab logits."""
+    logits_flat = logits.reshape(-1, logits.size(-1))
+    labels_flat = labels.reshape(-1)
+    total_loss = 0.0
+    n_chunks = 0
+    for i in range(0, logits_flat.size(0), chunk_size):
+        chunk_logits = logits_flat[i : i + chunk_size]
+        chunk_labels = labels_flat[i : i + chunk_size]
+        mask = chunk_labels != -100
+        if mask.any():
+            total_loss += torch.nn.functional.cross_entropy(
+                chunk_logits[mask], chunk_labels[mask], reduction="sum"
+            )
+            n_chunks += mask.sum()
+    return total_loss / n_chunks.clamp(min=1)
+
+
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     if hasattr(model, "config"):
         model.config.use_cache = False
+
+    # Enable gradient checkpointing to save activation memory
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
 
     is_fsdp = num_gpus > 1
     if is_fsdp:
@@ -76,11 +95,15 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         model = FSDP(
             model,
             auto_wrap_policy=wrap_policy,
-            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
             mixed_precision=mp_policy,
             device_id=device,
             use_orig_params=True,
+            forward_prefetch=True,
+            backward_prefetch=True,
         )
+    else:
+        model = model.to(dtype=torch.bfloat16)
 
     if optimizer is None:
         optimizer = torch.optim.AdamW(
@@ -102,11 +125,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
         outputs = model(input_ids)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            ignore_index=-100,
-        )
+        loss = _chunked_cross_entropy(logits, labels)
 
         loss.backward()
         optimizer.step()
@@ -116,8 +135,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         final_logits = logits.detach()
         final_loss = loss.item()
 
-    # Gather full state dict for weight verification.
-    # FSDP requires the FULL_STATE_DICT context; single-GPU can read directly.
+    # Gather full state dict for weight verification
     if is_fsdp:
         rank = dist.get_rank() if dist.is_initialized() else 0
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
