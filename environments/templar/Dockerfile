@@ -22,23 +22,14 @@ COPY --chown=appuser:appuser hparams/hparams.json /app/
 COPY --chown=appuser:appuser tokenizers/ /app/tokenizers/
 
 RUN python -c "\
-import json, os; \
+import json; \
 cfg = json.load(open('/app/hparams.json')); \
 model = cfg['benchmark_model_name']; \
-tokenizer_name = cfg.get('benchmark_tokenizer_name', ''); \
 from transformers import AutoModelForCausalLM, AutoTokenizer; \
 print(f'Downloading model: {model}'); \
 AutoModelForCausalLM.from_pretrained(model, torch_dtype='auto', trust_remote_code=True); \
 AutoTokenizer.from_pretrained(model, trust_remote_code=True); \
-if tokenizer_name and tokenizer_name != model: \
-    local_path = f'/app/tokenizers/{tokenizer_name}'; \
-    if os.path.isdir(local_path): \
-        print(f'Verifying local tokenizer: {local_path}'); \
-        AutoTokenizer.from_pretrained(local_path, trust_remote_code=True); \
-    else: \
-        print(f'Downloading tokenizer: {tokenizer_name}'); \
-        AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True); \
-print('Cached')"
+print('Model cached')"
 
 COPY --chown=appuser:appuser environments/templar/cache_dataset.py /app/
 RUN python -c "\
