@@ -103,21 +103,30 @@ def _gather_full_state(model):
     return state
 
 
-def _chunked_cross_entropy(logits, labels, chunk_size=4096):
-    """Compute cross-entropy in chunks to avoid materializing full vocab logits."""
-    logits_flat = logits.reshape(-1, logits.size(-1))
+def _chunked_lm_loss(lm_head, hidden_states, labels, chunk_tokens=2048):
+    """Compute LM loss without materializing full [batch, seq, vocab] logits.
+
+    Processes lm_head in chunks over the flattened sequence dimension so peak
+    memory is O(chunk_tokens * vocab) instead of O(batch * seq * vocab).
+    With 262K vocab, this saves ~4-8 GB VRAM.
+    """
+    _b, _s, h = hidden_states.shape
+    hidden_flat = hidden_states.reshape(-1, h)
     labels_flat = labels.reshape(-1)
-    total_loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-    n_valid = torch.tensor(0, device=logits.device, dtype=torch.long)
-    for i in range(0, logits_flat.size(0), chunk_size):
-        chunk_logits = logits_flat[i : i + chunk_size]
-        chunk_labels = labels_flat[i : i + chunk_size]
+    total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+    n_valid = torch.tensor(0, device=hidden_states.device, dtype=torch.long)
+
+    for i in range(0, hidden_flat.size(0), chunk_tokens):
+        chunk_h = hidden_flat[i : i + chunk_tokens]
+        chunk_labels = labels_flat[i : i + chunk_tokens]
+        chunk_logits = lm_head(chunk_h)
         mask = chunk_labels != -100
         if mask.any():
-            total_loss += torch.nn.functional.cross_entropy(
+            total_loss = total_loss + torch.nn.functional.cross_entropy(
                 chunk_logits[mask], chunk_labels[mask], reduction="sum"
             )
-            n_valid += mask.sum()
+            n_valid = n_valid + mask.sum()
+        del chunk_logits
     return total_loss / n_valid.clamp(min=1)
 
 
@@ -161,6 +170,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             fused=False,
         )
 
+    lm_head = model.lm_head
+
     total_tokens = 0
     final_logits = None
     final_loss = 0.0
@@ -170,9 +181,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         input_ids = batch[:, :-1]
         labels = batch[:, 1:]
 
-        outputs = model(input_ids)
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs
-        loss = _chunked_cross_entropy(logits, labels)
+        hidden_states = model.model(input_ids)[0]
+        loss = _chunked_lm_loss(lm_head, hidden_states, labels)
 
         loss.backward()
 
@@ -183,8 +193,10 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         optimizer.zero_grad(set_to_none=True)
 
         total_tokens += batch.numel()
-        final_logits = logits.detach()
+        with torch.no_grad():
+            final_logits = lm_head(hidden_states[:, -1:, :]).detach()
         final_loss = loss.item()
+        del hidden_states
 
     if is_multi:
         rank = dist.get_rank() if dist.is_initialized() else 0
