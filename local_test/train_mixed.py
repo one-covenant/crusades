@@ -194,7 +194,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
         total_tokens += batch.numel()
         with torch.no_grad():
-            final_logits = lm_head(hidden_states[:, -1:, :]).detach()
+            final_logits = lm_head(hidden_states).detach()
         final_loss = loss.item()
         del hidden_states
 
