@@ -1457,7 +1457,7 @@ def _create_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
     )
 
 
-_REFERENCE_MICRO_BATCH_SIZE = 4
+_REFERENCE_MICRO_BATCH_SIZE = 2
 
 
 def _run_reference(
@@ -1470,12 +1470,9 @@ def _run_reference(
 ) -> InnerStepsResult:
     """Run reference implementation for comparison.
 
-    Uses moderately large micro-batches (8) to balance activation memory
-    against floating-point divergence from gradient accumulation.  FSDP
-    FULL_SHARD (single-unit wrap, no auto_wrap_policy) stores activations
-    for ALL layers; micro_batch=16 OOMs on 3B Qwen (36 layers, 11008
-    intermediate).  For batch_size=32, micro_batch=8 means 4 accumulations
-    per step — low rounding compared to micro_batch=2 (16 accumulations).
+    Uses small micro-batches to stay within VRAM. FSDP FULL_SHARD with
+    per-layer wrapping and gradient checkpointing keeps peak memory
+    manageable even with large-vocab tokenizers (262K).
 
     When *ddp_model* is provided, the forward pass uses the distributed
     wrapper (DDP or FSDP) while gradient capture reads from the unwrapped
@@ -2030,6 +2027,10 @@ class Actor:
             )
 
             if _multi_gpu:
+                # Use per-layer wrapping so FSDP only all-gathers one
+                # layer at a time instead of the entire model (~15 GB).
+                import functools
+
                 from torch.distributed.fsdp import (
                     FullStateDictConfig,
                     ShardingStrategy,
@@ -2038,18 +2039,39 @@ class Actor:
                 from torch.distributed.fsdp import (
                     FullyShardedDataParallel as FSDP,  # noqa: N817
                 )
+                from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-                # Gradient checkpointing is incompatible with FULL_SHARD when
-                # the model is wrapped as a single FSDP unit (no auto_wrap_policy):
-                # FSDP frees param storage after forward, but checkpointing tries
-                # to re-access it during backward.  Disable it for the reference.
-                if hasattr(model, "gradient_checkpointing_disable"):
-                    model.gradient_checkpointing_disable()
+                _layer_cls = None
+                if (
+                    hasattr(model, "model")
+                    and hasattr(model.model, "layers")
+                    and len(model.model.layers) > 0
+                ):
+                    _layer_cls = type(model.model.layers[0])
+                elif (
+                    hasattr(model, "transformer")
+                    and hasattr(model.transformer, "h")
+                    and len(model.transformer.h) > 0
+                ):
+                    _layer_cls = type(model.transformer.h[0])
+
+                _ref_wrap_policy = (
+                    functools.partial(
+                        transformer_auto_wrap_policy, transformer_layer_cls={_layer_cls}
+                    )
+                    if _layer_cls
+                    else None
+                )
+
+                if hasattr(model, "gradient_checkpointing_enable"):
+                    model.gradient_checkpointing_enable()
 
                 ref_fsdp = FSDP(
                     model,
+                    auto_wrap_policy=_ref_wrap_policy,
                     sharding_strategy=ShardingStrategy.FULL_SHARD,
                     device_id=torch.device(f"cuda:{_LOCAL_RANK}"),
+                    forward_prefetch=True,
                 )
                 optimizer_ref = _create_optimizer(ref_fsdp)
 
