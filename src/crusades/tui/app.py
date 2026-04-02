@@ -1,6 +1,7 @@
 """Crusades TUI - Terminal dashboard for miners."""
 
 import argparse
+import statistics
 import sys
 import time
 
@@ -463,14 +464,13 @@ def create_evaluations_table(detail: SubmissionDetail) -> Panel:
     table.add_column("Status", justify="center", width=6)
     table.add_column("Time", justify="right", width=10)
 
-    total_mfu = 0.0
-    count = 0
+    mfu_scores: list[float] = []
 
     for idx, eval_data in enumerate(detail.evaluations, 1):
         mfu = eval_data.get("mfu", 0)
         tps = eval_data.get("tokens_per_second", 0)
-        total_mfu += mfu
-        count += 1
+        if mfu:
+            mfu_scores.append(mfu)
 
         success = eval_data.get("success", False)
         status_display = "[green]✓[/green]" if success else "[red]✗[/red]"
@@ -488,8 +488,8 @@ def create_evaluations_table(detail: SubmissionDetail) -> Panel:
     if not detail.evaluations:
         table.add_row("-", "-", "-", "-", "-", "-", "-")
 
-    avg_mfu = total_mfu / count if count > 0 else 0
-    title = f"[bold]Evaluations[/bold] (Avg MFU: [green]{avg_mfu:.2f}%[/green])"
+    median_mfu = statistics.median_low(mfu_scores) if mfu_scores else 0
+    title = f"[bold]Evaluations[/bold] (Median MFU: [green]{median_mfu:.2f}%[/green])"
 
     return Panel(table, title=title, border_style="cyan")
 
