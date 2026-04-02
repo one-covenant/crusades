@@ -25,7 +25,12 @@ import bittensor as bt
 import torch
 
 import crusades
-from crusades.affinetes import AffinetesRunner, BasilicaDeploymentContext, EvaluationResult
+from crusades.affinetes import (
+    AffinetesRunner,
+    BasilicaDeploymentContext,
+    EvaluationResult,
+    cleanup_stale_eval_containers,
+)
 from crusades.chain.commitments import (
     CodeUrlInfo,
     CommitmentReader,
@@ -155,6 +160,11 @@ class Validator(BaseNode):
                 netuid=hparams.netuid,
                 network=config.subtensor_network,
             )
+
+        # Kill any leftover Docker eval containers from previous sessions
+        # to reclaim GPUs before launching new evaluations
+        if self.affinetes_mode == "docker":
+            cleanup_stale_eval_containers()
 
         # Affinetes runner - all config comes from validated Pydantic models
         self.affinetes_runner = AffinetesRunner(
@@ -1304,6 +1314,7 @@ class Validator(BaseNode):
 
     async def cleanup(self) -> None:
         """Cleanup resources."""
+        AffinetesRunner.stop_current_docker_eval()
         await self._save_state()
         await super().cleanup()
         if self.db:
