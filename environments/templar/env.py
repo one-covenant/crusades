@@ -377,8 +377,8 @@ def _get_hparams_tokenizer_name() -> str | None:
                 if name:
                     logger.info(f"Using tokenizer from hparams: {name}")
                     return name
-            except Exception:
-                pass
+            except (json.JSONDecodeError, KeyError, OSError) as exc:
+                logger.warning(f"Failed to read tokenizer config from {p}: {exc}")
 
     _CACHE["_hparams_tokenizer_name_resolved"] = ""
     return None
