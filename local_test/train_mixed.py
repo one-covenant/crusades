@@ -20,7 +20,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -42,7 +41,7 @@ def get_strategy():
 
 
 def _apply_tp(model, tp_mesh):
-    for name, module in model.named_modules():
+    for _name, module in model.named_modules():
         if hasattr(module, "q_proj") and hasattr(module, "o_proj"):
             parallelize_module(
                 module,
@@ -104,9 +103,32 @@ def _gather_full_state(model):
     return state
 
 
+def _chunked_cross_entropy(logits, labels, chunk_size=4096):
+    """Compute cross-entropy in chunks to avoid materializing full vocab logits."""
+    logits_flat = logits.reshape(-1, logits.size(-1))
+    labels_flat = labels.reshape(-1)
+    total_loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+    n_valid = torch.tensor(0, device=logits.device, dtype=torch.long)
+    for i in range(0, logits_flat.size(0), chunk_size):
+        chunk_logits = logits_flat[i : i + chunk_size]
+        chunk_labels = labels_flat[i : i + chunk_size]
+        mask = chunk_labels != -100
+        if mask.any():
+            total_loss += torch.nn.functional.cross_entropy(
+                chunk_logits[mask], chunk_labels[mask], reduction="sum"
+            )
+            n_valid += mask.sum()
+    return total_loss / n_valid.clamp(min=1)
+
+
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     if hasattr(model, "config"):
         model.config.use_cache = False
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+
+    model = model.to(dtype=torch.bfloat16)
 
     strategy = get_strategy()
     expected_gpus = strategy["dp_size"] * strategy["tp_size"]
@@ -119,7 +141,6 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
     is_multi = num_gpus > 1
     dp_pg = None
-    dp_size = 1
 
     if is_multi:
         dp_size = strategy["dp_size"]
@@ -151,11 +172,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
         outputs = model(input_ids)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            ignore_index=-100,
-        )
+        loss = _chunked_cross_entropy(logits, labels)
 
         loss.backward()
 

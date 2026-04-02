@@ -1,16 +1,15 @@
-# Optimized single-GPU train.py — ~66-68% MFU on A100-80GB-SXM4
+# Reference: Single-GPU strategy (no get_strategy)
 #
-# Key optimizations:
-#   - torch.compile with reduce-overhead mode
-#   - torch.autocast bf16
-#   - Pre-fetched batches to avoid iterator overhead in timed loop
-#   - Gradient checkpointing disabled (more VRAM but faster)
-#   - Local references to optimizer.step / zero_grad
+# NOTE: Only works when the validator uses docker_num_gpus=1.
+# With docker_num_gpus=4 (current production), miners MUST use a multi-GPU
+# strategy (FSDP, DDP, TP, or mixed).  This file is kept as a reference.
+#
+# Memory-safe for large-vocab tokenizers (262K) via chunked cross-entropy
+# and gradient checkpointing.
 
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
 
 @dataclass
@@ -20,91 +19,65 @@ class InnerStepsResult:
     final_loss: float
 
 
-_COMPILED_FN = {}
-_PREPARED_MODEL_IDS = set()
-
-
-def _prepare_model(model):
-    model_id = id(model)
-    if model_id in _PREPARED_MODEL_IDS:
-        return
-    _PREPARED_MODEL_IDS.add(model_id)
-
-    if hasattr(model, "gradient_checkpointing_disable"):
-        model.gradient_checkpointing_disable()
-
-    if hasattr(model, "config"):
-        model.config.use_cache = False
-        try:
-            model.config.output_hidden_states = False
-        except Exception:
-            pass
-        try:
-            model.config.output_attentions = False
-        except Exception:
-            pass
-
-
-def _get_compiled_fn(model):
-    key = id(model)
-    cached = _COMPILED_FN.get(key)
-    if cached is not None:
-        return cached
-
-    ce_loss = F.cross_entropy
-
-    def fwd_bwd(input_ids, labels):
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            logits = model(input_ids).logits
-            loss = ce_loss(
-                logits.reshape(-1, logits.size(-1)),
-                labels.reshape(-1),
-                ignore_index=-100,
+def _chunked_cross_entropy(logits, labels, chunk_size=4096):
+    """Compute cross-entropy in chunks to avoid materializing full vocab logits."""
+    logits_flat = logits.reshape(-1, logits.size(-1))
+    labels_flat = labels.reshape(-1)
+    total_loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+    n_valid = torch.tensor(0, device=logits.device, dtype=torch.long)
+    for i in range(0, logits_flat.size(0), chunk_size):
+        chunk_logits = logits_flat[i : i + chunk_size]
+        chunk_labels = labels_flat[i : i + chunk_size]
+        mask = chunk_labels != -100
+        if mask.any():
+            total_loss += torch.nn.functional.cross_entropy(
+                chunk_logits[mask], chunk_labels[mask], reduction="sum"
             )
-        loss.backward()
-        return logits, loss
-
-    try:
-        compiled = torch.compile(fwd_bwd, mode="reduce-overhead", dynamic=False)
-    except Exception:
-        compiled = fwd_bwd
-
-    _COMPILED_FN[key] = compiled
-    return compiled
+            n_valid += mask.sum()
+    return total_loss / n_valid.clamp(min=1)
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
-    _prepare_model(model)
-    step_fn = _get_compiled_fn(model)
+    if hasattr(model, "config"):
+        model.config.use_cache = False
 
-    all_inputs = [None] * num_steps
-    all_labels = [None] * num_steps
-    tokens_per_batch = 0
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
 
-    for i in range(num_steps):
-        batch = next(data_iterator).to(device, dtype=torch.long, non_blocking=True)
-        all_inputs[i] = batch[:, :-1].contiguous()
-        all_labels[i] = batch[:, 1:].contiguous()
-        tokens_per_batch = batch.numel()
+    model = model.to(dtype=torch.bfloat16)
 
-    opt_step = optimizer.step
-    opt_zero = optimizer.zero_grad
-    total_tokens = num_steps * tokens_per_batch
-    last_step = num_steps - 1
+    if optimizer is None:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=1e-4,
+            weight_decay=0.1,
+            betas=(0.9, 0.95),
+            fused=True,
+        )
+
+    total_tokens = 0
     final_logits = None
-    final_loss_val = 0.0
+    final_loss = 0.0
 
     for step in range(num_steps):
-        logits, loss = step_fn(all_inputs[step], all_labels[step])
-        opt_step()
-        opt_zero(set_to_none=True)
+        batch = next(data_iterator).to(device, dtype=torch.long)
+        input_ids = batch[:, :-1]
+        labels = batch[:, 1:]
 
-        if step == last_step:
-            final_logits = logits.detach()
-            final_loss_val = loss.item()
+        outputs = model(input_ids)
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs
+        loss = _chunked_cross_entropy(logits, labels)
+
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        total_tokens += batch.numel()
+        final_logits = logits.detach()
+        final_loss = loss.item()
 
     return InnerStepsResult(
         final_logits=final_logits,
         total_tokens=total_tokens,
-        final_loss=final_loss_val,
+        final_loss=final_loss,
     )
