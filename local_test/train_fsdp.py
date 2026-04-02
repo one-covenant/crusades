@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import (
+    BackwardPrefetch,
     FullStateDictConfig,
     MixedPrecision,
     ShardingStrategy,
@@ -62,8 +63,8 @@ def _chunked_cross_entropy(logits, labels, chunk_size=4096):
     """Compute cross-entropy in chunks to avoid materializing full vocab logits."""
     logits_flat = logits.reshape(-1, logits.size(-1))
     labels_flat = labels.reshape(-1)
-    total_loss = 0.0
-    n_chunks = 0
+    total_loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+    n_valid = torch.tensor(0, device=logits.device, dtype=torch.long)
     for i in range(0, logits_flat.size(0), chunk_size):
         chunk_logits = logits_flat[i : i + chunk_size]
         chunk_labels = labels_flat[i : i + chunk_size]
@@ -72,8 +73,8 @@ def _chunked_cross_entropy(logits, labels, chunk_size=4096):
             total_loss += torch.nn.functional.cross_entropy(
                 chunk_logits[mask], chunk_labels[mask], reduction="sum"
             )
-            n_chunks += mask.sum()
-    return total_loss / n_chunks.clamp(min=1)
+            n_valid += mask.sum()
+    return total_loss / n_valid.clamp(min=1)
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
@@ -100,7 +101,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             device_id=device,
             use_orig_params=True,
             forward_prefetch=True,
-            backward_prefetch=True,
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
         )
     else:
         model = model.to(dtype=torch.bfloat16)
