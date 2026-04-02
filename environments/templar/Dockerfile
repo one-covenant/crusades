@@ -1,5 +1,5 @@
 # Usage: docker build --network=host -f environments/templar/Dockerfile -t templar-eval:latest .
-# Run from repo root so hparams.json is accessible
+# Run from repo root so hparams.json and tokenizers/ are accessible
 
 FROM pytorch/pytorch:2.9.0-cuda12.6-cudnn9-runtime
 
@@ -19,6 +19,7 @@ RUN pip install --no-cache-dir --user \
     "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu126torch2.9-cp311-cp311-linux_x86_64.whl"
 
 COPY --chown=appuser:appuser hparams/hparams.json /app/
+COPY --chown=appuser:appuser tokenizers/ /app/tokenizers/
 
 RUN python -c "\
 import json; \

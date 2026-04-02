@@ -25,7 +25,12 @@ import bittensor as bt
 import torch
 
 import crusades
-from crusades.affinetes import AffinetesRunner, BasilicaDeploymentContext, EvaluationResult
+from crusades.affinetes import (
+    AffinetesRunner,
+    BasilicaDeploymentContext,
+    EvaluationResult,
+    cleanup_stale_eval_containers,
+)
 from crusades.chain.commitments import (
     CodeUrlInfo,
     CommitmentReader,
@@ -38,6 +43,7 @@ from crusades.chain.payment import (
 )
 from crusades.chain.weights import WeightSetter
 from crusades.config import get_config, get_hparams
+from crusades.core.exploit_detector import check_code_for_exploits
 from crusades.core.protocols import SubmissionStatus
 from crusades.logging import setup_loki_logger
 from crusades.storage.database import Database, get_database
@@ -154,6 +160,11 @@ class Validator(BaseNode):
                 netuid=hparams.netuid,
                 network=config.subtensor_network,
             )
+
+        # Kill any leftover Docker eval containers from previous sessions
+        # to reclaim GPUs before launching new evaluations
+        if self.affinetes_mode == "docker":
+            cleanup_stale_eval_containers()
 
         # Affinetes runner - all config comes from validated Pydantic models
         self.affinetes_runner = AffinetesRunner(
@@ -769,6 +780,22 @@ class Validator(BaseNode):
             else:
                 logger.info(f"   Code hash verified: {actual_hash}")
 
+            # LLM-based exploit detection (fail-open: never blocks on errors)
+            is_safe, exploit_reason = await check_code_for_exploits(miner_code)
+            if not is_safe:
+                logger.error(
+                    f"   EXPLOIT DETECTED by LLM for {submission.submission_id}: {exploit_reason}"
+                )
+                await self.db.update_submission_code(submission.submission_id, miner_code)
+                await self.db.update_submission_status(
+                    submission.submission_id,
+                    SubmissionStatus.FAILED_EVALUATION,
+                    error_message=f"Exploit detected: {exploit_reason}",
+                )
+                await self._save_state()
+                continue
+            logger.info(f"   Exploit check: {exploit_reason}")
+
             # Run evaluations — one Basilica deployment per miner, N runs on it.
             # Each /evaluate call spawns a fresh torchrun subprocess inside the
             # container so GPU state is fully clean between runs.  The
@@ -1287,6 +1314,7 @@ class Validator(BaseNode):
 
     async def cleanup(self) -> None:
         """Cleanup resources."""
+        AffinetesRunner.stop_current_docker_eval()
         await self._save_state()
         await super().cleanup()
         if self.db:

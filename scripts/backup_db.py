@@ -5,7 +5,7 @@ import logging
 import sqlite3
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import boto3
@@ -69,7 +69,7 @@ def main() -> int:
             log.error("Missing %s in .env", key)
             return 1
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H%M")
     backup_name = f"crusades_{timestamp}.db"
 
     # 1. Safe SQLite snapshot to a temp file (safe even while validator is writing)
