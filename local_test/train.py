@@ -1,70 +1,15 @@
-# High-MFU FSDP strategy for 262K vocab (google/gemma-3-27b-it tokenizer)
+# Reference: Single-GPU strategy (no get_strategy)
 #
-# Adapted from the 151K-vocab version that achieved ~75% MFU.
-# Key change: bypasses HuggingFace's .float() upcast on logits, keeping them
-# in bf16 to avoid the 17 GB fp32 logits tensor (262K * B*S * 4).  In bf16
-# the logits cost ~8.6 GB — comparable to the 151K fp32 case (~10 GB).
+# NOTE: Only works when the validator uses docker_num_gpus=1.
+# With docker_num_gpus=4 (current production), miners MUST use a multi-GPU
+# strategy (FSDP, DDP, TP, or mixed).  This file is kept as a reference.
 #
-# Topology: dp_size=4, tp_size=1  (FSDP FULL_SHARD across 4 GPUs)
+# Memory-safe for large-vocab tokenizers (262K) via chunked cross-entropy
+# and gradient checkpointing.
 
-import functools
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
-import torch.nn.functional as F
-import torch.utils.checkpoint as ckpt
-from torch.distributed.fsdp import (
-    BackwardPrefetch,
-    MixedPrecision,
-    ShardingStrategy,
-)
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-
-try:
-    from torch.utils.checkpoint import create_selective_checkpoint_contexts, CheckpointPolicy
-
-    _HAS_SAC = True
-except ImportError:
-    _HAS_SAC = False
-
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.set_float32_matmul_precision("high")
-
-try:
-    torch.cuda.memory._set_allocator_settings("expandable_segments:True")
-except Exception:
-    pass
-
-try:
-    import torch._inductor.config as _ind_cfg
-
-    _ind_cfg.coordinate_descent_tuning = True
-    _ind_cfg.triton.unique_kernel_names = True
-    _ind_cfg.fx_graph_cache = True
-    _ind_cfg.triton.cudagraph_trees = True
-    _ind_cfg.epilogue_fusion = True
-    _ind_cfg.shape_padding = True
-except Exception:
-    pass
-
-try:
-    import torch._dynamo.config as _dyn_cfg
-
-    _dyn_cfg.cache_size_limit = 128
-    _dyn_cfg.suppress_errors = True
-    _dyn_cfg.assume_static_by_default = True
-    _dyn_cfg.automatic_dynamic_shapes = False
-    _dyn_cfg.optimize_ddp = True
-except Exception:
-    pass
-
-from flash_attn.losses.cross_entropy import CrossEntropyLoss as _FlashCELoss
-
-_flash_ce_inst = _FlashCELoss(ignore_index=-100)
 
 
 @dataclass
@@ -72,126 +17,34 @@ class InnerStepsResult:
     final_logits: torch.Tensor
     total_tokens: int
     final_loss: float
-    final_state: dict | None = None
 
 
-_PREPARED = set()
-
-# 262K vocab needs more activation-memory headroom than 151K.
-# Checkpoint 20 of 28 layers (SAC), leave 8 un-checkpointed for throughput.
-# MFU cost vs _UNCHECKPOINT_LAST_N=16: ~2-3 pp (SAC only recomputes non-mm ops).
-_UNCHECKPOINT_LAST_N = 8
-
-
-def _sac_policy(ctx, func, *args, **kwargs):
-    if func in {torch.ops.aten.mm.default, torch.ops.aten.addmm.default}:
-        return CheckpointPolicy.MUST_SAVE
-    return CheckpointPolicy.PREFER_RECOMPUTE
-
-
-class _AllSAC:
-    def __init__(self, num_ckpt_layers):
-        self.num_ckpt_layers = num_ckpt_layers
-        self._count = 0
-
-    def __call__(self, fn, *args, **kwargs):
-        self._count += 1
-        ctx_fn = functools.partial(create_selective_checkpoint_contexts, _sac_policy)
-        return ckpt.checkpoint(fn, *args, use_reentrant=False, context_fn=ctx_fn, **kwargs)
-
-
-def get_strategy():
-    return {"dp_size": 4, "tp_size": 1}
-
-
-def _prepare_model(model):
-    mid = id(model)
-    if mid in _PREPARED:
-        return
-    _PREPARED.add(mid)
-    if hasattr(model, "config"):
-        model.config.use_cache = False
-        if hasattr(model.config, "output_hidden_states"):
-            model.config.output_hidden_states = False
-        if hasattr(model.config, "output_attentions"):
-            model.config.output_attentions = False
-
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        num_layers = len(model.model.layers)
-        num_ckpt_layers = num_layers - _UNCHECKPOINT_LAST_N
-
-        for idx, layer in enumerate(model.model.layers):
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
-                layer.self_attn.layer_idx = 0
-            if hasattr(layer, "gradient_checkpointing") and idx >= num_ckpt_layers:
-                layer.gradient_checkpointing = False
-
-        if _HAS_SAC and num_ckpt_layers > 0:
-            if hasattr(model, "gradient_checkpointing_enable"):
-                model.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={
-                        "use_reentrant": False,
-                        "preserve_rng_state": False,
-                    }
-                )
-            for idx, layer in enumerate(model.model.layers):
-                if hasattr(layer, "gradient_checkpointing") and idx >= num_ckpt_layers:
-                    layer.gradient_checkpointing = False
-            model.model._gradient_checkpointing_func = _AllSAC(num_ckpt_layers)
-
-    # HuggingFace CausalLM models upcast logits to fp32 inside forward().
-    # With 262K vocab @ B=16, S=1024 that wastes ~8.6 GB per GPU.
-    # Staying in bf16 keeps peak memory comparable to the 151K fp32 case.
-    #
-    # lm_head is wrapped with @torch._dynamo.disable so that torch.compile
-    # creates a graph break right before it.  The backbone is compiled
-    # (standard FSDP+compile path); the lm_head runs eagerly so the
-    # inductor never allocates the [B*S, V] backward buffer (~8 GB).
-    if hasattr(model, "lm_head") and hasattr(model, "model"):
-        _backbone = model.model
-        _head = model.lm_head
-
-        @torch._dynamo.disable(recursive=False)
-        def _eager_lm_head(hidden):
-            return _head(hidden)
-
-        def _bf16_forward(input_ids, **kwargs):
-            return _eager_lm_head(_backbone(input_ids)[0])
-
-        model.forward = _bf16_forward
-
-
-def _get_wrap_policy(model):
-    layer_cls = set()
-    if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
-        layer_cls.add(type(model.model.layers[0]))
-    return functools.partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_cls)
+def _chunked_cross_entropy(logits, labels, chunk_size=4096):
+    """Compute cross-entropy in chunks to avoid materializing full vocab logits."""
+    logits_flat = logits.reshape(-1, logits.size(-1))
+    labels_flat = labels.reshape(-1)
+    total_loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+    n_valid = torch.tensor(0, device=logits.device, dtype=torch.long)
+    for i in range(0, logits_flat.size(0), chunk_size):
+        chunk_logits = logits_flat[i : i + chunk_size]
+        chunk_labels = labels_flat[i : i + chunk_size]
+        mask = chunk_labels != -100
+        if mask.any():
+            total_loss += torch.nn.functional.cross_entropy(
+                chunk_logits[mask], chunk_labels[mask], reduction="sum"
+            )
+            n_valid += mask.sum()
+    return total_loss / n_valid.clamp(min=1)
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
-    _prepare_model(model)
+    if hasattr(model, "config"):
+        model.config.use_cache = False
 
-    bf16_policy = MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
-        buffer_dtype=torch.bfloat16,
-    )
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
 
-    model = FSDP(
-        model,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        auto_wrap_policy=_get_wrap_policy(model),
-        mixed_precision=bf16_policy,
-        device_id=device,
-        use_orig_params=True,
-        forward_prefetch=True,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-    )
-
-    def fwd_fn(input_ids):
-        return model(input_ids)
-
-    compiled_fwd = torch.compile(fwd_fn, mode="default", dynamic=False)
+    model = model.to(dtype=torch.bfloat16)
 
     if optimizer is None:
         optimizer = torch.optim.AdamW(
@@ -202,47 +55,29 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             fused=True,
         )
 
-    all_inputs = []
-    all_labels = []
-    tokens_per_batch = 0
-    for _ in range(num_steps):
-        batch = next(data_iterator).to(device, dtype=torch.long, non_blocking=True)
-        all_inputs.append(batch[:, :-1].contiguous())
-        all_labels.append(batch[:, 1:].contiguous())
-        tokens_per_batch = batch.numel()
-
-    torch.cuda.synchronize(device)
-
-    total_tokens = num_steps * tokens_per_batch
-    opt_step = optimizer.step
-    opt_zero = optimizer.zero_grad
-    _ce = _flash_ce_inst
+    total_tokens = 0
+    final_logits = None
+    final_loss = 0.0
 
     for step in range(num_steps):
-        logits = compiled_fwd(all_inputs[step])
-        loss = _ce(logits.reshape(-1, logits.size(-1)), all_labels[step].reshape(-1))
+        batch = next(data_iterator).to(device, dtype=torch.long)
+        input_ids = batch[:, :-1]
+        labels = batch[:, 1:]
+
+        outputs = model(input_ids)
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs
+        loss = _chunked_cross_entropy(logits, labels)
+
         loss.backward()
-        opt_step()
-        opt_zero(set_to_none=True)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
-    final_logits = logits.detach()
-    final_loss = loss.item()
-
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    full_state = None
-    with FSDP.summon_full_params(model, writeback=False):
-        raw = model.module if hasattr(model, "module") else model
-        if rank == 0:
-            sd = raw.state_dict()
-            pinned = {k: torch.empty_like(v, device="cpu").pin_memory() for k, v in sd.items()}
-            for k, v in sd.items():
-                pinned[k].copy_(v, non_blocking=True)
-            torch.cuda.synchronize(device)
-            full_state = pinned
+        total_tokens += batch.numel()
+        final_logits = logits.detach()
+        final_loss = loss.item()
 
     return InnerStepsResult(
         final_logits=final_logits,
         total_tokens=total_tokens,
         final_loss=final_loss,
-        final_state=full_state,
     )
