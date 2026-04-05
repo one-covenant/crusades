@@ -12,11 +12,9 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from crusades import COMPETITION_VERSION
 from crusades.tui.client import (
     CrusadesClient,
     CrusadesData,
-    DatabaseClient,
     MockClient,
     SubmissionDetail,
     format_time_ago,
@@ -602,24 +600,17 @@ def get_key_nonblocking(timeout: float = 0.1) -> str | None:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def run_tui(base_url: str, refresh_interval: int, demo: bool = False, db_path: str | None = None):
+def run_tui(base_url: str, refresh_interval: int, demo: bool = False):
     """Run the interactive TUI."""
     import termios
-    from pathlib import Path
 
     # Save terminal state
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
 
-    # Select client based on mode (filter by competition version)
-    competition_version = COMPETITION_VERSION
-
     if demo:
         client_class = MockClient
         client_kwargs = {}
-    elif db_path and Path(db_path).exists():
-        client_class = DatabaseClient
-        client_kwargs = {"db_path": db_path, "spec_version": competition_version}
     else:
         client_class = CrusadesClient
         client_kwargs = {"base_url": base_url}
@@ -820,22 +811,15 @@ Controls:
     q              Quit
 
 Examples:
-  %(prog)s                              # Auto-detect: local DB or fall back to API
-  %(prog)s --url http://IP:8080         # Connect to validator's API (for miners)
-  %(prog)s --db /path/to/crusades.db    # Read from validator's database directly
-  %(prog)s --demo                       # Run with mock data for demo
+  %(prog)s --url http://IP:8080    # Connect to validator's API
+  %(prog)s --demo                  # Run with mock data for demo
         """,
     )
 
     parser.add_argument(
-        "--db",
-        default="crusades.db",
-        help="Path to validator's SQLite database (default: crusades.db, auto-detected)",
-    )
-    parser.add_argument(
         "--url",
         default="http://localhost:8000",
-        help="Crusades API base URL (used when local DB not found)",
+        help="Crusades API base URL (default: http://localhost:8000)",
     )
     parser.add_argument(
         "--refresh",
@@ -851,15 +835,10 @@ Examples:
 
     args = parser.parse_args()
 
-    from pathlib import Path
-
     if not args.demo:
-        if Path(args.db).exists():
-            console.print(f"[green]Using local database:[/green] {args.db}")
-        else:
-            console.print(f"[yellow]No local DB found,[/yellow] connecting to API: {args.url}")
+        console.print(f"[cyan]Connecting to API:[/cyan] {args.url}")
 
-    run_tui(args.url, args.refresh, demo=args.demo, db_path=args.db)
+    run_tui(args.url, args.refresh, demo=args.demo)
 
 
 if __name__ == "__main__":
