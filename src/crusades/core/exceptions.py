@@ -28,6 +28,16 @@ class EvaluationErrorCode(StrEnum):
     SEQUENCE_TRUNCATION = "sequence_truncation"
     WEIGHT_MISMATCH = "weight_mismatch"
 
+    # MFU threshold failures
+    INSUFFICIENT_MFU = "insufficient_mfu"
+    IMPLAUSIBLE_MFU = "implausible_mfu"
+
+    # Tampering / anti-cheat
+    TIMER_TAMPERING = "timer_tampering"
+    CONFIG_TAMPERING = "config_tampering"
+    DEFERRED_COMPUTATION = "deferred_computation"
+    FUNCTIONAL_TAMPERING = "functional_tampering"
+
     # Runtime errors
     TIMEOUT = "timeout"
     OUT_OF_MEMORY = "out_of_memory"
@@ -57,6 +67,12 @@ class EvaluationErrorCode(StrEnum):
             cls.INVALID_LOGITS_SHAPE,
             cls.SEQUENCE_TRUNCATION,
             cls.WEIGHT_MISMATCH,
+            cls.INSUFFICIENT_MFU,
+            cls.IMPLAUSIBLE_MFU,
+            cls.TIMER_TAMPERING,
+            cls.CONFIG_TAMPERING,
+            cls.DEFERRED_COMPUTATION,
+            cls.FUNCTIONAL_TAMPERING,
         }
 
     @classmethod
@@ -74,16 +90,25 @@ class EvaluationErrorCode(StrEnum):
             cls.MISSING_INNER_STEPS,
             cls.INVALID_RETURN_TYPE,
             # Code-level checks - deterministic regardless of data
-            cls.INSUFFICIENT_TRAINABLE_PARAMS,  # Code freezes layers or not
-            cls.NO_GRADIENTS_CAPTURED,  # Code calls optimizer.step() or not
-            cls.MISSING_LOGITS,  # Code returns None or not
-            cls.INVALID_LOGITS_SHAPE,  # Code returns wrong shape or not
-            cls.SEQUENCE_TRUNCATION,  # Code truncates or not
+            cls.INSUFFICIENT_TRAINABLE_PARAMS,
+            cls.NO_GRADIENTS_CAPTURED,
+            cls.MISSING_LOGITS,
+            cls.INVALID_LOGITS_SHAPE,
+            cls.SEQUENCE_TRUNCATION,
+            # MFU is determined by code quality, not random seed
+            cls.INSUFFICIENT_MFU,
+            cls.IMPLAUSIBLE_MFU,
+            # Tampering is always deterministic - code either cheats or not
+            cls.TIMER_TAMPERING,
+            cls.CONFIG_TAMPERING,
+            cls.DEFERRED_COMPUTATION,
+            cls.FUNCTIONAL_TAMPERING,
             # NOT fatal (data-dependent, can vary between seeds):
             # - INSUFFICIENT_PARAMS_CHANGED (borderline with few steps)
             # - GRADIENT_RELATIVE_ERROR_FAILED (varies with data)
             # - GRADIENT_COVERAGE_FAILED (borderline)
             # - LOSS_MISMATCH (varies with data)
+            # - WEIGHT_MISMATCH (varies with bfloat16 non-determinism)
             # - TOKEN_COUNT_MISMATCH (should be deterministic but edge cases)
         }
 
