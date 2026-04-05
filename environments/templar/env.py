@@ -201,6 +201,7 @@ class ParallelismConfig:
 
     dp_size: int
     tp_size: int
+    pp_size: int = 1
 
 
 def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismConfig | None:
@@ -210,8 +211,10 @@ def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismC
 
     - **Legacy string**: ``return "ddp"`` / ``"fsdp"`` / ``"tp"`` — converted
       to ``ParallelismConfig`` using *num_gpus*.
-    - **Dict literal**: ``return {"dp_size": 2, "tp_size": 2}`` — parsed
+    - **Dict literal**: ``return {"dp_size": 2, "tp_size": 2}`` or
+      ``return {"dp_size": 2, "tp_size": 1, "pp_size": 2}`` — parsed
       directly.  Only simple ``ast.Constant`` keys/values are accepted.
+      ``pp_size`` defaults to 1 when omitted.
 
     Returns ``None`` when the function is absent, unparseable, or contains
     non-literal expressions.
@@ -250,8 +253,9 @@ def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismC
                 if "dp_size" in d and "tp_size" in d:
                     dp = d["dp_size"]
                     tp = d["tp_size"]
-                    if dp >= 1 and tp >= 1:
-                        return ParallelismConfig(dp_size=dp, tp_size=tp)
+                    pp = d.get("pp_size", 1)
+                    if dp >= 1 and tp >= 1 and pp >= 1:
+                        return ParallelismConfig(dp_size=dp, tp_size=tp, pp_size=pp)
 
     return None
 
@@ -391,6 +395,7 @@ def _resolve_tokenizer_path(tokenizer_name: str) -> str:
         logger.info(f"Loading tokenizer from local path: {local}")
         return str(local)
     return tokenizer_name
+
 
 
 def _resize_model_for_tokenizer(model) -> None:
@@ -1257,6 +1262,9 @@ def _calculate_mfu(
 
     where dp_size is the data-parallel dimension of the miner's topology
     (dp_size=num_gpus for pure DDP, dp_size=1 for pure TP, mixed for hybrid).
+    Pipeline parallelism (pp_size) does not multiply unique tokens — all PP
+    stages process the same data.  PP bubble overhead naturally reduces MFU
+    because the same total FLOPs take longer wall time.
 
     Total useful FLOPs = 6 * params * total_unique_tokens (forward + backward).
     Total system peak  = peak_per_gpu * num_gpus * wall_time.
@@ -1940,14 +1948,17 @@ class Actor:
                     "success": False,
                     "error": (
                         "Multi-GPU evaluation requires get_strategy() in train.py "
-                        'returning "ddp"/"fsdp"/"tp" or {"dp_size": N, "tp_size": M}'
+                        'returning "ddp"/"fsdp"/"tp" or '
+                        '{"dp_size": N, "tp_size": M} or '
+                        '{"dp_size": N, "tp_size": M, "pp_size": P}'
                     ),
                     "seed": seed,
                     "code": code,
                 }
             par_config = ParallelismConfig(dp_size=1, tp_size=1)
 
-        if par_config.dp_size * par_config.tp_size != num_gpus:
+        total_par = par_config.dp_size * par_config.tp_size * par_config.pp_size
+        if total_par != num_gpus:
             return {
                 "task_id": task_id,
                 "mfu": 0.0,
@@ -1957,17 +1968,19 @@ class Actor:
                 "success": False,
                 "error": (
                     f"dp_size({par_config.dp_size}) * tp_size({par_config.tp_size}) "
-                    f"= {par_config.dp_size * par_config.tp_size} != num_gpus({num_gpus})"
+                    f"* pp_size({par_config.pp_size}) "
+                    f"= {total_par} != num_gpus({num_gpus})"
                 ),
                 "seed": seed,
                 "code": code,
             }
 
         logger.info(
-            f"Miner parallelism: dp_size={par_config.dp_size}, tp_size={par_config.tp_size}"
+            f"Miner parallelism: dp_size={par_config.dp_size}, "
+            f"tp_size={par_config.tp_size}, pp_size={par_config.pp_size}"
         )
 
-        data_rank = _LOCAL_RANK // par_config.tp_size if _multi_gpu else 0
+        data_rank = _LOCAL_RANK // (par_config.tp_size * par_config.pp_size) if _multi_gpu else 0
         data_world = par_config.dp_size if _multi_gpu else 1
 
         try:
@@ -2012,8 +2025,8 @@ class Actor:
             # Multi-GPU: always FSDP FULL_SHARD (scales to any model size,
             # all ranks participate regardless of miner strategy).
             # Data distribution matches the miner's declared topology:
-            # ranks in the same TP group share data, different DP groups
-            # get different data.  dp_size/tp_size drive the formula.
+            # ranks in the same TP/PP group share data, different DP groups
+            # get different data.  dp_size/tp_size/pp_size drive the formula.
             reference: InnerStepsResult | None = None
             reference_final_state: dict | None = None
             ref_fsdp: torch.nn.Module | None = None
@@ -2187,6 +2200,52 @@ class Actor:
                     "code": code,
                 }
 
+            # Verify trainable params on the pristine model BEFORE warmup.
+            # Must run here because miner inner_steps (e.g. PP) may freeze
+            # layers in-place, making a post-warmup check unreliable.
+            trainable_fail_result = None
+            if _IS_RANK_0:
+                trainable_ok, trainable_error, trainable_details = _verify_trainable_params(
+                    model, min_trainable_params_ratio
+                )
+                if not trainable_ok:
+                    trainable_fail_result = {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": trainable_error,
+                        "error_code": "insufficient_trainable_params",
+                        "seed": seed,
+                        "code": code,
+                        "diagnostics": {"trainable_params": trainable_details},
+                    }
+                else:
+                    logger.info("Trainable params check passed on pristine model")
+
+            if _multi_gpu:
+                local_fail = 1 if trainable_fail_result is not None else 0
+                fail_tensor = torch.tensor([local_fail], dtype=torch.int32, device=device)
+                dist.all_reduce(fail_tensor, op=dist.ReduceOp.MAX)
+                if fail_tensor.item() > 0:
+                    if trainable_fail_result is not None:
+                        return trainable_fail_result
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": "Trainable params check failed on rank 0",
+                        "seed": seed,
+                        "code": code,
+                    }
+            elif trainable_fail_result is not None:
+                return trainable_fail_result
+
             # Warmup uses randomized weights and a random data offset.
             # The real initial_state is restored after warmup completes.
             with torch.no_grad():
@@ -2281,23 +2340,6 @@ class Actor:
 
                     if warmup_failure is None:
                         logger.info("Warmup passed - proceeding with verification checks")
-                        trainable_ok, trainable_error, trainable_details = _verify_trainable_params(
-                            model, min_trainable_params_ratio
-                        )
-                        if not trainable_ok:
-                            warmup_failure = {
-                                "task_id": task_id,
-                                "mfu": 0.0,
-                                "tps": 0.0,
-                                "total_tokens": 0,
-                                "wall_time_seconds": 0.0,
-                                "success": False,
-                                "error": trainable_error,
-                                "error_code": "insufficient_trainable_params",
-                                "seed": seed,
-                                "code": code,
-                                "diagnostics": {"trainable_params": trainable_details},
-                            }
 
             except Exception as e:
                 error_msg = f"Early termination (warmup failed): {type(e).__name__}: {str(e)}"
@@ -2942,7 +2984,11 @@ class Actor:
             # Diagnostics
             diagnostics = {
                 "verification": verify_details,
-                "strategy": {"dp_size": par_config.dp_size, "tp_size": par_config.tp_size},
+                "strategy": {
+                    "dp_size": par_config.dp_size,
+                    "tp_size": par_config.tp_size,
+                    "pp_size": par_config.pp_size,
+                },
                 "reference_loss": reference.final_loss,
                 "candidate_loss": parsed.final_loss,
                 "expected_tokens": expected_tokens,

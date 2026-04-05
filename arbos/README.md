@@ -81,14 +81,11 @@ docker build --network=host --no-cache \
 ```bash
 # === Local Docker (recommended — uses your own GPUs, no cloud costs) ===
 
-# 2 GPUs (default from hparams.json docker.num_gpus)
+# 4 GPUs (default from hparams.json docker.num_gpus)
 uv run arbos/agent.py --train-py local_test/train_fsdp.py --local
 
 # Specific GPU devices
-uv run arbos/agent.py --train-py local_test/train_fsdp.py --local --gpu-devices 4,5
-
-# 4 GPUs for mixed parallelism
-uv run arbos/agent.py --train-py local_test/train_fsdp.py --local --num-gpus 4
+uv run arbos/agent.py --train-py local_test/train_fsdp.py --local --gpu-devices 4,5,6,7
 
 # Custom Docker image
 uv run arbos/agent.py --train-py local_test/train_fsdp.py --local --docker-image my-eval:v2
@@ -239,7 +236,7 @@ Use `--local` if you have A100 GPUs on your machine — it's free and faster (no
 The agent retries with exponential backoff. Consecutive failures trigger delays up to 2 minutes.
 
 **Q: How much does Basilica cost?**
-Each evaluation creates a fresh 2x A100 80GB deployment, runs the test, then deletes it. Cost is per-evaluation based on GPU time.
+Each evaluation creates a fresh 4x A100 80GB SXM deployment, runs the test, then deletes it. Cost is per-evaluation based on GPU time.
 
 **Q: What's the difference between miner and validator mode?**
 Only the submission instructions in the logs. Miner mode says "0.05 TAO fee"; validator mode says "burn_uid 3, no fee". The optimization loop is identical.

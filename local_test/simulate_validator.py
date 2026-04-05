@@ -11,15 +11,18 @@ same Docker container.
 2. Run the simulation (requires 4x A100 GPUs for 7B model):
 
     # Using GPUs 4,5,6,7 (adjust --gpus flag for your device IDs):
-    docker run --gpus '"device=4,5,6,7"' -it --rm \
+    # NOTE: NCCL throttling incentivizes pipeline parallelism by limiting
+    #        collective bandwidth (P2P disabled + single NCCL channel).
+    docker run --gpus '"device=0,1,2,3"' -it --rm \
         --ipc=host \
         --ulimit memlock=-1:-1 \
-        -e NCCL_P2P_LEVEL=NVL \
-        -e NCCL_SHM_USE_CUDA_MEMCPY=1 \
-        -e NCCL_NVLS_ENABLE=1 \
+        -e NCCL_P2P_DISABLE=1 \
+        -e NCCL_NVLS_ENABLE=0 \
+        -e NCCL_SHM_USE_CUDA_MEMCPY=0 \
         -e NCCL_IB_DISABLE=1 \
+        -e NCCL_MAX_NCHANNELS=1 \
         -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-        -v "$(pwd)/local_test/train.py":/test/train.py:ro \
+        -v "$(pwd)/local_test/train_pp.py":/test/train.py:ro \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
         -v "$(pwd)/hparams/hparams.json":/app/hparams.json:ro \
         -v "$(pwd)/environments/templar/env.py":/app/env.py:ro \
@@ -32,10 +35,11 @@ same Docker container.
     docker run --gpus 4 -it --rm \
         --ipc=host \
         --ulimit memlock=-1:-1 \
-        -e NCCL_P2P_LEVEL=NVL \
-        -e NCCL_SHM_USE_CUDA_MEMCPY=1 \
-        -e NCCL_NVLS_ENABLE=1 \
+        -e NCCL_P2P_DISABLE=1 \
+        -e NCCL_NVLS_ENABLE=0 \
+        -e NCCL_SHM_USE_CUDA_MEMCPY=0 \
         -e NCCL_IB_DISABLE=1 \
+        -e NCCL_MAX_NCHANNELS=1 \
         -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         -v "$(pwd)/local_test/train.py":/test/train.py:ro \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
@@ -48,9 +52,10 @@ same Docker container.
 
    Strategies for 4 GPUs:
    - train_mixed.py: dp_size=2, tp_size=2 (mixed DP+TP)
-   - train_ddp.py:   dp_size=4, tp_size=1 (4-way DDP) — update get_strategy()
-   - train_fsdp.py:  dp_size=4, tp_size=1 (4-way FSDP) — update get_strategy()
-   - train_tp.py:    dp_size=1, tp_size=4 (4-way TP) — update get_strategy()
+   - train_ddp.py:   dp_size=4, tp_size=1 (4-way DDP)
+   - train_fsdp.py:  dp_size=4, tp_size=1 (4-way FSDP)
+   - train_tp.py:    dp_size=1, tp_size=4 (4-way TP)
+   - train_pp.py:    dp_size=2, tp_size=1, pp_size=2 (2-way DP + 2-stage PP)
 """
 
 import asyncio

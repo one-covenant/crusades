@@ -475,7 +475,7 @@ class LocalDockerTester:
     ):
         self._hparams = hparams
         self._docker_cfg = hparams.get("docker", {})
-        self._num_gpus = num_gpus or self._docker_cfg.get("num_gpus", 2)
+        self._num_gpus = num_gpus or self._docker_cfg.get("num_gpus", 4)
         self._gpu_devices = gpu_devices
         self._eval_timeout = hparams.get("eval_timeout", 3600)
         self._session_id = f"arbos-{uuid.uuid4().hex[:12]}"
@@ -532,13 +532,15 @@ class LocalDockerTester:
             "--ulimit",
             "memlock=-1:-1",
             "-e",
-            "NCCL_P2P_LEVEL=NVL",
+            "NCCL_P2P_DISABLE=1",
             "-e",
-            "NCCL_SHM_USE_CUDA_MEMCPY=1",
+            "NCCL_SHM_USE_CUDA_MEMCPY=0",
             "-e",
-            "NCCL_NVLS_ENABLE=1",
+            "NCCL_NVLS_ENABLE=0",
             "-e",
             "NCCL_IB_DISABLE=1",
+            "-e",
+            "NCCL_MAX_NCHANNELS=1",
             "-e",
             "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
             "-e",

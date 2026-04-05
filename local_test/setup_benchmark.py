@@ -15,12 +15,39 @@ Run once before testing your train.py locally:
 
 import itertools
 import json
+import os
 import sys
 from pathlib import Path
 
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+def _load_dotenv() -> None:
+    """Load .env file from project root into os.environ (skip if missing)."""
+    env_path = Path(__file__).parent.parent / ".env"
+    if not env_path.is_file():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if value and value[0] in ('"', "'") and value[-1] == value[0]:
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
+_load_dotenv()
+
+
+def _hf_token() -> str | None:
+    """Return HF token from env (needed for gated models like Gemma)."""
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -33,25 +60,41 @@ def load_hparams():
         return json.load(f)
 
 
-def setup_model(model_name: str, output_dir: Path):
-    """Download and cache the benchmark model."""
+def setup_model(model_name: str, output_dir: Path, tokenizer_name: str | None = None):
+    """Download and cache the benchmark model and tokenizer."""
     print(f"Downloading model: {model_name}")
     print(f"   Output: {output_dir}")
 
-    # Download tokenizer
-    print("   Downloading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    token = _hf_token()
+    tok_source = tokenizer_name or model_name
+    print(f"   Downloading tokenizer ({tok_source})...")
+    tokenizer = AutoTokenizer.from_pretrained(tok_source, trust_remote_code=True, token=token)
     tokenizer.save_pretrained(output_dir)
 
-    # Download model
+    # Also save to tokenizers/<name> for Docker build (Dockerfile COPYs this directory)
+    project_root = Path(__file__).parent.parent
+    docker_tok_dir = project_root / "tokenizers" / tok_source
+    if not docker_tok_dir.exists():
+        docker_tok_dir.mkdir(parents=True, exist_ok=True)
+        tokenizer.save_pretrained(docker_tok_dir)
+        print(f"   Tokenizer also saved to: {docker_tok_dir} (for Docker build)")
+
     print("   Downloading model (this may take a while)...")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
+        token=token,
     )
-    model.save_pretrained(output_dir)
 
+    if tokenizer_name and tokenizer_name != model_name:
+        new_vocab = len(tokenizer)
+        old_vocab = model.config.vocab_size
+        if new_vocab != old_vocab:
+            print(f"   Resizing embeddings: {old_vocab} → {new_vocab}")
+            model.resize_token_embeddings(new_vocab)
+
+    model.save_pretrained(output_dir)
     print(f"   Model saved to: {output_dir}")
 
 
@@ -62,18 +105,21 @@ def setup_data(
     sequence_length: int,
     seed: int,
     output_path: Path,
+    tokenizer_name: str | None = None,
 ):
     """Download and tokenize benchmark data."""
+    tok_source = tokenizer_name or model_name
     print("Setting up benchmark data:")
     print(f"   Dataset: {dataset_name}")
+    print(f"   Tokenizer: {tok_source}")
     print(f"   Samples: {num_samples:,}")
     print(f"   Sequence length: {sequence_length}")
     print(f"   Seed: {seed}")
     print(f"   Output: {output_path}")
 
-    # Load tokenizer
-    print("   Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    token = _hf_token()
+    print(f"   Loading tokenizer ({tok_source})...")
+    tokenizer = AutoTokenizer.from_pretrained(tok_source, trust_remote_code=True, token=token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -129,7 +175,8 @@ def main():
 
     # Load config
     hparams = load_hparams()
-    model_name = hparams.get("benchmark_model_name", "Qwen/Qwen2.5-3B")
+    model_name = hparams.get("benchmark_model_name", "Qwen/Qwen2.5-7B")
+    tokenizer_name = hparams.get("benchmark_tokenizer_name", "") or None
     dataset_name = hparams.get("benchmark_dataset_name", "HuggingFaceFW/fineweb")
     num_samples = hparams.get("benchmark_data_samples", 10000)
     sequence_length = hparams.get("benchmark_sequence_length", 1024)
@@ -137,6 +184,7 @@ def main():
 
     print("Configuration from hparams.json:")
     print(f"   Model: {model_name}")
+    print(f"   Tokenizer: {tokenizer_name or model_name}")
     print(f"   Dataset: {dataset_name}")
     print(f"   Samples: {num_samples:,}")
     print(f"   Sequence length: {sequence_length}")
@@ -154,7 +202,7 @@ def main():
         print("   Delete it to re-download")
     else:
         model_dir.mkdir(parents=True, exist_ok=True)
-        setup_model(model_name, model_dir)
+        setup_model(model_name, model_dir, tokenizer_name=tokenizer_name)
     print()
 
     # Setup data
@@ -162,7 +210,15 @@ def main():
         print(f"Data already exists at {data_path}")
         print("   Delete it to regenerate")
     else:
-        setup_data(model_name, dataset_name, num_samples, sequence_length, seed, data_path)
+        setup_data(
+            model_name,
+            dataset_name,
+            num_samples,
+            sequence_length,
+            seed,
+            data_path,
+            tokenizer_name=tokenizer_name,
+        )
     print()
 
     print("=" * 60)
