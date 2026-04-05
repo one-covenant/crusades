@@ -264,10 +264,10 @@ Monitor crusades activity in real-time with the terminal dashboard.
 
 ```bash
 # For miners: connect to the validator's API
-tplr --url http://69.19.136.151:8080
+uv run -m crusades.tui --url http://69.19.136.151:8080
 
 # For validators: auto-detects local crusades.db
-tplr
+uv run -m crusades.tui
 ```
 
 ### Features

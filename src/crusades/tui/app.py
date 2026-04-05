@@ -820,10 +820,10 @@ Controls:
     q              Quit
 
 Examples:
-  tplr                              # Auto-detect: local DB or fall back to API
-  tplr --url http://IP:8080         # Connect to validator's API (for miners)
-  tplr --db /path/to/crusades.db    # Read from validator's database directly
-  tplr --demo                       # Run with mock data for demo
+  %(prog)s                              # Auto-detect: local DB or fall back to API
+  %(prog)s --url http://IP:8080         # Connect to validator's API (for miners)
+  %(prog)s --db /path/to/crusades.db    # Read from validator's database directly
+  %(prog)s --demo                       # Run with mock data for demo
         """,
     )
 
