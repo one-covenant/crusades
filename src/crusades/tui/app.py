@@ -605,6 +605,7 @@ def get_key_nonblocking(timeout: float = 0.1) -> str | None:
 def run_tui(base_url: str, refresh_interval: int, demo: bool = False, db_path: str | None = None):
     """Run the interactive TUI."""
     import termios
+    from pathlib import Path
 
     # Save terminal state
     fd = sys.stdin.fileno()
@@ -616,7 +617,7 @@ def run_tui(base_url: str, refresh_interval: int, demo: bool = False, db_path: s
     if demo:
         client_class = MockClient
         client_kwargs = {}
-    elif db_path:
+    elif db_path and Path(db_path).exists():
         client_class = DatabaseClient
         client_kwargs = {"db_path": db_path, "spec_version": competition_version}
     else:
@@ -819,22 +820,22 @@ Controls:
     q              Quit
 
 Examples:
-  tplr                     # Auto-detect crusades.db if it exists
-  tplr --demo              # Run with mock data for demo
-  tplr --db crusades.db    # Read from validator's database
-  tplr --url http://...    # Connect to API (legacy)
+  tplr                              # Auto-detect: local DB or fall back to API
+  tplr --url http://IP:8080         # Connect to validator's API (for miners)
+  tplr --db /path/to/crusades.db    # Read from validator's database directly
+  tplr --demo                       # Run with mock data for demo
         """,
     )
 
     parser.add_argument(
         "--db",
         default="crusades.db",
-        help="Path to validator's SQLite database (default: crusades.db)",
+        help="Path to validator's SQLite database (default: crusades.db, auto-detected)",
     )
     parser.add_argument(
         "--url",
         default="http://localhost:8000",
-        help="Crusades API base URL (legacy mode)",
+        help="Crusades API base URL (used when local DB not found)",
     )
     parser.add_argument(
         "--refresh",
@@ -849,6 +850,14 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    from pathlib import Path
+
+    if not args.demo:
+        if Path(args.db).exists():
+            console.print(f"[green]Using local database:[/green] {args.db}")
+        else:
+            console.print(f"[yellow]No local DB found,[/yellow] connecting to API: {args.url}")
 
     run_tui(args.url, args.refresh, demo=args.demo, db_path=args.db)
 
