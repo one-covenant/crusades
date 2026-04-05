@@ -127,7 +127,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         if i not in my_layer_indices:
             for p in layer.parameters():
                 p.requires_grad_(False)
-                p.data = p.data.to("meta")
+                p.data = torch.empty(0, dtype=p.dtype, device=device)
 
     for idx in my_layer_indices:
         layer = all_layers[idx]
