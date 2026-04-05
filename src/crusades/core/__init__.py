@@ -6,6 +6,7 @@ from .exceptions import (
     SandboxError,
     StorageError,
 )
+from .exploit_detector import check_code_for_exploits
 from .protocols import (
     EvaluationResult,
     SandboxRuntime,
@@ -22,4 +23,5 @@ __all__ = [
     "SandboxError",
     "EvaluationError",
     "StorageError",
+    "check_code_for_exploits",
 ]

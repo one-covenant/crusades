@@ -154,6 +154,7 @@ class HParams(BaseModel):
 
     # Benchmark settings
     benchmark_model_name: str
+    benchmark_tokenizer_name: str = ""
     benchmark_dataset_name: str
     benchmark_dataset_split: str
     benchmark_data_samples: int

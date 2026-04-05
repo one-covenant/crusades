@@ -263,8 +263,8 @@ Key settings in `hparams/hparams.json`:
 Monitor crusades activity in real-time with the terminal dashboard.
 
 ```bash
-# Connect to the official Crusades API
-uv run -m crusades.tui --url 69.19.136.151:8080
+# Connect to the validator's API
+uv run -m crusades.tui --url http://69.19.136.171:8080
 ```
 
 ### Features

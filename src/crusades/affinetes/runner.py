@@ -47,6 +47,93 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_DOCKER_CONTAINER_PREFIX = "crusades-eval-"
+
+
+def cleanup_stale_eval_containers() -> int:
+    """Kill and remove any leftover evaluation containers from previous sessions.
+
+    Call on validator startup to reclaim GPUs before launching new evals.
+    Returns the number of containers cleaned up.
+    """
+    cleaned = 0
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                f"name={_DOCKER_CONTAINER_PREFIX}",
+                "--format",
+                "{{.ID}} {{.Names}} {{.Status}}",
+            ],
+            capture_output=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return 0
+
+        for line in result.stdout.decode().strip().splitlines():
+            if not line:
+                continue
+            parts = line.split(None, 2)
+            container_id = parts[0]
+            container_name = parts[1] if len(parts) > 1 else container_id
+            logger.warning(f"Cleaning up stale eval container: {container_name} ({container_id})")
+            subprocess.run(
+                ["docker", "rm", "-f", container_id],
+                capture_output=True,
+                timeout=30,
+            )
+            cleaned += 1
+    except Exception as e:
+        logger.warning(f"Error during stale container cleanup: {e}")
+
+    if cleaned:
+        logger.info(f"Cleaned up {cleaned} stale evaluation container(s)")
+
+    # Also prune orphaned evaluation networks
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "network",
+                "ls",
+                "--filter",
+                f"name={AffinetesRunner._INTERNAL_NETWORK_PREFIX}",
+                "--format",
+                "{{.Name}}",
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            for net_name in result.stdout.decode().strip().splitlines():
+                if net_name:
+                    subprocess.run(
+                        ["docker", "network", "rm", net_name],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    logger.info(f"Removed orphaned eval network: {net_name}")
+    except Exception:
+        pass
+
+    return cleaned
+
+
+def _force_remove_container(container_name: str) -> None:
+    """Force-stop and remove a Docker container by name (best-effort)."""
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            timeout=15,
+        )
+    except Exception:
+        pass
+
 
 @dataclass
 class BasilicaDeploymentContext:
@@ -171,6 +258,8 @@ class AffinetesRunner:
     )
 
     _INTERNAL_NETWORK_PREFIX = "crusades_nccl_"
+
+    _current_docker_container: str | None = None
 
     def __init__(
         self,
@@ -492,6 +581,8 @@ asyncio.run(main())
         # Make readable by container's non-root user
         os.chmod(script_path, 0o644)
 
+        container_name = f"{_DOCKER_CONTAINER_PREFIX}{uuid.uuid4().hex[:12]}"
+
         try:
             # Build Docker run command
             # NOTE: Mount to /app/scripts/ (not /tmp/) because we use --tmpfs on /tmp
@@ -499,6 +590,8 @@ asyncio.run(main())
                 "docker",
                 "run",
                 "--rm",
+                "--name",
+                container_name,
                 "-v",
                 f"{script_path}:/app/scripts/eval_script.py:ro",
                 "-v",
@@ -552,11 +645,11 @@ asyncio.run(main())
                 ]
             )
 
-            # Timeout
+            # Grace period before SIGKILL when docker stop is called (not eval timeout)
             docker_cmd.extend(
                 [
                     "--stop-timeout",
-                    str(self.timeout),
+                    "30",
                 ]
             )
 
@@ -588,6 +681,7 @@ asyncio.run(main())
             logger.info(f"   Docker command: {' '.join(docker_cmd[:6])}...")
 
             # Run with timeout - stream logs in real-time
+            AffinetesRunner._current_docker_container = container_name
             process = await asyncio.create_subprocess_exec(
                 *docker_cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -668,6 +762,11 @@ asyncio.run(main())
                 await process.wait()
 
             except TimeoutError:
+                logger.warning(
+                    f"Evaluation timed out after {self.timeout}s, "
+                    f"force-removing container {container_name}"
+                )
+                _force_remove_container(container_name)
                 process.kill()
                 return EvaluationResult.failure(
                     f"Evaluation timed out after {self.timeout}s",
@@ -707,6 +806,8 @@ asyncio.run(main())
             )
 
         finally:
+            AffinetesRunner._current_docker_container = None
+            _force_remove_container(container_name)
             try:
                 os.unlink(script_path)
                 os.unlink(train_path)
@@ -714,6 +815,18 @@ asyncio.run(main())
                 pass
             if eval_network is not None:
                 self._remove_eval_network(eval_network)
+
+    @classmethod
+    def stop_current_docker_eval(cls) -> None:
+        """Force-stop the currently running Docker eval container, if any.
+
+        Safe to call from signal handlers or shutdown hooks.
+        """
+        container = cls._current_docker_container
+        if container:
+            logger.warning(f"Stopping active eval container on shutdown: {container}")
+            _force_remove_container(container)
+            cls._current_docker_container = None
 
     async def _evaluate_basilica(
         self,
