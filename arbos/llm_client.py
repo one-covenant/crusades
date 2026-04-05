@@ -255,7 +255,7 @@ class LLMClient:
         hparams: dict,
     ) -> LLMResponse:
         """Ask the LLM to suggest one improvement to the train.py code."""
-        num_gpus = (hparams.get("docker") or {}).get("num_gpus", 2)
+        num_gpus = (hparams.get("docker") or {}).get("num_gpus", 4)
         user_msg = f"""## Current best train.py (MFU: {mfu:.2f}%)
 
 ```python

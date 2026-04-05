@@ -75,14 +75,14 @@ Each submission undergoes the following verification checks:
 | **Logits Shape** | Logits must be 3D (batch, seq, vocab) | Required | Active |
 | **Sequence Length** | Logits seq dim must match expected | `seq_len - 1` | Active |
 | **Token Count** | Must process the expected number of tokens | Exact match | Active |
-| **Loss Validity** | Loss must be positive, not NaN, close to reference | `max_loss_difference: 0.3` | Active |
-| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.008` | Active |
+| **Loss Validity** | Loss must be positive, not NaN, close to reference | `max_loss_difference: 0.4` | Active |
+| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.015` | Active |
 | **Trainable Params** | All params must be trainable | `100%` | Active |
-| **Params Changed** | Most param elements must change during training | `min: 70%` | Active |
+| **Params Changed** | Most param elements must change during training | `min: 75%` | Active |
 | **Timer Integrity** | Multiple timer sources must agree | `timer_divergence_threshold: 0.5%` | Active |
-| **Min MFU** | Floor threshold -- submissions below are rejected | `min_mfu: 35%` | Active |
-| **Max Plausible MFU** | Ceiling cap -- no legitimate code exceeds this | `max_plausible_mfu: 75%` | Active |
-| **Success Rate** | Majority of runs must pass | `min_success_rate: 0.5` | Active |
+| **Min MFU** | Floor threshold -- submissions below are rejected | `min_mfu: 50%` | Active |
+| **Max Plausible MFU** | Ceiling cap -- no legitimate code exceeds this | `max_plausible_mfu: 85%` | Active |
+| **Success Rate** | Minimum passing runs to accept | `min_success_rate: 0.3` | Active |
 
 > **Note:** Training correctness is verified via loss comparison and final weight matching against a uniform FSDP reference model.
 
@@ -103,7 +103,7 @@ When `docker.num_gpus > 1`, the evaluation runs in multi-GPU mode. This allows m
 | MFU calculation | Per-GPU | Per-GPU × `dp_size` unique tokens |
 
 **Miner contract for multi-GPU:**
-- Must define `get_strategy()` returning `{"dp_size": N, "tp_size": M}` where `N * M == num_gpus` (legacy strings `"ddp"`, `"fsdp"`, `"tp"` also accepted)
+- Must define `get_strategy()` returning `{"dp_size": N, "tp_size": M}` (or `{"dp_size": N, "tp_size": M, "pp_size": P}`) where `N * M * P == num_gpus` (legacy strings `"ddp"`, `"fsdp"`, `"tp"` also accepted)
 - `optimizer` will be `None` -- create your own after wrapping the model
 - Any parallelism strategy is allowed: DDP, FSDP, TP, PP, or combinations
 - `torch.distributed` process group is already initialized by `torchrun`
@@ -182,7 +182,7 @@ uv run -m neurons.validator \
 
 ### Prerequisites
 
-1. **2x NVIDIA A100 GPUs** (or adjust `docker.num_gpus` in hparams.json)
+1. **4x NVIDIA A100 80GB SXM GPUs** (or adjust `docker.num_gpus` in hparams.json)
 2. **Docker** with GPU support (`nvidia-container-toolkit`)
 3. **Built evaluation image**
 
@@ -213,31 +213,34 @@ Edit `hparams/hparams.json`:
     "burn_rate": 0.95,
     "burn_uid": 1,
     
-    "evaluation_runs": 3,
-    "eval_steps": 5,
-    "min_success_rate": 0.5,
+    "evaluation_runs": 2,
+    "eval_steps": 20,
+    "min_success_rate": 0.3,
+
+    "benchmark_model_name": "Qwen/Qwen2.5-7B",
+    "benchmark_tokenizer_name": "google/gemma-3-27b-it",
     
     "docker": {
-        "num_gpus": 2,
-        "memory_limit": "80g",
-        "shm_size": "32g"
+        "num_gpus": 4,
+        "memory_limit": "320g",
+        "shm_size": "64g"
     },
     
     "verification": {
-        "max_loss_difference": 0.3,
-        "min_params_changed_ratio": 0.7,
-        "weight_relative_error_max": 0.008,
+        "max_loss_difference": 0.4,
+        "min_params_changed_ratio": 0.75,
+        "weight_relative_error_max": 0.015,
         "timer_divergence_threshold": 0.005
     },
     
     "mfu": {
         "gpu_peak_tflops": 312.0,
-        "max_plausible_mfu": 75.0,
-        "min_mfu": 35.0
+        "max_plausible_mfu": 85.0,
+        "min_mfu": 50.0
     },
     
     "adaptive_threshold": {
-        "base_threshold": 0.002,
+        "base_threshold": 0.01,
         "decay_percent": 0.05,
         "decay_interval_blocks": 100
     }
@@ -248,15 +251,18 @@ Edit `hparams/hparams.json`:
 |---------|-------------|---------|
 | `netuid` | Subnet ID for Crusades | `3` |
 | `burn_rate` | % of emissions to burn_uid | `0.95` (95%) |
-| `evaluation_runs` | Number of evaluation runs per submission | `3` |
-| `min_success_rate` | Minimum passing runs to accept | `0.5` (50%) |
-| `docker.num_gpus` | Number of GPUs (multi-GPU via `torchrun`) | `2` |
-| `docker.memory_limit` | Container memory limit | `"80g"` |
-| `docker.shm_size` | Shared memory (auto-scaled for multi-GPU NCCL) | `"32g"` |
-| `weight_relative_error_max` | Max relative error for final weight check | `0.008` (0.8%) |
+| `evaluation_runs` | Number of evaluation runs per submission | `2` |
+| `eval_steps` | Training steps per evaluation run | `20` |
+| `min_success_rate` | Minimum passing runs to accept | `0.3` (30%) |
+| `benchmark_model_name` | Model for evaluation | `Qwen/Qwen2.5-7B` |
+| `benchmark_tokenizer_name` | Tokenizer (262K vocab, gated) | `google/gemma-3-27b-it` |
+| `docker.num_gpus` | Number of GPUs (multi-GPU via `torchrun`) | `4` |
+| `docker.memory_limit` | Container memory limit | `"320g"` |
+| `docker.shm_size` | Shared memory (auto-scaled for multi-GPU NCCL) | `"64g"` |
+| `weight_relative_error_max` | Max relative error for final weight check | `0.015` (1.5%) |
 | `timer_divergence_threshold` | Max divergence between timer sources | `0.005` (0.5%) |
-| `min_mfu` | Floor MFU threshold — reject below this | `35.0` |
-| `max_plausible_mfu` | Ceiling MFU cap — no code exceeds this | `75.0` |
+| `min_mfu` | Floor MFU threshold — reject below this | `50.0` |
+| `max_plausible_mfu` | Ceiling MFU cap — no code exceeds this | `85.0` |
 | `gpu_peak_tflops` | GPU peak TFLOPS for MFU calculation | `312.0` (A100 bf16) |
 
 ### Step 4: Run Validator
@@ -287,7 +293,7 @@ uv run -m neurons.validator \
 │   FIRST EVALUATION (~2-4 minutes)                                           │
 │   ┌──────────────────────────────────────────────────────────────────┐      │
 │   │ 1. Validator requests deployment from Basilica API               │      │
-│   │ 2. Basilica provisions A100 GPU                                  │      │
+│   │ 2. Basilica provisions 4x A100 GPUs                              │      │
 │   │ 3. Basilica pulls Docker image from ghcr.io                      │      │
 │   │ 4. Basilica starts FastAPI server (uvicorn)                      │      │
 │   │ 5. Validator calls POST /evaluate with miner's code              │      │
@@ -345,13 +351,13 @@ Edit `hparams/hparams.json`:
     "netuid": 3,
     "basilica": {
         "image": "ghcr.io/YOUR_ORG/templar-eval:latest",
-        "ttl_seconds": 3600,
-        "gpu_count": 2,
+        "ttl_seconds": 7200,
+        "gpu_count": 4,
         "gpu_models": ["A100"],
         "min_gpu_memory_gb": 80,
         "interconnect": "SXM",
-        "cpu": "8",
-        "memory": "80Gi"
+        "cpu": "16",
+        "memory": "320Gi"
     }
 }
 ```
@@ -364,8 +370,8 @@ Edit `hparams/hparams.json`:
 | `gpu_models` | Acceptable GPU types | ["A100"] |
 | `min_gpu_memory_gb` | Minimum VRAM | 80 |
 | `interconnect` | GPU interconnect type | "SXM" |
-| `cpu` | CPU cores | "8" |
-| `memory` | Container memory | "80Gi" |
+| `cpu` | CPU cores | "16" |
+| `memory` | Container memory | "320Gi" |
 
 ### Step 4: Run Validator
 

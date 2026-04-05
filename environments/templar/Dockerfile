@@ -1,5 +1,10 @@
 # Usage: docker build --network=host -f environments/templar/Dockerfile -t templar-eval:latest .
-# Run from repo root so hparams.json and tokenizers/ are accessible
+# Run from repo root so hparams.json and tokenizers/ are accessible.
+#
+# The tokenizers/ directory must exist locally (it's in .gitignore).
+# Run `uv run local_test/setup_benchmark.py` first — it downloads the
+# gated Gemma tokenizer (requires HF_TOKEN env var) and saves it to
+# tokenizers/google/gemma-3-27b-it/ for this COPY step.
 
 FROM pytorch/pytorch:2.9.0-cuda12.6-cudnn9-runtime
 

@@ -475,7 +475,7 @@ class LocalDockerTester:
     ):
         self._hparams = hparams
         self._docker_cfg = hparams.get("docker", {})
-        self._num_gpus = num_gpus or self._docker_cfg.get("num_gpus", 2)
+        self._num_gpus = num_gpus or self._docker_cfg.get("num_gpus", 4)
         self._gpu_devices = gpu_devices
         self._eval_timeout = hparams.get("eval_timeout", 3600)
         self._session_id = f"arbos-{uuid.uuid4().hex[:12]}"

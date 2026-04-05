@@ -57,7 +57,7 @@ def test_hparams():
     check("has basilica", "basilica" in h)
     check("eval_steps is int", isinstance(h.get("eval_steps"), int))
     check("gpu_peak_tflops", h["mfu"]["gpu_peak_tflops"] == 312.0)
-    check("gpu_count in basilica", h["basilica"]["gpu_count"] == 2)
+    check("gpu_count in basilica", h["basilica"]["gpu_count"] == 4)
 
 
 def test_validate_code():
@@ -366,17 +366,17 @@ def test_tester_payload():
     tester = BasilicaTester(h)
     payload = tester._build_payload("# test code")
 
-    check("payload has model_url", payload["model_url"] == "Qwen/Qwen2.5-3B")
+    check("payload has model_url", payload["model_url"] == "Qwen/Qwen2.5-7B")
     check("payload has data_url", payload["data_url"] == "HuggingFaceFW/fineweb")
     check("payload has batch_size", payload["batch_size"] == 16)
     check("payload has sequence_length", payload["sequence_length"] == 1024)
     check("payload has steps", payload["steps"] == 20)
     check("payload has code", payload["code"] == "# test code")
-    check("payload has num_gpus", payload["num_gpus"] == 2)
+    check("payload has num_gpus", payload["num_gpus"] == 4)
     check("payload has gpu_peak_tflops", payload["gpu_peak_tflops"] == 312.0)
-    check("payload has max_loss_difference", payload["max_loss_difference"] == 0.3)
+    check("payload has max_loss_difference", payload["max_loss_difference"] == 0.4)
     check("payload has min_params_changed_ratio", payload["min_params_changed_ratio"] == 0.75)
-    check("payload has weight_relative_error_max", payload["weight_relative_error_max"] == 0.008)
+    check("payload has weight_relative_error_max", payload["weight_relative_error_max"] == 0.015)
     check("payload has timer_divergence_threshold", payload["timer_divergence_threshold"] == 0.005)
 
 
@@ -388,9 +388,9 @@ def test_local_tester_payload():
     tester = LocalDockerTester(h, num_gpus=4, gpu_devices="4,5,6,7")
     payload = tester._build_payload("# test code")
 
-    check("local payload model_url", payload["model_url"] == "Qwen/Qwen2.5-3B")
+    check("local payload model_url", payload["model_url"] == "Qwen/Qwen2.5-7B")
     check("local payload num_gpus=4", payload["num_gpus"] == 4)
-    check("local payload has verification fields", payload["weight_relative_error_max"] == 0.008)
+    check("local payload has verification fields", payload["weight_relative_error_max"] == 0.015)
 
     cmd = tester._docker_cmd("/tmp/code.py", "/tmp/params.json", "/tmp/runner.py")
     check("docker cmd starts with docker", cmd[0] == "docker")
