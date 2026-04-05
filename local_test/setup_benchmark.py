@@ -24,9 +24,30 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+def _load_dotenv() -> None:
+    """Load .env file from project root into os.environ (skip if missing)."""
+    env_path = Path(__file__).parent.parent / ".env"
+    if not env_path.is_file():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if value and value[0] in ('"', "'") and value[-1] == value[0]:
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
+_load_dotenv()
+
+
 def _hf_token() -> str | None:
     """Return HF token from env (needed for gated models like Gemma)."""
     return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
