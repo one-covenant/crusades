@@ -782,19 +782,22 @@ class Validator(BaseNode):
 
             # LLM-based exploit detection (fail-open: never blocks on errors)
             is_safe, exploit_reason = await check_code_for_exploits(miner_code)
+            safe_reason = (
+                exploit_reason[:500].replace("\n", " ").replace("\r", "") if exploit_reason else ""
+            )
             if not is_safe:
                 logger.error(
-                    f"   EXPLOIT DETECTED by LLM for {submission.submission_id}: {exploit_reason}"
+                    f"   EXPLOIT DETECTED by LLM for {submission.submission_id}: {safe_reason}"
                 )
                 await self.db.update_submission_code(submission.submission_id, miner_code)
                 await self.db.update_submission_status(
                     submission.submission_id,
                     SubmissionStatus.FAILED_EVALUATION,
-                    error_message=f"Exploit detected: {exploit_reason}",
+                    error_message=f"Exploit detected: {safe_reason}",
                 )
                 await self._save_state()
                 continue
-            logger.info(f"   Exploit check: {exploit_reason}")
+            logger.info(f"   Exploit check: {safe_reason}")
 
             # Run evaluations — one Basilica deployment per miner, N runs on it.
             # Each /evaluate call spawns a fresh torchrun subprocess inside the
